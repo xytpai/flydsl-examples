@@ -1,6 +1,7 @@
 import time
 import torch
 import argparse
+import numpy as np
 from torch.profiler import profile, ProfilerActivity
 from dataclasses import dataclass
 
@@ -24,6 +25,11 @@ def create_inputs(args):
     a = torch.randn(args.n, dtype=args.dtype).cuda()
     b = torch.randn(args.n, dtype=args.dtype).cuda()
     return a, b
+
+
+def create_outputs(args):
+    c = torch.randn(args.n, dtype=args.dtype).cuda()
+    return (c,)
 
 
 def create_add_kernel(dtype, VEC_SIZE):
@@ -142,9 +148,8 @@ def create_add_kernel(dtype, VEC_SIZE):
 
 
 EXE = None
-def func(a, b):
+def func(a, b, out):
     global EXE
-    out = torch.empty_like(a)
     if not EXE:
         if a.dtype == torch.float:
             module = create_add_kernel(F32Type, 4)
@@ -154,49 +159,54 @@ def func(a, b):
             module = create_add_kernel(BF16Type, 8)
         EXE = flydsl.compile(module)
     EXE(a, b, out, out.numel())
-    return (out, )
 
 
-def ref_func(a, b):
-    return (a + b, )
+def ref_func(a, b, out):
+    torch.add(a, b, out=out)
 
 
-def benchmark(args, func, ref_func, warmup=10, niters=10, use_profiler=False):
+# def func(a, b, out):
+#     ref_func(a, b, out=out)
+
+
+def benchmark(args, func, ref_func, warmup=20, niters=100):
     inputs = create_inputs(args)
-    outputs = func(*inputs)
-    ref_outputs = ref_func(*inputs)
+    outputs = create_outputs(args)
+    ref_outputs = create_outputs(args)
+    inouts = inputs + outputs
+    ref_inouts = inputs + ref_outputs
+    func(*inouts)
+    ref_func(*ref_inouts)
     for output, ref_output in zip(outputs, ref_outputs):
         is_allclose = torch.allclose(output, ref_output)
         assert is_allclose == True
     print("validation passed!", flush=True)
+
     # get ref_func perf
     for i in range(warmup):
-        outputs = ref_func(*inputs)
+        ref_func(*ref_inouts)
     with profile(activities=[ProfilerActivity.CUDA], ) as prof:
         for i in range(niters):
-            outputs = ref_func(*inputs)
+            ref_func(*ref_inouts)
     table = prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1)
     print(table)
+
     # get func perf
     for i in range(warmup):
-        outputs = func(*inputs)
-    if use_profiler:
-        with profile(activities=[ProfilerActivity.CUDA], ) as prof:
-            for i in range(niters):
-                outputs = func(*inputs)
-        table = prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1)
-        print(table)
-    else:
-        torch.cuda.synchronize()
-        start = torch.cuda.Event(enable_timing=True)
-        stop = torch.cuda.Event(enable_timing=True)
-        start.record()
-        for i in range(niters):
-            outputs = func(*inputs)
-        stop.record()
-        torch.cuda.synchronize()
-        elapsed_per_iter = start.elapsed_time(stop) / niters * 1e3
-        print(f"[FlyDSL] elapsed_per_iter:{elapsed_per_iter} us")
+        func(*inouts)
+    torch.cuda.synchronize()
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    latencies = []
+    for i in range(niters):
+        start_event.record()
+        func(*inouts)
+        end_event.record()
+        end_event.synchronize()
+        latencies.append(start_event.elapsed_time(end_event))
+    avg = np.mean(latencies)
+    elapsed_per_iter = avg * 1e3
+    print(f"[FlyDSL] elapsed_per_iter:{elapsed_per_iter} us")
 
 
 if __name__ == '__main__':
