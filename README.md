@@ -6,7 +6,7 @@ Empowered by https://github.com/rocm/flydsl we are now able to develop high-perf
 This repository will provide the following examples from scratch:
 
 - [x] Pointwise Add
-- [ ] Reduction
+- [x] Batch Reduce
 - [ ] RMS Norm
 - [ ] SGEMM
 - [ ] HGEMM
@@ -135,6 +135,8 @@ for idx_in_vec in range(VEC_SIZE):
     a_val = frgA[(idx_in_vec, )]
 
 ```
+
+## 2. Batch Reduce
 
 ---
 
