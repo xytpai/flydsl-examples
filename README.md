@@ -77,6 +77,65 @@ Self CPU time total: 114.020ms
 Self CUDA time total: 3.891ms
 ```
 
+Let's take a closer look at details:
+
+- Thread/Value Layout
+
+```python
+# To create a TV layout.
+# thread_layout determines how are threads arranged in a thread block
+thread_layout = flir.make_ordered_layout((BLOCK_SIZE,), order=(0,))
+# value_layout determines how are values arranged in a thread
+value_layout = flir.make_ordered_layout((VEC_SIZE,), order=(0,))
+```
+
+- Get the data for a single thread
+
+```python
+# define vectorized atomic load
+copy_atom_load = flir.make_copy_atom(dtype.get(), vector_size=VEC_SIZE)
+# define tv layout copy
+tiled_copy_A = flir.make_tiled_copy_tv(copy_atom_load, thread_layout, value_layout, thr_shape=(BLOCK_SIZE,), val_shape=(VEC_SIZE,))
+
+# Create a tensor view from a memref with a specific layout and shape.
+tensor_A = flir.make_tensor(A, shape=(n,), strides=(1,))
+# Partition a tensor view.
+gA = flir.zipped_divide(tensor_A, (BLOCK_WORK_SIZE,))
+# Get tensor view of this block
+blkA = gA[(bid_x,)]
+# Get per-thread slice of the tiled copy
+thr_copy_A = tiled_copy_A.get_slice(tid_x)
+# Get tensor view of this thread
+thrA = thr_copy_A.partition_S(blkA)
+
+# Create register in this thread for A fragment
+frgA = flir.make_fragment_like(thrA, dtype.get())
+
+val_shape = tiled_copy_A.val_shape
+# Create tensor in register for mask
+frgPred = flir.make_rmem_tensor(val_shape, IntegerType.get_signless(1))
+for idx_in_vec in range(val_shape[0]): # iter VEC_SIZE
+    idx_in_vec = flir.const_index(idx_in_vec)
+
+    # Return absolute coordinates for a given linear index.
+    # thrCrd is just an identity tensor maps each coordinate to itself, useful for tracking
+    # coordinates during partitioning.
+    coords = thrCrd.coords_from_linear(idx_in_vec) 
+
+    pred_val = flir.elem_less(coords, (n,))
+    pred_offsets = tuple(frgPred.offsets_from_linear(idx_in_vec))
+    frgPred[pred_offsets] = pred_val
+
+# Copy to register
+flir.copy(tiled_copy_A, thrA, frgA, pred=frgPred)
+
+for idx_in_vec in range(VEC_SIZE):
+    idx_in_vec = flir.const_index(idx_in_vec)
+    # Get a value
+    a_val = frgA[(idx_in_vec, )]
+
+```
+
 ---
 
 > Contact: xytpai@gmail.com
