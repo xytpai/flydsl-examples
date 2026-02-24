@@ -22,17 +22,17 @@ class Args:
 
 
 def create_inputs(args):
-    a = torch.randn(args.n, dtype=args.dtype).cuda()
-    b = torch.randn(args.n, dtype=args.dtype).cuda()
+    a = torch.randn(args.n, dtype=args.dtype, device='cuda')
+    b = torch.randn(args.n, dtype=args.dtype, device='cuda')
     return a, b
 
 
 def create_outputs(args):
-    c = torch.randn(args.n, dtype=args.dtype).cuda()
+    c = torch.randn(args.n, dtype=args.dtype, device='cuda')
     return (c,)
 
 
-def create_add_kernel(dtype, VEC_SIZE):
+def create_add_kernel(dtype, VEC_SIZE: int):
     # NOTE: dtype is static, n is dynamic
 
     # NOTE: Kernel operands in the lowered module use dynamic memref types.
@@ -157,16 +157,14 @@ def func(a, b, out):
             module = create_add_kernel(F16Type, 8)
         elif a.dtype == torch.bfloat16:
             module = create_add_kernel(BF16Type, 8)
-        EXE = flydsl.compile(module)
+        optimized = run_pipeline(module, Pipeline().canonicalize().cse())
+        EXE = flydsl.compile(optimized)
     EXE(a, b, out, out.numel())
+    torch.cuda.synchronize()
 
 
 def ref_func(a, b, out):
     torch.add(a, b, out=out)
-
-
-# def func(a, b, out):
-#     ref_func(a, b, out=out)
 
 
 def benchmark(args, func, ref_func, warmup=20, niters=100):
@@ -180,9 +178,10 @@ def benchmark(args, func, ref_func, warmup=20, niters=100):
     for output, ref_output in zip(outputs, ref_outputs):
         is_allclose = torch.allclose(output, ref_output)
         assert is_allclose == True
-    print("validation passed!", flush=True)
+    print("validation passed!\n", flush=True)
 
     # get ref_func perf
+    print("===================== [REF] =====================")
     for i in range(warmup):
         ref_func(*ref_inouts)
     with profile(activities=[ProfilerActivity.CUDA], ) as prof:
@@ -192,21 +191,14 @@ def benchmark(args, func, ref_func, warmup=20, niters=100):
     print(table)
 
     # get func perf
+    print("===================== [FLYDSL] =====================")
     for i in range(warmup):
         func(*inouts)
-    torch.cuda.synchronize()
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-    latencies = []
-    for i in range(niters):
-        start_event.record()
-        func(*inouts)
-        end_event.record()
-        end_event.synchronize()
-        latencies.append(start_event.elapsed_time(end_event))
-    avg = np.mean(latencies)
-    elapsed_per_iter = avg * 1e3
-    print(f"[FlyDSL] elapsed_per_iter:{elapsed_per_iter} us")
+    with profile(activities=[ProfilerActivity.CUDA], ) as prof:
+        for i in range(niters):
+            func(*inouts)
+    table = prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1)
+    print(table)
 
 
 if __name__ == '__main__':
