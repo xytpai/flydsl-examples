@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import flydsl
 from flydsl.dialects.ext import flir
 from flydsl.dialects.ext import arith
+from flydsl.compiler.pipeline import Pipeline, run_pipeline
 from _mlir import ir
 from _mlir.ir import F16Type, BF16Type, F32Type, IntegerType
 import _mlir.extras.types as T
@@ -139,16 +140,19 @@ def create_add_kernel(dtype, VEC_SIZE):
     return PointwiseAdd()
 
 
+EXE = None
 def func(a, b):
+    global EXE
     out = torch.empty_like(a)
-    if a.dtype == torch.float:
-        module = create_add_kernel(F32Type, 4)
-    elif a.dtype == torch.half:
-        module = create_add_kernel(F16Type, 8)
-    elif a.dtype == torch.bfloat16:
-        module = create_add_kernel(BF16Type, 8)
-    exe = flydsl.compile(module)
-    exe(a, b, out, out.numel())
+    if not EXE:
+        if a.dtype == torch.float:
+            module = create_add_kernel(F32Type, 4)
+        elif a.dtype == torch.half:
+            module = create_add_kernel(F16Type, 8)
+        elif a.dtype == torch.bfloat16:
+            module = create_add_kernel(BF16Type, 8)
+        EXE = flydsl.compile(module)
+    EXE(a, b, out, out.numel())
     return (out, )
 
 
@@ -164,6 +168,15 @@ def benchmark(args, func, ref_func, warmup=10, niters=10, use_profiler=False):
         is_allclose = torch.allclose(output, ref_output)
         assert is_allclose == True
     print("validation passed!", flush=True)
+    # get ref_func perf
+    for i in range(warmup):
+        outputs = ref_func(*inputs)
+    with profile(activities=[ProfilerActivity.CUDA], ) as prof:
+        for i in range(niters):
+            outputs = ref_func(*inputs)
+    table = prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1)
+    print(table)
+    # get func perf
     for i in range(warmup):
         outputs = func(*inputs)
     if use_profiler:
@@ -174,22 +187,23 @@ def benchmark(args, func, ref_func, warmup=10, niters=10, use_profiler=False):
         print(table)
     else:
         torch.cuda.synchronize()
-        start = time.time()
+        start = torch.cuda.Event(enable_timing=True)
+        stop = torch.cuda.Event(enable_timing=True)
+        start.record()
         for i in range(niters):
             outputs = func(*inputs)
+        stop.record()
         torch.cuda.synchronize()
-        end = time.time()
-        elapsed_per_iter = (end - start) / niters
-        print(f"elapsed_per_iter:{elapsed_per_iter * 1e6} us")
+        elapsed_per_iter = start.elapsed_time(stop) / niters * 1e3
+        print(f"[FlyDSL] elapsed_per_iter:{elapsed_per_iter} us")
 
 
 if __name__ == '__main__':
-    print(f"run: {__file__}")
     parser = argparse.ArgumentParser(description="Examples")
     parser.add_argument("--n", type=int, required=True)
     parser.add_argument("--dtype", type=str, required=True)
     args = parser.parse_args()
-    print(args)
+    print(f"run: {__file__}, args: {args}")
     dtype_convert = {'f32': torch.float, 'f16': torch.half, 'bf16': torch.bfloat16}
     args.dtype = dtype_convert[args.dtype]
     args = Args(**vars(args))
