@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import flydsl
 from flydsl.dialects.ext import flir
 from flydsl.dialects.ext import arith
+from flydsl.runtime.device import get_rocm_arch
 from flydsl.compiler.pipeline import Pipeline, run_pipeline
 from _mlir import ir
 from _mlir.ir import F16Type, BF16Type, F32Type, IntegerType
@@ -31,12 +32,13 @@ def create_add_kernel(dtype, VEC_SIZE):
     # NOTE: Kernel operands in the lowered module use dynamic memref types.
     # Keep the host stub signature dynamic too so gpu.launch_func types match.
     S = ir.ShapedType.get_dynamic_size()
+    ARCH = get_rocm_arch()
     BLOCK_SIZE = 256
     BLOCK_WORK_SIZE = BLOCK_SIZE * VEC_SIZE
     
     class PointwiseAdd(flir.MlirModule):
         GPU_MODULE_NAME = "pointwise_kernels"
-        GPU_MODULE_TARGETS = ['#rocdl.target<abi = "500">']
+        GPU_MODULE_TARGETS = [f'#rocdl.target<chip = "{ARCH}">']
 
         @flir.kernel
         def pointwise_add_kernel(
@@ -48,12 +50,11 @@ def create_add_kernel(dtype, VEC_SIZE):
         ):
             # Get index
             tid_x = flir.thread_idx("x")
-            bid_x = flir.block_idx("x")            
-            linear_x = bid_x * BLOCK_WORK_SIZE + tid_x * VEC_SIZE
+            bid_x = flir.block_idx("x")
 
             # Create thread/value layouts
-            thread_layout = flir.make_ordered_layout((BLOCK_SIZE, ))
-            value_layout = flir.make_ordered_layout((VEC_SIZE, ))
+            thread_layout = flir.make_ordered_layout((BLOCK_SIZE,), order=(0,))
+            value_layout = flir.make_ordered_layout((VEC_SIZE,), order=(0,))
 
             # Create copy atoms
             copy_atom_load = flir.make_copy_atom(dtype.get(), vector_size=VEC_SIZE)
@@ -65,17 +66,17 @@ def create_add_kernel(dtype, VEC_SIZE):
             tiled_copy_C = flir.make_tiled_copy_tv(copy_atom_store, thread_layout, value_layout, thr_shape=(BLOCK_SIZE,), val_shape=(VEC_SIZE,))
 
             # Specify input tensor layouts
-            tensor_A = flir.make_tensor(A, shape=(n, ), strides=(1, ))
-            tensor_B = flir.make_tensor(B, shape=(n, ), strides=(1, ))
-            tensor_C = flir.make_tensor(C, shape=(n, ), strides=(1, ))
+            tensor_A = flir.make_tensor(A, shape=(n,), strides=(1,))
+            tensor_B = flir.make_tensor(B, shape=(n,), strides=(1,))
+            tensor_C = flir.make_tensor(C, shape=(n,), strides=(1,))
 
             # Get per-block coordinates
-            gA = flir.zipped_divide(tensor_A, (BLOCK_WORK_SIZE, ))
-            gB = flir.zipped_divide(tensor_B, (BLOCK_WORK_SIZE, ))
-            gC = flir.zipped_divide(tensor_C, (BLOCK_WORK_SIZE, ))
-            idC = flir.make_identity_tensor((n, )) # For tracking coordinates only
-            cC = flir.zipped_divide(idC, (BLOCK_WORK_SIZE, ))
-            blk_coord = (bid_x, )
+            gA = flir.zipped_divide(tensor_A, (BLOCK_WORK_SIZE,))
+            gB = flir.zipped_divide(tensor_B, (BLOCK_WORK_SIZE,))
+            gC = flir.zipped_divide(tensor_C, (BLOCK_WORK_SIZE,))
+            idC = flir.make_identity_tensor((n,)) # For tracking coordinates only
+            cC = flir.zipped_divide(idC, (BLOCK_WORK_SIZE,))
+            blk_coord = (bid_x,)
             blkA = gA[blk_coord]
             blkB = gB[blk_coord]
             blkC = gC[blk_coord]
@@ -101,7 +102,7 @@ def create_add_kernel(dtype, VEC_SIZE):
             for linear in range(total_vals):
                 linear_idx = flir.const_index(linear)
                 coords = thrCrd.coords_from_linear(linear_idx)
-                pred_val = flir.elem_less(coords, (n, ))
+                pred_val = flir.elem_less(coords, (n,))
                 pred_offsets = tuple(frgPred.offsets_from_linear(linear_idx))
                 frgPred[pred_offsets] = pred_val
 
@@ -137,7 +138,7 @@ def create_add_kernel(dtype, VEC_SIZE):
                 kernel_operands=[A, B, C, n],
             )
 
-    return PointwiseAdd()
+    return PointwiseAdd().module
 
 
 EXE = None
