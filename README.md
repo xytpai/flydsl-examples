@@ -129,7 +129,7 @@ for idx_in_vec in range(val_shape[0]): # iter VEC_SIZE
 # Copy to register
 flir.copy(tiled_copy_A, thrA, frgA, pred=frgPred)
 
-for idx_in_vec in range(VEC_SIZE):
+for idx_in_vec in range_constexpr(VEC_SIZE):
     idx_in_vec = flir.const_index(idx_in_vec)
     # Get a value
     a_val = frgA[(idx_in_vec, )]

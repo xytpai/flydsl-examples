@@ -10,6 +10,9 @@ from flydsl.dialects.ext import flir
 from flydsl.dialects.ext import arith
 from flydsl.runtime.device import get_rocm_arch
 from flydsl.compiler.pipeline import Pipeline, run_pipeline
+from flydsl.dialects.ext.python_control_flow import range_constexpr, lower_range_for_loops
+from flydsl.utils import SmemAllocator
+
 from _mlir import ir
 from _mlir.ir import F16Type, BF16Type, F32Type, IntegerType
 import _mlir.extras.types as T
@@ -36,17 +39,126 @@ def ref_func(x, y):
     torch.sum(x, dim=1, keepdim=True, out=y)
 
 
+def make_block_reduce_add(tid, WARP_SIZE, RED_SLOTS):
+    def block_reduce_add(val_f32, scratch_memref):
+        fm_fast = flir.arith.FastMathFlags.fast
+        arith_ops = flir.arith
+        gpu = flir.gpu_ext
+        zero_idx = flir.const_index(0)
+
+        if RED_SLOTS == 1:
+            # Fast path: single-wave block (RED_SLOTS==1) needs no LDS and no barrier.
+            # After xor-shuffle reduction, all lanes hold the same reduced value.
+            width_i32 = arith.as_value(arith.constant(WARP_SIZE, type=T.i32()))
+            w = arith.as_value(val_f32)
+            for shift in [32, 16, 8, 4, 2, 1]:
+                offset = arith.as_value(arith.constant(shift, type=T.i32()))
+                peer = arith.as_value(gpu.ShuffleOp(arith.as_value(w), offset, width_i32, mode="xor").shuffleResult)
+                w = arith.as_value(arith_ops.AddFOp(arith.as_value(w), peer, fastmath=fm_fast).result)
+            return w
+
+        scratch_tv = flir.make_tensor(scratch_memref, shape=(RED_SLOTS,), strides=(1,))
+        tid_v = tid.value if hasattr(tid, "value") else tid
+        tid_v = arith.as_value(tid_v)
+        tid_i32 = arith.as_value(arith_ops.IndexCastOp(T.i32(), tid_v).result)
+        c_warp_i32 = arith.as_value(arith.constant(WARP_SIZE, type=T.i32()))
+        lane_i32 = arith.as_value(arith_ops.RemUIOp(tid_i32, c_warp_i32).result)
+        wave_i32 = arith.as_value(arith_ops.DivUIOp(tid_i32, c_warp_i32).result)
+        width_i32 = arith.as_value(arith.constant(WARP_SIZE, type=T.i32()))
+        # Use Flir layout algebra to compute LDS indices for the reduction scratch.
+        c_num_waves = flir.const_index(RED_SLOTS)
+        c1 = flir.const_index(1)
+        shape_red = flir.make_shape(c_num_waves)
+        stride_red = flir.make_stride(c1)
+        layout_red = flir.make_layout(shape_red, stride_red)
+
+        w = arith.as_value(val_f32)
+        for sh in [32, 16, 8, 4, 2, 1]:
+            off = arith.as_value(arith.constant(sh, type=T.i32()))
+            peer = arith.as_value(gpu.ShuffleOp(arith.as_value(w), off, width_i32, mode="xor").shuffleResult)
+            w = arith.as_value(arith_ops.AddFOp(arith.as_value(w), peer, fastmath=fm_fast).result)
+        
+        is_lane0 = arith.as_value(arith_ops.CmpIOp(
+            arith_ops.CmpIPredicate.eq,
+            lane_i32,
+            arith.as_value(arith.constant(0, type=T.i32())),
+        ).result)
+        if is_lane0:
+            wave_idx = arith_ops.IndexCastOp(T.index(), wave_i32).result
+            red_idx = flir.crd2idx(flir.make_coord(wave_idx), layout_red)
+            scratch_tv[red_idx] = w
+        gpu.barrier()
+
+        NUM_WAVES = RED_SLOTS
+        is_wave0 = arith.as_value(arith_ops.CmpIOp(
+            arith_ops.CmpIPredicate.eq,
+            wave_i32,
+            arith.as_value(arith.constant(0, type=T.i32())),
+        ).result)
+        # Only wave0 does final reduction and writes scratch[0].
+        if is_wave0:
+            in_range = arith.as_value(arith_ops.CmpIOp(
+                arith_ops.CmpIPredicate.ult,
+                lane_i32,
+                arith.as_value(arith.constant(NUM_WAVES, type=T.i32())),
+            ).result)
+
+            c0_i32 = arith.as_value(arith.constant(0, type=T.i32()))
+            lane_safe_i32 = arith.as_value(flir.arith.SelectOp(in_range, lane_i32, c0_i32).result)
+            lane_safe_idx = arith.as_value(arith_ops.IndexCastOp(T.index(), lane_safe_i32).result)
+            red_idx = flir.crd2idx(flir.make_coord(lane_safe_idx), layout_red)
+            v = scratch_tv[red_idx]
+            z = arith.as_value(arith.constant(0.0, type=T.f32()))
+            ww = arith.as_value(flir.arith.SelectOp(in_range, v, z).result)
+
+            for sh in [32, 16, 8, 4, 2, 1]:
+                off = arith.as_value(arith.constant(sh, type=T.i32()))
+                peer = arith.as_value(gpu.ShuffleOp(arith.as_value(ww), off, width_i32, mode="xor").shuffleResult)
+                ww = arith.as_value(arith_ops.AddFOp(arith.as_value(ww), peer, fastmath=fm_fast).result)
+
+            is_lane0_2 = arith.as_value(arith_ops.CmpIOp(
+                arith_ops.CmpIPredicate.eq,
+                lane_i32,
+                arith.as_value(arith.constant(0, type=T.i32())),
+            ).result)
+            if is_lane0_2:
+                red_idx0 = flir.crd2idx(flir.make_coord(zero_idx), layout_red)
+                scratch_tv[red_idx0] = ww
+
+        gpu.barrier()
+        red_idx0 = flir.crd2idx(flir.make_coord(zero_idx), layout_red)
+        return scratch_tv[red_idx0]
+
+    try:
+        return lower_range_for_loops(block_reduce_add)
+    except Exception:
+        return block_reduce_add
+
+
 def create_reduce_kernel(dtype, VEC_SIZE: int):
     S = ir.ShapedType.get_dynamic_size()
     ARCH = get_rocm_arch()
-    THR_M, THR_N = 1, 256
+    BLOCK_THREADS = 256
+    THR_M, THR_N = 1, BLOCK_THREADS
     VAL_M, VAL_N = VEC_SIZE, VEC_SIZE
     TILE_M = THR_M * VAL_M
     TILE_N = THR_N * VAL_N
+    WARP_SIZE = 64
+    RED_SLOTS = max(1, (BLOCK_THREADS + WARP_SIZE - 1) // WARP_SIZE)
+    allocator = SmemAllocator(None, arch=ARCH)
+    _state = {}
     
     class BatchReduce(flir.MlirModule):
         GPU_MODULE_NAME = "reduce_kernels"
         GPU_MODULE_TARGETS = [f'#rocdl.target<chip = "{ARCH}">']
+
+        def init_gpu_module(self):
+            elem_type = dtype.get()
+            compute_type = T.f32()
+            _state["elem_type"] = elem_type
+            _state["compute_type"] = compute_type
+            _state["smem_red"] = allocator.allocate_array(T.f32(), RED_SLOTS)
+            allocator.finalize()
 
         @flir.kernel
         def batch_reduce_kernel(
