@@ -8,8 +8,7 @@ This repository will provide the following examples from scratch:
 - [x] Pointwise Add
 - [x] Batch Reduce
 - [x] RMS Norm
-- [ ] SGEMM
-- [ ] HGEMM
+- [x] HGEMM
 - [ ] GEMM-FP8
 - [ ] GEMM Fusions
 
@@ -247,6 +246,12 @@ Self CUDA time total: 5.424ms
 -------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
 Self CPU time total: 104.695ms
 Self CUDA time total: 613.066us
+```
+
+## 4. HGEMM
+
+```bash
+python3 hgemm.py --m=8192 --n=8192 --k=8192 --dtype=f16
 ```
 
 ---
