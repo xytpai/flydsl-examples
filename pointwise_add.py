@@ -115,7 +115,7 @@ def create_add_kernel(dtype, VEC_SIZE: int):
             flir.copy(tiled_copy_A, thrA, frgA, pred=frgPred)
             flir.copy(tiled_copy_B, thrB, frgB, pred=frgPred)
 
-            for v in range(VEC_SIZE):
+            for v in range_constexpr(VEC_SIZE):
                 idx = flir.const_index(v)
                 coords = (idx, )
                 a_val = frgA[coords]
