@@ -6,15 +6,15 @@ from torch.profiler import profile, ProfilerActivity
 from dataclasses import dataclass
 
 import flydsl
-from flydsl.dialects.ext import flir
-from flydsl.dialects.ext import arith
+from flydsl.dialects.ext import flir, gpu, arith
 from flydsl.runtime.device import get_rocm_arch
 from flydsl.compiler.pipeline import Pipeline, run_pipeline
 from flydsl.dialects.ext.python_control_flow import range_constexpr, lower_range_for_loops
 from flydsl.utils import SmemAllocator
+fm_fast = flir.arith.FastMathFlags.fast
 
 from _mlir import ir
-from _mlir.ir import F16Type, BF16Type, F32Type, IntegerType
+from _mlir.ir import F16Type, BF16Type, F32Type, IntegerType, VectorType
 import _mlir.extras.types as T
 
 
@@ -41,9 +41,7 @@ def ref_func(x, y):
 
 def make_block_reduce_add(tid, WARP_SIZE, RED_SLOTS):
     def block_reduce_add(val_f32, scratch_memref):
-        fm_fast = flir.arith.FastMathFlags.fast
         arith_ops = flir.arith
-        gpu = flir.gpu_ext
         zero_idx = flir.const_index(0)
 
         if RED_SLOTS == 1:
@@ -139,25 +137,19 @@ def create_reduce_kernel(dtype, VEC_SIZE: int):
     S = ir.ShapedType.get_dynamic_size()
     ARCH = get_rocm_arch()
     BLOCK_THREADS = 256
-    THR_M, THR_N = 1, BLOCK_THREADS
-    VAL_M, VAL_N = VEC_SIZE, VEC_SIZE
-    TILE_M = THR_M * VAL_M
-    TILE_N = THR_N * VAL_N
     WARP_SIZE = 64
+    BLOCK_WORK_SIZE = BLOCK_THREADS * VEC_SIZE
     RED_SLOTS = max(1, (BLOCK_THREADS + WARP_SIZE - 1) // WARP_SIZE)
     allocator = SmemAllocator(None, arch=ARCH)
-    _state = {}
     
     class BatchReduce(flir.MlirModule):
         GPU_MODULE_NAME = "reduce_kernels"
         GPU_MODULE_TARGETS = [f'#rocdl.target<chip = "{ARCH}">']
 
         def init_gpu_module(self):
-            elem_type = dtype.get()
-            compute_type = T.f32()
-            _state["elem_type"] = elem_type
-            _state["compute_type"] = compute_type
-            _state["smem_red"] = allocator.allocate_array(T.f32(), RED_SLOTS)
+            self.dtype = dtype.get()
+            self.acc_type = T.f32()
+            self.smem = allocator.allocate_array(T.f32(), RED_SLOTS)
             allocator.finalize()
 
         @flir.kernel
@@ -168,95 +160,58 @@ def create_reduce_kernel(dtype, VEC_SIZE: int):
             batch_size: lambda: T.index(),
             reduce_size: lambda: T.index(),
         ):
-            # Get index
             tid_x = flir.thread_idx("x")
             bid_x = flir.block_idx("x")
-            bid_y = flir.block_idx("y")
-
-            # Create thread/value layouts
-            thread_layout = flir.make_ordered_layout((THR_M, THR_N), order=(1, 0))
-            value_layout = flir.make_ordered_layout((VAL_M, VAL_N), order=(1, 0))
-
-            # Create copy atoms
-            copy_atom_load = flir.make_copy_atom(dtype.get(), vector_size=VEC_SIZE)
-            copy_atom_store = flir.make_copy_atom(dtype.get(), vector_size=VEC_SIZE)
-
-            # Tiled Copies
-            tiled_copy_X = flir.make_tiled_copy_tv(copy_atom_load, thread_layout, x_value_layout, thr_shape=(THR_M, THR_N), val_shape=(VAL_M, VAL_N))
-            tiled_copy_Y = flir.make_tiled_copy_tv(copy_atom_store, thread_layout, value_layout, thr_shape=(THR_M, THR_N), val_shape=(VAL_M, VAL_N))
-
-            # Specify input tensor layouts
-            tensor_X = flir.make_tensor(A, shape=(batch_size, reduce_size), strides=(reduce_size, 1))
-            tensor_Y = flir.make_tensor(B, shape=(batch_size, 1), strides=(1, 1))
-
-            # Get per-block coordinates
-            gX = flir.zipped_divide(tensor_X, (TILE_M, TILE_N))
-            gY = flir.zipped_divide(tensor_Y, (TILE_M, 1))
-            idX = flir.make_identity_tensor((batch_size, reduce_size)) # For tracking coordinates only
-            idY = flir.make_identity_tensor((batch_size, 1)) # For tracking coordinates only
-            cX = flir.zipped_divide(idX, (TILE_M, TILE_N))
-            cY = flir.zipped_divide(idY, (TILE_M, 1))
-            blkX = gX[(bid_y, bid_x)]
-            blkY = gY[(bid_y, 1)]
-            blkXrd = cX[(bid_y, bid_x)]
-            blkYrd = cY[(bid_y, 1)]
-
-            # Get per-thread coordinates
-            thr_copy_X = tiled_copy_X.get_slice(tid_x)
-            thr_copy_Y = tiled_copy_Y.get_slice(tid_x)
-            thrX = thr_copy_X.partition_S(blkX)
-            thrY = thr_copy_Y.partition_S(blkY)
-            thrXrd = thr_copy_X.partition_S(blkXrd)
-            thrYrd = thr_copy_Y.partition_S(blkYrd)
-
-            frgX = flir.make_fragment_like(thrX, dtype.get())
-            frgY = flir.make_fragment_like(thrY, dtype.get())
-
-            frgPred = flir.make_rmem_tensor((THR_M, THR_N), IntegerType.get_signless(1))
-
-            for idx_in_vec in range(THR_M * THR_N):
-                idx_in_vec = flir.const_index(idx_in_vec)
-                coords = thrXrd.coords_from_linear(idx_in_vec)
-                pred_val = flir.elem_less(coords, (batch_size, reduce_size))
-                pred_offsets = tuple(frgPred.offsets_from_linear(idx_in_vec))
-                frgPred[pred_offsets] = pred_val
-
-            flir.copy(tiled_copy_X, thrX, frgX, pred=frgPred)
-
-            for v in range(VEC_SIZE):
-                idx = flir.const_index(v)
-                coords = (idx, )
-                a_val = frgA[coords]
-                b_val = frgB[coords]
-                c_val = a_val + b_val
-                frgC[coords] = c_val
-
-            flir.copy(tiled_copy_C, frgC, thrC, pred=frgPred)
+            vec_type = VectorType.get([VEC_SIZE], self.dtype)
+            acc_vec_type = VectorType.get([VEC_SIZE], self.acc_type)
+            c_zero = arith.constant(0.0, type=self.acc_type)
+            thread_sum = (c_zero)
+            for vec_idx in range(tid_x * VEC_SIZE, reduce_size, BLOCK_WORK_SIZE):
+                vec_addr = bid_x * reduce_size + vec_idx
+                vec = flir.vector.load(vec_type, X, [arith.as_value(vec_addr)], alignment=16)
+                vec = flir.arith.extf(acc_vec_type, arith.as_value(vec))
+                red = flir.vector.reduction(self.acc_type, "add", arith.as_value(vec), fastmath=fm_fast)
+                thread_sum = thread_sum + red
+            block_reduce_add = make_block_reduce_add(tid_x, WARP_SIZE, RED_SLOTS)
+            base_ptr = allocator.get_base()
+            sum_val = block_reduce_add(thread_sum, self.smem(base_ptr).get())
+            sum_val = flir.arith.truncf(self.dtype, (sum_val))
+            flir.memref.store(arith.as_value(sum_val), Y, [flir.const_index(bid_x),])
 
         @flir.jit
         def __call__(
             self: flir.T.i64,
-            A: lambda: T.memref(S, dtype.get()),
-            B: lambda: T.memref(S, dtype.get()),
-            C: lambda: T.memref(S, dtype.get()),
-            n: lambda: T.index(),
+            X: lambda: T.memref(S, dtype.get()),
+            Y: lambda: T.memref(S, dtype.get()),
+            batch_size: lambda: T.index(),
+            reduce_size: lambda: T.index(),
         ):
             c1 = arith.index(1)
-            c_tile_elems = arith.index(BLOCK_WORK_SIZE)
-            gx = (n + c_tile_elems - c1) // c_tile_elems
-            bx = arith.index(BLOCK_SIZE)
+            bx = arith.index(BLOCK_THREADS)
             flir.gpu_ext.LaunchFuncOp(
                 [self.GPU_MODULE_NAME, "batch_reduce_kernel"],
-                grid_size=(gx, c1, c1),
+                grid_size=(batch_size, c1, c1),
                 block_size=(bx, c1, c1),
-                kernel_operands=[A, B, C, n],
+                kernel_operands=[X, Y, batch_size, reduce_size],
             )
 
     return BatchReduce().module
 
 
+EXE = None
 def func(x, y):
-    ref_func(x, y)
+    global EXE
+    if not EXE:
+        if x.dtype == torch.float:
+            module = create_reduce_kernel(F32Type, 4)
+        elif x.dtype == torch.half:
+            module = create_reduce_kernel(F16Type, 8)
+        elif x.dtype == torch.bfloat16:
+            module = create_reduce_kernel(BF16Type, 8)
+        optimized = run_pipeline(module, Pipeline().canonicalize().cse())
+        EXE = flydsl.compile(optimized)
+    EXE(x, y, x.shape[0], x.shape[1])
+    torch.cuda.synchronize()
 
 
 def benchmark(args, func, ref_func, warmup=20, niters=100):

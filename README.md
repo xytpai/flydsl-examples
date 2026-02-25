@@ -138,6 +138,71 @@ for idx_in_vec in range_constexpr(VEC_SIZE):
 
 ## 2. Batch Reduce
 
+```bash
+python3 batch_reduce.py --batch_size=4 --reduce_size=2048 --dtype=f16
+```
+
+```txt
+run: /home/yuxu/flydsl-examples/batch_reduce.py, args: Namespace(batch_size=4, reduce_size=2048, dtype='f16')
+validation passed!
+
+===================== [REF] =====================
+[W225 05:28:18.762480600 collection.cpp:1116] Warning: ROCTracer produced duplicate flow start: 1 (function operator())
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+void at::native::reduce_kernel<512, 1, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us     687.062us       100.00%     687.062us       6.871us           100  
+                                        hipLaunchKernel        95.26%     460.725us        95.26%     460.725us       4.607us       0.000us         0.00%       0.000us       0.000us           100  
+                                   hipDeviceSynchronize         4.74%      22.922us         4.74%      22.922us      22.922us       0.000us         0.00%       0.000us       0.000us             1  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 483.647us
+Self CUDA time total: 687.062us
+
+===================== [FLYDSL] =====================
+-------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                     Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+      batch_reduce_kernel         0.00%       0.000us         0.00%       0.000us       0.000us     516.783us       100.00%     516.783us       5.168us           100  
+          hipStreamCreate        72.63%      88.464ms        72.63%      88.464ms     884.637us       0.000us         0.00%       0.000us       0.000us           100  
+    hipModuleLaunchKernel         0.84%       1.025ms         0.84%       1.025ms      10.254us       0.000us         0.00%       0.000us       0.000us           100  
+     hipStreamSynchronize         2.17%       2.639ms         2.17%       2.639ms      26.388us       0.000us         0.00%       0.000us       0.000us           100  
+         hipStreamDestroy        24.24%      29.527ms        24.24%      29.527ms     295.267us       0.000us         0.00%       0.000us       0.000us           100  
+     hipDeviceSynchronize         0.11%     138.746us         0.11%     138.746us       1.374us       0.000us         0.00%       0.000us       0.000us           101  
+-------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 121.793ms
+Self CUDA time total: 516.783us
+```
+
+Leverage vector utilities to perform vectorized loads and stores, improving code readability:
+
+```python
+@flir.kernel
+def batch_reduce_kernel(
+    self: flir.T.i64,
+    X: lambda: T.memref(S, dtype.get()),
+    Y: lambda: T.memref(S, dtype.get()),
+    batch_size: lambda: T.index(),
+    reduce_size: lambda: T.index(),
+):
+    tid_x = flir.thread_idx("x")
+    bid_x = flir.block_idx("x")
+    vec_type = VectorType.get([VEC_SIZE], self.dtype)
+    acc_vec_type = VectorType.get([VEC_SIZE], self.acc_type)
+    c_zero = arith.constant(0.0, type=self.acc_type)
+    thread_sum = (c_zero)
+    for vec_idx in range(tid_x * VEC_SIZE, reduce_size, BLOCK_WORK_SIZE):
+        vec_addr = bid_x * reduce_size + vec_idx
+        vec = flir.vector.load(vec_type, X, [arith.as_value(vec_addr)], alignment=16)
+        vec = flir.arith.extf(acc_vec_type, arith.as_value(vec))
+        red = flir.vector.reduction(self.acc_type, "add", arith.as_value(vec), fastmath=fm_fast)
+        thread_sum = thread_sum + red
+    block_reduce_add = make_block_reduce_add(tid_x, WARP_SIZE, RED_SLOTS)
+    base_ptr = allocator.get_base()
+    sum_val = block_reduce_add(thread_sum, self.smem(base_ptr).get())
+    sum_val = flir.arith.truncf(self.dtype, (sum_val))
+    flir.memref.store(arith.as_value(sum_val), Y, [flir.const_index(bid_x),])
+```
+
 ---
 
 > Contact: xytpai@gmail.com
