@@ -3,6 +3,7 @@ import torch
 import argparse
 import numpy as np
 from torch.profiler import profile, ProfilerActivity
+import torch.nn.functional as F
 from dataclasses import dataclass
 
 import flydsl
@@ -40,18 +41,19 @@ class Args:
 def create_inputs(args):
     a = torch.empty((args.m, args.k), dtype=args.dtype, device='cuda')
     a.uniform_(-1, 1)
-    b = torch.empty((args.k, args.n), dtype=args.dtype, device='cuda')
+    b = torch.empty((args.n, args.k), dtype=args.dtype, device='cuda')
     b.uniform_(-1, 1)
     return (a, b)
 
 
 def create_outputs(args):
-    c = torch.randn((args.m, args.n), dtype=args.dtype, device='cuda')
+    c = torch.zeros((args.m, args.n), dtype=args.dtype, device='cuda')
     return (c,)
 
 
 def ref_func(a, b, c):
-    torch.mm(a, b, out=c)
+    # torch.mm(a, b, out=c)
+    F.linear(a, b, out=c)
 
 
 def create_hgemm_kernel(
@@ -108,6 +110,7 @@ def create_hgemm_kernel(
             k_div4bytes = (k * ELEMENT_BYTES) / 4
             layout_a = flir.make_layout((m, k_bytes), stride=(k_bytes, 1))
             layout_a_div4 = flir.make_layout((m, k_div4bytes), stride=(k_div4bytes, 1))
+            layout_b = make_preshuffle_b_layout(flir, arith, c_n=n, c_k=k, kpack_bytes=16, elem_bytes=ELEMENT_BYTES).layout_b
             layout_lds = flir.make_layout((TILE_M, TILE_K), stride=(TILE_K, 1))
 
             # CK-style XOR16 swizzle parameter (const).
@@ -168,47 +171,52 @@ def create_hgemm_kernel(
             acc_init = arith.unwrap(arith.constant_vector(0.0, FT.f32x4))
             c4 = arith.constant(4, index=True)
 
-            def a_tile_chunk_coord_i32(i: int, tx_i32_base: int, chunk_i32: int = 4):
-                tile_k_dwords = (TILE_K * 2) // 4
-                layout_a_tile_div4 = flir.make_layout((TILE_M, tile_k_dwords), stride=(tile_k_dwords, 1))
-                return tile_chunk_coord_i32(
-                    flir,
-                    arith,
-                    tx_i32_base=tx_i32_base,
-                    i=i,
-                    total_threads=BLOCK_THREADS,
-                    layout_tile_div4=layout_a_tile_div4,
-                    chunk_i32=chunk_i32,
-                )
+            # Decompose global_n -> (n_blk, n_intra) once per ni.
+            c_n0 = n / 16
+            layout_n_blk_intra = flir.make_layout((c_n0, 16), stride=(16, 1))
+            n_intra_list = []
+            n_blk_list = []
+            for i in range_constexpr(num_acc_n):
+                offset = i * 16
+                c_offset = arith.constant(offset, index=True)
+                global_n = by_n + n_tile_base + c_offset + lane_mod_16
+                coord_n = flir.idx2crd(global_n, layout_n_blk_intra)
+                n_blk_list.append(flir.get(coord_n, 0))
+                n_intra_list.append(flir.get(coord_n, 1))
 
             # DMA async version: direct global-to-LDS transfer
             def dma_a_tile_to_lds(base_k_div4, lds_buffer):
                 from _mlir.dialects import llvm, memref as memref_dialect
-
-                dma_bytes = A_ASYNC_LOAD_BYTES
-                bytes_per_dword = 4
-                chunk_i32 = dma_bytes // bytes_per_dword
-
+                DMA_BYTES = A_ASYNC_LOAD_BYTES
+                BYTES_PER_DWORD = 4
+                chunk_i32 = DMA_BYTES // BYTES_PER_DWORD
+                tile_k_dwords = TILE_K_BYTES // BYTES_PER_DWORD
+                layout_a_tile_div4 = flir.make_layout((TILE_M, tile_k_dwords), stride=(tile_k_dwords, 1))
                 for i in range_constexpr(NUM_A_ASYNC_LOADS):
-                    row_a_local, col_a_local_i32 = a_tile_chunk_coord_i32(i, tid_x * A_ASYNC_LOAD_DWORD, chunk_i32=chunk_i32)
+                    row_a_local, col_a_local_i32 = tile_chunk_coord_i32(
+                        flir,
+                        arith,
+                        tx_i32_base=tid_x * A_ASYNC_LOAD_DWORD,
+                        i=i,
+                        total_threads=BLOCK_THREADS,
+                        layout_tile_div4=layout_a_tile_div4,
+                        chunk_i32=chunk_i32,
+                    )
                     col_a_local_sw = flir.swizzle_xor16(row_a_local, col_a_local_i32 * c4, k_blocks16)
                     row_a_global = bx_m + row_a_local
                     coord_a_g = flir.make_coord(row_a_global, base_k_div4 * c4 + col_a_local_sw)
                     global_offset = arith.index_cast(FT.i32, flir.crd2idx(coord_a_g, layout_a))
-
                     if i == 0:
-                        lds_addr = memref_dialect.extract_aligned_pointer_as_index(lds_buffer) + wave_id * WAVE_SIZE * dma_bytes
+                        lds_addr = memref_dialect.extract_aligned_pointer_as_index(lds_buffer) + wave_id * WAVE_SIZE * DMA_BYTES
                         lds_ptr_i64_lane0 = rocdl.readfirstlane(FT.i64, arith.index_cast(FT.i64, lds_addr))
                     else:
-                        lds_ptr_i64_lane0 += BLOCK_THREADS * dma_bytes
+                        lds_ptr_i64_lane0 += BLOCK_THREADS * DMA_BYTES
                     lds_ptr = buffer_ops.create_llvm_ptr(lds_ptr_i64_lane0, address_space=3)
-
                     # DMA from global to LDS using buffer_load_lds
-                    size_i32 = arith.constant(dma_bytes, type=FT.i32)
+                    size_i32 = arith.constant(DMA_BYTES, type=FT.i32)
                     soffset = arith.constant(0, type=FT.i32)
                     offset_imm = arith.constant(0, type=FT.i32)
                     aux = arith.constant(1, type=FT.i32)
-
                     rocdl.raw_ptr_buffer_load_lds(
                         a_rsrc,
                         lds_ptr,
@@ -222,22 +230,6 @@ def create_hgemm_kernel(
             def prefetch_a_to_lds(base_k, lds_buffer):
                 base_k_div4 = base_k / 4
                 dma_a_tile_to_lds(base_k_div4, lds_buffer)
-            
-            # Decompose global_n -> (n_blk, n_intra) once per ni.
-            c_n0 = n / 16
-            layout_n_blk_intra = flir.make_layout((c_n0, 16), stride=(16, 1))
-            n_intra_list = []
-            n_blk_list = []
-            for i in range_constexpr(num_acc_n):
-                offset = i * 16
-                c_offset = arith.constant(offset, index=True)
-                global_n = by_n + n_tile_base + c_offset + lane_mod_16
-                coord_n = flir.idx2crd(global_n, layout_n_blk_intra)
-                n_blk_list.append(flir.get(coord_n, 0))
-                n_intra_list.append(flir.get(coord_n, 1))
-            layout_b = make_preshuffle_b_layout(
-                flir, arith, c_n=n, c_k=k, kpack_bytes=16, elem_bytes=ELEMENT_BYTES
-            ).layout_b
             
             def load_b_packs_k64(base_k, ku: int, ni: int):
                 # FP8/INT8/FP16/BF16: load 16 bytes (one full KPack).
@@ -488,6 +480,29 @@ def create_hgemm_kernel(
     return HGEMM().module
 
 
+def shuffle_weight(x: torch.Tensor, layout=(16, 16), use_int4=False) -> torch.Tensor:
+    # Hardcode BLOCK_K and BLOCK_N
+    x_type = x.dtype
+    if hasattr(torch, "float4_e2m1fn_x2") and x_type == torch.float4_e2m1fn_x2:
+        x = x.view(torch.uint8)
+
+    IN, IK = layout
+    BK = IK * 2
+    K = 16 // x.element_size() if not use_int4 else 32
+    BN = IN
+    assert x.shape[-2] % BN == 0, f"{x.shape[-2]} % {BN} == {x.shape[-2] % BN }"
+    assert x.shape[-1] % BK == 0, f"{x.shape[-1]} % {BK} == {x.shape[-1] % BK }"
+
+    x_ = x
+    x_ = x_.view(-1, x.shape[-2] // BN, BN, x.shape[-1] // BK, BK // K, K)
+    x_ = x_.permute(0, 1, 3, 4, 2, 5)
+    x_ = x_.contiguous()
+    x_ = x_.view(*x.shape)
+    x_ = x_.view(x_type)
+    x_.is_shuffled = True
+    return x_
+
+
 EXE = None
 def func(a, b, c):
     m = a.shape[0]
@@ -496,7 +511,7 @@ def func(a, b, c):
     ELEMENT_BYTES = 2
     TILE_M = 128
     TILE_N = 128
-    TILE_K = 32
+    TILE_K = 128
     ASYNC_COPY = True
     global EXE
     if not EXE:
@@ -506,7 +521,8 @@ def func(a, b, c):
             module = create_hgemm_kernel(BF16Type, ELEMENT_BYTES, TILE_M, TILE_N, TILE_K, ASYNC_COPY, False)
         optimized = run_pipeline(module, Pipeline().canonicalize().cse())
         EXE = flydsl.compile(optimized)
-    EXE(a, b, c, m, n, k)
+    b_shuffled = shuffle_weight(b, layout=(16, 16))
+    EXE(a, b_shuffled, c, m, n, k)
     torch.cuda.synchronize()
 
 
