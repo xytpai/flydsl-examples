@@ -350,11 +350,9 @@ def create_hgemm_kernel(
                 if IS_FP16:
                     # gfx942 fp16 MFMA: 16x16x16 f16 (operands are v4f16, 8B packs)
                     mfma_fn = rocdl.mfma_f32_16x16x16f16
-                elif IS_BF16:
+                else:
                     # bf16 MFMA K16 variant uses i16 bit-pattern packs (v4i16)
                     mfma_fn = rocdl.mfma_f32_16x16x16bf16_1k
-                else:
-                    mfma_fn = rocdl.mfma_f32_16x16x32_fp8_fp8
 
                 def mfma_step(acc_in, a, b):
                     return mfma_fn(mfma_res_ty, [a, b, acc_in, 0, 0, 0])
@@ -585,7 +583,7 @@ def func(a, b, c):
     TILE_M = 64
     TILE_N = 256
     TILE_K = 64
-    ASYNC_COPY = True
+    ASYNC_COPY = False
     global EXE
     if not EXE:
         if a.dtype == torch.half:
