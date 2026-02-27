@@ -52,8 +52,8 @@ def create_outputs(args):
 
 
 def ref_func(a, b, c):
-    # torch.mm(a, b, out=c)
     F.linear(a, b, out=c)
+    torch.cuda.synchronize()
 
 
 def create_hgemm_kernel(
@@ -105,11 +105,16 @@ def create_hgemm_kernel(
             n: lambda: T.index(),
             k: lambda: T.index(),
         ):
+            acc_init = arith.unwrap(arith.constant_vector(0.0, FT.f32x4))
+
             layout_c = flir.make_layout((m, n), stride=(n, 1))
+
             k_bytes = k * ELEMENT_BYTES
-            k_div4bytes = (k * ELEMENT_BYTES) / 4
+            k_div4bytes = k_bytes // 4
+
             layout_a = flir.make_layout((m, k_bytes), stride=(k_bytes, 1))
             layout_a_div4 = flir.make_layout((m, k_div4bytes), stride=(k_div4bytes, 1))
+
             layout_b = make_preshuffle_b_layout(flir, arith, c_n=n, c_k=k, kpack_bytes=16, elem_bytes=ELEMENT_BYTES).layout_b
             layout_lds = flir.make_layout((TILE_M, TILE_K), stride=(TILE_K, 1))
 
@@ -168,9 +173,6 @@ def create_hgemm_kernel(
             n_per_wave = arith.constant(n_per_wave, index=True)
             n_tile_base = wave_id * n_per_wave
 
-            acc_init = arith.unwrap(arith.constant_vector(0.0, FT.f32x4))
-            c4 = arith.constant(4, index=True)
-
             # Decompose global_n -> (n_blk, n_intra) once per ni.
             c_n0 = n / 16
             layout_n_blk_intra = flir.make_layout((c_n0, 16), stride=(16, 1))
@@ -183,53 +185,89 @@ def create_hgemm_kernel(
                 coord_n = flir.idx2crd(global_n, layout_n_blk_intra)
                 n_blk_list.append(flir.get(coord_n, 0))
                 n_intra_list.append(flir.get(coord_n, 1))
+            
+            TILE_K_DWORDS = TILE_K_BYTES // 4
+            layout_a_tile_div4 = flir.make_layout((TILE_M, TILE_K_DWORDS), stride=(TILE_K_DWORDS, 1))
+            c4 = arith.constant(4, index=True)
+            tx_i32_base = tid_x * c4
+            tx_i32_async_base = tid_x * A_ASYNC_LOAD_DWORD
+            atom_a_g2r16 = flir.make_copy_atom(self.dtype, vector_size=VEC_SIZE)
 
-            # DMA async version: direct global-to-LDS transfer
-            def dma_a_tile_to_lds(base_k_div4, lds_buffer):
-                from _mlir.dialects import llvm, memref as memref_dialect
-                DMA_BYTES = A_ASYNC_LOAD_BYTES
-                BYTES_PER_DWORD = 4
-                chunk_i32 = DMA_BYTES // BYTES_PER_DWORD
-                tile_k_dwords = TILE_K_BYTES // BYTES_PER_DWORD
-                layout_a_tile_div4 = flir.make_layout((TILE_M, tile_k_dwords), stride=(tile_k_dwords, 1))
-                for i in range_constexpr(NUM_A_ASYNC_LOADS):
+            def _vec16_type():
+                if IS_FP16:
+                    return FT.f16x8  # 16B
+                if IS_BF16:
+                    return FT.bf16x8  # 16B
+
+            def load_a_16(idx_elem):
+                return buffer_copy_gmem16_dwordx4(
+                    flir,
+                    arg=a,
+                    elem_type=self.dtype,
+                    idx_i32=idx_elem,
+                    atom_g2r16=atom_a_g2r16,
+                    rsrc=a_rsrc,
+                    vec_elems=VEC_SIZE,
+                    elem_bytes=ELEMENT_BYTES,
+                )
+            
+            # Original register-based load/store (kept for reference)
+            def load_a_tile(base_k_div4):
+                parts = []
+                for i in range_constexpr(NUM_A_LOADS):
                     row_a_local, col_a_local_i32 = tile_chunk_coord_i32(
                         flir,
                         arith,
-                        tx_i32_base=tid_x * A_ASYNC_LOAD_DWORD,
+                        tx_i32_base=tx_i32_base,
                         i=i,
                         total_threads=BLOCK_THREADS,
                         layout_tile_div4=layout_a_tile_div4,
-                        chunk_i32=chunk_i32,
+                        chunk_i32=4,
                     )
-                    col_a_local_sw = flir.swizzle_xor16(row_a_local, col_a_local_i32 * c4, k_blocks16)
                     row_a_global = bx_m + row_a_local
-                    coord_a_g = flir.make_coord(row_a_global, base_k_div4 * c4 + col_a_local_sw)
-                    global_offset = arith.index_cast(FT.i32, flir.crd2idx(coord_a_g, layout_a))
-                    if i == 0:
-                        lds_addr = memref_dialect.extract_aligned_pointer_as_index(lds_buffer) + wave_id * WAVE_SIZE * DMA_BYTES
-                        lds_ptr_i64_lane0 = rocdl.readfirstlane(FT.i64, arith.index_cast(FT.i64, lds_addr))
-                    else:
-                        lds_ptr_i64_lane0 += BLOCK_THREADS * DMA_BYTES
-                    lds_ptr = buffer_ops.create_llvm_ptr(lds_ptr_i64_lane0, address_space=3)
-                    # DMA from global to LDS using buffer_load_lds
-                    size_i32 = arith.constant(DMA_BYTES, type=FT.i32)
-                    soffset = arith.constant(0, type=FT.i32)
-                    offset_imm = arith.constant(0, type=FT.i32)
-                    aux = arith.constant(1, type=FT.i32)
-                    rocdl.raw_ptr_buffer_load_lds(
-                        a_rsrc,
-                        lds_ptr,
-                        arith.unwrap(size_i32),
-                        arith.unwrap(global_offset),
-                        arith.unwrap(soffset),
-                        arith.unwrap(offset_imm),
-                        arith.unwrap(aux),
+                    coord_a_g = flir.make_coord(row_a_global, base_k_div4 + col_a_local_i32)
+                    idx_i32 = flir.crd2idx(coord_a_g, layout_a_div4)
+                    # `idx_i32` is a dword offset. For 2B element types (fp16/bf16),
+                    # convert to element offset so the generic `vector.load` path reads
+                    # the right address (FLIR only specializes buffer_load_dwordx4 for 1B types).
+                    idx_elem = idx_i32 * arith.constant(2, index=True)
+                    a_16B = load_a_16(idx_elem)
+                    parts.append(vector.bitcast(FT.i32x4, a_16B))
+                return parts
+            
+            def prefetch_a_tile(base_k):
+                base_k_bytes = base_k * arith.constant(ELEMENT_BYTES, index=True)
+                base_k_div4 = base_k_bytes / 4
+                return load_a_tile(base_k_div4)
+            
+            def store_a_tile_to_lds(vec_a_parts, lds_buffer):
+                for i in range_constexpr(NUM_A_LOADS):
+                    row_a_local, col_a_local_i32 = tile_chunk_coord_i32(
+                        flir,
+                        arith,
+                        tx_i32_base=tx_i32_base,
+                        i=i,
+                        total_threads=BLOCK_THREADS,
+                        layout_tile_div4=layout_a_tile_div4,
+                        chunk_i32=4,
                     )
-
-            def prefetch_a_to_lds(base_k, lds_buffer):
-                base_k_div4 = base_k / 4
-                dma_a_tile_to_lds(base_k_div4, lds_buffer)
+                    lds_store_16b_xor16(
+                        flir,
+                        arith,
+                        vector,
+                        lds_memref=lds_buffer,
+                        vec16_ty=_vec16_type(),
+                        elem_type=self.dtype,
+                        atom_s16=atom_a_g2r16,
+                        layout_lds=layout_lds,
+                        row_local=row_a_local,
+                        col_local_i32=col_a_local_i32,
+                        tx_c4=c4,
+                        k_blocks16=k_blocks16,
+                        lds_base=arith.constant(0, index=True),
+                        vec_part_i32x4=vec_a_parts[i],
+                        elem_bytes=ELEMENT_BYTES,
+                    )
             
             def load_b_packs_k64(base_k, ku: int, ni: int):
                 # FP8/INT8/FP16/BF16: load 16 bytes (one full KPack).
@@ -281,12 +319,6 @@ def create_hgemm_kernel(
                         packs1.append(b1)
                     b_tile.append((packs0, packs1))
                 return b_tile
-            
-            def _vec16_type():
-                if IS_FP16:
-                    return FT.f16x8  # 16B
-                if IS_BF16:
-                    return FT.bf16x8  # 16B
             
             def lds_load_16b(curr_row_a_lds, col_base, lds_buffer):
                 # Swizzle in bytes, then convert to element offset for memref indexing.
@@ -403,26 +435,67 @@ def create_hgemm_kernel(
                         rocdl.sched_dswr(1)
                 rocdl.sched_barrier(0)
 
+            b_tile_ping = None
+            b_tile_pong = None
+            def prefetch_a0_pack(lds_buffer):
+                # (mi=0, ku=0): prefetch both K32 halves (K64) for the first A-pack.
+                return lds_load_packs_k64(row_a_lds, col_offset_base_bytes, lds_buffer)
+            
             k0 = arith.constant(0, index=True)
-            prefetch_a_to_lds(k0, lds_a_pong)  # Single buffer (reuses same)
-            b_tile0 = load_b_tile(k0)
+            b_tile_pong = load_b_tile(k0)
+            store_a_tile_to_lds(prefetch_a_tile(k0), lds_a_pong)
             gpu.barrier()
             accs = [acc_init] * (num_acc_n * m_repeat)
-            b_tile_cur = b_tile0
-            for k_base in range(0, k - TILE_K, TILE_K):
-                next_k = k_base + TILE_K
-                prefetch_a_to_lds(next_k, lds_a_pong)  # Reuse same buffer
-                b_next = load_b_tile(next_k)
-                accs, _ = compute_tile(accs, b_tile_cur, lds_a_pong)
-                # Single LDS buffer: ensure *all* waves are done reading A from LDS
-                # before any wave overwrites it with the next tile.
-                gpu.barrier()
+            c_k_main = k - TILE_K
+            a0_prefetch_pong = prefetch_a0_pack(lds_a_pong)
+
+            num_tiles = k // TILE_K
+            c_k_stop = k - (TILE_K * 3)
+            for k_iv in range(0, c_k_stop, TILE_K * 2):
+                next_k1 = k_iv + TILE_K
+                b_tile_ping = load_b_tile(next_k1)
+                store_a_tile_to_lds(prefetch_a_tile(next_k1), lds_a_ping)
+                accs, _ = compute_tile(
+                    accs, b_tile_pong, lds_a_pong, a0_prefetch=a0_prefetch_pong
+                )
+                a0_prefetch_pong = None
                 hot_loop_scheduler()
                 gpu.barrier()
-                b_tile_cur = b_next
+
+                a0_prefetch_ping = prefetch_a0_pack(lds_a_ping)
+
+                next_k2 = k_iv + TILE_K * 2
+                b_tile_pong = load_b_tile(next_k2)
+                store_a_tile_to_lds(prefetch_a_tile(next_k2), lds_a_pong)
+                accs, _ = compute_tile(
+                    accs, b_tile_ping, lds_a_ping, a0_prefetch=a0_prefetch_ping
+                )
+                a0_prefetch_ping = None
+
+                hot_loop_scheduler()
+                gpu.barrier()
+
+                a0_prefetch_pong = prefetch_a0_pack(lds_a_pong)
+            last_k = k - TILE_K
+            b_tile_ping = load_b_tile(last_k)
+            store_a_tile_to_lds(prefetch_a_tile(last_k), lds_a_ping)
+
+            accs, _ = compute_tile(
+                accs, b_tile_pong, lds_a_pong, a0_prefetch=a0_prefetch_pong
+            )
+            a0_prefetch_pong = None
+
+            hot_loop_scheduler()
+            gpu.barrier()
+
+            a0_prefetch_ping = prefetch_a0_pack(lds_a_ping)
 
             final_accs, scales = compute_tile(
-                accs, b_tile_cur, lds_a_pong, is_last_tile=True
+                accs,
+                b_tile_ping,
+                lds_a_ping,
+                is_last_tile=True,
+                a0_prefetch=a0_prefetch_ping,
             )
 
             def store_output(final_accs, scales):
@@ -507,11 +580,11 @@ EXE = None
 def func(a, b, c):
     m = a.shape[0]
     k = a.shape[1]
-    n = b.shape[1]
+    n = b.shape[0]
     ELEMENT_BYTES = 2
-    TILE_M = 128
-    TILE_N = 128
-    TILE_K = 128
+    TILE_M = 64
+    TILE_N = 256
+    TILE_K = 64
     ASYNC_COPY = True
     global EXE
     if not EXE:
@@ -519,8 +592,7 @@ def func(a, b, c):
             module = create_hgemm_kernel(F16Type, ELEMENT_BYTES, TILE_M, TILE_N, TILE_K, ASYNC_COPY, True)
         elif a.dtype == torch.bfloat16:
             module = create_hgemm_kernel(BF16Type, ELEMENT_BYTES, TILE_M, TILE_N, TILE_K, ASYNC_COPY, False)
-        optimized = run_pipeline(module, Pipeline().canonicalize().cse())
-        EXE = flydsl.compile(optimized)
+        EXE = flydsl.compile(module)
     b_shuffled = shuffle_weight(b, layout=(16, 16))
     EXE(a, b_shuffled, c, m, n, k)
     torch.cuda.synchronize()
@@ -536,8 +608,8 @@ def benchmark(args, func, ref_func, warmup=20, niters=100):
     ref_func(*ref_inouts)
     for output, ref_output in zip(outputs, ref_outputs):
         is_allclose = torch.allclose(output, ref_output, atol=1e-3, rtol=1e-3)
-        print(output)
-        print(ref_output)
+        # print(output)
+        # print(ref_output)
         assert is_allclose == True
     print("validation passed!\n", flush=True)
 
