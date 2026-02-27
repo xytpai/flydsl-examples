@@ -7,11 +7,11 @@ from dataclasses import dataclass
 
 import flydsl
 from flydsl.lang.ir.types import T as FT
-from flydsl.dialects.ext import flir, gpu, arith
+from flydsl.dialects.ext import flir, gpu, arith, buffer_ops
 from flydsl.runtime.device import get_rocm_arch
 from flydsl.compiler.pipeline import Pipeline, run_pipeline
 from flydsl.dialects.ext.python_control_flow import range_constexpr, lower_range_for_loops
-from flydsl.utils import SmemAllocator
+from flydsl.utils import SmemAllocator, SmemPtr
 fm_fast = flir.arith.FastMathFlags.fast
 
 from _mlir import ir
@@ -65,7 +65,8 @@ def create_hgemm_kernel(
 
         def init_gpu_module(self):
             self.dtype = DTYPE.get()
-            self.acc_type = T.f32()            
+            self.i32 = T.i32()
+            self.acc_type = T.f32()
             self.lds_a_pong = allocator_pong.allocate_array(self.dtype, TILE_M * TILE_K)
             self.lds_a_ping = allocator_ping.allocate_array(self.dtype, TILE_M * TILE_K)
             allocator_pong.finalize()
@@ -95,7 +96,29 @@ def create_hgemm_kernel(
             bid_x = flir.block_idx("x")
             bid_y = flir.block_idx("y")
 
+            base_ptr0, base_ptr1 = allocator_pong.get_base(), allocator_ping.get_base()
+            lds_a_pong_ptr = self.lds_a_pong(base_ptr0)
+            lds_a_ping_ptr = self.lds_a_ping(base_ptr1)
 
+            lds_a_pong = SmemPtr(
+                base_ptr0, lds_a_pong_ptr.byte_offset, self.dtype, shape=(TILE_M * TILE_K,)
+            ).get()
+            lds_a_ping = SmemPtr(
+                base_ptr1, lds_a_ping_ptr.byte_offset, self.dtype, shape=(TILE_M * TILE_K,)
+            ).get()
+
+            m_i32 = arith.index_cast(self.i32, m)
+            n_i32 = arith.index_cast(self.i32, n)
+            k_i32 = arith.index_cast(self.i32, k)
+
+            a_bytes = m_i32 * k_i32 * arith.i32(ELEMENT_BYTES)
+            c_bytes = m_i32 * n_i32 * arith.i32(ELEMENT_BYTES)
+            a_rsrc = buffer_ops.create_buffer_resource(a, num_records_bytes=a_bytes)
+            c_rsrc = buffer_ops.create_buffer_resource(c, num_records_bytes=c_bytes)
+            b_rsrc = buffer_ops.create_buffer_resource(b, max_size=True)
+
+            bx_m = bid_x * TILE_M
+            by_n = bid_y * TILE_N
 
         @flir.jit
         def __call__(
