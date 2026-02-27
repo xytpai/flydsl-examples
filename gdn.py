@@ -1,3 +1,14 @@
+from _mlir.dialects import builtin, gpu as _gpu
+from flydsl.dialects.ext import buffer_ops
+def stream_ptr_to_async_token(stream_ptr_value, loc=None, ip=None):
+    stream_llvm_ptr = buffer_ops.create_llvm_ptr(stream_ptr_value)
+    
+    async_token_type = _gpu.AsyncTokenType.get()
+    cast_op = builtin.UnrealizedConversionCastOp(
+        [async_token_type], [stream_llvm_ptr], loc=loc, ip=ip
+    )
+    return cast_op.results[0]
+
 import functools
 import pytest
 from typing import Optional, Any, Callable, Dict, Literal, Optional, Tuple
@@ -49,17 +60,39 @@ def _create_jit_functions(
     V: int,
     HV: int,
     use_initial_state: bool,
-    use_qk_l2norm: bool
+    use_qk_l2norm: bool,
+    N: int
 ):
     DYN = ir.ShapedType.get_dynamic_size()
     ARCH = get_rocm_arch()
-    """Create JIT-compiled launcher functions for all kernel variants."""
+    allocator = SmemAllocator(None, arch=ARCH)
+    NUM_WARPS_SMALL = 4
+    V_PER_WARP_SMALL = TILE_V_SMALL // NUM_WARPS_SMALL
+    ROWS_PER_ITER_SMALL = 32 // V_PER_WARP_SMALL
+    NUM_K_ITERS_SMALL = TILE_K // ROWS_PER_ITER_SMALL
 
     # gdn_small, gdn_small_varlen, gdn_large, gdn_large_varlen = _define_kernels()
 
     class RunSmallBatch(flir.MlirModule):
         GPU_MODULE_NAME = "gdn_kernels"
         GPU_MODULE_TARGETS = [f'#rocdl.target<chip = "{ARCH}">']
+        
+        @flir.kernel
+        def gdn_kernel_small_batch(
+            self: flir.T.i64,
+            h0_source: lambda: T.memref(DYN, F32Type.get()),
+            num_v_tiles: lambda: T.index(),
+            q: lambda: T.memref(DYN, BF16Type.get()),
+            k: lambda: T.memref(DYN, BF16Type.get()),
+            v: lambda: T.memref(DYN, BF16Type.get()),
+            a: lambda: T.memref(DYN, BF16Type.get()),
+            b: lambda: T.memref(DYN, BF16Type.get()),
+            A_log: lambda: T.memref(DYN, F32Type.get()),
+            dt_bias: lambda: T.memref(DYN, BF16Type.get()),
+            o: lambda: T.memref(DYN, BF16Type.get()),
+            h0_indices: lambda: T.memref(DYN, IntegerType.get_signless(32)),
+        ):
+            pass
         
         @flir.jit
         def __call__(
@@ -77,10 +110,22 @@ def _create_jit_functions(
             o: lambda: T.memref(DYN, BF16Type.get()),
             stream: lambda: T.i64(),
         ):
-            pass
+            batch_size = N * HV
+            gx = arith.index(batch_size * NUM_BLOCKS_PER_STATE_SMALL)
+            c1 = arith.index(1)
+            bx = arith.index(NUM_THREADS)
+            num_v_tiles_small = arith.index((V + TILE_V_SMALL - 1) // TILE_V_SMALL)
+            flir.gpu_ext.LaunchFuncOp(
+                [self.GPU_MODULE_NAME, "gdn_kernel_small_batch"],
+                grid_size=(gx, c1, c1),
+                block_size=(bx, c1, c1),
+                kernel_operands=[h0_source, num_v_tiles_small, q, k, v, a, b, A_log, dt_bias, o, h0_indices],
+                async_dependencies=[stream_ptr_to_async_token(stream)],
+            )
+            
             # pool_size, hv_dim, k_dim, v_dim = h0_source.layout.shape
             # n_indices = h0_indices.layout.shape[0]
-            # batch_size = n_indices * hv_dim
+            # batch_size = N * HV
 
             # copy_atom = cute.make_copy_atom(
             #     cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
@@ -212,35 +257,9 @@ def _get_compiled_kernel(N, H, HV, K, V, pool_size, use_small_batch, is_varlen_d
         V,
         HV,
         use_initial_state=True,
-        use_qk_l2norm=True)
-
-    # compiled_kernel = cute.compile(
-    #     kernel_func,
-    #     cu_seqlens_tensor,
-    #     q_tensor,
-    #     k_tensor,
-    #     v_tensor,
-    #     a_tensor,
-    #     b_tensor,
-    #     A_log_tensor,
-    #     dt_bias_tensor,
-    #     h0_source_tensor,
-    #     h0_indices_tensor,
-    #     o_tensor,
-    #     softplus_beta=softplus_beta,
-    #     softplus_threshold=softplus_threshold,
-    #     scale=scale,
-    #     B=B_compile,
-    #     T=T_compile,
-    #     H=H,
-    #     K=K,
-    #     V=V,
-    #     HV=HV,
-    #     use_initial_state=True,
-    #     use_qk_l2norm=True,
-    #     stream=stream,
-    # )
-
+        use_qk_l2norm=True,
+        N=N)
+    compiled_kernel = flydsl.compile(kernel_func)
     _compiled_kernels[key] = compiled_kernel
     logger.info(
         f"FLY DSL GDN kernel compiled: N={N}, H={H}, HV={HV}, K={K}, V={V}, pool_size={pool_size}, small_batch={use_small_batch}, varlen={is_varlen_decode}"
@@ -333,20 +352,20 @@ def flydsl_fused_sigmoid_gating_delta_rule_update(
         N, H, HV, K, V, pool_size, use_small_batch, is_varlen_decode
     )
 
-    # compiled_kernel(
-    #     cu_seqlens_tensor,
-    #     q_tensor,
-    #     k_tensor,
-    #     v_tensor,
-    #     a_tensor,
-    #     b_tensor,
-    #     A_log_tensor,
-    #     dt_bias_tensor,
-    #     h0_source_tensor,
-    #     h0_indices_tensor,
-    #     o_tensor,
-    #     stream,
-    # )
+    compiled_kernel(
+        cu_seqlens_tensor,
+        q_tensor,
+        k_tensor,
+        v_tensor,
+        a_tensor,
+        b_tensor,
+        A_log_tensor,
+        dt_bias_tensor,
+        h0_source_tensor,
+        h0_indices_tensor,
+        o_tensor,
+        stream,
+    )
 
     return o
 
