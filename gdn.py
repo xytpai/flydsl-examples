@@ -63,6 +63,9 @@ def _create_jit_functions(
     use_qk_l2norm: bool,
     N: int
 ):
+    _asv = arith.as_value
+    _asid = flir.const_index
+    _extf = flir.arith.extf
     DYN = ir.ShapedType.get_dynamic_size()
     ARCH = get_rocm_arch()
     allocator = SmemAllocator(None, arch=ARCH)
@@ -76,14 +79,21 @@ def _create_jit_functions(
     class RunSmallBatch(flir.MlirModule):
         GPU_MODULE_NAME = "gdn_kernels"
         GPU_MODULE_TARGETS = [f'#rocdl.target<chip = "{ARCH}">']
+
+        def init_gpu_module(self):
+            self.sData = allocator.allocate_array(T.f32(), TILE_K * TILE_V_SMALL * NUM_STAGES)
+            self.smem_o = allocator.allocate_array(T.f32(), TILE_V_SMALL)
+            self.sK = allocator.allocate_array(T.f32(), TILE_K)
+            self.sQ = allocator.allocate_array(T.f32(), TILE_K)
+            allocator.finalize()
         
         @flir.kernel
         def gdn_kernel_small_batch(
             self: flir.T.i64,
-            h0_source: lambda: T.memref(DYN, F32Type.get()),
+            h0_source: lambda: T.memref(DYN, HV, K, V, F32Type.get()),
             num_v_tiles: lambda: T.index(),
-            q: lambda: T.memref(DYN, BF16Type.get()),
-            k: lambda: T.memref(DYN, BF16Type.get()),
+            q: lambda: T.memref(N, 1, H, K, BF16Type.get()),
+            k: lambda: T.memref(N, 1, H, K, BF16Type.get()),
             v: lambda: T.memref(DYN, BF16Type.get()),
             a: lambda: T.memref(DYN, BF16Type.get()),
             b: lambda: T.memref(DYN, BF16Type.get()),
@@ -92,20 +102,61 @@ def _create_jit_functions(
             o: lambda: T.memref(DYN, BF16Type.get()),
             h0_indices: lambda: T.memref(DYN, IntegerType.get_signless(32)),
         ):
+            tidx = flir.thread_idx("x")
+            in_warp_tid = tidx % 32
+            warp_idx = tidx / 32
+            block_idx = flir.block_idx("x")
+
+            batch_idx = block_idx // NUM_BLOCKS_PER_STATE_SMALL
+            batch_inner = block_idx % NUM_BLOCKS_PER_STATE_SMALL
+            num_v_tiles_per_block = num_v_tiles // NUM_BLOCKS_PER_STATE_SMALL
+            start_v_tile = batch_inner * num_v_tiles_per_block
+
+            i_n = batch_idx // HV
+            i_hv = batch_idx % HV
+            i_h = i_hv // (HV // H)
+
+            pool_idx = flir.memref.load(h0_indices, [arith.as_value(i_n)])
+            base_ptr = allocator.get_base()
+
+            if pool_idx >= 0:
+                k_local = in_warp_tid // V_PER_WARP_SMALL
+                v_local = in_warp_tid % V_PER_WARP_SMALL
+                v_base = warp_idx * V_PER_WARP_SMALL
+                v_idx = v_base + v_local
+
+                sData = flir.make_tensor(
+                    self.sData(base_ptr).get(),
+                    shape=(TILE_K, TILE_V_SMALL, NUM_STAGES),
+                    strides=(TILE_V_SMALL_PADDED, 1, TILE_K * TILE_V_SMALL_PADDED),
+                )
+                smem_o = flir.make_tensor(self.smem_o(base_ptr).get(), shape=(TILE_V_SMALL,), strides=(1,))
+                sK = flir.make_tensor(self.sK(base_ptr).get(), shape=(TILE_K,), strides=(1,))
+                sQ = flir.make_tensor(self.sQ(base_ptr).get(), shape=(TILE_K,), strides=(1,))
+
+                if tidx < TILE_K:
+                    sK[(tidx,)] = _extf(T.f32(), flir.memref.load(k, [_asv(i_n), _asid(0), _asv(i_h), _asv(tidx)]))
+                    sQ[(tidx,)] = _extf(T.f32(), flir.memref.load(q, [_asv(i_n), _asid(0), _asv(i_h), _asv(tidx)]))
+                
+                # gSrc_batch = flir.memref.load(h0_source, [_asv(pool_idx), _asv(i_hv), _asv(None), _asv(None)])
+                # gSrc_batch = h0_source[(pool_idx, i_hv, None, None)]
+                # gSrc = cute.local_tile(gSrc_batch, (TILE_K, TILE_V_SMALL), (0, None))
+                # thr_copy_load = tiled_copy_load.get_slice(tidx)
+
             pass
         
         @flir.jit
         def __call__(
             self: flir.T.i64,
             cu_seqlens: lambda: T.memref(DYN, IntegerType.get_signless(32)),
-            q: lambda: T.memref(DYN, BF16Type.get()),
-            k: lambda: T.memref(DYN, BF16Type.get()),
+            q: lambda: T.memref(N, 1, H, K, BF16Type.get()),
+            k: lambda: T.memref(N, 1, H, K, BF16Type.get()),
             v: lambda: T.memref(DYN, BF16Type.get()),
             a: lambda: T.memref(DYN, BF16Type.get()),
             b: lambda: T.memref(DYN, BF16Type.get()),
             A_log: lambda: T.memref(DYN, F32Type.get()),
             dt_bias: lambda: T.memref(DYN, BF16Type.get()),
-            h0_source: lambda: T.memref(DYN, F32Type.get()),
+            h0_source: lambda: T.memref(DYN, HV, K, V, F32Type.get()),
             h0_indices: lambda: T.memref(DYN, IntegerType.get_signless(32)),
             o: lambda: T.memref(DYN, BF16Type.get()),
             stream: lambda: T.i64(),
@@ -122,7 +173,7 @@ def _create_jit_functions(
                 kernel_operands=[h0_source, num_v_tiles_small, q, k, v, a, b, A_log, dt_bias, o, h0_indices],
                 async_dependencies=[stream_ptr_to_async_token(stream)],
             )
-            
+
             # pool_size, hv_dim, k_dim, v_dim = h0_source.layout.shape
             # n_indices = h0_indices.layout.shape[0]
             # batch_size = N * HV
