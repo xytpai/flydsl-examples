@@ -30,6 +30,8 @@ from _mlir import ir
 from _mlir.ir import F16Type, BF16Type, F32Type, IntegerType, VectorType, IndexType
 import _mlir.extras.types as T
 
+from utils.ftensor import GTensor, STensor
+
 
 _compiled_kernels: Dict[Tuple, object] = {}
 _cu_seqlens_cache: Dict[Tuple, torch.Tensor] = {}
@@ -90,10 +92,10 @@ def _create_jit_functions(
         @flir.kernel
         def gdn_kernel_small_batch(
             self: flir.T.i64,
-            h0_source: lambda: T.memref(DYN, HV, K, V, F32Type.get()),
+            h0_source: lambda: T.memref(DYN, F32Type.get()),
             num_v_tiles: lambda: T.index(),
-            q: lambda: T.memref(N, 1, H, K, BF16Type.get()),
-            k: lambda: T.memref(N, 1, H, K, BF16Type.get()),
+            q: lambda: T.memref(DYN, BF16Type.get()),
+            k: lambda: T.memref(DYN, BF16Type.get()),
             v: lambda: T.memref(DYN, BF16Type.get()),
             a: lambda: T.memref(DYN, BF16Type.get()),
             b: lambda: T.memref(DYN, BF16Type.get()),
@@ -116,7 +118,8 @@ def _create_jit_functions(
             i_hv = batch_idx % HV
             i_h = i_hv // (HV // H)
 
-            pool_idx = flir.memref.load(h0_indices, [arith.as_value(i_n)])
+            h0_indices_tensor = GTensor(h0_indices, IntegerType.get_signless(32), (N,))
+            pool_idx = h0_indices_tensor[(i_n,)]
             base_ptr = allocator.get_base()
 
             if pool_idx >= 0:
@@ -125,21 +128,22 @@ def _create_jit_functions(
                 v_base = warp_idx * V_PER_WARP_SMALL
                 v_idx = v_base + v_local
 
-                sData = flir.make_tensor(
-                    self.sData(base_ptr).get(),
+                sData_tensor = STensor(self.sData(base_ptr), T.f32(), 
                     shape=(TILE_K, TILE_V_SMALL, NUM_STAGES),
-                    strides=(TILE_V_SMALL_PADDED, 1, TILE_K * TILE_V_SMALL_PADDED),
-                )
-                smem_o = flir.make_tensor(self.smem_o(base_ptr).get(), shape=(TILE_V_SMALL,), strides=(1,))
-                sK = flir.make_tensor(self.sK(base_ptr).get(), shape=(TILE_K,), strides=(1,))
-                sQ = flir.make_tensor(self.sQ(base_ptr).get(), shape=(TILE_K,), strides=(1,))
+                    stride=(TILE_V_SMALL_PADDED, 1, TILE_K * TILE_V_SMALL_PADDED))
+                smem_o_tensor = STensor(self.smem_o(base_ptr), T.f32(), shape=(TILE_V_SMALL,))
+                sK_tensor = STensor(self.sK(base_ptr), T.f32(), shape=(TILE_K,))
+                sQ_tensor = STensor(self.sQ(base_ptr), T.f32(), shape=(TILE_K,))
+
+                q_tensor = GTensor(q, BF16Type.get(), (N, 1, H, K))
+                k_tensor = GTensor(k, BF16Type.get(), (N, 1, H, K))
 
                 if tidx < TILE_K:
-                    sK[(tidx,)] = _extf(T.f32(), flir.memref.load(k, [_asv(i_n), _asid(0), _asv(i_h), _asv(tidx)]))
-                    sQ[(tidx,)] = _extf(T.f32(), flir.memref.load(q, [_asv(i_n), _asid(0), _asv(i_h), _asv(tidx)]))
+                    sK_tensor[(tidx,)] = _extf(T.f32(), k_tensor[(i_n, 0, i_h, tidx)])
+                    sQ_tensor[(tidx,)] = _extf(T.f32(), q_tensor[(i_n, 0, i_h, tidx)])
                 
-                # gSrc_batch = flir.memref.load(h0_source, [_asv(pool_idx), _asv(i_hv), _asv(None), _asv(None)])
-                # gSrc_batch = h0_source[(pool_idx, i_hv, None, None)]
+                h0_source_tensor = GTensor(h0_source, F32Type.get(), (-1, HV, K, V))
+                gSrc_batch = h0_source_tensor[(pool_idx, i_hv, None, None)]
                 # gSrc = cute.local_tile(gSrc_batch, (TILE_K, TILE_V_SMALL), (0, None))
                 # thr_copy_load = tiled_copy_load.get_slice(tidx)
 
@@ -149,14 +153,14 @@ def _create_jit_functions(
         def __call__(
             self: flir.T.i64,
             cu_seqlens: lambda: T.memref(DYN, IntegerType.get_signless(32)),
-            q: lambda: T.memref(N, 1, H, K, BF16Type.get()),
-            k: lambda: T.memref(N, 1, H, K, BF16Type.get()),
+            q: lambda: T.memref(DYN, BF16Type.get()),
+            k: lambda: T.memref(DYN, BF16Type.get()),
             v: lambda: T.memref(DYN, BF16Type.get()),
             a: lambda: T.memref(DYN, BF16Type.get()),
             b: lambda: T.memref(DYN, BF16Type.get()),
             A_log: lambda: T.memref(DYN, F32Type.get()),
             dt_bias: lambda: T.memref(DYN, BF16Type.get()),
-            h0_source: lambda: T.memref(DYN, HV, K, V, F32Type.get()),
+            h0_source: lambda: T.memref(DYN, F32Type.get()),
             h0_indices: lambda: T.memref(DYN, IntegerType.get_signless(32)),
             o: lambda: T.memref(DYN, BF16Type.get()),
             stream: lambda: T.i64(),
