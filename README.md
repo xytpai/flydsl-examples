@@ -19,7 +19,8 @@ Check the ROCm version using `amd-smi`. My version is `7.0.1`.
 ```bash
 git clone https://github.com/ROCm/FlyDSL
 cd FlyDSL
-bash scripts/build_llvm.sh
+git checkout 05b38fe47b14e3179574aefb259a1c0739524ec3
+bash scripts/build_llvm.sh -j64
 
 # After this you will see the installed path.
 # -- Installing: /home/yuxu/llvm-project/mlir_install/lib/cmake/llvm/LLVMConfigExtensions.cmake
@@ -27,9 +28,8 @@ bash scripts/build_llvm.sh
 # ==============================================
 # LLVM/MLIR build completed successfully!
 
-export MLIR_PATH=/home/yuxu/llvm-project/build
-export MLIR_DIR=/home/yuxu/llvm-project
-./flir/build.sh
+export MLIR_PATH=/home/yuxu/llvm-project/build-flydsl/mlir_install
+bash scripts/build.sh -j64
 python3 -m pip install -e .
 ```
 
