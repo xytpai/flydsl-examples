@@ -152,17 +152,16 @@ class TorchTensor(FTensorBase):
 
 
 class GTensor(FTensorBase):
-    def __init__(self, fx_tensor, dtype, shape, stride=None, base_offset=0, vec_size=1):
+    def __init__(self, fx_tensor, dtype, shape, stride=None, base_offset=0):
         super().__init__(dtype, shape, stride, base_offset)
-        self.vec_size = vec_size
         self.fx_tensor = fx_tensor
         self.rsrc = buffer_ops.create_buffer_resource(self.fx_tensor, max_size=True)
     
-    def load(self, offset):
-        return buffer_ops.buffer_load(self.rsrc, offset, vec_width=self.vec_size, dtype=self.dtype)
+    def load(self, offset, vec_size=1):
+        return buffer_ops.buffer_load(self.rsrc, offset, vec_width=vec_size, dtype=self.dtype)
     
-    def store(self, offset, value):
-        buffer_ops.buffer_store(value, self.rsrc, offset, offset_is_bytes=False)
+    def store(self, offset, value, vec_size=1):
+        buffer_ops.buffer_store(value, self.rsrc, offset, offset_is_bytes=False, vec_width=vec_size)
 
 
 class STensor(FTensorBase):
@@ -170,10 +169,10 @@ class STensor(FTensorBase):
         super().__init__(dtype, shape, stride, base_offset)
         self.fx_tensor = fx_tensor
     
-    def load(self, offset):
+    def load(self, offset, vec_size=1):
         return self.fx_tensor.load([arith.as_value(offset)])
     
-    def store(self, offset, value):
+    def store(self, offset, value, vec_size=1):
         self.fx_tensor.store(value, [arith.as_value(offset)])
 
 
