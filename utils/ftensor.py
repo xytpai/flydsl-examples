@@ -74,11 +74,12 @@ class FTensorView:
             block_offset_d = block_idxs[d] * block_work_size_d
             thread_offset_d = block_offset_d + thread_idxs[d] * thread_layout[d]
             if thread_offset_d >= self.shape[d]:
-                return None, None
+                return
             src_offset += thread_offset_d * src_tensor.stride[d]
             dst_offset += thread_offset_d * self.stride[d]
         thread_layout_v = thread_layout[:-1] + (thread_layout[-1] // vec_size,)
         coords = list(product(*(range(s) for s in thread_layout_v)))
+        print(coords)
         for coord in coords:
             src_vec_offset = src_offset
             dst_vec_offset = dst_offset
@@ -94,9 +95,8 @@ class FTensorView:
 
 
 class FTensorBase(ABC):
-    def __init__(self, fx_tensor, dtype, shape, stride=None, base_offset=0):
+    def __init__(self, dtype, shape, stride=None, base_offset=0):
         self.tensor_view = None
-        self.fx_tensor = fx_tensor
         self.dtype = dtype
         self.shape = shape
         self.stride = stride
@@ -132,10 +132,23 @@ class FTensorBase(ABC):
         self.tensor_view.copy_(src_tensor, thread_layout, value_layout, block_idxs, thread_idxs, vec_size)
 
 
+class TorchTensor(FTensorBase):
+    def __init__(self, torch_tensor, dtype, shape, stride=None, base_offset=0):
+        super().__init__(dtype, shape, stride, base_offset)
+        self.torch_tensor = torch_tensor
+    
+    def load(self, offset, vec_size=1):
+        return self.torch_tensor.view(-1)[offset:offset+vec_size]
+    
+    def store(self, offset, value, vec_size=1):
+        self.torch_tensor.view(-1)[offset:offset+vec_size] = value
+
+
 class GTensor(FTensorBase):
     def __init__(self, fx_tensor, dtype, shape, stride=None, base_offset=0, vec_size=1):
-        super().__init__(fx_tensor, dtype, shape, stride, base_offset)
+        super().__init__(dtype, shape, stride, base_offset)
         self.vec_size = vec_size
+        self.fx_tensor = fx_tensor
         self.rsrc = buffer_ops.create_buffer_resource(self.fx_tensor, max_size=True)
     
     def load(self, offset):
@@ -147,10 +160,31 @@ class GTensor(FTensorBase):
 
 class STensor(FTensorBase):
     def __init__(self, fx_tensor, dtype, shape, stride=None, base_offset=0):
-        super().__init__(fx_tensor, dtype, shape, stride, base_offset)
+        super().__init__(dtype, shape, stride, base_offset)
+        self.fx_tensor = fx_tensor
     
     def load(self, offset):
         return self.fx_tensor.load([arith.as_value(offset)])
     
     def store(self, offset, value):
         self.fx_tensor.store(value, [arith.as_value(offset)])
+
+
+if __name__ == '__main__':
+    print('==== test ftensor ===')
+    import torch
+    shape = (4, 8)
+    a = torch.zeros(shape)
+    b = torch.FloatTensor([[1,2],[3,4]])
+    print(a)
+    print(b)
+    a_tensor = TorchTensor(a, torch.float, shape)
+    b_tensor = TorchTensor(b, torch.float, (2, 2))
+    a_tensor[(1, None)][(7,)] = 9
+    assert a_tensor[(1, None)][(7,)].item() == 9
+    a_tensor.local_tile((2, 2), (1, 2)).copy_(
+        b_tensor, 
+        thread_layout=(2, 1), value_layout=(1, 2),
+        block_idxs=(1, 2), thread_idxs=(0, 0), vec_size=2
+    )
+    print(a)
