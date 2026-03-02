@@ -139,7 +139,7 @@ class FTensorBase(ABC):
         self._lazy_init()
         return self.tensor_view.local_tile(tile_shape, tile_idxs)
     
-    def copy_(src_tensor, thread_layout, value_layout, thread_idxs, vec_size):
+    def copy_(self, src_tensor, thread_layout, value_layout, thread_idxs, vec_size):
         self._lazy_init()
         self.tensor_view.copy_(src_tensor, thread_layout, value_layout, thread_idxs, vec_size)
 
@@ -160,7 +160,7 @@ class GTensor(FTensorBase):
     def __init__(self, fx_tensor, dtype, shape, stride=None, base_offset=0):
         super().__init__(dtype, shape, stride, base_offset)
         self.fx_tensor = fx_tensor
-        self.rsrc = buffer_ops.create_buffer_resource(self.fx_tensor, max_size=True)
+        # self.rsrc = buffer_ops.create_buffer_resource(self.fx_tensor, max_size=True)
     
     def load(self, offset, vec_size=1):
         # return buffer_ops.buffer_load(self.rsrc, offset, dtype=self.dtype)
