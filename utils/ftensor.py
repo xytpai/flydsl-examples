@@ -12,9 +12,11 @@ from flydsl.dialects.ext.python_control_flow import range_constexpr, lower_range
 from flydsl.utils import SmemAllocator
 fm_fast = flir.arith.FastMathFlags.fast
 _asid = flir.const_index
+_asv = arith.as_value
 from _mlir import ir
-from _mlir.ir import F16Type, BF16Type, F32Type, IntegerType, VectorType, IndexType
+from _mlir.ir import F16Type, BF16Type, F32Type, IntegerType, VectorType, IndexType, IntegerAttr
 import _mlir.extras.types as T
+from _mlir.dialects.arith import addi
 
 
 class FTensorView:
@@ -25,25 +27,27 @@ class FTensorView:
             self.stride = tuple((np.cumprod(shape[::-1])[::-1].tolist()+[1,])[1:])
         else:
             self.stride = stride
-        self.base_offset = base_offset
+        self.base_offset = base_offset # dynamic
         self.load_impl = load_impl
         self.store_impl = store_impl
     
     def linear_offset(self, idxs):
         slice_shape = []
         slice_stride = []
-        offset = self.base_offset
+        d_offset = self.base_offset
         for i in range_constexpr(len(idxs)):
-            d = idxs[i]
-            if d is None:
+            md_id = idxs[i]
+            if md_id is None:
                 slice_shape.append(self.shape[i])
                 slice_stride.append(self.stride[i])
-                d = 0
-            offset = offset + d * self.stride[i]
+            elif isinstance(md_id, int):
+                d_offset = d_offset + md_id * self.stride[i]
+            else:
+                d_offset = d_offset + md_id * self.stride[i]
         if len(slice_shape) > 0:
-            return offset, slice_shape, slice_stride
+            return d_offset, tuple(slice_shape), tuple(slice_stride)
         else:
-            return (offset,)
+            return (d_offset,)
     
     def _lazy_init(self):
         pass
@@ -64,10 +68,12 @@ class FTensorView:
         self.store_impl(offset[0], value)
     
     def local_tile(self, tile_shape, tile_idxs):
-        offset = self.base_offset
+        d_offset = self.base_offset
+        stride = []
         for i in range_constexpr(len(tile_idxs)):
-            offset = offset + tile_idxs[i] * tile_shape[i] * self.stride[i]
-        return FTensorView(self.dtype, tile_shape, self.stride, offset, self.load_impl, self.store_impl)
+            d_offset = d_offset + tile_idxs[i] * tile_shape[i] * self.stride[i]
+            stride.append(self.stride[i])
+        return FTensorView(self.dtype, tile_shape, tuple(stride), d_offset, self.load_impl, self.store_impl)
     
     def copy_(self, src_tensor, thread_layout, value_layout, thread_idxs, vec_size):
         src_tensor._lazy_init()
@@ -75,11 +81,10 @@ class FTensorView:
         src_offset = src_tensor.base_offset
         dst_offset = self.base_offset
         for d in range_constexpr(ndim):
-            thread_offset_d = thread_idxs[d] * value_layout[d]
-            src_offset = src_offset + thread_offset_d * src_tensor.stride[d]
-            dst_offset = dst_offset + thread_offset_d * self.stride[d]
+            src_offset = src_offset + thread_idxs[d] * value_layout[d] * self.stride[d]
+            dst_offset = dst_offset + thread_idxs[d] * value_layout[d] * self.stride[d]
         value_layout_v = value_layout[:-1] + (value_layout[-1] // vec_size,)
-        coords = list(product(*(range(s) for s in value_layout_v)))
+        coords = tuple(product(*(range(s) for s in value_layout_v)))
         for coord in coords:
             src_vec_offset = src_offset
             dst_vec_offset = dst_offset
@@ -158,22 +163,24 @@ class GTensor(FTensorBase):
         self.rsrc = buffer_ops.create_buffer_resource(self.fx_tensor, max_size=True)
     
     def load(self, offset, vec_size=1):
-        return buffer_ops.buffer_load(self.rsrc, offset, vec_width=vec_size, dtype=self.dtype)
+        # return buffer_ops.buffer_load(self.rsrc, offset, dtype=self.dtype)
+        return flir.memref.load(self.fx_tensor, [arith.as_value(offset)])
     
     def store(self, offset, value, vec_size=1):
-        buffer_ops.buffer_store(value, self.rsrc, offset, offset_is_bytes=False, vec_width=vec_size)
+        # buffer_ops.buffer_store(value, self.rsrc, offset, offset_is_bytes=False)
+        flir.memref.store(arith.as_value(value), self.fx_tensor, [flir.const_index(offset),])
 
 
 class STensor(FTensorBase):
     def __init__(self, fx_tensor, dtype, shape, stride=None, base_offset=0):
         super().__init__(dtype, shape, stride, base_offset)
-        self.fx_tensor = fx_tensor
+        self.fx_tensor = fx_tensor.get()
     
     def load(self, offset, vec_size=1):
-        return self.fx_tensor.load([arith.as_value(offset)])
+        return flir.memref.load(self.fx_tensor, [offset])
     
     def store(self, offset, value, vec_size=1):
-        self.fx_tensor.store(value, [arith.as_value(offset)])
+        flir.memref.store(arith.as_value(value), self.fx_tensor, [flir.const_index(offset),])
 
 
 if __name__ == '__main__':
