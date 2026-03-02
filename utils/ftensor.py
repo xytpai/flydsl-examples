@@ -177,7 +177,7 @@ class STensor(FTensorBase):
         self.fx_tensor = fx_tensor.get()
     
     def load(self, offset, vec_size=1):
-        return flir.memref.load(self.fx_tensor, [offset])
+        return flir.memref.load(self.fx_tensor, [arith.as_value(offset)])
     
     def store(self, offset, value, vec_size=1):
         flir.memref.store(arith.as_value(value), self.fx_tensor, [flir.const_index(offset),])

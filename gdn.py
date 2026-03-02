@@ -76,6 +76,9 @@ def _create_jit_functions(
     ROWS_PER_ITER_SMALL = 32 // V_PER_WARP_SMALL
     NUM_K_ITERS_SMALL = TILE_K // ROWS_PER_ITER_SMALL
 
+    def _extf32(value):
+        return _extf(T.f32(), value)
+
     # gdn_small, gdn_small_varlen, gdn_large, gdn_large_varlen = _define_kernels()
 
     class RunSmallBatch(flir.MlirModule):
@@ -104,9 +107,11 @@ def _create_jit_functions(
             o: lambda: T.memref(DYN, BF16Type.get()),
             h0_indices: lambda: T.memref(DYN, IntegerType.get_signless(32)),
         ):
+            c0 = arith.index(1)
+            c1 = arith.index(1)
             tidx = flir.thread_idx("x")
             in_warp_tid = tidx % 32
-            warp_idx = tidx / 32
+            warp_idx = tidx // 32
             block_idx = flir.block_idx("x")
 
             batch_idx = block_idx // NUM_BLOCKS_PER_STATE_SMALL
@@ -143,9 +148,101 @@ def _create_jit_functions(
                     sQ_tensor[(tidx,)] = _extf(T.f32(), q_tensor[(i_n, 0, i_h, tidx)])
                 
                 h0_source_tensor = GTensor(h0_source, F32Type.get(), (-1, HV, K, V))
-                gSrc_batch = h0_source_tensor[(pool_idx, i_hv, None, None)]
-                # gSrc = cute.local_tile(gSrc_batch, (TILE_K, TILE_V_SMALL), (0, None))
-                # thr_copy_load = tiled_copy_load.get_slice(tidx)
+                gSrc_batch = h0_source_tensor[(arith.index_cast(T.index(), pool_idx), i_hv, None, None)]
+
+                prefetch_count = min(NUM_STAGES - 1, num_v_tiles_per_block)
+                for v_tile_offset in range(prefetch_count):
+                    v_tile = start_v_tile + v_tile_offset
+                    stage = v_tile_offset % NUM_STAGES
+                    gSrc_tile = gSrc_batch.local_tile((TILE_K, TILE_V_SMALL), (0, v_tile))
+                    sData_stage = sData_tensor[(None, None, stage)]
+                    sData_stage.copy_(gSrc_tile, thread_layout=(32, 4), value_layout=(1, 4), thread_idxs=(warp_idx, in_warp_tid), vec_size=1)
+                
+                A_log_tensor = GTensor(A_log, F32Type.get(), (HV,))
+                dt_bias_tensor = GTensor(dt_bias, BF16Type.get(), (HV,))
+                a_tensor = GTensor(a, BF16Type.get(), (N, 1, HV))
+                b_tensor = GTensor(b, BF16Type.get(), (N, 1, HV))
+
+                r_A_log = _extf32(_asv(A_log_tensor[(i_hv,)]))
+                r_dt_bias = _extf(T.f32(), dt_bias_tensor[(i_hv,)])
+                r_a = _extf(T.f32(), a_tensor[(i_n, 0, i_hv)])
+                r_b = _extf(T.f32(), b_tensor[(i_n, 0, i_hv)])
+
+                r_g = 0.0
+                r_beta = 0.0
+                if in_warp_tid == 0:
+                    x = r_a + r_dt_bias
+                    beta_x = softplus_beta * x
+                    softplus_x = 0.0
+                    if beta_x <= softplus_threshold:
+                        exp_beta_x = flir.math.exp2(_asv(beta_x), fastmath=fm_fast)
+                        log_input = _extf32(_asv(1.0 + exp_beta_x))
+                        log_result = _extf32(_asv(flir.math.LogOp(_asv(log_input))))
+                        softplus_x = _extf32(_asv((1.0 / softplus_beta) * log_result))
+                    else:
+                        softplus_x = x
+                    r_g_value = (0.0 - flir.math.exp2(_asv(r_A_log), fastmath=fm_fast)) * softplus_x
+                    r_beta = 1.0 / (1.0 + flir.math.exp2(_asv(0.0 - r_b)))
+                    r_g = flir.math.exp2(_asv(r_g_value))
+            
+                width_i32 = arith.as_value(arith.constant(32, type=T.i32()))
+                r_g = gpu.ShuffleOp(_asv(r_g), _asv(0), width_i32, mode="idx").shuffleResult
+                r_beta = gpu.ShuffleOp(_asv(r_beta), _asv(0), width_i32, mode="idx").shuffleResult
+                gpu.barrier()
+
+                if use_qk_l2norm:
+                    sum_q_partial = _extf32(_asv(0.0))
+                    sum_k_partial = _extf32(_asv(0.0))
+                    if tidx < TILE_K:
+                        q_val = _extf32(_asv(sQ_tensor[(tidx,)]))
+                        k_val = _extf32(_asv(sK_tensor[(tidx,)]))
+                        sum_q_partial = q_val * q_val
+                        sum_k_partial = k_val * k_val
+
+                    # for offset in [16, 8, 4, 2, 1]:
+                    #     sum_q_partial += cute.arch.shuffle_sync_bfly(
+                    #         sum_q_partial, offset=offset, mask=-1, mask_and_clamp=31
+                    #     )
+                    #     sum_k_partial += cute.arch.shuffle_sync_bfly(
+                    #         sum_k_partial, offset=offset, mask=-1, mask_and_clamp=31
+                    #     )
+
+                    if in_warp_tid == 0:
+                        smem_o_tensor[(warp_idx,)] = sum_q_partial
+                        smem_o_tensor[(warp_idx + 4,)] = sum_k_partial
+                    gpu.barrier()
+
+                    inv_norm_q = _extf32(_asv(0.0))
+                    inv_norm_k = _extf32(_asv(0.0))
+                    if warp_idx == 0:
+                        local_sum_q = _extf32(_asv(0.0))
+                        local_sum_k = _extf32(_asv(0.0))
+                        if in_warp_tid < NUM_WARPS_SMALL:
+                            local_sum_q = smem_o_tensor[(in_warp_tid,)]
+                            local_sum_k = smem_o_tensor[(in_warp_tid + 4,)]
+                        # for offset in [2, 1]:
+                        #     local_sum_q += cute.arch.shuffle_sync_bfly(
+                        #         local_sum_q, offset=offset, mask=-1, mask_and_clamp=31
+                        #     )
+                        #     local_sum_k += cute.arch.shuffle_sync_bfly(
+                        #         local_sum_k, offset=offset, mask=-1, mask_and_clamp=31
+                        #     )
+                        if in_warp_tid == 0:
+                            smem_o_tensor[(0,)] = _extf32(_asv(flir.math.rsqrt(_asv(local_sum_q + 1e-6))))
+                            smem_o_tensor[(1,)] = _extf32(_asv(flir.math.rsqrt(_asv(local_sum_k + 1e-6))))
+                    gpu.barrier()
+
+                    inv_norm_q = smem_o_tensor[(c0,)]
+                    inv_norm_k = smem_o_tensor[(c1,)]
+
+                    if tidx < TILE_K:
+                        sK_tensor[(tidx,)] = sK_tensor[(tidx,)] * inv_norm_k
+                        sQ_tensor[(tidx,)] = sQ_tensor[(tidx,)] * scale * inv_norm_q
+                    gpu.barrier()
+                else:
+                    if tidx < TILE_K:
+                        sQ_tensor[(tidx,)] = sQ_tensor[(tidx,)] * scale
+                    gpu.barrier()
 
             pass
         
