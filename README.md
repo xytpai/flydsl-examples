@@ -12,6 +12,8 @@ This repository will provide the following examples from scratch:
 - [ ] GEMM-FP8
 - [ ] GEMM Fusions
 
+For IR study: https://mlir.llvm.org/docs/
+
 ## 0. How to install FlyDSL on AMD GPUs
 
 Check the ROCm version using `amd-smi`. My version is `7.0.1`.

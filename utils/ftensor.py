@@ -56,6 +56,8 @@ class FTensorView:
         return f"TensorView(offset={self.base_offset}, shape={self.shape}, stride={self.stride}, dtype={self.dtype})"
 
     def __getitem__(self, idxs):
+        if not isinstance(idxs, tuple):
+            idxs = (idxs,)
         offset = self.linear_offset(idxs)
         if len(offset) == 1:
             return self.load_impl(offset[0])
@@ -63,6 +65,8 @@ class FTensorView:
             return FTensorView(self.dtype, offset[1], offset[2], offset[0], self.load_impl, self.store_impl)
     
     def __setitem__(self, idxs, value):
+        if not isinstance(idxs, tuple):
+            idxs = (idxs,)
         offset = self.linear_offset(idxs)
         assert len(offset) == 1
         self.store_impl(offset[0], value)
