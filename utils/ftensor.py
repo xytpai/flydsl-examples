@@ -85,7 +85,7 @@ class FTensorView:
         src_offset = src_tensor.base_offset
         dst_offset = self.base_offset
         for d in range_constexpr(ndim):
-            src_offset = src_offset + thread_idxs[d] * value_layout[d] * self.stride[d]
+            src_offset = src_offset + thread_idxs[d] * value_layout[d] * src_tensor.stride[d]
             dst_offset = dst_offset + thread_idxs[d] * value_layout[d] * self.stride[d]
         value_layout_v = value_layout[:-1] + (value_layout[-1] // vec_size,)
         coords = tuple(product(*(range(s) for s in value_layout_v)))

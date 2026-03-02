@@ -105,12 +105,11 @@ def _create_jit_functions(
             A_log: lambda: T.memref(DYN, F32Type.get()),
             dt_bias: lambda: T.memref(DYN, BF16Type.get()),
             o: lambda: T.memref(DYN, BF16Type.get()),
-            h0_indices: lambda: T.memref(DYN, IntegerType.get_signless(32)),
+            h0_indices: lambda: T.memref(DYN, T.i32()),
         ):
-            i0 = arith.constant(0, type=T.i32())
-            i1 = arith.constant(1, type=T.i32())
-            c0 = arith.constant(0, type=T.i32(), index=True)
-            c1 = arith.constant(1, type=T.i32(), index=True)
+            i32_0 = arith.constant(0, type=T.i32())
+            id32_0 = arith.constant(0, type=T.i32(), index=True)
+            id32_1 = arith.constant(1, type=T.i32(), index=True)
             tidx = flir.thread_idx("x")
             in_warp_tid = tidx % 32
             warp_idx = tidx // 32
@@ -125,7 +124,7 @@ def _create_jit_functions(
             i_hv = batch_idx % HV
             i_h = i_hv // (HV // H)
 
-            h0_indices_tensor = GTensor(h0_indices, IntegerType.get_signless(32), (N,))
+            h0_indices_tensor = GTensor(h0_indices, T.i32(), (N,))
             pool_idx_ = h0_indices_tensor[i_n]
             pool_idx = arith.index_cast(T.index(), pool_idx_)
             base_ptr = allocator.get_base()
@@ -166,7 +165,7 @@ def _create_jit_functions(
                 a_tensor = GTensor(a, BF16Type.get(), (N, 1, HV))
                 b_tensor = GTensor(b, BF16Type.get(), (N, 1, HV))
 
-                r_A_log = _extf32(_asv(A_log_tensor[i_hv]))
+                r_A_log = A_log_tensor[i_hv]
                 r_dt_bias = _extf32(dt_bias_tensor[i_hv])
                 r_a = _extf32(a_tensor[i_n, 0, i_hv])
                 r_b = _extf32(b_tensor[i_n, 0, i_hv])
@@ -178,19 +177,19 @@ def _create_jit_functions(
                     beta_x = softplus_beta * x
                     softplus_x = _extf32(_asv(0.0))
                     if beta_x <= softplus_threshold:
-                        exp_beta_x = flir.math.exp2(_asv(beta_x), fastmath=fm_fast)
-                        log_input = _extf32(_asv(_extf32(_asv(1.0)) + exp_beta_x))
-                        log_result = _extf32(_asv(flir.math.LogOp(_asv(log_input))))
-                        softplus_x = _extf32(_asv((_extf32(_asv(1.0)) / softplus_beta) * log_result))
+                        exp_beta_x = flir.math.exp(_asv(beta_x), fastmath=fm_fast)
+                        log_input = _extf32(_asv(1.0)) + exp_beta_x
+                        log_result = flir.math.log(_asv(log_input))
+                        softplus_x = _extf32(_asv(_extf32(_asv(1.0)) / softplus_beta * log_result))
                     else:
                         softplus_x = x
-                    r_g_value = (_extf32(_asv(0.0)) - flir.math.exp2(_asv(r_A_log), fastmath=fm_fast)) * softplus_x
-                    r_beta = _extf32(_asv(1.0)) / (_extf32(_asv(1.0)) + flir.math.exp2(_asv(_extf32(_asv(0.0)) - r_b)))
-                    r_g = flir.math.exp2(_asv(r_g_value))
+                    r_g_value = _extf32(_asv(0.0)) - flir.math.exp(_asv(r_A_log), fastmath=fm_fast) * softplus_x
+                    r_beta = _extf32(_asv(1.0)) / (_extf32(_asv(1.0)) + flir.math.exp(_asv(_extf32(_asv(0.0)) - r_b), fastmath=fm_fast))
+                    r_g = flir.math.exp(_asv(r_g_value), fastmath=fm_fast)
             
                 width_i32 = arith.as_value(arith.constant(32, type=T.i32()))
-                r_g = gpu.ShuffleOp(_asv(r_g), _asv(i0), width_i32, mode="idx").shuffleResult
-                r_beta = gpu.ShuffleOp(_asv(r_beta), _asv(i0), width_i32, mode="idx").shuffleResult
+                r_g = gpu.ShuffleOp(_asv(r_g), _asv(i32_0), width_i32, mode="idx").shuffleResult
+                r_beta = gpu.ShuffleOp(_asv(r_beta), _asv(i32_0), width_i32, mode="idx").shuffleResult
                 gpu.barrier()
 
                 if use_qk_l2norm:
@@ -203,8 +202,10 @@ def _create_jit_functions(
                         sum_k_partial = k_val * k_val
 
                     for offset in [16, 8, 4, 2, 1]:
-                        sum_q_partial += gpu.ShuffleOp(_asv(sum_q_partial), _asv(arith.constant(offset, type=T.i32())), width_i32, mode="xor").shuffleResult
-                        sum_k_partial += gpu.ShuffleOp(_asv(sum_k_partial), _asv(arith.constant(offset, type=T.i32())), width_i32, mode="xor").shuffleResult
+                        sum_q_partial_peer = gpu.ShuffleOp(_asv(sum_q_partial), _asv(arith.constant(offset, type=T.i32())), width_i32, mode="xor").shuffleResult
+                        sum_q_partial = arith.as_value(flir.arith.AddFOp(arith.as_value(sum_q_partial), _asv(sum_q_partial_peer), fastmath=fm_fast).result)
+                        sum_k_partial_peer = gpu.ShuffleOp(_asv(sum_k_partial), _asv(arith.constant(offset, type=T.i32())), width_i32, mode="xor").shuffleResult
+                        sum_k_partial = arith.as_value(flir.arith.AddFOp(arith.as_value(sum_k_partial), _asv(sum_k_partial_peer), fastmath=fm_fast).result)
 
                     if in_warp_tid == 0:
                         smem_o_tensor[warp_idx] = sum_q_partial
@@ -220,15 +221,15 @@ def _create_jit_functions(
                             local_sum_q = smem_o_tensor[in_warp_tid]
                             local_sum_k = smem_o_tensor[in_warp_tid + 4]
                         for offset in [2, 1]:
-                            local_sum_q += gpu.ShuffleOp(_asv(local_sum_q), _asv(arith.constant(offset, type=T.i32())), width_i32, mode="xor").shuffleResult
-                            local_sum_k += gpu.ShuffleOp(_asv(local_sum_k), _asv(arith.constant(offset, type=T.i32())), width_i32, mode="xor").shuffleResult
+                            local_sum_q = local_sum_q + gpu.ShuffleOp(_asv(local_sum_q), _asv(arith.constant(offset, type=T.i32())), width_i32, mode="xor").shuffleResult
+                            local_sum_k = local_sum_k + gpu.ShuffleOp(_asv(local_sum_k), _asv(arith.constant(offset, type=T.i32())), width_i32, mode="xor").shuffleResult
                         if in_warp_tid == 0:
-                            smem_o_tensor[c0] = _extf32(_asv(flir.math.rsqrt(_extf32(_asv(local_sum_q + 1e-6)).value)))
-                            smem_o_tensor[c1] = _extf32(_asv(flir.math.rsqrt(_extf32(_asv(local_sum_k + 1e-6)).value)))
+                            smem_o_tensor[id32_0] = _extf32(_asv(flir.math.rsqrt(_extf32(_asv(local_sum_q + 1e-6)).value)))
+                            smem_o_tensor[id32_1] = _extf32(_asv(flir.math.rsqrt(_extf32(_asv(local_sum_k + 1e-6)).value)))
                     gpu.barrier()
 
-                    inv_norm_q = smem_o_tensor[c0]
-                    inv_norm_k = smem_o_tensor[c1]
+                    inv_norm_q = smem_o_tensor[id32_0]
+                    inv_norm_k = smem_o_tensor[id32_1]
 
                     if tidx < TILE_K:
                         sK_tensor[tidx] = sK_tensor[tidx] * inv_norm_k
@@ -315,7 +316,7 @@ def _create_jit_functions(
         @flir.jit
         def __call__(
             self: flir.T.i64,
-            cu_seqlens: lambda: T.memref(DYN, IntegerType.get_signless(32)),
+            cu_seqlens: lambda: T.memref(DYN, T.i32()),
             q: lambda: T.memref(DYN, BF16Type.get()),
             k: lambda: T.memref(DYN, BF16Type.get()),
             v: lambda: T.memref(DYN, BF16Type.get()),
@@ -324,7 +325,7 @@ def _create_jit_functions(
             A_log: lambda: T.memref(DYN, F32Type.get()),
             dt_bias: lambda: T.memref(DYN, BF16Type.get()),
             h0_source: lambda: T.memref(DYN, F32Type.get()),
-            h0_indices: lambda: T.memref(DYN, IntegerType.get_signless(32)),
+            h0_indices: lambda: T.memref(DYN, T.i32()),
             o: lambda: T.memref(DYN, BF16Type.get()),
             stream: lambda: T.i64(),
         ):
@@ -340,60 +341,6 @@ def _create_jit_functions(
                 kernel_operands=[h0_source, num_v_tiles_small, q, k, v, a, b, A_log, dt_bias, o, h0_indices],
                 async_dependencies=[stream_ptr_to_async_token(stream)],
             )
-
-            # pool_size, hv_dim, k_dim, v_dim = h0_source.layout.shape
-            # n_indices = h0_indices.layout.shape[0]
-            # batch_size = N * HV
-
-            # copy_atom = cute.make_copy_atom(
-            #     cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
-            #     cutlass.Float32,
-            #     num_bits_per_copy=128,
-            # )
-            # num_v_tiles_small = cute.ceil_div(v_dim, TILE_V_SMALL)
-            # smem_layout_small = cute.make_layout(
-            #     (TILE_K, TILE_V_SMALL, NUM_STAGES),
-            #     stride=(TILE_V_SMALL_PADDED, 1, TILE_K * TILE_V_SMALL_PADDED),
-            # )
-            # thread_layout_small = cute.make_layout((32, 4), stride=(4, 1))
-            # val_layout_small = cute.make_layout((1, 4))
-            # tiled_copy_load_small = cute.make_tiled_copy_tv(
-            #     copy_atom, thread_layout_small, val_layout_small
-            # )
-            # smem_bytes_small = (
-            #     4 * TILE_K * TILE_V_SMALL_PADDED * NUM_STAGES
-            #     + 4 * TILE_V_SMALL
-            #     + 4 * TILE_K * 2
-            #     + 64
-            # )
-
-            # gdn_small(
-            #     tiled_copy_load_small,
-            #     h0_source,
-            #     smem_layout_small,
-            #     num_v_tiles_small,
-            #     q,
-            #     k,
-            #     v,
-            #     a,
-            #     b,
-            #     A_log,
-            #     dt_bias,
-            #     o,
-            #     h0_indices,
-            #     softplus_beta,
-            #     softplus_threshold,
-            #     scale,
-            #     H,
-            #     HV,
-            #     use_qk_l2norm,
-            # ).launch(
-            #     grid=(batch_size * NUM_BLOCKS_PER_STATE_SMALL, 1, 1),
-            #     block=[NUM_THREADS, 1, 1],
-            #     smem=smem_bytes_small,
-            #     stream=stream,
-            # )
-    
     return RunSmallBatch().module
 
 
@@ -414,15 +361,17 @@ def _get_compiled_kernel(N, H, HV, K, V, pool_size, use_small_batch, is_varlen_d
         return _compiled_kernels[key]
 
     cu_seqlens = torch.zeros(N + 1, dtype=torch.int32, device="cuda")
+    assert is_varlen_decode == False
 
-    if is_varlen_decode:
-        q = torch.zeros(1, N, H, K, dtype=torch.bfloat16, device="cuda")
-        k = torch.zeros(1, N, H, K, dtype=torch.bfloat16, device="cuda")
-        v = torch.zeros(1, N, HV, V, dtype=torch.bfloat16, device="cuda")
-        a = torch.zeros(N, HV, dtype=torch.bfloat16, device="cuda")
-        b = torch.zeros(N, HV, dtype=torch.bfloat16, device="cuda")
-        o = torch.zeros(1, N, HV, V, dtype=torch.bfloat16, device="cuda")
-    else:
+    # if is_varlen_decode:
+    #     q = torch.zeros(1, N, H, K, dtype=torch.bfloat16, device="cuda")
+    #     k = torch.zeros(1, N, H, K, dtype=torch.bfloat16, device="cuda")
+    #     v = torch.zeros(1, N, HV, V, dtype=torch.bfloat16, device="cuda")
+    #     a = torch.zeros(N, HV, dtype=torch.bfloat16, device="cuda")
+    #     b = torch.zeros(N, HV, dtype=torch.bfloat16, device="cuda")
+    #     o = torch.zeros(1, N, HV, V, dtype=torch.bfloat16, device="cuda")
+    # else:
+    if True:
         q = torch.zeros(N, 1, H, K, dtype=torch.bfloat16, device="cuda")
         k = torch.zeros(N, 1, H, K, dtype=torch.bfloat16, device="cuda")
         v = torch.zeros(N, 1, HV, V, dtype=torch.bfloat16, device="cuda")
@@ -798,7 +747,7 @@ def fused_sigmoid_gating_delta_rule_update(
     initial_state_source: torch.Tensor,
     initial_state_indices: torch.Tensor,
     scale: Optional[float] = None,
-    use_qk_l2norm_in_kernel: bool = False,
+    use_qk_l2norm_in_kernel: bool = True,
     cu_seqlens: Optional[torch.Tensor] = None,
     is_kda: bool = False,
 ):
