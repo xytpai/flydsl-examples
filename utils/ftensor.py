@@ -164,15 +164,19 @@ class GTensor(FTensorBase):
     def __init__(self, fx_tensor, dtype, shape, stride=None, base_offset=0):
         super().__init__(dtype, shape, stride, base_offset)
         self.fx_tensor = fx_tensor
-        # self.rsrc = buffer_ops.create_buffer_resource(self.fx_tensor, max_size=True)
     
     def load(self, offset, vec_size=1):
-        # return buffer_ops.buffer_load(self.rsrc, offset, dtype=self.dtype)
-        return flir.memref.load(self.fx_tensor, [flir.const_index(offset)])
+        if vec_size > 1:
+            vec_type = VectorType.get([vec_size], self.dtype)
+            return flir.vector.load(vec_type, self.fx_tensor, [flir.const_index(offset)], alignment=16)
+        else:
+            return flir.memref.load(self.fx_tensor, [flir.const_index(offset)])
     
     def store(self, offset, value, vec_size=1):
-        # buffer_ops.buffer_store(value, self.rsrc, offset, offset_is_bytes=False)
-        flir.memref.store(arith.as_value(value), self.fx_tensor, [flir.const_index(offset),])
+        if vec_size > 1:
+            flir.vector.store(arith.as_value(value), self.fx_tensor, [flir.const_index(offset)], alignment=16)
+        else:
+            flir.memref.store(arith.as_value(value), self.fx_tensor, [flir.const_index(offset),])
 
 
 class STensor(FTensorBase):
@@ -181,10 +185,17 @@ class STensor(FTensorBase):
         self.fx_tensor = fx_tensor.get()
     
     def load(self, offset, vec_size=1):
-        return flir.memref.load(self.fx_tensor, [flir.const_index(offset)])
+        if vec_size > 1:
+            vec_type = VectorType.get([vec_size], self.dtype)
+            return flir.vector.load(vec_type, self.fx_tensor, [flir.const_index(offset)], alignment=16)
+        else:
+            return flir.memref.load(self.fx_tensor, [flir.const_index(offset)])
     
     def store(self, offset, value, vec_size=1):
-        flir.memref.store(arith.as_value(value), self.fx_tensor, [flir.const_index(offset),])
+        if vec_size > 1:
+            flir.vector.store(arith.as_value(value), self.fx_tensor, [flir.const_index(offset)], alignment=16)
+        else:
+            flir.memref.store(arith.as_value(value), self.fx_tensor, [flir.const_index(offset),])
 
 
 if __name__ == '__main__':

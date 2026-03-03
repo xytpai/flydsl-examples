@@ -284,7 +284,12 @@ def create_fused_gdn_kernel(dtype, VEC_SIZE: int, use_qk_l2norm: bool, NUM_BLOCK
                     for v_tile_offset in range(num_v_tiles_per_block):
                         v_tile = start_v_tile + v_tile_offset
                         state_batch_tile = state_tensor[pool_idx, hv_i, None, None].local_tile((TILE_K, TILE_V), (0, v_tile)) # 128, 32
-                        sdata_tensor.copy_(state_batch_tile, thread_layout=(32, 4), value_layout=(TILE_K // 32, TILE_V // 4), thread_idxs=(tidx / 4, tidx % 4), vec_size=1)
+                        sdata_tensor.copy_(
+                            state_batch_tile, 
+                            thread_layout=(32, 4), 
+                            value_layout=(TILE_K // 32, TILE_V // 4), 
+                            thread_idxs=(tidx / 4, tidx % 4), 
+                            vec_size=VEC_SIZE)
                         
                         v_global = v_tile * TILE_V + v_idx
                         r_v = _extf32(v_tensor[b_i, sq_i, hv_i, v_global])
@@ -380,9 +385,9 @@ def func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out):
         if args.dtype == torch.float:
             module = create_fused_gdn_kernel(F32Type, 4, args.use_qk_l2norm)
         elif args.dtype == torch.half:
-            module = create_fused_gdn_kernel(F16Type, 4, args.use_qk_l2norm)
+            module = create_fused_gdn_kernel(F16Type, 8, args.use_qk_l2norm)
         elif args.dtype == torch.bfloat16:
-            module = create_fused_gdn_kernel(BF16Type, 4, args.use_qk_l2norm)
+            module = create_fused_gdn_kernel(BF16Type, 8, args.use_qk_l2norm)
         optimized = run_pipeline(module, Pipeline().canonicalize().cse())
         EXE = flydsl.compile(optimized)
     EXE(query, key, value, a, b, dt_bias, A_log, indices, state, out, 
@@ -404,12 +409,14 @@ def benchmark(args, func, ref_func, warmup=20, niters=100):
     ref_func(*ref_inouts)
     for output, ref_output in zip(outputs, ref_outputs):
         is_allclose = torch.allclose(output, ref_output, atol=1e-2, rtol=1e-2)
-        maxdiff = (output - ref_output).abs().max()
+        maxdiff_out = (output - ref_output).abs().max()
+        is_allclose = is_allclose and torch.allclose(inouts[-2], ref_inouts[-2], atol=1e-2, rtol=1e-2)
+        maxdiff_state = (inouts[-2] - ref_inouts[-2]).abs().max()
         # print("ref_output")
         # print(ref_output)
         # print("output")
         # print(output)
-        print(f"maxdiff:{maxdiff}")
+        print(f"maxdiff_out:{maxdiff_out}\nmaxdiff_state:{maxdiff_state}")
         assert is_allclose == True
     print("validation passed!\n", flush=True)
 
