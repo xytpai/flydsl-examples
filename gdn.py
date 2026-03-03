@@ -95,24 +95,104 @@ def ref_func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out)
     state.copy_(last_recurrent_state)
 
 
-# EXE = None
-# def func(x, weight, eps, out):
-#     global EXE
-#     if not EXE:
-#         if x.dtype == torch.float:
-#             module = create_rms_norm_kernel(F32Type, 4, eps)
-#         elif x.dtype == torch.half:
-#             module = create_rms_norm_kernel(F16Type, 8, eps)
-#         elif x.dtype == torch.bfloat16:
-#             module = create_rms_norm_kernel(BF16Type, 8, eps)
-#         optimized = run_pipeline(module, Pipeline().canonicalize().cse())
-#         EXE = flydsl.compile(optimized)
-#     EXE(x, weight, out, x.shape[0], x.shape[1])
-#     torch.cuda.synchronize()
+def create_fused_gdn_kernel(dtype, VEC_SIZE: int, use_qk_l2norm: bool, NUM_BLOCKS_PER_STATE: int = 8):
+    DYN = ir.ShapedType.get_dynamic_size()
+    ARCH = get_rocm_arch()
+    BLOCK_THREADS = 128
+    WARP_SIZE = 32
+    WARP_SIZE_WORK_SIZE = WARP_SIZE * VEC_SIZE
+    BLOCK_WORK_SIZE = BLOCK_THREADS * VEC_SIZE
+    allocator = SmemAllocator(None, arch=ARCH)
+    
+    class FGDN(flir.MlirModule):
+        GPU_MODULE_NAME = "linear_attention_kernels"
+        GPU_MODULE_TARGETS = [f'#rocdl.target<chip = "{ARCH}">']
+
+        def init_gpu_module(self):
+            self.dtype = dtype.get()
+            self.acc_type = T.f32()
+            self.smem = allocator.allocate_array(T.f32(), 1)
+            allocator.finalize()
+
+        @flir.kernel
+        def fused_gdn_kernel(
+            self: flir.T.i64,
+            query: lambda: T.memref(DYN, dtype.get()),
+            key: lambda: T.memref(DYN, dtype.get()),
+            value: lambda: T.memref(DYN, dtype.get()),
+            a: lambda: T.memref(DYN, dtype.get()),
+            b: lambda: T.memref(DYN, dtype.get()),
+            dt_bias: lambda: T.memref(DYN, dtype.get()),
+            A_log: lambda: T.memref(DYN, F32Type.get()),
+            indices: lambda: T.memref(DYN, T.i32()),
+            state: lambda: T.memref(DYN, F32Type.get()),
+            out: lambda: T.memref(DYN, dtype.get()),
+            batch_size: lambda: T.index(),
+            seq_length: lambda: T.index(),
+            num_k_heads: lambda: T.index(),
+            num_v_heads: lambda: T.index(),
+            head_k_dim: lambda: T.index(),
+            head_v_dim: lambda: T.index(),
+        ):
+            tidx = flir.thread_idx("x")
+            bidx = flir.block_idx("x")
+            in_warp_tid = tidx % 32
+            warp_idx = tidx // 32
+            batch_idx = bidx // NUM_BLOCKS_PER_STATE
+            batch_inner = bidx % NUM_BLOCKS_PER_STATE
+
+            pass
+            
+        @flir.jit
+        def __call__(
+            self: flir.T.i64,
+            query: lambda: T.memref(DYN, dtype.get()),
+            key: lambda: T.memref(DYN, dtype.get()),
+            value: lambda: T.memref(DYN, dtype.get()),
+            a: lambda: T.memref(DYN, dtype.get()),
+            b: lambda: T.memref(DYN, dtype.get()),
+            dt_bias: lambda: T.memref(DYN, dtype.get()),
+            A_log: lambda: T.memref(DYN, F32Type.get()),
+            indices: lambda: T.memref(DYN, T.i32()),
+            state: lambda: T.memref(DYN, F32Type.get()),
+            out: lambda: T.memref(DYN, dtype.get()),
+            batch_size: lambda: T.index(),
+            seq_length: lambda: T.index(),
+            num_k_heads: lambda: T.index(),
+            num_v_heads: lambda: T.index(),
+            head_k_dim: lambda: T.index(),
+            head_v_dim: lambda: T.index(),
+        ):
+            c1 = arith.index(1)
+            bx = arith.index(BLOCK_THREADS)
+            gx = batch_size * num_v_heads * arith.index(NUM_BLOCKS_PER_STATE)
+            flir.gpu_ext.LaunchFuncOp(
+                [self.GPU_MODULE_NAME, "fused_gdn_kernel"],
+                grid_size=(gx, c1, c1),
+                block_size=(bx, c1, c1),
+                kernel_operands=[query, key, value, a, b, dt_bias, A_log, indices, state, out,
+                    batch_size, seq_length, num_k_heads, num_v_heads, head_k_dim, head_v_dim],
+            )
+
+    return FGDN().module
 
 
+EXE = None
 def func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out):
-    return ref_func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out)
+    global EXE
+    if not EXE:
+        if args.dtype == torch.float:
+            module = create_fused_gdn_kernel(F32Type, 4, True)
+        elif args.dtype == torch.half:
+            module = create_fused_gdn_kernel(F16Type, 4, True)
+        elif args.dtype == torch.bfloat16:
+            module = create_fused_gdn_kernel(BF16Type, 4, True)
+        optimized = run_pipeline(module, Pipeline().canonicalize().cse())
+        EXE = flydsl.compile(optimized)
+    EXE(query, key, value, a, b, dt_bias, A_log, indices, state, out, 
+        args.b, args.sq, args.num_k_heads, args.num_v_heads, 
+        args.head_k_dim, args.head_v_dim)
+    torch.cuda.synchronize()
 
 
 def benchmark(args, func, ref_func, warmup=20, niters=100):
