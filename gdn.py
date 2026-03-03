@@ -307,7 +307,7 @@ def create_fused_gdn_kernel(
                         gpu.barrier()
 
                         sum_hk = _create_f32(0)
-                        for k_iter in range(NUM_K_ITERS):
+                        for k_iter in range_constexpr(NUM_K_ITERS):
                             k_base = k_iter * ROWS_PER_ITER
                             k_idx = k_base + k_local
                             h_val = sdata_tensor[k_idx, v_idx] * r_g
@@ -324,7 +324,7 @@ def create_fused_gdn_kernel(
                         v_new = sscalar_tensor[wid * V_PER_WARP + v_local]
 
                         sum_hq = _create_f32(0.0)
-                        for k_iter in range(NUM_K_ITERS):
+                        for k_iter in range_constexpr(NUM_K_ITERS):
                             k_base = k_iter * ROWS_PER_ITER
                             k_idx = k_base + k_local
                             h_old = sdata_tensor[k_idx, v_idx] * r_g
