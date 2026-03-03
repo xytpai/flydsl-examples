@@ -53,6 +53,7 @@ def create_outputs(args):
     return (out,)
 
 
+@torch.compile
 def ref_func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out):
     beta = b.sigmoid()
     g = -A_log.float().exp() * F.softplus(a.float() + dt_bias, beta=1.0, threshold=20.0)
@@ -98,7 +99,14 @@ def ref_func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out)
     state.copy_(last_recurrent_state)
 
 
-def create_fused_gdn_kernel(dtype, VEC_SIZE: int, use_qk_l2norm: bool, NUM_BLOCKS_PER_STATE: int = 2, TILE_V: int = 32):
+def create_fused_gdn_kernel(
+    dtype,
+    VEC_SIZE: int,
+    use_qk_l2norm: bool, 
+    NUM_BLOCKS_PER_STATE: int = 2, 
+    TILE_V: int = 32,
+    TILE_K: int = 128
+):
     _asv = arith.as_value
     _asid = flir.const_index
     _extf = flir.arith.extf
@@ -116,7 +124,6 @@ def create_fused_gdn_kernel(dtype, VEC_SIZE: int, use_qk_l2norm: bool, NUM_BLOCK
     NUM_WARPS = BLOCK_THREADS // WARP_SIZE
     V_PER_WARP = TILE_V // NUM_WARPS
     ROWS_PER_ITER = WARP_SIZE // V_PER_WARP
-    TILE_K = 128 # fixed
     NUM_K_ITERS = TILE_K // ROWS_PER_ITER
 
     softplus_beta = 1.0
@@ -164,10 +171,11 @@ def create_fused_gdn_kernel(dtype, VEC_SIZE: int, use_qk_l2norm: bool, NUM_BLOCK
             seq_length: lambda: T.index(),
             num_k_heads: lambda: T.index(),
             num_v_heads: lambda: T.index(),
-            head_k_dim: lambda: T.index(),
+            head_k_dim_: lambda: T.index(),
             head_v_dim: lambda: T.index(),
             scale: lambda: T.f32(),
         ):
+            head_k_dim = TILE_K
             i32_0 = arith.constant(0, type=T.i32())
             width_i32 = arith.as_value(arith.constant(WARP_SIZE, type=T.i32()))
             # state: # (b, num_v_heads, head_k_dim, NUM_BLOCKS_PER_STATE * num_v_tiles_per_block * TILE_V)
@@ -284,12 +292,14 @@ def create_fused_gdn_kernel(dtype, VEC_SIZE: int, use_qk_l2norm: bool, NUM_BLOCK
                     for v_tile_offset in range(num_v_tiles_per_block):
                         v_tile = start_v_tile + v_tile_offset
                         state_batch_tile = state_tensor[pool_idx, hv_i, None, None].local_tile((TILE_K, TILE_V), (0, v_tile)) # 128, 32
+                        BLOCK_SIZE_M = 32
+                        BLOCK_SIZE_N = 4
                         sdata_tensor.copy_(
                             state_batch_tile, 
-                            thread_layout=(32, 4), 
-                            value_layout=(TILE_K // 32, TILE_V // 4), 
-                            thread_idxs=(tidx / 4, tidx % 4), 
-                            vec_size=VEC_SIZE)
+                            thread_layout=(BLOCK_SIZE_M, BLOCK_SIZE_N), 
+                            value_layout=(TILE_K // BLOCK_SIZE_M, TILE_V // BLOCK_SIZE_N), 
+                            thread_idxs=(tidx / BLOCK_SIZE_N, tidx % BLOCK_SIZE_N), 
+                            vec_size=TILE_V // BLOCK_SIZE_N)
                         
                         v_global = v_tile * TILE_V + v_idx
                         r_v = _extf32(v_tensor[b_i, sq_i, hv_i, v_global])
@@ -383,11 +393,11 @@ def func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out):
     global EXE
     if not EXE:
         if args.dtype == torch.float:
-            module = create_fused_gdn_kernel(F32Type, 4, args.use_qk_l2norm)
+            module = create_fused_gdn_kernel(F32Type, 4, args.use_qk_l2norm, TILE_K=args.head_k_dim)
         elif args.dtype == torch.half:
-            module = create_fused_gdn_kernel(F16Type, 8, args.use_qk_l2norm)
+            module = create_fused_gdn_kernel(F16Type, 8, args.use_qk_l2norm, TILE_K=args.head_k_dim)
         elif args.dtype == torch.bfloat16:
-            module = create_fused_gdn_kernel(BF16Type, 8, args.use_qk_l2norm)
+            module = create_fused_gdn_kernel(BF16Type, 8, args.use_qk_l2norm, TILE_K=args.head_k_dim)
         optimized = run_pipeline(module, Pipeline().canonicalize().cse())
         EXE = flydsl.compile(optimized)
     EXE(query, key, value, a, b, dt_bias, A_log, indices, state, out, 
