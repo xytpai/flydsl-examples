@@ -30,7 +30,7 @@ class Args:
     num_v_heads: int
     head_k_dim: int
     head_v_dim: int
-    use_qk_l2norm: bool = False
+    use_qk_l2norm: bool = True
 
 
 def create_inputs(args):
@@ -122,10 +122,16 @@ def create_fused_gdn_kernel(dtype, VEC_SIZE: int, use_qk_l2norm: bool, NUM_BLOCK
     softplus_beta = 1.0
     softplus_threshold = 20.0
 
-    shfl_offsets = []
+    rows_shfl_offsets = []
     offsets_ = ROWS_PER_ITER // 2
     while offsets_ >= 1:
-        shfl_offsets.append(int(offsets_))
+        rows_shfl_offsets.append(int(offsets_))
+        offsets_ /= 2
+    
+    nwarps_shfl_offsets = []
+    offsets_ = NUM_WARPS // 2
+    while offsets_ >= 1:
+        nwarps_shfl_offsets.append(int(offsets_))
         offsets_ /= 2
     
     class FGDN(flir.MlirModule):
@@ -236,7 +242,40 @@ def create_fused_gdn_kernel(dtype, VEC_SIZE: int, use_qk_l2norm: bool, NUM_BLOCK
                 r_beta = gpu.ShuffleOp(_asv(r_beta), _asv(i32_0), width_i32, mode="idx").shuffleResult
 
                 if use_qk_l2norm:
-                    pass
+                    sum_q_partial = _create_f32(0.0)
+                    sum_k_partial = _create_f32(0.0)
+                    if tidx < TILE_K:
+                        q_val = sq_tensor[tidx]
+                        k_val = sk_tensor[tidx]
+                        sum_q_partial = q_val * q_val
+                        sum_k_partial = k_val * k_val
+                    for offset in [16, 8, 4, 2, 1]:
+                        sum_q_partial = sum_q_partial + gpu.ShuffleOp(_asv(sum_q_partial), _asv(arith.constant(offset, type=T.i32())), width_i32, mode="xor").shuffleResult
+                        sum_k_partial = sum_k_partial + gpu.ShuffleOp(_asv(sum_k_partial), _asv(arith.constant(offset, type=T.i32())), width_i32, mode="xor").shuffleResult
+                    if w_tid == 0:
+                        sscalar_tensor[wid] = sum_q_partial
+                        sscalar_tensor[wid + 16] = sum_k_partial
+                    gpu.barrier()
+                    inv_norm_q = _create_f32(0.0)
+                    inv_norm_k = _create_f32(0.0)
+                    if wid == 0:
+                        local_sum_q = _create_f32(0.0)
+                        local_sum_k = _create_f32(0.0)
+                        if w_tid < NUM_WARPS:
+                            local_sum_q = sscalar_tensor[w_tid]
+                            local_sum_k = sscalar_tensor[w_tid + 16]
+                        for offset in nwarps_shfl_offsets: # LOG2(NUM_WARPS)
+                            local_sum_q = local_sum_q + gpu.ShuffleOp(_asv(local_sum_q), _asv(arith.constant(offset, type=T.i32())), width_i32, mode="xor").shuffleResult
+                            local_sum_k = local_sum_k + gpu.ShuffleOp(_asv(local_sum_k), _asv(arith.constant(offset, type=T.i32())), width_i32, mode="xor").shuffleResult
+                        if w_tid == 0:
+                            sscalar_tensor[0] = _extf32(_asv(flir.math.rsqrt(_extf32(_asv(local_sum_q + 1e-6)).value)))
+                            sscalar_tensor[1] = _extf32(_asv(flir.math.rsqrt(_extf32(_asv(local_sum_k + 1e-6)).value)))
+                    gpu.barrier()
+                    inv_norm_q = sscalar_tensor[0]
+                    inv_norm_k = sscalar_tensor[1]
+                    if tidx < TILE_K:
+                        sk_tensor[tidx] = sk_tensor[tidx] * inv_norm_k
+                        sq_tensor[tidx] = sq_tensor[tidx] * scale * inv_norm_q
                 else:
                     if tidx < TILE_K:
                         sq_tensor[tidx] = sq_tensor[tidx] * scale
@@ -261,7 +300,7 @@ def create_fused_gdn_kernel(dtype, VEC_SIZE: int, use_qk_l2norm: bool, NUM_BLOCK
                         r_k_val = sk_tensor[k_idx]
                         sum_hk = sum_hk + h_val * r_k_val
 
-                    for offset in shfl_offsets: # LOG2(ROWS_PER_ITER)
+                    for offset in rows_shfl_offsets: # LOG2(ROWS_PER_ITER)
                         sum_hk = sum_hk + gpu.ShuffleOp(_asv(sum_hk), _asv(arith.constant(offset * V_PER_WARP, type=T.i32())), width_i32, mode="xor").shuffleResult
 
                     v_new = (r_v - sum_hk) * r_beta
@@ -281,7 +320,7 @@ def create_fused_gdn_kernel(dtype, VEC_SIZE: int, use_qk_l2norm: bool, NUM_BLOCK
                         sdata_tensor[k_idx, v_idx] = h_new
                         sum_hq = sum_hq + h_new * r_q_val
                     
-                    for offset in shfl_offsets: # LOG2(ROWS_PER_ITER)
+                    for offset in rows_shfl_offsets: # LOG2(ROWS_PER_ITER)
                         sum_hq = sum_hq + gpu.ShuffleOp(_asv(sum_hq), _asv(arith.constant(offset * V_PER_WARP, type=T.i32())), width_i32, mode="xor").shuffleResult
                     
                     v_global_out = v_tile * TILE_V + v_idx
@@ -365,7 +404,7 @@ def benchmark(args, func, ref_func, warmup=20, niters=100):
     func(*inouts)
     ref_func(*ref_inouts)
     for output, ref_output in zip(outputs, ref_outputs):
-        is_allclose = torch.allclose(output, ref_output, atol=1e-1, rtol=1e-1)
+        is_allclose = torch.allclose(output, ref_output, atol=1e-2, rtol=1e-2)
         maxdiff = (output - ref_output).abs().max()
         print("ref_output")
         print(ref_output)
