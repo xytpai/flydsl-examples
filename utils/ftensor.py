@@ -168,7 +168,7 @@ class GTensor(FTensorBase):
     
     def load(self, offset, vec_size=1):
         # return buffer_ops.buffer_load(self.rsrc, offset, dtype=self.dtype)
-        return flir.memref.load(self.fx_tensor, [arith.as_value(offset)])
+        return flir.memref.load(self.fx_tensor, [flir.const_index(offset)])
     
     def store(self, offset, value, vec_size=1):
         # buffer_ops.buffer_store(value, self.rsrc, offset, offset_is_bytes=False)
@@ -181,7 +181,7 @@ class STensor(FTensorBase):
         self.fx_tensor = fx_tensor.get()
     
     def load(self, offset, vec_size=1):
-        return flir.memref.load(self.fx_tensor, [arith.as_value(offset)])
+        return flir.memref.load(self.fx_tensor, [flir.const_index(offset)])
     
     def store(self, offset, value, vec_size=1):
         flir.memref.store(arith.as_value(value), self.fx_tensor, [flir.const_index(offset),])
