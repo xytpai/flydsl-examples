@@ -18,6 +18,8 @@ from _mlir import ir
 from _mlir.ir import F16Type, BF16Type, F32Type, IntegerType, VectorType
 import _mlir.extras.types as T
 
+from utils.ftensor import GTensor, STensor
+
 
 @dataclass
 class Args:
@@ -95,14 +97,23 @@ def ref_func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out)
     state.copy_(last_recurrent_state)
 
 
-def create_fused_gdn_kernel(dtype, VEC_SIZE: int, use_qk_l2norm: bool, NUM_BLOCKS_PER_STATE: int = 8):
+def create_fused_gdn_kernel(dtype, VEC_SIZE: int, use_qk_l2norm: bool, NUM_BLOCKS_PER_STATE: int = 2, TILE_V: int = 32):
+    _asv = arith.as_value
+    _asid = flir.const_index
+    _extf = flir.arith.extf
+    def _extf32(value):
+        return _extf(T.f32(), value)
+    def _create_f32_zero():
+        return _extf32(_asv(0.0))
+
     DYN = ir.ShapedType.get_dynamic_size()
     ARCH = get_rocm_arch()
+    allocator = SmemAllocator(None, arch=ARCH)
     BLOCK_THREADS = 128
     WARP_SIZE = 32
-    WARP_SIZE_WORK_SIZE = WARP_SIZE * VEC_SIZE
-    BLOCK_WORK_SIZE = BLOCK_THREADS * VEC_SIZE
-    allocator = SmemAllocator(None, arch=ARCH)
+    NUM_WARPS = BLOCK_THREADS // WARP_SIZE
+    V_PER_WARP = TILE_V // NUM_WARPS
+    TILE_K = 128 # fixed
     
     class FGDN(flir.MlirModule):
         GPU_MODULE_NAME = "linear_attention_kernels"
@@ -111,7 +122,8 @@ def create_fused_gdn_kernel(dtype, VEC_SIZE: int, use_qk_l2norm: bool, NUM_BLOCK
         def init_gpu_module(self):
             self.dtype = dtype.get()
             self.acc_type = T.f32()
-            self.smem = allocator.allocate_array(T.f32(), 1)
+            self.sq = allocator.allocate_array(T.f32(), TILE_K)
+            self.sk = allocator.allocate_array(T.f32(), TILE_K)
             allocator.finalize()
 
         @flir.kernel
@@ -134,15 +146,66 @@ def create_fused_gdn_kernel(dtype, VEC_SIZE: int, use_qk_l2norm: bool, NUM_BLOCK
             head_k_dim: lambda: T.index(),
             head_v_dim: lambda: T.index(),
         ):
+            # state: # (b, num_v_heads, head_k_dim, NUM_BLOCKS_PER_STATE * num_v_tiles_per_block * TILE_V)
+            # block_size = b * num_v_heads * NUM_BLOCKS_PER_STATE
+
             tidx = flir.thread_idx("x")
             bidx = flir.block_idx("x")
-            in_warp_tid = tidx % 32
-            warp_idx = tidx // 32
-            batch_idx = bidx // NUM_BLOCKS_PER_STATE
-            batch_inner = bidx % NUM_BLOCKS_PER_STATE
+            base_ptr = allocator.get_base()
+            w_tid = tidx % WARP_SIZE
+            wid = tidx // WARP_SIZE
+
+            b_hv_i = bidx // NUM_BLOCKS_PER_STATE
+            b_i = b_hv_i // num_v_heads
+            hv_i = b_hv_i % num_v_heads
+
+            num_v_tiles = head_v_dim // TILE_V
+            num_v_tiles_per_block = num_v_tiles // NUM_BLOCKS_PER_STATE
+            tile_v_i = (bidx % NUM_BLOCKS_PER_STATE) * num_v_tiles_per_block * TILE_V
+            
+            hk_i = hv_i // (num_v_heads // num_k_heads)
+
+            indices_tensor = GTensor(indices, T.i32(), (batch_size,))
+            pool_idx = arith.index_cast(T.index(), indices_tensor[b_i])
+
+            sq_tensor = STensor(self.sq(base_ptr), T.f32(), shape=(TILE_K,))
+            sk_tensor = STensor(self.sk(base_ptr), T.f32(), shape=(TILE_K,))
+            state_tensor = GTensor(state, F32Type.get(), shape=(batch_size, num_v_heads, head_k_dim, head_v_dim))
+
+            q_tensor = GTensor(query, BF16Type.get(), (batch_size, seq_length, num_k_heads, head_k_dim))
+            k_tensor = GTensor(key, BF16Type.get(), (batch_size, seq_length, num_k_heads, head_k_dim))
+
+            A_log_tensor = GTensor(A_log, F32Type.get(), (num_v_heads,))
+            dt_bias_tensor = GTensor(dt_bias, BF16Type.get(), (num_v_heads,))
+            a_tensor = GTensor(a, BF16Type.get(), (batch_size, seq_length, num_v_heads))
+            b_tensor = GTensor(b, BF16Type.get(), (batch_size, seq_length, num_v_heads))
+
+            sq_i = 0
+            
+            if pool_idx >= 0:
+                k_local = w_tid // V_PER_WARP
+                v_local = w_tid % V_PER_WARP
+                v_base = wid * V_PER_WARP
+                v_idx = v_base + v_local
+                
+                if tidx < TILE_K:
+                    sq_tensor[tidx] = _extf32(q_tensor[b_i, sq_i, hk_i, tidx])
+                    sk_tensor[tidx] = _extf32(k_tensor[b_i, sq_i, hk_i, tidx])
+                
+                state_batch = state_tensor[pool_idx, hv_i, None, None]
+
+                r_A_log = A_log_tensor[hv_i]
+                r_dt_bias = _extf32(dt_bias_tensor[hv_i])
+                r_a = _extf32(a_tensor[b_i, sq_i, hv_i])
+                r_b = _extf32(b_tensor[b_i, sq_i, hv_i])
+
+                r_g = _create_f32_zero()
+                r_beta = _create_f32_zero()
+
+                
 
             pass
-            
+
         @flir.jit
         def __call__(
             self: flir.T.i64,
