@@ -43,7 +43,7 @@ def create_inputs(args):
     dt_bias.uniform_(1, 2)
     A_log = torch.randn((args.num_v_heads), dtype=torch.float32, device="cuda")
     A_log.uniform_(0, 16)
-    indices = torch.arange((args.b), dtype=torch.int32, device="cuda")
+    indices = torch.arange(args.b - 1, -1, -1, dtype=torch.int32, device="cuda")
     state = torch.randn((args.b, args.num_v_heads, args.head_k_dim, args.head_v_dim), dtype=torch.float32, device="cuda")
     return (args, query, key, value, a, b, dt_bias, A_log, indices, state)
 
@@ -77,7 +77,7 @@ def ref_func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out)
     # beta,  # (b, num_v_heads, sq)
     scale = 1 / (args.head_k_dim ** 0.5)
     query = query * scale
-    last_recurrent_state = state.clone()
+    last_recurrent_state = state[indices]
     for i in range(args.sq):
         q_t = query[:, :, i]
         k_t = key[:, :, i]
@@ -96,7 +96,7 @@ def ref_func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out)
         last_recurrent_state = last_recurrent_state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
         # core_attn_out: # (b, num_v_heads, sq, head_v_dim)
         out[:, i, :] = (last_recurrent_state * q_t.unsqueeze(-1)).sum(dim=-2)
-    state.copy_(last_recurrent_state)
+    state[indices] = last_recurrent_state
 
 
 def create_fused_gdn_kernel(

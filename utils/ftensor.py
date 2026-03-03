@@ -101,6 +101,13 @@ class FTensorView:
                     dst_vec_offset = dst_vec_offset + coord[d] * self.stride[d]
             value = src_tensor.load_impl(src_vec_offset, vec_size=vec_size)
             self.store_impl(dst_vec_offset, value, vec_size=vec_size)
+    
+    def vec_store(self, idxs, value, vec_size):
+        if not isinstance(idxs, tuple):
+            idxs = (idxs,)
+        offset = self.linear_offset(idxs)
+        assert len(offset) == 1
+        self.store_impl(offset[0], value, vec_size=vec_size)
 
 
 class FTensorBase(ABC):
@@ -146,6 +153,10 @@ class FTensorBase(ABC):
     def copy_(self, src_tensor, thread_layout, value_layout, thread_idxs, vec_size):
         self._lazy_init()
         self.tensor_view.copy_(src_tensor, thread_layout, value_layout, thread_idxs, vec_size)
+    
+    def vec_store(self, idxs, value, vec_size):
+        self._lazy_init()
+        self.tensor_view.vec_store(idxs, value, vec_size)
 
 
 class TorchTensor(FTensorBase):
