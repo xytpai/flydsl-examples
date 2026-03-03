@@ -47,7 +47,7 @@ def create_inputs(args):
 
 
 def create_outputs(args):
-    out = torch.randn((args.b, args.sq, args.num_v_heads, args.head_v_dim), dtype=args.dtype, device='cuda')
+    out = torch.zeros((args.b, args.sq, args.num_v_heads, args.head_v_dim), dtype=args.dtype, device='cuda')
     return (out,)
 
 
@@ -93,11 +93,10 @@ def ref_func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out)
         last_recurrent_state = last_recurrent_state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
         # core_attn_out: # (b, num_v_heads, sq, head_v_dim)
         out[:, i, :] = (last_recurrent_state * q_t.unsqueeze(-1)).sum(dim=-2)
-    out = out[indices]
     state.copy_(last_recurrent_state)
 
 
-def create_fused_gdn_kernel(dtype, VEC_SIZE: int, use_qk_l2norm: bool, NUM_BLOCKS_PER_STATE: int = 8, TILE_V: int = 32):
+def create_fused_gdn_kernel(dtype, VEC_SIZE: int, use_qk_l2norm: bool, NUM_BLOCKS_PER_STATE: int = 2, TILE_V: int = 32):
     _asv = arith.as_value
     _asid = flir.const_index
     _extf = flir.arith.extf
@@ -131,7 +130,7 @@ def create_fused_gdn_kernel(dtype, VEC_SIZE: int, use_qk_l2norm: bool, NUM_BLOCK
             self.sdata = allocator.allocate_array(T.f32(), TILE_K * TILE_V)
             self.sq = allocator.allocate_array(T.f32(), TILE_K)
             self.sk = allocator.allocate_array(T.f32(), TILE_K)
-            self.sscalar = allocator.allocate_array(T.f32(), 64)
+            self.sscalar = allocator.allocate_array(T.f32(), 128)
             allocator.finalize()
 
         @flir.kernel
@@ -155,6 +154,7 @@ def create_fused_gdn_kernel(dtype, VEC_SIZE: int, use_qk_l2norm: bool, NUM_BLOCK
             head_v_dim: lambda: T.index(),
             scale: lambda: T.f32(),
         ):
+            i32_0 = arith.constant(0, type=T.i32())
             width_i32 = arith.as_value(arith.constant(32, type=T.i32()))
             # state: # (b, num_v_heads, head_k_dim, NUM_BLOCKS_PER_STATE * num_v_tiles_per_block * TILE_V)
             # block_size = b * num_v_heads * NUM_BLOCKS_PER_STATE
@@ -172,29 +172,27 @@ def create_fused_gdn_kernel(dtype, VEC_SIZE: int, use_qk_l2norm: bool, NUM_BLOCK
             num_v_tiles = head_v_dim // TILE_V
             num_v_tiles_per_block = num_v_tiles // NUM_BLOCKS_PER_STATE
             start_v_tile = (bidx % NUM_BLOCKS_PER_STATE) * num_v_tiles_per_block
-            tile_v_i = start_v_tile * TILE_V
             
             hk_i = hv_i // (num_v_heads // num_k_heads)
 
             indices_tensor = GTensor(indices, T.i32(), (batch_size,))
             pool_idx = arith.index_cast(T.index(), indices_tensor[b_i])
-
-            sdata_tensor = STensor(self.sdata(base_ptr), T.f32(), shape=(TILE_K, TILE_V))
-            sq_tensor = STensor(self.sq(base_ptr), T.f32(), shape=(TILE_K,))
-            sk_tensor = STensor(self.sk(base_ptr), T.f32(), shape=(TILE_K,))
-            sscalar_tensor = STensor(self.sscalar(base_ptr), T.f32(), shape=(32,))
-
-            state_tensor = GTensor(state, F32Type.get(), shape=(batch_size, num_v_heads, head_k_dim, head_v_dim))
+            # pool_idx = b_i
 
             q_tensor = GTensor(query, BF16Type.get(), (batch_size, seq_length, num_k_heads, head_k_dim))
             k_tensor = GTensor(key, BF16Type.get(), (batch_size, seq_length, num_k_heads, head_k_dim))
             v_tensor = GTensor(value, BF16Type.get(), (batch_size, seq_length, num_v_heads, head_v_dim))
-
-            A_log_tensor = GTensor(A_log, F32Type.get(), (num_v_heads,))
-            dt_bias_tensor = GTensor(dt_bias, BF16Type.get(), (num_v_heads,))
             a_tensor = GTensor(a, BF16Type.get(), (batch_size, seq_length, num_v_heads))
             b_tensor = GTensor(b, BF16Type.get(), (batch_size, seq_length, num_v_heads))
+            dt_bias_tensor = GTensor(dt_bias, BF16Type.get(), (num_v_heads,))
+            A_log_tensor = GTensor(A_log, F32Type.get(), (num_v_heads,))
+            state_tensor = GTensor(state, F32Type.get(), shape=(batch_size, num_v_heads, head_k_dim, head_v_dim))
             out_tensor = GTensor(out, BF16Type.get(), (batch_size, seq_length, num_v_heads, head_v_dim))
+
+            sdata_tensor = STensor(self.sdata(base_ptr), T.f32(), shape=(TILE_K, TILE_V))
+            sq_tensor = STensor(self.sq(base_ptr), T.f32(), shape=(TILE_K,))
+            sk_tensor = STensor(self.sk(base_ptr), T.f32(), shape=(TILE_K,))
+            sscalar_tensor = STensor(self.sscalar(base_ptr), T.f32(), shape=(128,))
 
             sq_i = arith.constant(0, type=T.i32())
             
@@ -218,7 +216,7 @@ def create_fused_gdn_kernel(dtype, VEC_SIZE: int, use_qk_l2norm: bool, NUM_BLOCK
                 r_g = _create_f32(0)
                 r_beta = _create_f32(0)
 
-                if w_tid == 0 and wid == 0:
+                if w_tid == 0:
                     x = r_a + r_dt_bias
                     beta_x = softplus_beta * x
                     softplus_x = _create_f32(0)
@@ -232,13 +230,10 @@ def create_fused_gdn_kernel(dtype, VEC_SIZE: int, use_qk_l2norm: bool, NUM_BLOCK
                     r_g_value = _create_f32(0) - flir.math.exp(_asv(r_A_log), fastmath=fm_fast) * softplus_x
                     r_beta = _create_f32(1) / (_create_f32(1) + flir.math.exp(_asv(_create_f32(0) - r_b), fastmath=fm_fast))
                     r_g = flir.math.exp(_asv(r_g_value), fastmath=fm_fast)
-
-                    sscalar_tensor[0] = r_g
-                    sscalar_tensor[1] = r_beta
                 
                 gpu.barrier()
-                rg = sscalar_tensor[0]
-                r_beta = sscalar_tensor[1]
+                r_g = gpu.ShuffleOp(_asv(r_g), _asv(i32_0), width_i32, mode="idx").shuffleResult
+                r_beta = gpu.ShuffleOp(_asv(r_beta), _asv(i32_0), width_i32, mode="idx").shuffleResult
                 gpu.barrier()
 
                 if use_qk_l2norm:
@@ -254,7 +249,7 @@ def create_fused_gdn_kernel(dtype, VEC_SIZE: int, use_qk_l2norm: bool, NUM_BLOCK
                     v_global = v_tile * TILE_V + v_idx
 
                     state_batch_tile = state_batch.local_tile((TILE_K, TILE_V), (0, v_tile)) # 128, 32
-                    sdata_tensor.copy_(state_batch_tile, thread_layout=(32, 4), value_layout=(4, 8), thread_idxs=(tidx / 8, tidx % 8), vec_size=1)
+                    sdata_tensor.copy_(state_batch_tile, thread_layout=(32, 4), value_layout=(4, 8), thread_idxs=(tidx / 4, tidx % 4), vec_size=1)
 
                     r_v = _extf32(v_tensor[b_i, sq_i, hv_i, v_global])
                     sum_hk = _create_f32(0)
@@ -270,11 +265,11 @@ def create_fused_gdn_kernel(dtype, VEC_SIZE: int, use_qk_l2norm: bool, NUM_BLOCK
 
                     v_new = (r_v - sum_hk) * r_beta
 
-                    ss_id = wid * arith.constant(V_PER_WARP, type=T.i32(), index=True) + v_local
                     if w_tid < V_PER_WARP:
-                        sscalar_tensor[ss_id] = v_new
+                        sscalar_tensor[wid * V_PER_WARP + w_tid] = v_new
                     gpu.barrier()
-                    v_new = sscalar_tensor[ss_id]
+                    v_new = sscalar_tensor[wid * V_PER_WARP + v_local]
+                    gpu.barrier()
 
                     sum_hq = _create_f32(0.0)
                     for k_iter in range_constexpr(NUM_K_ITERS):
@@ -360,6 +355,7 @@ def func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out):
 
 
 def benchmark(args, func, ref_func, warmup=20, niters=100):
+    torch.manual_seed(2025)
     inputs = create_inputs(args)
     outputs = create_outputs(args)
     ref_outputs = create_outputs(args)
