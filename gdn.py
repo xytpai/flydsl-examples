@@ -105,6 +105,7 @@ def ref_func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out)
 
 def create_fused_gdn_kernel(
     dtype,
+    mfma_fn,
     VEC_SIZE: int,
     use_qk_l2norm: bool, 
     NUM_BLOCKS_PER_STATE: int = 2, 
@@ -399,11 +400,11 @@ def func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out):
     global EXE
     if not EXE:
         if args.dtype == torch.float:
-            module = create_fused_gdn_kernel(F32Type, 4, args.use_qk_l2norm, TILE_K=args.head_k_dim)
+            module = create_fused_gdn_kernel(F32Type, None, 4, args.use_qk_l2norm, TILE_K=args.head_k_dim)
         elif args.dtype == torch.half:
-            module = create_fused_gdn_kernel(F16Type, 8, args.use_qk_l2norm, TILE_K=args.head_k_dim)
+            module = create_fused_gdn_kernel(F16Type, rocdl.mfma_f32_16x16x4f16, 8, args.use_qk_l2norm, TILE_K=args.head_k_dim)
         elif args.dtype == torch.bfloat16:
-            module = create_fused_gdn_kernel(BF16Type, 8, args.use_qk_l2norm, TILE_K=args.head_k_dim)
+            module = create_fused_gdn_kernel(BF16Type, rocdl.mfma_f32_16x16x4bf16_1k, 8, args.use_qk_l2norm, TILE_K=args.head_k_dim)
         optimized = run_pipeline(module, Pipeline().canonicalize().cse())
         EXE = flydsl.compile(optimized)
     EXE(query, key, value, a, b, dt_bias, A_log, indices, state, out, 
