@@ -125,6 +125,7 @@ def create_fused_gdn_kernel(
     allocator = SmemAllocator(None, arch=ARCH)
     BLOCK_THREADS = 128
     WARP_SIZE = 32
+    COPY_THREAD_LAYOUT_N = 4
     NUM_WARPS = BLOCK_THREADS // WARP_SIZE
     V_PER_WARP = TILE_V // NUM_WARPS
     ROWS_PER_ITER = WARP_SIZE // V_PER_WARP
@@ -298,14 +299,13 @@ def create_fused_gdn_kernel(
                     for v_tile_offset in range(num_v_tiles_per_block):
                         v_tile = start_v_tile + v_tile_offset
                         state_batch_tile = state_tensor[pool_idx, hv_i, None, None].local_tile((TILE_K, TILE_V), (0, v_tile)) # 128, 32
-                        BLOCK_SIZE_N = 4
-                        BLOCK_SIZE_M = BLOCK_THREADS // BLOCK_SIZE_N
+                        BLOCK_SIZE_M = BLOCK_THREADS // COPY_THREAD_LAYOUT_N
                         sdata_tensor.copy_(
                             state_batch_tile, 
-                            thread_layout=(BLOCK_SIZE_M, BLOCK_SIZE_N), 
-                            value_layout=(TILE_K // BLOCK_SIZE_M, TILE_V // BLOCK_SIZE_N), 
-                            thread_idxs=(tidx / BLOCK_SIZE_N, tidx % BLOCK_SIZE_N), 
-                            vec_size=TILE_V // BLOCK_SIZE_N)
+                            thread_layout=(BLOCK_SIZE_M, COPY_THREAD_LAYOUT_N), 
+                            value_layout=(TILE_K // BLOCK_SIZE_M, TILE_V // COPY_THREAD_LAYOUT_N), 
+                            thread_idxs=(tidx / COPY_THREAD_LAYOUT_N, tidx % COPY_THREAD_LAYOUT_N), 
+                            vec_size=TILE_V // COPY_THREAD_LAYOUT_N)
                         
                         v_global = v_tile * TILE_V + v_idx
                         r_v = _extf32(v_tensor[b_i, sq_i, hv_i, v_global])
@@ -350,7 +350,7 @@ def create_fused_gdn_kernel(
                         gpu.barrier()
 
                         for k_iter in range_constexpr(NUM_K_ITERS):
-                            flat_idx = tidx + k_iter * 128
+                            flat_idx = tidx + k_iter * BLOCK_THREADS
                             k_write = flat_idx // TILE_V
                             v_write = flat_idx % TILE_V
                             v_global_write = v_tile * TILE_V + v_write
