@@ -34,7 +34,7 @@ class Args:
     num_v_heads: int
     head_k_dim: int
     head_v_dim: int
-    use_qk_l2norm: bool = True
+    use_qk_l2norm: bool = False
 
 
 def create_inputs(args):
@@ -262,12 +262,12 @@ def create_fused_gdn_kernel(
                             k_val = sk_tensor[tidx]
                             sum_q_partial = q_val * q_val
                             sum_k_partial = k_val * k_val
-                        for offset in [16, 8, 4, 2, 1]:
+                        for offset in nwarps_shfl_offsets: # LOG2(NUM_WARPS)
                             sum_q_partial = sum_q_partial + gpu.ShuffleOp(_asv(sum_q_partial), _asv(arith.constant(offset, type=T.i32())), width_i32, mode="xor").shuffleResult
                             sum_k_partial = sum_k_partial + gpu.ShuffleOp(_asv(sum_k_partial), _asv(arith.constant(offset, type=T.i32())), width_i32, mode="xor").shuffleResult
                         if w_tid == 0:
                             sscalar_tensor[wid] = sum_q_partial
-                            sscalar_tensor[wid + 16] = sum_k_partial
+                            sscalar_tensor[wid + NUM_WARPS] = sum_k_partial
                         gpu.barrier()
                         inv_norm_q = _create_f32(0.0)
                         inv_norm_k = _create_f32(0.0)
@@ -276,7 +276,7 @@ def create_fused_gdn_kernel(
                             local_sum_k = _create_f32(0.0)
                             if w_tid < NUM_WARPS:
                                 local_sum_q = sscalar_tensor[w_tid]
-                                local_sum_k = sscalar_tensor[w_tid + 16]
+                                local_sum_k = sscalar_tensor[w_tid + NUM_WARPS]
                             for offset in nwarps_shfl_offsets: # LOG2(NUM_WARPS)
                                 local_sum_q = local_sum_q + gpu.ShuffleOp(_asv(local_sum_q), _asv(arith.constant(offset, type=T.i32())), width_i32, mode="xor").shuffleResult
                                 local_sum_k = local_sum_k + gpu.ShuffleOp(_asv(local_sum_k), _asv(arith.constant(offset, type=T.i32())), width_i32, mode="xor").shuffleResult
@@ -298,8 +298,8 @@ def create_fused_gdn_kernel(
                     for v_tile_offset in range(num_v_tiles_per_block):
                         v_tile = start_v_tile + v_tile_offset
                         state_batch_tile = state_tensor[pool_idx, hv_i, None, None].local_tile((TILE_K, TILE_V), (0, v_tile)) # 128, 32
-                        BLOCK_SIZE_M = 32
                         BLOCK_SIZE_N = 4
+                        BLOCK_SIZE_M = BLOCK_THREADS // BLOCK_SIZE_N
                         sdata_tensor.copy_(
                             state_batch_tile, 
                             thread_layout=(BLOCK_SIZE_M, BLOCK_SIZE_N), 
@@ -640,7 +640,7 @@ def fused_sigmoid_gating_delta_rule_update(
     )
 
 
-def run_triton_kernel(out, A_log, dt_bias, q, k, v, a, b, initial_state, indices, scale):
+def run_triton_kernel(out, A_log, dt_bias, q, k, v, a, b, initial_state, indices, scale, use_qk_l2norm_in_kernel):
     fused_sigmoid_gating_delta_rule_update(
         out,
         A_log=A_log,
@@ -655,13 +655,14 @@ def run_triton_kernel(out, A_log, dt_bias, q, k, v, a, b, initial_state, indices
         initial_state_source=initial_state,
         initial_state_indices=indices,
         scale=scale,
-        use_qk_l2norm_in_kernel=True,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         cu_seqlens=None,
     )
 
 
 def ref_func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out):
-    run_triton_kernel(out, A_log, dt_bias, query, key, value, a, b, state, indices, float(1.0 / (args.head_k_dim ** 0.5)))
+    run_triton_kernel(out, A_log, dt_bias, query, key, value, a, b, state, indices,
+        float(1.0 / (args.head_k_dim ** 0.5)), args.use_qk_l2norm)
 
 
 def benchmark(args, func, ref_func, warmup=20, niters=100):
