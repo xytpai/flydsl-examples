@@ -21,6 +21,7 @@ from _mlir.dialects.arith import addi
 
 class FTensorView:
     def __init__(self, dtype, shape, stride, base_offset, load_impl, store_impl):
+        # self.arch = get_rocm_arch()
         self.dtype = dtype
         self.shape = shape
         if stride is None:
@@ -175,6 +176,7 @@ class GTensor(FTensorBase):
     def __init__(self, fx_tensor, dtype, shape, stride=None, base_offset=0):
         super().__init__(dtype, shape, stride, base_offset)
         self.fx_tensor = fx_tensor
+        # self.dtype_bytes = self.dtype.width // 8
     
     def load(self, offset, vec_size=1):
         if vec_size > 1:

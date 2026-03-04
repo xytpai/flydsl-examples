@@ -11,7 +11,7 @@ import triton
 import triton.language as tl
 
 import flydsl
-from flydsl.dialects.ext import flir, gpu, arith
+from flydsl.dialects.ext import flir, gpu, arith, rocdl
 from flydsl.runtime.device import get_rocm_arch
 from flydsl.compiler.pipeline import Pipeline, run_pipeline
 from flydsl.dialects.ext.python_control_flow import range_constexpr, lower_range_for_loops
@@ -123,8 +123,8 @@ def create_fused_gdn_kernel(
     DYN = ir.ShapedType.get_dynamic_size()
     ARCH = get_rocm_arch()
     allocator = SmemAllocator(None, arch=ARCH)
-    BLOCK_THREADS = 128
-    WARP_SIZE = 32
+    BLOCK_THREADS = 256
+    WARP_SIZE = 64
     COPY_THREAD_LAYOUT_N = 4
     NUM_WARPS = BLOCK_THREADS // WARP_SIZE
     V_PER_WARP = TILE_V // NUM_WARPS
