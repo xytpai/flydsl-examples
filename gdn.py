@@ -107,9 +107,9 @@ def create_fused_gdn_kernel(
     dtype,
     mfma_fn,
     VEC_SIZE: int,
-    use_qk_l2norm: bool, 
-    NUM_BLOCKS_PER_STATE: int = 2, 
-    TILE_V: int = 32,
+    use_qk_l2norm: bool,
+    NUM_BLOCKS_PER_STATE: int = 4,
+    TILE_V: int = 16,
     TILE_K: int = 128
 ):
     _asv = arith.as_value
