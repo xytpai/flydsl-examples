@@ -279,7 +279,7 @@ def create_fused_gdn_kernel(
                             r_g = flir.math.exp(_asv(r_g_value), fastmath=fm_fast)
                         
                         if sq_i == 0:
-                                gpu.barrier()
+                            gpu.barrier()
                         
                         for block_atom_v_i in range_constexpr(BLOCK_ATOM_V_STEPS):
                             v_local_i = block_atom_v_i * BLOCK_ATOM_V + v_local_atom_i
@@ -288,7 +288,9 @@ def create_fused_gdn_kernel(
                             
                             sum_hk = _create_f32(0)
                             sdata_vec = sdata_tensor.vec_load((k_local_vec_i, v_local_i), VALUES_PER_THREAD_K)
+                            sq_vec = sq_tensor.vec_load((sq_i, k_local_vec_i), VALUES_PER_THREAD_K)
                             sk_vec = sk_tensor.vec_load((sq_i, k_local_vec_i), VALUES_PER_THREAD_K)
+
                             for i in range_constexpr(VALUES_PER_THREAD_K):
                                 h_val = vector.extract(sdata_vec, static_position=[i], dynamic_position=[]) * r_g
                                 r_k_val = vector.extract(sk_vec, static_position=[i], dynamic_position=[])
@@ -299,12 +301,8 @@ def create_fused_gdn_kernel(
 
                             v_new = (r_v - sum_hk) * r_beta
                             v_new = gpu.ShuffleOp(_asv(v_new), _asv(arith.index_cast(T.i32(), (w_tid // THREADS_PER_K) * THREADS_PER_K)), width_i32, mode="idx").shuffleResult
-                            gpu.barrier()
 
                             sum_hq = _create_f32(0.0)
-                            sdata_vec = sdata_tensor.vec_load((k_local_vec_i, v_local_i), VALUES_PER_THREAD_K)
-                            sk_vec = sk_tensor.vec_load((sq_i, k_local_vec_i), VALUES_PER_THREAD_K)
-                            sq_vec = sq_tensor.vec_load((sq_i, k_local_vec_i), VALUES_PER_THREAD_K)
                             sdata_vec_new = []
                             for i in range_constexpr(VALUES_PER_THREAD_K):
                                 h_old = vector.extract(sdata_vec, static_position=[i], dynamic_position=[]) * r_g
@@ -315,9 +313,7 @@ def create_fused_gdn_kernel(
                                 sum_hq = sum_hq + h_new * r_q_val
                             vec_type = VectorType.get([VALUES_PER_THREAD_K], T.f32())
                             sdata_vec_new_ = vector.from_elements(vec_type, sdata_vec_new)
-                            gpu.barrier()
                             sdata_tensor.vec_store((k_local_vec_i, v_local_i), sdata_vec_new_, VALUES_PER_THREAD_K)
-                            gpu.barrier()
 
                             for offset in K_THREAD_SHFL_OFFSETS:
                                 sum_hq = sum_hq + gpu.ShuffleOp(_asv(sum_hq), _asv(arith.constant(offset, type=T.i32())), width_i32, mode="xor").shuffleResult
