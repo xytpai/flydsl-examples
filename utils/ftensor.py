@@ -71,6 +71,20 @@ class FTensorView:
         offset = self.linear_offset(idxs)
         assert len(offset) == 1
         self.store_impl(offset[0], value)
+
+    def vec_load(self, idxs, vec_size):
+        if not isinstance(idxs, tuple):
+            idxs = (idxs,)
+        offset = self.linear_offset(idxs)
+        assert len(offset) == 1
+        return self.load_impl(offset[0], vec_size=vec_size)
+    
+    def vec_store(self, idxs, value, vec_size):
+        if not isinstance(idxs, tuple):
+            idxs = (idxs,)
+        offset = self.linear_offset(idxs)
+        assert len(offset) == 1
+        self.store_impl(offset[0], value, vec_size=vec_size)
     
     def local_tile(self, tile_shape, tile_idxs):
         d_offset = self.base_offset
@@ -102,13 +116,6 @@ class FTensorView:
                     dst_vec_offset = dst_vec_offset + coord[d] * self.stride[d]
             value = src_tensor.load_impl(src_vec_offset, vec_size=vec_size)
             self.store_impl(dst_vec_offset, value, vec_size=vec_size)
-    
-    def vec_store(self, idxs, value, vec_size):
-        if not isinstance(idxs, tuple):
-            idxs = (idxs,)
-        offset = self.linear_offset(idxs)
-        assert len(offset) == 1
-        self.store_impl(offset[0], value, vec_size=vec_size)
 
 
 class FTensorBase(ABC):
@@ -147,6 +154,14 @@ class FTensorBase(ABC):
         self._lazy_init()
         self.tensor_view[idxs] = value
     
+    def vec_load(self, idxs, vec_size):
+        self._lazy_init()
+        return self.tensor_view.vec_load(idxs, vec_size)
+    
+    def vec_store(self, idxs, value, vec_size):
+        self._lazy_init()
+        self.tensor_view.vec_store(idxs, value, vec_size)
+    
     def local_tile(self, tile_shape, tile_idxs):
         self._lazy_init()
         return self.tensor_view.local_tile(tile_shape, tile_idxs)
@@ -154,10 +169,6 @@ class FTensorBase(ABC):
     def copy_(self, src_tensor, thread_layout, value_layout, thread_idxs, vec_size):
         self._lazy_init()
         self.tensor_view.copy_(src_tensor, thread_layout, value_layout, thread_idxs, vec_size)
-    
-    def vec_store(self, idxs, value, vec_size):
-        self._lazy_init()
-        self.tensor_view.vec_store(idxs, value, vec_size)
 
 
 class TorchTensor(FTensorBase):

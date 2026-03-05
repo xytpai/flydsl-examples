@@ -163,7 +163,7 @@ def create_fused_gdn_kernel(
             self.sdata = allocator.allocate_array(T.f32(), TILE_K * TILE_V_PAD)
             self.sq = allocator.allocate_array(T.f32(), seq_length * TILE_K)
             self.sk = allocator.allocate_array(T.f32(), seq_length * TILE_K)
-            self.sscalar = allocator.allocate_array(T.f32(), 64)
+            self.sscalar = allocator.allocate_array(T.f32(), 32)
             allocator.finalize()
 
         @flir.kernel
@@ -253,29 +253,7 @@ def create_fused_gdn_kernel(
                                 thread_layout=(BLOCK_SIZE_M, COPY_THREAD_LAYOUT_N), 
                                 value_layout=(TILE_K // BLOCK_SIZE_M, TILE_V // COPY_THREAD_LAYOUT_N), 
                                 thread_idxs=(tidx / COPY_THREAD_LAYOUT_N, tidx % COPY_THREAD_LAYOUT_N), 
-                                vec_size=2)
-                        
-                        # state_tensor_ = flir.make_tensor(state, shape=(batch_size, num_v_heads, head_k_dim, head_v_dim), 
-                        #     strides=(num_v_heads * head_k_dim * head_v_dim, head_k_dim * head_v_dim, head_v_dim, 1))
-                        # state_tensor_tiles = flir.zipped_divide(state_tensor_, (1, 1, TILE_K, TILE_V))
-                        # sdata_tensor_ = flir.make_tensor(self.sdata(sbase).get(), shape=(1, 1, TILE_K, TILE_V), strides=(TILE_K * TILE_V_PAD, TILE_K * TILE_V_PAD, TILE_V_PAD, 1))
-                        # sdata_tensor_tiles = flir.zipped_divide(sdata_tensor_, (1, 1, TILE_K, TILE_V))
-                        # if sq_i == 0:
-                        #     state_tensor_block_tile = state_tensor_tiles[(pool_idx, hv_i, 0, v_tile)]
-                        #     sdata_tensor_block_tile = sdata_tensor_tiles[(0, 0, 0, 0)]
-                        #     copy_atom_load = flir.make_copy_atom(dtype.get(), vector_size=4)
-                        #     copy_atom_store = flir.make_copy_atom(dtype.get(), vector_size=4)
-                        #     thread_shape = (BLOCK_SIZE_M, COPY_THREAD_LAYOUT_N) # 64, 4
-                        #     value_shape = (TILE_K // BLOCK_SIZE_M, TILE_V // COPY_THREAD_LAYOUT_N) # 2, 4
-                        #     thread_layout = flir.make_layout(thread_shape, stride=(thread_shape[1], 1))
-                        #     value_layout = flir.make_layout(value_shape, stride=(value_shape[1], 1))
-                        #     tiled_copy_load = flir.make_tiled_copy_tv(copy_atom_load, thread_layout, value_layout, thr_shape=thread_shape, val_shape=value_shape)
-                        #     tiled_copy_store = flir.make_tiled_copy_tv(copy_atom_store, thread_layout, value_layout, thr_shape=thread_shape, val_shape=value_shape)
-                        #     ldg_copy = tiled_copy_load.get_slice(tidx).partition_S(state_tensor_block_tile)
-                        #     sts_copy = tiled_copy_store.get_slice(tidx).partition_D(sdata_tensor_block_tile)
-                        #     frag = flir.make_fragment_like(ldg_copy, T.f32())
-                        #     flir.copy(tiled_copy_load, ldg_copy, frag)
-                        #     flir.copy(tiled_copy_store, frag, sts_copy)
+                                vec_size=1)
                             
                         r_a = sscalar_tensor[sq_i]
                         r_b = sscalar_tensor[seq_length + sq_i]
@@ -340,14 +318,18 @@ def create_fused_gdn_kernel(
                         gpu.barrier()
 
                         if sq_i == seq_length - 1:
-                            for k_iter in range_constexpr(NUM_K_ITERS):
-                                flat_idx = tidx + k_iter * BLOCK_THREADS
-                                k_write = flat_idx // TILE_V
-                                v_write = flat_idx % TILE_V
-                                v_global_write = v_tile * TILE_V + v_write
-                                if k_write < TILE_K:
-                                    state_tensor[pool_idx, hv_i, k_write, v_global_write] = sdata_tensor[k_write, v_write]
-                        gpu.barrier()
+                            STG_VEC_SIZE = 4
+                            BLOCK_WORK_SIZE = BLOCK_THREADS * STG_VEC_SIZE
+                            THREADS_PER_V = TILE_V // STG_VEC_SIZE
+                            THREADS_PER_K = BLOCK_THREADS // THREADS_PER_V
+                            ITERS = TILE_K // (BLOCK_THREADS // THREADS_PER_V)
+                            for k_iter in range_constexpr(ITERS):
+                                k_idx = tidx // THREADS_PER_V + k_iter * THREADS_PER_K
+                                v_vec_s_idx = (tidx % THREADS_PER_V) * STG_VEC_SIZE
+                                v_vec_g_idx = v_tile * TILE_V + v_vec_s_idx
+                                if k_idx < TILE_K:
+                                    vec = sdata_tensor.vec_load((k_idx, v_vec_s_idx), STG_VEC_SIZE)
+                                    state_tensor.vec_store((pool_idx, hv_i, k_idx, v_vec_g_idx), vec, STG_VEC_SIZE)
             return
 
         @flir.jit
