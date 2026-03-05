@@ -112,8 +112,8 @@ def create_fused_gdn_kernel(
     head_k_dim: int,
     head_v_dim: int,
     use_qk_l2norm: bool,
-    NUM_BLOCKS_PER_STATE: int = 4,
-    TILE_V: int = 16,    
+    NUM_BLOCKS_PER_STATE: int = 2,
+    TILE_V: int = 32,
     softplus_beta: float = 1.0,
     softplus_threshold: float = 20.0,
 ):
@@ -197,6 +197,7 @@ def create_fused_gdn_kernel(
             head_v_dim_: lambda: T.index(),
             scale: lambda: T.f32(),
         ):
+            v_blocks16 = arith.index(TILE_V * self.dtype.width // 8 // 16)
             i32_0 = arith.constant(0, type=T.i32())
             width_i32 = arith.as_value(arith.constant(WARP_SIZE, type=T.i32()))
             # state: # (b, num_v_heads, head_k_dim, NUM_BLOCKS_PER_STATE * num_v_tiles_per_block * TILE_V)
