@@ -132,15 +132,25 @@ def create_fused_gdn_kernel(
 
     BLOCK_THREADS = 256
     WARP_SIZE = 64
-    COPY_THREAD_LAYOUT_N = 4
     TILE_V_PAD = TILE_V + 4
     K_ITERS_UNROLL = 8
+
+    LDG_VEC_SIZE = 4
+    STG_VEC_SIZE = 4
 
     TILE_K = head_k_dim
     NUM_WARPS = BLOCK_THREADS // WARP_SIZE
     V_PER_WARP = TILE_V // NUM_WARPS
     ROWS_PER_ITER = WARP_SIZE // V_PER_WARP
     NUM_K_ITERS = TILE_K // ROWS_PER_ITER
+
+    LDG_THREADS_PER_V = TILE_V // LDG_VEC_SIZE
+    LDG_THREADS_PER_K = BLOCK_THREADS // LDG_THREADS_PER_V
+    LDG_K_ITERS = TILE_K // (BLOCK_THREADS // LDG_THREADS_PER_V)
+
+    STG_THREADS_PER_V = TILE_V // STG_VEC_SIZE
+    STG_THREADS_PER_K = BLOCK_THREADS // STG_THREADS_PER_V
+    STG_K_ITERS = TILE_K // (BLOCK_THREADS // STG_THREADS_PER_V)
 
     rows_shfl_offsets = []
     offsets_ = ROWS_PER_ITER // 2
@@ -247,13 +257,13 @@ def create_fused_gdn_kernel(
                         v_tile = start_v_tile + v_tile_offset
 
                         if sq_i == 0:
-                            BLOCK_SIZE_M = BLOCK_THREADS // COPY_THREAD_LAYOUT_N
-                            sdata_tensor.copy_(
-                                state_tensor[pool_idx, hv_i, None, None].local_tile((TILE_K, TILE_V), (0, v_tile)), # 128, 32
-                                thread_layout=(BLOCK_SIZE_M, COPY_THREAD_LAYOUT_N), 
-                                value_layout=(TILE_K // BLOCK_SIZE_M, TILE_V // COPY_THREAD_LAYOUT_N), 
-                                thread_idxs=(tidx / COPY_THREAD_LAYOUT_N, tidx % COPY_THREAD_LAYOUT_N), 
-                                vec_size=1)
+                            for k_iter in range_constexpr(LDG_K_ITERS):
+                                k_idx = tidx // LDG_THREADS_PER_V + k_iter * LDG_THREADS_PER_K
+                                v_vec_s_idx = (tidx % LDG_THREADS_PER_V) * LDG_VEC_SIZE
+                                v_vec_g_idx = v_tile * TILE_V + v_vec_s_idx
+                                if k_idx < TILE_K:
+                                    vec = state_tensor.vec_load((pool_idx, hv_i, k_idx, v_vec_g_idx), LDG_VEC_SIZE)
+                                    sdata_tensor.vec_store((k_idx, v_vec_s_idx), vec, LDG_VEC_SIZE)
                             
                         r_a = sscalar_tensor[sq_i]
                         r_b = sscalar_tensor[seq_length + sq_i]
@@ -318,14 +328,9 @@ def create_fused_gdn_kernel(
                         gpu.barrier()
 
                         if sq_i == seq_length - 1:
-                            STG_VEC_SIZE = 4
-                            BLOCK_WORK_SIZE = BLOCK_THREADS * STG_VEC_SIZE
-                            THREADS_PER_V = TILE_V // STG_VEC_SIZE
-                            THREADS_PER_K = BLOCK_THREADS // THREADS_PER_V
-                            ITERS = TILE_K // (BLOCK_THREADS // THREADS_PER_V)
-                            for k_iter in range_constexpr(ITERS):
-                                k_idx = tidx // THREADS_PER_V + k_iter * THREADS_PER_K
-                                v_vec_s_idx = (tidx % THREADS_PER_V) * STG_VEC_SIZE
+                            for k_iter in range_constexpr(STG_K_ITERS):
+                                k_idx = tidx // STG_THREADS_PER_V + k_iter * STG_THREADS_PER_K
+                                v_vec_s_idx = (tidx % STG_THREADS_PER_V) * STG_VEC_SIZE
                                 v_vec_g_idx = v_tile * TILE_V + v_vec_s_idx
                                 if k_idx < TILE_K:
                                     vec = sdata_tensor.vec_load((k_idx, v_vec_s_idx), STG_VEC_SIZE)
