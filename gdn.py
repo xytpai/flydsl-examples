@@ -105,18 +105,17 @@ def ref_func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out)
 
 def create_fused_gdn_kernel(
     dtype,
-    mfma_fn,
     VEC_SIZE: int,
+    seq_length: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_k_dim: int,
+    head_v_dim: int,
     use_qk_l2norm: bool,
     NUM_BLOCKS_PER_STATE: int = 4,
-    TILE_V: int = 16,
-    TILE_K: int = 128,
-    batch_size: int = 2,
-    seq_length: int = 2,
-    num_k_heads: int = 16,
-    num_v_heads: int = 32,
-    head_k_dim: int = 128,
-    head_v_dim: int = 128,
+    TILE_V: int = 16,    
+    softplus_beta: float = 1.0,
+    softplus_threshold: float = 20.0,
 ):
     _asv = arith.as_value
     _asid = flir.const_index
@@ -130,30 +129,29 @@ def create_fused_gdn_kernel(
     DYN = ir.ShapedType.get_dynamic_size()
     ARCH = get_rocm_arch()
     allocator = SmemAllocator(None, arch=ARCH)
+
     BLOCK_THREADS = 256
     WARP_SIZE = 64
     COPY_THREAD_LAYOUT_N = 4
+    TILE_V_PAD = TILE_V + 4
+    K_ITERS_UNROLL = 8
+
+    TILE_K = head_k_dim
     NUM_WARPS = BLOCK_THREADS // WARP_SIZE
     V_PER_WARP = TILE_V // NUM_WARPS
     ROWS_PER_ITER = WARP_SIZE // V_PER_WARP
     NUM_K_ITERS = TILE_K // ROWS_PER_ITER
-
-    softplus_beta = 1.0
-    softplus_threshold = 20.0
 
     rows_shfl_offsets = []
     offsets_ = ROWS_PER_ITER // 2
     while offsets_ >= 1:
         rows_shfl_offsets.append(int(offsets_))
         offsets_ /= 2
-    
     nwarps_shfl_offsets = []
     offsets_ = NUM_WARPS // 2
     while offsets_ >= 1:
         nwarps_shfl_offsets.append(int(offsets_))
         offsets_ /= 2
-    
-    TILE_V_PAD = TILE_V + 4
     
     class FGDN(flir.MlirModule):
         GPU_MODULE_NAME = "linear_attention_kernels"
@@ -181,7 +179,7 @@ def create_fused_gdn_kernel(
             indices: lambda: T.memref(DYN, T.i32()),
             state: lambda: T.memref(DYN, F32Type.get()),
             out: lambda: T.memref(DYN, dtype.get()),
-            batch_size_: lambda: T.index(),
+            batch_size: lambda: T.index(),
             seq_length_: lambda: T.index(),
             num_k_heads_: lambda: T.index(),
             num_v_heads_: lambda: T.index(),
@@ -208,24 +206,24 @@ def create_fused_gdn_kernel(
             hv_i = b_hv_i % num_v_heads
             hk_i = hv_i // (num_v_heads // num_k_heads)
 
-            indices_tensor = GTensor(indices, T.i32(), (batch_size,))
+            indices_tensor = GTensor(indices, T.i32(), (-1,))
             pool_idx = arith.index_cast(T.index(), indices_tensor[b_i])
 
-            q_tensor = GTensor(query, dtype.get(), shape=(batch_size, seq_length, num_k_heads, head_k_dim))
-            k_tensor = GTensor(key, dtype.get(), shape=(batch_size, seq_length, num_k_heads, head_k_dim))
-            v_tensor = GTensor(value, dtype.get(), shape=(batch_size, seq_length, num_v_heads, head_v_dim))
-            a_tensor = GTensor(a, dtype.get(), shape=(batch_size, seq_length, num_v_heads))
-            b_tensor = GTensor(b, dtype.get(), shape=(batch_size, seq_length, num_v_heads))
+            q_tensor = GTensor(query, dtype.get(), shape=(-1, seq_length, num_k_heads, head_k_dim))
+            k_tensor = GTensor(key, dtype.get(), shape=(-1, seq_length, num_k_heads, head_k_dim))
+            v_tensor = GTensor(value, dtype.get(), shape=(-1, seq_length, num_v_heads, head_v_dim))
+            a_tensor = GTensor(a, dtype.get(), shape=(-1, seq_length, num_v_heads))
+            b_tensor = GTensor(b, dtype.get(), shape=(-1, seq_length, num_v_heads))
             dt_bias_tensor = GTensor(dt_bias, dtype.get(), shape=(num_v_heads,))
             A_log_tensor = GTensor(A_log, F32Type.get(), shape=(num_v_heads,))
-            state_tensor = GTensor(state, F32Type.get(), shape=(batch_size, num_v_heads, head_k_dim, head_v_dim))
-            out_tensor = GTensor(out, dtype.get(), shape=(batch_size, seq_length, num_v_heads, head_v_dim))
+            state_tensor = GTensor(state, F32Type.get(), shape=(-1, num_v_heads, head_k_dim, head_v_dim))
+            out_tensor = GTensor(out, dtype.get(), shape=(-1, seq_length, num_v_heads, head_v_dim))
 
             sbase = allocator.get_base()
             sdata_tensor = STensor(self.sdata(sbase), T.f32(), shape=(TILE_K, TILE_V), stride=(TILE_V_PAD, 1))
             sq_tensor = STensor(self.sq(sbase), T.f32(), shape=(seq_length, TILE_K,))
             sk_tensor = STensor(self.sk(sbase), T.f32(), shape=(seq_length, TILE_K,))
-            sscalar_tensor = STensor(self.sscalar(sbase), T.f32(), shape=(64,))
+            sscalar_tensor = STensor(self.sscalar(sbase), T.f32(), shape=(-1,))
 
             k_local = w_tid // V_PER_WARP
             v_local = w_tid % V_PER_WARP
@@ -234,109 +232,56 @@ def create_fused_gdn_kernel(
 
             if pool_idx >= 0:
                 for sq_i in range_constexpr(seq_length):
-                    # k_local = w_tid // V_PER_WARP
-                    # v_local = w_tid % V_PER_WARP
-                    # v_base = wid * V_PER_WARP
-                    # v_idx = v_base + v_local
-                    
                     if tidx < TILE_K:
                         sk_tensor[sq_i, tidx] = _extf32(k_tensor[b_i, sq_i, hk_i, tidx])
                         sq_tensor[sq_i, tidx] = _extf32(q_tensor[b_i, sq_i, hk_i, tidx]) * scale
-                        sscalar_tensor[32 + sq_i] = _extf32(a_tensor[b_i, sq_i, hv_i])
-                        sscalar_tensor[32 + seq_length + sq_i] = _extf32(b_tensor[b_i, sq_i, hv_i])
-                    gpu.barrier()
-
-                    # if sq_i == 0:
-                    #     if True:
-                    #         BLOCK_SIZE_M = BLOCK_THREADS // COPY_THREAD_LAYOUT_N
-                    #         sdata_tensor.copy_(
-                    #             state_tensor[pool_idx, hv_i, None, None].local_tile((TILE_K, TILE_V), (0, start_v_tile)), # 128, 32
-                    #             thread_layout=(BLOCK_SIZE_M, COPY_THREAD_LAYOUT_N), 
-                    #             value_layout=(TILE_K // BLOCK_SIZE_M, TILE_V // COPY_THREAD_LAYOUT_N), 
-                    #             thread_idxs=(tidx / COPY_THREAD_LAYOUT_N, tidx % COPY_THREAD_LAYOUT_N), 
-                    #             vec_size=TILE_V // COPY_THREAD_LAYOUT_N)
-                            
-                    #         gpu.barrier()
-
-                    # r_A_log = A_log_tensor[hv_i]
-                    # r_dt_bias = _extf32(dt_bias_tensor[hv_i])
-                    # r_a = _extf32(a_tensor[b_i, sq_i, hv_i])
-                    # r_b = _extf32(b_tensor[b_i, sq_i, hv_i])
-
-                    # r_g = _create_f32(0)
-                    # r_beta = _create_f32(0)
-
-                    # # if wid == 0 and w_tid == 0:
-                    # if True:
-                    #     x = r_a + r_dt_bias
-                    #     beta_x = _create_f32(softplus_beta) * x
-                    #     softplus_x = _create_f32(0)
-                    #     if beta_x <= softplus_threshold:
-                    #         softplus_x = _create_f32(1.0 / softplus_beta) * flir.math.log1p(_asv(flir.math.exp(_asv(beta_x), fastmath=fm_fast)), fastmath=fm_fast)
-                    #     else:
-                    #         softplus_x = x
-                    #     r_g_value = _create_f32(0) - flir.math.exp(_asv(r_A_log), fastmath=fm_fast) * softplus_x
-                    #     r_beta = _create_f32(1) / (_create_f32(1) + flir.math.exp(_asv(_create_f32(0) - r_b), fastmath=fm_fast))
-                    #     r_g = flir.math.exp(_asv(r_g_value), fastmath=fm_fast)
-                    # r_g = gpu.ShuffleOp(_asv(r_g), _asv(i32_0), width_i32, mode="idx").shuffleResult
-                    # r_beta = gpu.ShuffleOp(_asv(r_beta), _asv(i32_0), width_i32, mode="idx").shuffleResult
-
-                    # if use_qk_l2norm:
-                    #     sum_q_partial = _create_f32(0.0)
-                    #     sum_k_partial = _create_f32(0.0)
-                    #     if tidx < TILE_K:
-                    #         q_val = sq_tensor[tidx]
-                    #         k_val = sk_tensor[tidx]
-                    #         sum_q_partial = q_val * q_val
-                    #         sum_k_partial = k_val * k_val
-                    #     for offset in nwarps_shfl_offsets: # LOG2(NUM_WARPS)
-                    #         sum_q_partial = sum_q_partial + gpu.ShuffleOp(_asv(sum_q_partial), _asv(arith.constant(offset, type=T.i32())), width_i32, mode="xor").shuffleResult
-                    #         sum_k_partial = sum_k_partial + gpu.ShuffleOp(_asv(sum_k_partial), _asv(arith.constant(offset, type=T.i32())), width_i32, mode="xor").shuffleResult
-                    #     if w_tid == 0:
-                    #         sscalar_tensor[wid] = sum_q_partial
-                    #         sscalar_tensor[wid + NUM_WARPS] = sum_k_partial
-                    #     gpu.barrier()
-                    #     inv_norm_q = _create_f32(0.0)
-                    #     inv_norm_k = _create_f32(0.0)
-                    #     if wid == 0:
-                    #         local_sum_q = _create_f32(0.0)
-                    #         local_sum_k = _create_f32(0.0)
-                    #         if w_tid < NUM_WARPS:
-                    #             local_sum_q = sscalar_tensor[w_tid]
-                    #             local_sum_k = sscalar_tensor[w_tid + NUM_WARPS]
-                    #         for offset in nwarps_shfl_offsets: # LOG2(NUM_WARPS)
-                    #             local_sum_q = local_sum_q + gpu.ShuffleOp(_asv(local_sum_q), _asv(arith.constant(offset, type=T.i32())), width_i32, mode="xor").shuffleResult
-                    #             local_sum_k = local_sum_k + gpu.ShuffleOp(_asv(local_sum_k), _asv(arith.constant(offset, type=T.i32())), width_i32, mode="xor").shuffleResult
-                    #         if w_tid == 0:
-                    #             sscalar_tensor[0] = _extf32(_asv(flir.math.rsqrt(_extf32(_asv(local_sum_q + 1e-6)).value)))
-                    #             sscalar_tensor[1] = _extf32(_asv(flir.math.rsqrt(_extf32(_asv(local_sum_k + 1e-6)).value)))
-                    #     gpu.barrier()
-                    #     inv_norm_q = sscalar_tensor[0]
-                    #     inv_norm_k = sscalar_tensor[1]
-                    #     if tidx < TILE_K:
-                    #         sk_tensor[tidx] = sk_tensor[tidx] * inv_norm_k
-                    #         sq_tensor[tidx] = sq_tensor[tidx] * scale * inv_norm_q
-                    # else:
-                    # if True:
-                    #     if tidx < TILE_K:
-                    #         sq_tensor[tidx] = sq_tensor[tidx] * scale
-                    
-                    # gpu.barrier()
-
-                    # state_batch_tile = state_tensor[pool_idx, hv_i, None, None]
-                    # state_local = state + state_batch_tile.base_offset
-                    # state_ = flir.make_tensor(state, shape=(batch_size, num_v_heads, head_k_dim, head_v_dim), 
-                    #     strides=(num_v_heads * head_k_dim * head_v_dim, head_k_dim * head_v_dim, head_v_dim, 1))
+                        sscalar_tensor[sq_i] = _extf32(a_tensor[b_i, sq_i, hv_i])
+                        sscalar_tensor[seq_length + sq_i] = _extf32(b_tensor[b_i, sq_i, hv_i])
+                gpu.barrier()
 
                 r_A_log = A_log_tensor[hv_i]
                 r_dt_bias = _extf32(dt_bias_tensor[hv_i])
                 
                 for v_tile_offset in range_constexpr(num_v_tiles_per_block):
-                    for sq_i in range_constexpr(seq_length):    
-                        r_a = sscalar_tensor[32 + sq_i]
-                        r_b = sscalar_tensor[32 + seq_length + sq_i]
+                    for sq_i in range_constexpr(seq_length):
+                        v_tile = start_v_tile + v_tile_offset
+
+                        if sq_i == 0:
+                            BLOCK_SIZE_M = BLOCK_THREADS // COPY_THREAD_LAYOUT_N
+                            sdata_tensor.copy_(
+                                state_tensor[pool_idx, hv_i, None, None].local_tile((TILE_K, TILE_V), (0, v_tile)), # 128, 32
+                                thread_layout=(BLOCK_SIZE_M, COPY_THREAD_LAYOUT_N), 
+                                value_layout=(TILE_K // BLOCK_SIZE_M, TILE_V // COPY_THREAD_LAYOUT_N), 
+                                thread_idxs=(tidx / COPY_THREAD_LAYOUT_N, tidx % COPY_THREAD_LAYOUT_N), 
+                                vec_size=2)
+                        
+                        # state_tensor_ = flir.make_tensor(state, shape=(batch_size, num_v_heads, head_k_dim, head_v_dim), 
+                        #     strides=(num_v_heads * head_k_dim * head_v_dim, head_k_dim * head_v_dim, head_v_dim, 1))
+                        # state_tensor_tiles = flir.zipped_divide(state_tensor_, (1, 1, TILE_K, TILE_V))
+                        # sdata_tensor_ = flir.make_tensor(self.sdata(sbase).get(), shape=(1, 1, TILE_K, TILE_V), strides=(TILE_K * TILE_V_PAD, TILE_K * TILE_V_PAD, TILE_V_PAD, 1))
+                        # sdata_tensor_tiles = flir.zipped_divide(sdata_tensor_, (1, 1, TILE_K, TILE_V))
+                        # if sq_i == 0:
+                        #     state_tensor_block_tile = state_tensor_tiles[(pool_idx, hv_i, 0, v_tile)]
+                        #     sdata_tensor_block_tile = sdata_tensor_tiles[(0, 0, 0, 0)]
+                        #     copy_atom_load = flir.make_copy_atom(dtype.get(), vector_size=4)
+                        #     copy_atom_store = flir.make_copy_atom(dtype.get(), vector_size=4)
+                        #     thread_shape = (BLOCK_SIZE_M, COPY_THREAD_LAYOUT_N) # 64, 4
+                        #     value_shape = (TILE_K // BLOCK_SIZE_M, TILE_V // COPY_THREAD_LAYOUT_N) # 2, 4
+                        #     thread_layout = flir.make_layout(thread_shape, stride=(thread_shape[1], 1))
+                        #     value_layout = flir.make_layout(value_shape, stride=(value_shape[1], 1))
+                        #     tiled_copy_load = flir.make_tiled_copy_tv(copy_atom_load, thread_layout, value_layout, thr_shape=thread_shape, val_shape=value_shape)
+                        #     tiled_copy_store = flir.make_tiled_copy_tv(copy_atom_store, thread_layout, value_layout, thr_shape=thread_shape, val_shape=value_shape)
+                        #     ldg_copy = tiled_copy_load.get_slice(tidx).partition_S(state_tensor_block_tile)
+                        #     sts_copy = tiled_copy_store.get_slice(tidx).partition_D(sdata_tensor_block_tile)
+                        #     frag = flir.make_fragment_like(ldg_copy, T.f32())
+                        #     flir.copy(tiled_copy_load, ldg_copy, frag)
+                        #     flir.copy(tiled_copy_store, frag, sts_copy)
+                            
+                        r_a = sscalar_tensor[sq_i]
+                        r_b = sscalar_tensor[seq_length + sq_i]
                         r_g = _create_f32(0)
                         r_beta = _create_f32(0)
+
                         if True:
                             x = r_a + r_dt_bias
                             beta_x = _create_f32(softplus_beta) * x
@@ -349,44 +294,41 @@ def create_fused_gdn_kernel(
                             r_beta = _create_f32(1) / (_create_f32(1) + flir.math.exp(_asv(_create_f32(0) - r_b), fastmath=fm_fast))
                             r_g = flir.math.exp(_asv(r_g_value), fastmath=fm_fast)
 
-                        v_tile = start_v_tile + v_tile_offset
-                        BLOCK_SIZE_M = BLOCK_THREADS // COPY_THREAD_LAYOUT_N
-                        if sq_i == 0:
-                            sdata_tensor.copy_(
-                                state_tensor[pool_idx, hv_i, None, None].local_tile((TILE_K, TILE_V), (0, v_tile)), # 128, 32
-                                thread_layout=(BLOCK_SIZE_M, COPY_THREAD_LAYOUT_N), 
-                                value_layout=(TILE_K // BLOCK_SIZE_M, TILE_V // COPY_THREAD_LAYOUT_N), 
-                                thread_idxs=(tidx / COPY_THREAD_LAYOUT_N, tidx % COPY_THREAD_LAYOUT_N), 
-                                vec_size=TILE_V // COPY_THREAD_LAYOUT_N)
-                            gpu.barrier()
-                            
                         v_global = v_tile * TILE_V + v_idx
-                        r_v = _extf32(v_tensor[b_i, sq_i, hv_i, v_global])                        
+                        r_v = _extf32(v_tensor[b_i, sq_i, hv_i, v_global])
 
                         sum_hk = _create_f32(0)
-                        for k_iter in range_constexpr(NUM_K_ITERS):
-                            k_base = k_iter * ROWS_PER_ITER
-                            k_idx = k_base + k_local
-                            h_val = sdata_tensor[k_idx, v_idx] * r_g
-                            r_k_val = sk_tensor[sq_i, k_idx]
-                            sum_hk = sum_hk + h_val * r_k_val
+                        if sq_i == 0:
+                            gpu.barrier()
+
+                        for k_iter_i in range(NUM_K_ITERS // K_ITERS_UNROLL):
+                            for k_iter_j in range_constexpr(K_ITERS_UNROLL):
+                                k_iter = k_iter_i * K_ITERS_UNROLL + k_iter_j
+                                k_base = k_iter * ROWS_PER_ITER
+                                k_idx = k_base + k_local
+                                h_val = sdata_tensor[k_idx, v_idx] * r_g
+                                r_k_val = sk_tensor[sq_i, k_idx]
+                                sum_hk = sum_hk + h_val * r_k_val
 
                         for offset in rows_shfl_offsets: # LOG2(ROWS_PER_ITER)
                             sum_hk = sum_hk + gpu.ShuffleOp(_asv(sum_hk), _asv(arith.constant(offset * V_PER_WARP, type=T.i32())), width_i32, mode="xor").shuffleResult
 
                         v_new = (r_v - sum_hk) * r_beta
                         v_new = gpu.ShuffleOp(_asv(v_new), _asv(arith.index_cast(T.i32(), v_local)), width_i32, mode="idx").shuffleResult
+                        gpu.barrier()
 
                         sum_hq = _create_f32(0.0)
-                        for k_iter in range_constexpr(NUM_K_ITERS):
-                            k_base = k_iter * ROWS_PER_ITER
-                            k_idx = k_base + k_local
-                            h_old = sdata_tensor[k_idx, v_idx] * r_g
-                            r_k_val = sk_tensor[sq_i, k_idx]
-                            r_q_val = sq_tensor[sq_i, k_idx]
-                            h_new = h_old + r_k_val * v_new
-                            sdata_tensor[k_idx, v_idx] = h_new
-                            sum_hq = sum_hq + h_new * r_q_val
+                        for k_iter_i in range(NUM_K_ITERS // K_ITERS_UNROLL):
+                            for k_iter_j in range_constexpr(K_ITERS_UNROLL):
+                                k_iter = k_iter_i * K_ITERS_UNROLL + k_iter_j
+                                k_base = k_iter * ROWS_PER_ITER
+                                k_idx = k_base + k_local
+                                h_old = sdata_tensor[k_idx, v_idx] * r_g
+                                r_k_val = sk_tensor[sq_i, k_idx]
+                                r_q_val = sq_tensor[sq_i, k_idx]
+                                h_new = h_old + r_k_val * v_new
+                                sdata_tensor[k_idx, v_idx] = h_new
+                                sum_hq = sum_hq + h_new * r_q_val
                             
                         for offset in rows_shfl_offsets: # LOG2(ROWS_PER_ITER)
                             sum_hq = sum_hq + gpu.ShuffleOp(_asv(sum_hq), _asv(arith.constant(offset * V_PER_WARP, type=T.i32())), width_i32, mode="xor").shuffleResult
@@ -395,6 +337,7 @@ def create_fused_gdn_kernel(
                         sum_hq = flir.arith.truncf(dtype.get(), _asv(sum_hq))
                         if k_local == 0:
                             out_tensor[b_i, sq_i, hv_i, v_global_out] = sum_hq
+                        gpu.barrier()
 
                         if sq_i == seq_length - 1:
                             for k_iter in range_constexpr(NUM_K_ITERS):
@@ -447,11 +390,35 @@ def func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out):
     global EXE
     if not EXE:
         if args.dtype == torch.float:
-            module = create_fused_gdn_kernel(F32Type, None, 4, args.use_qk_l2norm, TILE_K=args.head_k_dim)
+            module = create_fused_gdn_kernel(
+                F32Type,
+                4,
+                args.sq,
+                args.num_k_heads,
+                args.num_v_heads,
+                args.head_k_dim,
+                args.head_v_dim,
+                args.use_qk_l2norm)
         elif args.dtype == torch.half:
-            module = create_fused_gdn_kernel(F16Type, rocdl.mfma_f32_16x16x4f16, 8, args.use_qk_l2norm, TILE_K=args.head_k_dim)
+            module = create_fused_gdn_kernel(
+                F16Type,
+                8,
+                args.sq,
+                args.num_k_heads,
+                args.num_v_heads,
+                args.head_k_dim,
+                args.head_v_dim,
+                args.use_qk_l2norm)
         elif args.dtype == torch.bfloat16:
-            module = create_fused_gdn_kernel(BF16Type, rocdl.mfma_f32_16x16x4bf16_1k, 8, args.use_qk_l2norm, TILE_K=args.head_k_dim)
+            module = create_fused_gdn_kernel(
+                BF16Type,
+                8,
+                args.sq,
+                args.num_k_heads,
+                args.num_v_heads,
+                args.head_k_dim,
+                args.head_v_dim,
+                args.use_qk_l2norm)
         optimized = run_pipeline(module, Pipeline().canonicalize().cse())
         EXE = flydsl.compile(optimized)
     EXE(query, key, value, a, b, dt_bias, A_log, indices, state, out, 
