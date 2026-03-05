@@ -112,7 +112,7 @@ def create_fused_gdn_kernel(
     head_k_dim: int,
     head_v_dim: int,
     use_qk_l2norm: bool,
-    TILE_V: int = 32,
+    TILE_V: int = 16,
     softplus_beta: float = 1.0,
     softplus_threshold: float = 20.0,
 ):
@@ -147,8 +147,8 @@ def create_fused_gdn_kernel(
     NUM_V_TILES_PER_BLOCK = NUM_V_TILES // NUM_BLOCKS_PER_STATE
     assert NUM_V_TILES_PER_BLOCK >= 1
 
-    LDG_VEC_SIZE = 8
-    STG_VEC_SIZE = 8
+    LDG_VEC_SIZE = 4
+    STG_VEC_SIZE = 4
     LDG_THREADS_PER_V = TILE_V // LDG_VEC_SIZE
     LDG_THREADS_PER_K = BLOCK_THREADS // LDG_THREADS_PER_V
     LDG_K_ITERS = TILE_K // (BLOCK_THREADS // LDG_THREADS_PER_V)
@@ -173,7 +173,7 @@ def create_fused_gdn_kernel(
             self.sdata = allocator.allocate_array(T.f32(), TILE_K_PADDED * TILE_V)
             self.sq = allocator.allocate_array(T.f32(), seq_length * TILE_K)
             self.sk = allocator.allocate_array(T.f32(), seq_length * TILE_K)
-            self.sscalar = allocator.allocate_array(T.f32(), 32)
+            self.sscalar = allocator.allocate_array(T.f32(), seq_length * 2)
             allocator.finalize()
 
         @flir.kernel
