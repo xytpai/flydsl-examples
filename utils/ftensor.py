@@ -5,7 +5,7 @@ from itertools import product
 from abc import ABC, abstractmethod
 
 import flydsl
-from flydsl.dialects.ext import flir, gpu, arith, buffer_ops
+from flydsl.dialects.ext import flir, gpu, arith, buffer_ops, math
 from flydsl.runtime.device import get_rocm_arch
 from flydsl.compiler.pipeline import Pipeline, run_pipeline
 from flydsl.dialects.ext.python_control_flow import range_constexpr, lower_range_for_loops
@@ -32,7 +32,7 @@ class FTensorView:
         self.load_impl = load_impl
         self.store_impl = store_impl
     
-    def linear_offset(self, idxs):
+    def _linear_offset(self, idxs):
         slice_shape = []
         slice_stride = []
         d_offset = self.base_offset
@@ -59,7 +59,7 @@ class FTensorView:
     def __getitem__(self, idxs):
         if not isinstance(idxs, tuple):
             idxs = (idxs,)
-        offset = self.linear_offset(idxs)
+        offset = self._linear_offset(idxs)
         if len(offset) == 1:
             return self.load_impl(offset[0])
         else:
@@ -68,23 +68,30 @@ class FTensorView:
     def __setitem__(self, idxs, value):
         if not isinstance(idxs, tuple):
             idxs = (idxs,)
-        offset = self.linear_offset(idxs)
+        offset = self._linear_offset(idxs)
         assert len(offset) == 1
         self.store_impl(offset[0], value)
 
     def vec_load(self, idxs, vec_size):
         if not isinstance(idxs, tuple):
             idxs = (idxs,)
-        offset = self.linear_offset(idxs)
+        offset = self._linear_offset(idxs)
         assert len(offset) == 1
         return self.load_impl(offset[0], vec_size=vec_size)
     
     def vec_store(self, idxs, value, vec_size):
         if not isinstance(idxs, tuple):
             idxs = (idxs,)
-        offset = self.linear_offset(idxs)
+        offset = self._linear_offset(idxs)
         assert len(offset) == 1
         self.store_impl(offset[0], value, vec_size=vec_size)
+    
+    def linear_offset(self, idxs):
+        if not isinstance(idxs, tuple):
+            idxs = (idxs,)
+        offset = self._linear_offset(idxs)
+        assert len(offset) == 1
+        return offset[0]
     
     def local_tile(self, tile_shape, tile_idxs):
         d_offset = self.base_offset
@@ -161,6 +168,10 @@ class FTensorBase(ABC):
     def vec_store(self, idxs, value, vec_size):
         self._lazy_init()
         self.tensor_view.vec_store(idxs, value, vec_size)
+    
+    def linear_offset(self, idxs):
+        self._lazy_init()
+        return self.tensor_view.linear_offset(idxs)
     
     def local_tile(self, tile_shape, tile_idxs):
         self._lazy_init()
