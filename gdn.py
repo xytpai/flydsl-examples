@@ -233,16 +233,32 @@ def create_fused_gdn_kernel(
             sscalar_tensor = STensor(self.sscalar(sbase), T.f32(), shape=(-1,))
 
             if pool_idx >= 0:
-                for sq_i in range_constexpr(seq_length):
-                    if tidx < TILE_K:
-                        sk_tensor[sq_i, tidx] = _extf32(k_tensor[b_i, sq_i, hk_i, tidx])
-                        sq_tensor[sq_i, tidx] = _extf32(q_tensor[b_i, sq_i, hk_i, tidx]) * scale
-                        sscalar_tensor[sq_i] = _extf32(a_tensor[b_i, sq_i, hv_i])
-                        sscalar_tensor[seq_length + sq_i] = _extf32(b_tensor[b_i, sq_i, hv_i])
-                gpu.barrier()
 
                 r_A_log = A_log_tensor[hv_i]
                 r_dt_bias = _extf32(dt_bias_tensor[hv_i])
+
+                for sq_i in range_constexpr(seq_length):
+                    if arith.ult(tidx, TILE_K):
+                        sk_tensor[sq_i, tidx] = _extf32(k_tensor[b_i, sq_i, hk_i, tidx])
+                        sq_tensor[sq_i, tidx] = _extf32(q_tensor[b_i, sq_i, hk_i, tidx]) * scale            
+                    if tidx == 0:
+                        r_g = _create_f32(0)
+                        r_beta = _create_f32(0)
+                        r_a = _extf32(a_tensor[b_i, sq_i, hv_i])
+                        r_b = _extf32(b_tensor[b_i, sq_i, hv_i])
+                        x = r_a + r_dt_bias
+                        beta_x = _create_f32(softplus_beta) * x
+                        softplus_x = _create_f32(0)
+                        if beta_x <= softplus_threshold:
+                            softplus_x = _create_f32(1.0 / softplus_beta) * flir.math.log1p(_asv(flir.math.exp(_asv(beta_x), fastmath=fm_fast)), fastmath=fm_fast)
+                        else:
+                            softplus_x = x
+                        r_g_value = _create_f32(0) - flir.math.exp(_asv(r_A_log), fastmath=fm_fast) * softplus_x
+                        r_beta = _create_f32(1) / (_create_f32(1) + flir.math.exp(_asv(_create_f32(0) - r_b), fastmath=fm_fast))
+                        r_g = flir.math.exp(_asv(r_g_value), fastmath=fm_fast)
+                        sscalar_tensor[sq_i] = r_g
+                        sscalar_tensor[seq_length + sq_i] = r_beta
+                gpu.barrier()
                 
                 for v_tile_offset in range_constexpr(NUM_V_TILES_PER_BLOCK):
                     v_tile = start_v_tile + v_tile_offset
@@ -257,26 +273,11 @@ def create_fused_gdn_kernel(
                     gpu.barrier()
 
                     for sq_i in range_constexpr(seq_length):
-                        r_a = sscalar_tensor[sq_i]
-                        r_b = sscalar_tensor[seq_length + sq_i]
-                        r_g = _create_f32(0)
-                        r_beta = _create_f32(0)
-
+                        r_g = sscalar_tensor[sq_i]
+                        r_beta = sscalar_tensor[seq_length + sq_i]
                         sk_vec = sk_tensor.vec_load((sq_i, k_local_vec_i), VALUES_PER_THREAD_K)
                         sq_vec = sq_tensor.vec_load((sq_i, k_local_vec_i), VALUES_PER_THREAD_K)
 
-                        if True:
-                            x = r_a + r_dt_bias
-                            beta_x = _create_f32(softplus_beta) * x
-                            softplus_x = _create_f32(0)
-                            if beta_x <= softplus_threshold:
-                                softplus_x = _create_f32(1.0 / softplus_beta) * flir.math.log1p(_asv(flir.math.exp(_asv(beta_x), fastmath=fm_fast)), fastmath=fm_fast)
-                            else:
-                                softplus_x = x
-                            r_g_value = _create_f32(0) - flir.math.exp(_asv(r_A_log), fastmath=fm_fast) * softplus_x
-                            r_beta = _create_f32(1) / (_create_f32(1) + flir.math.exp(_asv(_create_f32(0) - r_b), fastmath=fm_fast))
-                            r_g = flir.math.exp(_asv(r_g_value), fastmath=fm_fast)
-                        
                         for block_atom_v_i in range_constexpr(BLOCK_ATOM_V_STEPS):
                             v_local_i = block_atom_v_i * BLOCK_ATOM_V + v_local_atom_i
                             v_global = v_tile * TILE_V + v_local_i
