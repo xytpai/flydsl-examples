@@ -5,7 +5,7 @@ from itertools import product
 from abc import ABC, abstractmethod
 
 import flydsl
-from flydsl.dialects.ext import flir, gpu, arith, buffer_ops
+from flydsl.dialects.ext import flir, gpu, arith, buffer_ops, math
 from flydsl.runtime.device import get_rocm_arch
 from flydsl.compiler.pipeline import Pipeline, run_pipeline
 from flydsl.dialects.ext.python_control_flow import range_constexpr, lower_range_for_loops
