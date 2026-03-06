@@ -146,15 +146,11 @@ def create_fused_gdn_kernel(
     NUM_BLOCKS_PER_STATE = NUM_V_TILES // 2
     NUM_V_TILES_PER_BLOCK = NUM_V_TILES // NUM_BLOCKS_PER_STATE
     assert NUM_V_TILES_PER_BLOCK >= 1
-
-    LDG_VEC_SIZE = 4
-    STG_VEC_SIZE = 4
+    
+    LDG_VEC_SIZE = VEC_SIZE // 2
     LDG_THREADS_PER_V = TILE_V // LDG_VEC_SIZE
     LDG_THREADS_PER_K = BLOCK_THREADS // LDG_THREADS_PER_V
     LDG_K_ITERS = TILE_K // (BLOCK_THREADS // LDG_THREADS_PER_V)
-    STG_THREADS_PER_V = TILE_V // STG_VEC_SIZE
-    STG_THREADS_PER_K = BLOCK_THREADS // STG_THREADS_PER_V
-    STG_K_ITERS = TILE_K // (BLOCK_THREADS // STG_THREADS_PER_V)
 
     K_THREAD_SHFL_OFFSETS = []
     offsets_ = THREADS_PER_K // 2
@@ -297,7 +293,7 @@ def create_fused_gdn_kernel(
                                 sum_hk = sum_hk + h_val * r_k_val
 
                             for offset in K_THREAD_SHFL_OFFSETS:
-                                sum_hk = sum_hk + gpu.ShuffleOp(_asv(sum_hk), _asv(arith.constant(offset, type=T.i32())), width_i32, mode="xor").shuffleResult
+                                sum_hk = sum_hk + gpu.ShuffleOp(_asv(sum_hk), _asv(arith.constant(offset, type=T.i32())), width_i32, mode="down").shuffleResult
 
                             v_new = (r_v - sum_hk) * r_beta
                             v_new = gpu.ShuffleOp(_asv(v_new), _asv(arith.index_cast(T.i32(), (w_tid // THREADS_PER_K) * THREADS_PER_K)), width_i32, mode="idx").shuffleResult
@@ -316,7 +312,7 @@ def create_fused_gdn_kernel(
                             sdata_tensor.vec_store((k_local_vec_i, v_local_i), sdata_vec_new_, VALUES_PER_THREAD_K)
 
                             for offset in K_THREAD_SHFL_OFFSETS:
-                                sum_hq = sum_hq + gpu.ShuffleOp(_asv(sum_hq), _asv(arith.constant(offset, type=T.i32())), width_i32, mode="xor").shuffleResult
+                                sum_hq = sum_hq + gpu.ShuffleOp(_asv(sum_hq), _asv(arith.constant(offset, type=T.i32())), width_i32, mode="down").shuffleResult
                             
                             sum_hq = flir.arith.truncf(dtype.get(), _asv(sum_hq))
                             if k_local_vec_i == 0:
@@ -324,18 +320,18 @@ def create_fused_gdn_kernel(
                             gpu.barrier()
 
                         if sq_i == seq_length - 1:
-                            for k_iter in range_constexpr(STG_K_ITERS):
-                                k_idx = tidx // STG_THREADS_PER_V + k_iter * STG_THREADS_PER_K
-                                v_vec_s_idx = (tidx % STG_THREADS_PER_V) * STG_VEC_SIZE
+                            for k_iter in range_constexpr(LDG_K_ITERS):
+                                k_idx = tidx // LDG_THREADS_PER_V + k_iter * LDG_THREADS_PER_K
+                                v_vec_s_idx = (tidx % LDG_THREADS_PER_V) * LDG_VEC_SIZE
                                 v_vec_g_idx = v_tile * TILE_V + v_vec_s_idx
                                 if k_idx < TILE_K:
                                     state_out_vec = []
-                                    for i in range_constexpr(STG_VEC_SIZE):
+                                    for i in range_constexpr(LDG_VEC_SIZE):
                                         data = sdata_tensor[k_idx, v_vec_s_idx + i]
                                         state_out_vec.append(data)
-                                    vec_type = VectorType.get([STG_VEC_SIZE], T.f32())
+                                    vec_type = VectorType.get([LDG_VEC_SIZE], T.f32())
                                     state_out_vec_ = vector.from_elements(vec_type, state_out_vec)
-                                    state_tensor.vec_store((pool_idx, hv_i, k_idx, v_vec_g_idx), state_out_vec_, STG_VEC_SIZE)
+                                    state_tensor.vec_store((pool_idx, hv_i, k_idx, v_vec_g_idx), state_out_vec_, LDG_VEC_SIZE)
             return
 
         @flir.jit
