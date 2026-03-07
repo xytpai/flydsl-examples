@@ -128,17 +128,18 @@ def create_fused_gdn_kernel(
     ARCH = get_rocm_arch()
     allocator = SmemAllocator(None, arch=ARCH)
     
-    NUM_WARPS = 4
+    # NUM_WARPS = 4
     WARP_SIZE = 64
     WARP_TILE_V = 32
-    WARP_TILE_V_STEPS = 1
+
+    TILE_V = head_v_dim
+    NUM_WARPS = TILE_V // WARP_TILE_V
 
     BLOCK_THREADS = NUM_WARPS * WARP_SIZE
     VALUES_PER_THREAD_V = VEC_SIZE // 2
     WARP_TILE_V_THREADS = WARP_TILE_V // VALUES_PER_THREAD_V
     WARP_TILE_K_THREADS = WARP_SIZE // WARP_TILE_V_THREADS
-    WARP_TILE_V_TOTAL = WARP_TILE_V_STEPS * WARP_TILE_V
-    TILE_V = NUM_WARPS * WARP_TILE_V_TOTAL
+    # TILE_V = NUM_WARPS * WARP_TILE_V
     TILE_K = head_k_dim
     VALUES_PER_THREAD_K = TILE_K // WARP_TILE_K_THREADS
 
@@ -229,7 +230,7 @@ def create_fused_gdn_kernel(
                         sk_tensor[sq_i, tidx] = _extf32(k_tensor[b_i, sq_i, hk_i, tidx])
                 gpu.barrier()
 
-                global_v_vec_i = wid * WARP_TILE_V_TOTAL + warp_v_vec_i
+                global_v_vec_i = wid * WARP_TILE_V + warp_v_vec_i
                 state_vecs = []
                 for i in range_constexpr(VALUES_PER_THREAD_K):
                     state_ = state_tensor.vec_load((pool_idx, hv_i, warp_k_begin_i + i * WARP_TILE_K_THREADS, global_v_vec_i), VALUES_PER_THREAD_V)
