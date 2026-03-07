@@ -172,7 +172,7 @@ def create_fused_gdn_kernel(
         def init_gpu_module(self):
             self.dtype = dtype.get()
             self.acc_type = T.f32()
-            self.sdata = allocator.allocate_array(T.f32(), TILE_K * TILE_V_PADDED)
+            # self.sdata = allocator.allocate_array(T.f32(), TILE_K * TILE_V_PADDED)
             self.sq = allocator.allocate_array(T.f32(), seq_length * TILE_K)
             self.sk = allocator.allocate_array(T.f32(), seq_length * TILE_K)
             self.sscalar = allocator.allocate_array(T.f32(), seq_length * 2)
@@ -235,7 +235,7 @@ def create_fused_gdn_kernel(
             out_tensor = GTensor(out, dtype.get(), shape=(-1, seq_length, num_v_heads, head_v_dim))
 
             sbase = allocator.get_base()
-            sdata_tensor = STensor(self.sdata(sbase), T.f32(), shape=(TILE_K, TILE_V), stride=(TILE_V_PADDED, 1))
+            # sdata_tensor = STensor(self.sdata(sbase), T.f32(), shape=(TILE_K, TILE_V), stride=(TILE_V_PADDED, 1))
             sq_tensor = STensor(self.sq(sbase), T.f32(), shape=(seq_length, TILE_K,))
             sk_tensor = STensor(self.sk(sbase), T.f32(), shape=(seq_length, TILE_K,))
             sscalar_tensor = STensor(self.sscalar(sbase), T.f32(), shape=(-1,))
@@ -271,12 +271,22 @@ def create_fused_gdn_kernel(
                 for v_tile_offset in range_constexpr(NUM_V_TILES_PER_BLOCK):
                     v_tile = start_v_tile + v_tile_offset
 
-                    for k_iter in range_constexpr(LDG_K_ITERS):
-                        k_idx = tidx // LDG_THREADS_PER_V + k_iter * LDG_THREADS_PER_K
-                        v_vec_s_idx = (tidx % LDG_THREADS_PER_V) * LDG_VEC_SIZE
-                        v_vec_g_idx = v_tile * TILE_V + v_vec_s_idx
-                        vec = state_tensor.vec_load((pool_idx, hv_i, k_idx, v_vec_g_idx), LDG_VEC_SIZE)
-                        sdata_tensor.vec_store((k_idx, v_vec_s_idx), vec, LDG_VEC_SIZE)
+                    # for k_iter in range_constexpr(LDG_K_ITERS):
+                    #     k_idx = tidx // LDG_THREADS_PER_V + k_iter * LDG_THREADS_PER_K
+                    #     v_vec_s_idx = (tidx % LDG_THREADS_PER_V) * LDG_VEC_SIZE
+                    #     v_vec_g_idx = v_tile * TILE_V + v_vec_s_idx
+                        # vec = state_tensor.vec_load((pool_idx, hv_i, k_idx, v_vec_g_idx), LDG_VEC_SIZE)
+                        # sdata_tensor.vec_store((k_idx, v_vec_s_idx), vec, LDG_VEC_SIZE)
+                    state_vecs = []
+                    for block_atom_v_i in range_constexpr(BLOCK_ATOM_V_STEPS):
+                        v_block_vec_i = block_atom_v_i * BLOCK_ATOM_V + v_local_vec_i
+                        v_global_vec_i = v_tile * TILE_V + v_block_vec_i
+                        state_vecs_ = []
+                        for i in range_constexpr(VALUES_PER_THREAD_K):
+                            state_ = state_tensor.vec_load((pool_idx, hv_i, w_tid + i * WARP_SIZE, v_global_vec_i), VALUES_PER_THREAD_V)
+                            state_vecs_.append(state_)
+                        state_vecs.append(state_vecs_)
+
                     gpu.barrier()
 
                     for sq_i in range_constexpr(seq_length):
@@ -294,7 +304,8 @@ def create_fused_gdn_kernel(
                             sum_hq = vector.from_elements(vacc_vec_type, [_create_f32(0) for i in range_constexpr(VALUES_PER_THREAD_V)])
 
                             for i in range_constexpr(VALUES_PER_THREAD_K):
-                                h_val = sdata_tensor.vec_load((w_tid + i * WARP_SIZE, v_block_vec_i), VALUES_PER_THREAD_V) * r_g
+                                # h_val = sdata_tensor.vec_load((w_tid + i * WARP_SIZE, v_block_vec_i), VALUES_PER_THREAD_V) * r_g
+                                h_val = state_vecs[block_atom_v_i][i] * r_g
                                 r_k_val = vector.BroadcastOp(vacc_vec_type, _asv(sk_tensor[sq_i, w_tid + i * WARP_SIZE]))
                                 sum_hk = vector.FMAOp(_asv(h_val), _asv(r_k_val), _asv(sum_hk)).result
                             
@@ -305,11 +316,13 @@ def create_fused_gdn_kernel(
                             v_new = gpu.ShuffleOp(_asv(v_new), _asv(i32_0), width_i32, mode="idx").shuffleResult
                             
                             for i in range_constexpr(VALUES_PER_THREAD_K):
-                                h_old = sdata_tensor.vec_load((w_tid + i * WARP_SIZE, v_block_vec_i), VALUES_PER_THREAD_V) * r_g
+                                # h_old = sdata_tensor.vec_load((w_tid + i * WARP_SIZE, v_block_vec_i), VALUES_PER_THREAD_V) * r_g
+                                h_old = state_vecs[block_atom_v_i][i] * r_g
                                 r_k_val = vector.BroadcastOp(vacc_vec_type, _asv(sk_tensor[sq_i, w_tid + i * WARP_SIZE]))
                                 r_q_val = vector.BroadcastOp(vacc_vec_type, _asv(sq_tensor[sq_i, w_tid + i * WARP_SIZE]))
                                 h_new = vector.FMAOp(_asv(r_k_val), _asv(v_new), _asv(h_old)).result
-                                sdata_tensor.vec_store((w_tid + i * WARP_SIZE, v_block_vec_i), h_new, VALUES_PER_THREAD_V)
+                                # sdata_tensor.vec_store((w_tid + i * WARP_SIZE, v_block_vec_i), h_new, VALUES_PER_THREAD_V)
+                                state_vecs[block_atom_v_i][i] = h_new
                                 sum_hq = vector.FMAOp(_asv(h_new), _asv(r_q_val), _asv(sum_hq)).result
                             
                             for offset in K_THREAD_SHFL_OFFSETS:
@@ -320,18 +333,24 @@ def create_fused_gdn_kernel(
                                 sum_hq = flir.arith.truncf(v_vec_type, _asv(sum_hq))
                                 out_tensor.vec_store((b_i, sq_i, hv_i, v_global_vec_i), sum_hq, VALUES_PER_THREAD_V)
                     
-                    for k_iter in range_constexpr(LDG_K_ITERS):
-                        k_idx = tidx // LDG_THREADS_PER_V + k_iter * LDG_THREADS_PER_K
-                        v_vec_s_idx = (tidx % LDG_THREADS_PER_V) * LDG_VEC_SIZE
-                        v_vec_g_idx = v_tile * TILE_V + v_vec_s_idx
-                        if k_idx < TILE_K:
-                            state_out_vec = []
-                            for i in range_constexpr(LDG_VEC_SIZE):
-                                data = sdata_tensor[k_idx, v_vec_s_idx + i]
-                                state_out_vec.append(data)
-                            vec_type = VectorType.get([LDG_VEC_SIZE], T.f32())
-                            state_out_vec_ = vector.from_elements(vec_type, state_out_vec)
-                            state_tensor.vec_store((pool_idx, hv_i, k_idx, v_vec_g_idx), state_out_vec_, LDG_VEC_SIZE)
+                    # for k_iter in range_constexpr(LDG_K_ITERS):
+                    #     k_idx = tidx // LDG_THREADS_PER_V + k_iter * LDG_THREADS_PER_K
+                    #     v_vec_s_idx = (tidx % LDG_THREADS_PER_V) * LDG_VEC_SIZE
+                    #     v_vec_g_idx = v_tile * TILE_V + v_vec_s_idx
+                    #     if k_idx < TILE_K:
+                    #         state_out_vec = []
+                    #         for i in range_constexpr(LDG_VEC_SIZE):
+                    #             data = sdata_tensor[k_idx, v_vec_s_idx + i]
+                    #             state_out_vec.append(data)
+                    #         vec_type = VectorType.get([LDG_VEC_SIZE], T.f32())
+                    #         state_out_vec_ = vector.from_elements(vec_type, state_out_vec)
+                    #         state_tensor.vec_store((pool_idx, hv_i, k_idx, v_vec_g_idx), state_out_vec_, LDG_VEC_SIZE)
+
+                    for block_atom_v_i in range_constexpr(BLOCK_ATOM_V_STEPS):
+                        v_block_vec_i = block_atom_v_i * BLOCK_ATOM_V + v_local_vec_i
+                        v_global_vec_i = v_tile * TILE_V + v_block_vec_i
+                        for i in range_constexpr(VALUES_PER_THREAD_K):
+                            state_tensor.vec_store((pool_idx, hv_i, w_tid + i * WARP_SIZE, v_global_vec_i), state_vecs[block_atom_v_i][i], VALUES_PER_THREAD_V)
             return
 
         @flir.jit
