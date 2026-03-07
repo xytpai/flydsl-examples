@@ -34,7 +34,7 @@ class Args:
     num_v_heads: int
     head_k_dim: int
     head_v_dim: int
-    use_qk_l2norm: bool = False
+    use_qk_l2norm: bool = True
 
 
 def create_inputs(args):
