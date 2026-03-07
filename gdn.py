@@ -131,8 +131,9 @@ def create_fused_gdn_kernel(
     # NUM_WARPS = 4
     WARP_SIZE = 64
     WARP_TILE_V = 32
+    NUM_BLOCKS_PER_V_DIM = 1
 
-    TILE_V = head_v_dim
+    TILE_V = head_v_dim // NUM_BLOCKS_PER_V_DIM
     NUM_WARPS = TILE_V // WARP_TILE_V
 
     BLOCK_THREADS = NUM_WARPS * WARP_SIZE
@@ -143,9 +144,10 @@ def create_fused_gdn_kernel(
     TILE_K = head_k_dim
     VALUES_PER_THREAD_K = TILE_K // WARP_TILE_K_THREADS
 
-    assert TILE_V == head_v_dim
     assert VALUES_PER_THREAD_K >= 1
     assert TILE_K % WARP_TILE_K_THREADS == 0
+    assert TILE_K <= BLOCK_THREADS
+    assert NUM_WARPS >= 1
 
     K_THREAD_SHFL_OFFSETS = []
     offsets_ = WARP_TILE_K_THREADS // 2
@@ -195,8 +197,11 @@ def create_fused_gdn_kernel(
             w_tid = tidx % WARP_SIZE
             wid = tidx // WARP_SIZE
 
-            b_i = bidx // num_v_heads
-            hv_i = bidx % num_v_heads
+            b_hv_i = bidx // NUM_BLOCKS_PER_V_DIM
+            tile_v_start = bidx % NUM_BLOCKS_PER_V_DIM * TILE_V
+
+            b_i = b_hv_i // num_v_heads
+            hv_i = b_hv_i % num_v_heads
             hk_i = hv_i // (num_v_heads // num_k_heads)
 
             warp_k_begin_i = w_tid // WARP_TILE_V_THREADS
@@ -230,7 +235,7 @@ def create_fused_gdn_kernel(
                         sk_tensor[sq_i, tidx] = _extf32(k_tensor[b_i, sq_i, hk_i, tidx])
                 gpu.barrier()
 
-                global_v_vec_i = wid * WARP_TILE_V + warp_v_vec_i
+                global_v_vec_i = tile_v_start + wid * WARP_TILE_V + warp_v_vec_i
                 state_vecs = []
                 for i in range_constexpr(VALUES_PER_THREAD_K):
                     state_ = state_tensor.vec_load((pool_idx, hv_i, warp_k_begin_i + i * WARP_TILE_K_THREADS, global_v_vec_i), VALUES_PER_THREAD_V)
@@ -316,7 +321,7 @@ def create_fused_gdn_kernel(
         ):
             c1 = arith.index(1)
             bx = arith.index(BLOCK_THREADS)
-            gx = batch_size * num_v_heads
+            gx = batch_size * num_v_heads * arith.index(NUM_BLOCKS_PER_V_DIM)
             flir.gpu_ext.LaunchFuncOp(
                 [self.GPU_MODULE_NAME, "fused_gdn_kernel"],
                 grid_size=(gx, c1, c1),
