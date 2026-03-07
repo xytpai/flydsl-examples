@@ -155,6 +155,12 @@ def create_fused_gdn_kernel(
         K_THREAD_SHFL_OFFSETS.append(int(offsets_))
         offsets_ /= 2
     
+    WARP_SIZE_SHFL_OFFSETS = []
+    offsets_ = WARP_SIZE // 2
+    while offsets_ >= 1:
+        WARP_SIZE_SHFL_OFFSETS.append(int(offsets_))
+        offsets_ /= 2
+    
     class FGDN(flir.MlirModule):
         GPU_MODULE_NAME = "linear_attention_kernels"
         GPU_MODULE_TARGETS = [f'#rocdl.target<chip = "{ARCH}">']
@@ -164,6 +170,7 @@ def create_fused_gdn_kernel(
             self.acc_type = T.f32()
             self.sq = allocator.allocate_array(T.f32(), seq_length * TILE_K)
             self.sk = allocator.allocate_array(T.f32(), seq_length * TILE_K)
+            self.sr = allocator.allocate_array(T.f32(), 2 * NUM_WARPS)
             allocator.finalize()
 
         @flir.kernel
@@ -223,6 +230,7 @@ def create_fused_gdn_kernel(
             sbase = allocator.get_base()
             sq_tensor = STensor(self.sq(sbase), T.f32(), shape=(seq_length, TILE_K,))
             sk_tensor = STensor(self.sk(sbase), T.f32(), shape=(seq_length, TILE_K,))
+            sr_tensor = STensor(self.sr(sbase), T.f32(), shape=(-1,))
 
             if pool_idx >= 0:
 
@@ -230,9 +238,47 @@ def create_fused_gdn_kernel(
                 r_dt_bias = _extf32(dt_bias_tensor[hv_i])
 
                 for sq_i in range_constexpr(seq_length):
-                    if tidx < TILE_K:
-                        sq_tensor[sq_i, tidx] = _extf32(q_tensor[b_i, sq_i, hk_i, tidx]) * scale
-                        sk_tensor[sq_i, tidx] = _extf32(k_tensor[b_i, sq_i, hk_i, tidx])
+                    if use_qk_l2norm:
+                        q_val = _create_f32(0)
+                        k_val = _create_f32(0)
+                        sum_q_partial = _create_f32(0)
+                        sum_k_partial = _create_f32(0)
+                        if tidx < TILE_K:
+                            q_val = _extf32(q_tensor[b_i, sq_i, hk_i, tidx])
+                            k_val = _extf32(k_tensor[b_i, sq_i, hk_i, tidx])
+                            sum_q_partial = q_val * q_val
+                            sum_k_partial = k_val * k_val
+                        for offset in WARP_SIZE_SHFL_OFFSETS:
+                            sum_q_partial = sum_q_partial + gpu.ShuffleOp(_asv(sum_q_partial), _asv(arith.constant(offset, type=T.i32())), width_i32, mode="xor").shuffleResult
+                            sum_k_partial = sum_k_partial + gpu.ShuffleOp(_asv(sum_k_partial), _asv(arith.constant(offset, type=T.i32())), width_i32, mode="xor").shuffleResult
+                        if w_tid == 0:
+                            sr_tensor[wid] = sum_q_partial
+                            sr_tensor[NUM_WARPS + wid] = sum_k_partial
+                        gpu.barrier()
+                        inv_norm_q = _create_f32(0)
+                        inv_norm_k = _create_f32(0)
+                        if wid == 0:
+                            local_sum_q = _create_f32(0)
+                            local_sum_k = _create_f32(0)
+                            if w_tid < NUM_WARPS:
+                                local_sum_q = sr_tensor[w_tid]
+                                local_sum_k = sr_tensor[NUM_WARPS + w_tid]
+                            for offset in WARP_SIZE_SHFL_OFFSETS:
+                                local_sum_q = local_sum_q + gpu.ShuffleOp(_asv(local_sum_q), _asv(arith.constant(offset, type=T.i32())), width_i32, mode="xor").shuffleResult
+                                local_sum_k = local_sum_k + gpu.ShuffleOp(_asv(local_sum_k), _asv(arith.constant(offset, type=T.i32())), width_i32, mode="xor").shuffleResult
+                            if w_tid == 0:
+                                sr_tensor[0] = _extf32(_asv(flir.math.rsqrt(_extf32(_asv(local_sum_q + 1e-6)).value)))
+                                sr_tensor[1] = _extf32(_asv(flir.math.rsqrt(_extf32(_asv(local_sum_k + 1e-6)).value)))
+                        gpu.barrier()
+                        inv_norm_q = sr_tensor[0]
+                        inv_norm_k = sr_tensor[1]
+                        if tidx < TILE_K:
+                            sq_tensor[sq_i, tidx] = q_val * scale * inv_norm_q
+                            sk_tensor[sq_i, tidx] = k_val * inv_norm_k
+                    else:
+                        if tidx < TILE_K:
+                            sq_tensor[sq_i, tidx] = _extf32(q_tensor[b_i, sq_i, hk_i, tidx]) * scale
+                            sk_tensor[sq_i, tidx] = _extf32(k_tensor[b_i, sq_i, hk_i, tidx])
                 gpu.barrier()
 
                 global_v_vec_i = tile_v_start + wid * WARP_TILE_V + warp_v_vec_i
