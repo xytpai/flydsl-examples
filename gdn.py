@@ -161,7 +161,6 @@ def create_fused_gdn_kernel(
             self.acc_type = T.f32()
             self.sq = allocator.allocate_array(T.f32(), seq_length * TILE_K)
             self.sk = allocator.allocate_array(T.f32(), seq_length * TILE_K)
-            self.sscalar = allocator.allocate_array(T.f32(), seq_length * 2)
             allocator.finalize()
 
         @flir.kernel
@@ -218,7 +217,6 @@ def create_fused_gdn_kernel(
             sbase = allocator.get_base()
             sq_tensor = STensor(self.sq(sbase), T.f32(), shape=(seq_length, TILE_K,))
             sk_tensor = STensor(self.sk(sbase), T.f32(), shape=(seq_length, TILE_K,))
-            sscalar_tensor = STensor(self.sscalar(sbase), T.f32(), shape=(-1,))
 
             if pool_idx >= 0:
 
@@ -227,9 +225,18 @@ def create_fused_gdn_kernel(
 
                 for sq_i in range_constexpr(seq_length):
                     if tidx < TILE_K:
+                        sq_tensor[sq_i, tidx] = _extf32(q_tensor[b_i, sq_i, hk_i, tidx]) * scale
                         sk_tensor[sq_i, tidx] = _extf32(k_tensor[b_i, sq_i, hk_i, tidx])
-                        sq_tensor[sq_i, tidx] = _extf32(q_tensor[b_i, sq_i, hk_i, tidx]) * scale            
-                    if tidx == 0:
+                gpu.barrier()
+
+                global_v_vec_i = wid * WARP_TILE_V_TOTAL + warp_v_vec_i
+                state_vecs = []
+                for i in range_constexpr(VALUES_PER_THREAD_K):
+                    state_ = state_tensor.vec_load((pool_idx, hv_i, warp_k_begin_i + i * WARP_TILE_K_THREADS, global_v_vec_i), VALUES_PER_THREAD_V)
+                    state_vecs.append(state_)
+
+                for sq_i in range_constexpr(seq_length):
+                    if True:
                         r_g = _create_f32(0)
                         r_beta = _create_f32(0)
                         r_a = _extf32(a_tensor[b_i, sq_i, hv_i])
@@ -244,19 +251,9 @@ def create_fused_gdn_kernel(
                         r_g_value = _create_f32(0) - flir.math.exp(_asv(r_A_log), fastmath=fm_fast) * softplus_x
                         r_beta = _create_f32(1) / (_create_f32(1) + flir.math.exp(_asv(_create_f32(0) - r_b), fastmath=fm_fast))
                         r_g = flir.math.exp(_asv(r_g_value), fastmath=fm_fast)
-                        sscalar_tensor[sq_i] = r_g
-                        sscalar_tensor[seq_length + sq_i] = r_beta
-                gpu.barrier()
 
-                global_v_vec_i = wid * WARP_TILE_V_TOTAL + warp_v_vec_i
-                state_vecs = []
-                for i in range_constexpr(VALUES_PER_THREAD_K):
-                    state_ = state_tensor.vec_load((pool_idx, hv_i, warp_k_begin_i + i * WARP_TILE_K_THREADS, global_v_vec_i), VALUES_PER_THREAD_V)
-                    state_vecs.append(state_)
-
-                for sq_i in range_constexpr(seq_length):
-                    r_g = vector.BroadcastOp(acc_vec_t, _asv(sscalar_tensor[sq_i]))
-                    r_beta = vector.BroadcastOp(acc_vec_t, _asv(sscalar_tensor[seq_length + sq_i]))
+                    r_g = vector.BroadcastOp(acc_vec_t, _asv(r_g))
+                    r_beta = vector.BroadcastOp(acc_vec_t, _asv(r_beta))
 
                     r_v = v_tensor.vec_load((b_i, sq_i, hv_i, global_v_vec_i), VALUES_PER_THREAD_V)
                     r_v = flir.arith.extf(acc_vec_t, _asv(r_v))
