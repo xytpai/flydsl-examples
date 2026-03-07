@@ -279,7 +279,7 @@ def create_fused_gdn_kernel(
                         if tidx < TILE_K:
                             sq_tensor[sq_i, tidx] = _extf32(q_tensor[b_i, sq_i, hk_i, tidx]) * scale
                             sk_tensor[sq_i, tidx] = _extf32(k_tensor[b_i, sq_i, hk_i, tidx])
-                gpu.barrier()
+                    gpu.barrier()
 
                 global_v_vec_i = tile_v_start + wid * WARP_TILE_V + warp_v_vec_i
                 state_vecs = []
