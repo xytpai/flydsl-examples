@@ -114,6 +114,7 @@ def create_fused_gdn_kernel(
     use_qk_l2norm: bool,
     softplus_beta: float = 1.0,
     softplus_threshold: float = 20.0,
+    NUM_BLOCKS_PER_V_DIM = 2,
 ):
     _asv = arith.as_value
     _asid = flir.const_index
@@ -131,7 +132,6 @@ def create_fused_gdn_kernel(
     # NUM_WARPS = 4
     WARP_SIZE = 64
     WARP_TILE_V = 32
-    NUM_BLOCKS_PER_V_DIM = 1
 
     TILE_V = head_v_dim // NUM_BLOCKS_PER_V_DIM
     NUM_WARPS = TILE_V // WARP_TILE_V
@@ -379,10 +379,21 @@ def create_fused_gdn_kernel(
     return FGDN().module
 
 
+def choose_kwargs(args):
+    d = {}
+    if args.b == 1 or (args.b >= 16 and args.b <= 64):
+        d['NUM_BLOCKS_PER_V_DIM'] = 2
+    else:
+        d['NUM_BLOCKS_PER_V_DIM'] = 1
+    return d
+
+
 EXE = None
 def func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out):
     global EXE
     if not EXE:
+        kwargs = choose_kwargs(args)
+        print(kwargs)
         if args.dtype == torch.float:
             module = create_fused_gdn_kernel(
                 F32Type,
@@ -392,7 +403,8 @@ def func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out):
                 args.num_v_heads,
                 args.head_k_dim,
                 args.head_v_dim,
-                args.use_qk_l2norm)
+                args.use_qk_l2norm,
+                **kwargs)
         elif args.dtype == torch.half:
             module = create_fused_gdn_kernel(
                 F16Type,
@@ -402,7 +414,8 @@ def func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out):
                 args.num_v_heads,
                 args.head_k_dim,
                 args.head_v_dim,
-                args.use_qk_l2norm)
+                args.use_qk_l2norm,
+                **kwargs)
         elif args.dtype == torch.bfloat16:
             module = create_fused_gdn_kernel(
                 BF16Type,
@@ -412,7 +425,8 @@ def func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out):
                 args.num_v_heads,
                 args.head_k_dim,
                 args.head_v_dim,
-                args.use_qk_l2norm)
+                args.use_qk_l2norm,
+                **kwargs)
         optimized = run_pipeline(module, Pipeline().canonicalize().cse())
         EXE = flydsl.compile(optimized)
     EXE(query, key, value, a, b, dt_bias, A_log, indices, state, out, 
