@@ -114,7 +114,7 @@ def create_fused_gdn_kernel(
     use_qk_l2norm: bool,
     softplus_beta: float = 1.0,
     softplus_threshold: float = 20.0,
-    NUM_BLOCKS_PER_V_DIM = 2,
+    NUM_BLOCKS_PER_V_DIM: int = 2,
 ):
     _asv = arith.as_value
     _asid = flir.const_index
@@ -302,12 +302,23 @@ def create_fused_gdn_kernel(
                     gpu.barrier()
 
                 global_v_vec_i = tile_v_start + wid * WARP_TILE_V + warp_v_vec_i
-                state_vecs = []
+                state_vecs = [0] * VALUES_PER_THREAD_K
                 for i in range_constexpr(VALUES_PER_THREAD_K):
-                    state_ = state_tensor.vec_load((pool_idx, hv_i, warp_k_begin_i + i * WARP_TILE_K_THREADS, global_v_vec_i), VALUES_PER_THREAD_V)
-                    state_vecs.append(state_)
+                    state_vecs[i] = state_tensor.vec_load((pool_idx, hv_i, warp_k_begin_i + i * WARP_TILE_K_THREADS, global_v_vec_i), VALUES_PER_THREAD_V)
 
                 for sq_i in range_constexpr(seq_length):
+                    
+                    # preload lds data
+                    sq_tensor_cache = [0] * VALUES_PER_THREAD_K
+                    sk_tensor_cache = [0] * VALUES_PER_THREAD_K
+                    for i in range_constexpr(VALUES_PER_THREAD_K):
+                        sq_tensor_ = sq_tensor[sq_i, warp_k_begin_i + i * WARP_TILE_K_THREADS]
+                        sk_tensor_ = sk_tensor[sq_i, warp_k_begin_i + i * WARP_TILE_K_THREADS]
+                        sq_tensor_ = vector.BroadcastOp(acc_vec_t, _asv(sq_tensor_))
+                        sk_tensor_ = vector.BroadcastOp(acc_vec_t, _asv(sk_tensor_))
+                        sq_tensor_cache[i] = sq_tensor_
+                        sk_tensor_cache[i] = sk_tensor_
+                    
                     if True:
                         r_g = _create_f32(0)
                         r_beta = _create_f32(0)
@@ -335,7 +346,7 @@ def create_fused_gdn_kernel(
 
                     for i in range_constexpr(VALUES_PER_THREAD_K):
                         h_val = state_vecs[i] * r_g
-                        r_k_val = vector.BroadcastOp(acc_vec_t, _asv(sk_tensor[sq_i, warp_k_begin_i + i * WARP_TILE_K_THREADS]))
+                        r_k_val = sk_tensor_cache[i]
                         sum_hk = vector.FMAOp(_asv(h_val), _asv(r_k_val), _asv(sum_hk)).result
                     
                     for offset in K_THREAD_SHFL_OFFSETS:
@@ -346,8 +357,8 @@ def create_fused_gdn_kernel(
 
                     for i in range_constexpr(VALUES_PER_THREAD_K):
                         h_old = state_vecs[i] * r_g
-                        r_k_val = vector.BroadcastOp(acc_vec_t, _asv(sk_tensor[sq_i, warp_k_begin_i + i * WARP_TILE_K_THREADS]))
-                        r_q_val = vector.BroadcastOp(acc_vec_t, _asv(sq_tensor[sq_i, warp_k_begin_i + i * WARP_TILE_K_THREADS]))
+                        r_k_val = sk_tensor_cache[i]
+                        r_q_val = sq_tensor_cache[i]
                         h_new = vector.FMAOp(_asv(r_k_val), _asv(v_new), _asv(h_old)).result
                         state_vecs[i] = h_new
                         sum_hq = vector.FMAOp(_asv(h_new), _asv(r_q_val), _asv(sum_hq)).result
