@@ -139,6 +139,9 @@ def create_fused_gdn_kernel(
     BLOCK_THREADS = NUM_WARPS * WARP_SIZE
     VALUES_PER_THREAD_V = VEC_SIZE // 2
     WARP_TILE_V_THREADS = WARP_TILE_V // VALUES_PER_THREAD_V
+    # NOTE: WARP_TILE_V = 32 means that every group of 8 threads in a warp reads 8 consecutive 8-byte elements (i.e., a contiguous 64-byte segment).
+    # Here, each access needs to be at least 32 bytes to meet the memory transaction requirement.
+
     WARP_TILE_K_THREADS = WARP_SIZE // WARP_TILE_V_THREADS
     # TILE_V = NUM_WARPS * WARP_TILE_V
     TILE_K = head_k_dim
