@@ -36,6 +36,17 @@ class Args:
     head_v_dim: int
     use_qk_l2norm: bool = True
 
+    def __hash__(self):
+        return hash((
+            self.dtype,
+            self.b,
+            self.sq,
+            self.num_k_heads,
+            self.num_v_heads,
+            self.head_k_dim,
+            self.head_v_dim,
+            self.use_qk_l2norm))
+
 
 def create_inputs(args):
     query = torch.randn((args.b, args.sq, args.num_k_heads, args.head_k_dim), dtype=args.dtype, device='cuda')
@@ -137,7 +148,7 @@ def create_fused_gdn_kernel(
     NUM_WARPS = TILE_V // WARP_TILE_V
 
     BLOCK_THREADS = NUM_WARPS * WARP_SIZE
-    VALUES_PER_THREAD_V = VEC_SIZE // 2
+    VALUES_PER_THREAD_V = 4
     WARP_TILE_V_THREADS = WARP_TILE_V // VALUES_PER_THREAD_V
     # NOTE: WARP_TILE_V = 32 means that every group of 8 threads in a warp reads 8 consecutive 8-byte elements (i.e., a contiguous 64-byte segment).
     # Here, each access needs to be at least 32 bytes to meet the memory transaction requirement.
@@ -419,47 +430,50 @@ def choose_kwargs(args):
     return d
 
 
-EXE = None
+@functools.lru_cache(maxsize=1024)
+def get_func(args):
+    kwargs = choose_kwargs(args)
+    func = create_fused_gdn_kernel
+    if args.dtype == torch.float:
+        module = func(
+            F32Type,
+            4,
+            args.sq,
+            args.num_k_heads,
+            args.num_v_heads,
+            args.head_k_dim,
+            args.head_v_dim,
+            args.use_qk_l2norm,
+            **kwargs)
+    elif args.dtype == torch.half:
+        module = func(
+            F16Type,
+            8,
+            args.sq,
+            args.num_k_heads,
+            args.num_v_heads,
+            args.head_k_dim,
+            args.head_v_dim,
+            args.use_qk_l2norm,
+            **kwargs)
+    elif args.dtype == torch.bfloat16:
+        module = func(
+            BF16Type,
+            8,
+            args.sq,
+            args.num_k_heads,
+            args.num_v_heads,
+            args.head_k_dim,
+            args.head_v_dim,
+            args.use_qk_l2norm,
+            **kwargs)
+    optimized = run_pipeline(module, Pipeline().canonicalize().cse())
+    EXE = flydsl.compile(optimized)
+    return EXE
+
+
 def func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out):
-    global EXE
-    if not EXE:
-        kwargs = choose_kwargs(args)
-        print(kwargs)
-        if args.dtype == torch.float:
-            module = create_fused_gdn_kernel(
-                F32Type,
-                4,
-                args.sq,
-                args.num_k_heads,
-                args.num_v_heads,
-                args.head_k_dim,
-                args.head_v_dim,
-                args.use_qk_l2norm,
-                **kwargs)
-        elif args.dtype == torch.half:
-            module = create_fused_gdn_kernel(
-                F16Type,
-                8,
-                args.sq,
-                args.num_k_heads,
-                args.num_v_heads,
-                args.head_k_dim,
-                args.head_v_dim,
-                args.use_qk_l2norm,
-                **kwargs)
-        elif args.dtype == torch.bfloat16:
-            module = create_fused_gdn_kernel(
-                BF16Type,
-                8,
-                args.sq,
-                args.num_k_heads,
-                args.num_v_heads,
-                args.head_k_dim,
-                args.head_v_dim,
-                args.use_qk_l2norm,
-                **kwargs)
-        optimized = run_pipeline(module, Pipeline().canonicalize().cse())
-        EXE = flydsl.compile(optimized)
+    EXE = get_func(args)
     EXE(query, key, value, a, b, dt_bias, A_log, indices, state, out, 
         args.b, args.sq, args.num_k_heads, args.num_v_heads, 
         args.head_k_dim, args.head_v_dim, float(1.0 / (args.head_k_dim ** 0.5)))
