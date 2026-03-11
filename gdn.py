@@ -117,7 +117,6 @@ def ref_func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out)
 def create_fused_preshuffle_gdn_kernel(
     dtype,
     VEC_SIZE: int,
-    batch_size: int,
     seq_length: int,
     num_k_heads: int,
     num_v_heads: int,
@@ -126,6 +125,9 @@ def create_fused_preshuffle_gdn_kernel(
     use_qk_l2norm: bool,
     softplus_beta: float = 1.0,
     softplus_threshold: float = 20.0,
+    NUM_BLOCKS_PER_V_DIM: int = 1,
+    NUM_WARPS: int = 4,
+    WARP_THREADS_K: int = 8,
 ):
     _asv = arith.as_value
     _asid = flir.const_index
@@ -140,9 +142,7 @@ def create_fused_preshuffle_gdn_kernel(
     ARCH = get_rocm_arch()
     allocator = SmemAllocator(None, arch=ARCH)
     
-    NUM_WARPS = 2
-    WARP_THREADS_K = 8
-    WARP_THREADS_V = 8
+    WARP_THREADS_V = 64 // WARP_THREADS_K
     VALUES_PER_THREAD_K = 4 # 16B
 
     WARP_SIZE = WARP_THREADS_V * WARP_THREADS_K
@@ -157,7 +157,6 @@ def create_fused_preshuffle_gdn_kernel(
 
     WARP_TILE_V = WARP_THREADS_V
     WARP_GROUP_TILE_V = NUM_WARPS * WARP_TILE_V
-    NUM_BLOCKS_PER_V_DIM = head_v_dim // WARP_GROUP_TILE_V // 2 # NOTE: 2 iterators in a warp
     TILE_V = head_v_dim // NUM_BLOCKS_PER_V_DIM
     WARP_TILE_V_ITERS = TILE_V // WARP_GROUP_TILE_V
     assert TILE_V >= 1
@@ -206,6 +205,7 @@ def create_fused_preshuffle_gdn_kernel(
             indices: lambda: T.memref(DYN, T.i32()),
             state: lambda: T.memref(DYN, F32Type.get()),
             out: lambda: T.memref(DYN, dtype.get()),
+            batch_size: lambda: T.index(),
             scale: lambda: T.f32(),
         ):
             i32_0 = arith.constant(0, type=T.i32())
@@ -402,6 +402,7 @@ def create_fused_preshuffle_gdn_kernel(
             indices: lambda: T.memref(DYN, T.i32()),
             state: lambda: T.memref(DYN, F32Type.get()),
             out: lambda: T.memref(DYN, dtype.get()),
+            batch_size: lambda: T.index(),
             scale: lambda: T.f32(),
         ):
             c1 = arith.index(1)
@@ -411,7 +412,7 @@ def create_fused_preshuffle_gdn_kernel(
                 [self.GPU_MODULE_NAME, "fused_gdn_kernel"],
                 grid_size=(gx, c1, c1),
                 block_size=(bx, c1, c1),
-                kernel_operands=[query, key, value, a, b, dt_bias, A_log, indices, state, out, scale],
+                kernel_operands=[query, key, value, a, b, dt_bias, A_log, indices, state, out, batch_size, scale],
             )
 
     return FGDN().module
@@ -434,7 +435,6 @@ def get_func(args):
         module = func(
             F32Type,
             4,
-            args.b,
             args.sq,
             args.num_k_heads,
             args.num_v_heads,
@@ -446,7 +446,6 @@ def get_func(args):
         module = func(
             F16Type,
             8,
-            args.b,
             args.sq,
             args.num_k_heads,
             args.num_v_heads,
@@ -458,7 +457,6 @@ def get_func(args):
         module = func(
             BF16Type,
             8,
-            args.b,
             args.sq,
             args.num_k_heads,
             args.num_v_heads,
@@ -475,7 +473,7 @@ def func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out):
     origin_state_shape = state.shape
     state_ = state.permute(0, 1, 3, 2).contiguous()
     EXE = get_func(args)
-    EXE(query, key, value, a, b, dt_bias, A_log, indices, state_, out, float(1.0 / (args.head_k_dim ** 0.5)))
+    EXE(query, key, value, a, b, dt_bias, A_log, indices, state_, out, args.b, float(1.0 / (args.head_k_dim ** 0.5)))
     state_ = state_.permute(0, 1, 3, 2).contiguous()
     state.copy_(state_)
     torch.cuda.synchronize()
