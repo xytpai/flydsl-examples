@@ -320,9 +320,9 @@ def create_fused_preshuffle_gdn_kernel(
                 
                 for sq_i in range_constexpr(seq_length):
 
+                    r_g = _create_f32(0)
+                    r_beta = _create_f32(0)
                     if True:
-                        r_g = _create_f32(0)
-                        r_beta = _create_f32(0)
                         r_a = _extf32(a_tensor[b_i, sq_i, hv_i])
                         r_b = _extf32(b_tensor[b_i, sq_i, hv_i])
                         x = r_a + r_dt_bias
@@ -338,6 +338,13 @@ def create_fused_preshuffle_gdn_kernel(
                     
                     r_g_vec = vector.BroadcastOp(acc_vec_t, _asv(r_g))
                     r_beta_vec = vector.BroadcastOp(acc_vec_t, _asv(r_beta))
+
+                    sq_vecs = [0] * WARP_TILE_K_ITERS
+                    sk_vecs = [0] * WARP_TILE_K_ITERS
+                    for ki in range_constexpr(WARP_TILE_K_ITERS):
+                        warp_k_vec_i = warp_k_vec_start + ki * WARP_TILE_K
+                        sq_vecs[ki] = sq_tensor.vec_load((sq_i, warp_k_vec_i), VALUES_PER_THREAD_K)
+                        sk_vecs[ki] = sk_tensor.vec_load((sq_i, warp_k_vec_i), VALUES_PER_THREAD_K)
                     
                     for vi in range_constexpr(WARP_TILE_V_ITERS):
 
@@ -347,11 +354,7 @@ def create_fused_preshuffle_gdn_kernel(
                         sum_hk = vector.from_elements(acc_vec_t, [_create_f32(0) for i in range_constexpr(VALUES_PER_THREAD_K)])
                         
                         for ki in range_constexpr(WARP_TILE_K_ITERS):
-                            warp_k_vec_i = warp_k_vec_start + ki * WARP_TILE_K
-                            # preload lds data
-                            sq_vec = sq_tensor.vec_load((sq_i, warp_k_vec_i), VALUES_PER_THREAD_K)
-                            sk_vec = sk_tensor.vec_load((sq_i, warp_k_vec_i), VALUES_PER_THREAD_K)
-                            sum_hk = vector.FMAOp(_asv(state_vecs[vi * WARP_TILE_K_ITERS + ki] * r_g_vec), _asv(sk_vec), _asv(sum_hk)).result
+                            sum_hk = vector.FMAOp(_asv(state_vecs[vi * WARP_TILE_K_ITERS + ki] * r_g_vec), _asv(sk_vecs[ki]), _asv(sum_hk)).result
                         
                         sum_hk = vector.ReductionOp(T.f32(), vector.CombiningKind.ADD, _asv(sum_hk)).dest
 
@@ -365,10 +368,9 @@ def create_fused_preshuffle_gdn_kernel(
                         sum_hq = vector.from_elements(acc_vec_t, [_create_f32(0) for i in range_constexpr(VALUES_PER_THREAD_K)])
 
                         for ki in range_constexpr(WARP_TILE_K_ITERS):
-                            warp_k_vec_i = warp_k_vec_start + ki * WARP_TILE_K
                             h_old = state_vecs[vi * WARP_TILE_K_ITERS + ki] * r_g_vec
-                            r_q_val = sq_tensor.vec_load((sq_i, warp_k_vec_i), VALUES_PER_THREAD_K)
-                            r_k_val = sk_tensor.vec_load((sq_i, warp_k_vec_i), VALUES_PER_THREAD_K)
+                            r_q_val = sq_vecs[ki]
+                            r_k_val = sk_vecs[ki]
                             h_new = vector.FMAOp(_asv(r_k_val), _asv(v_new), _asv(h_old)).result
                             state_vecs[vi * WARP_TILE_K_ITERS + ki] = h_new
                             sum_hq = vector.FMAOp(_asv(h_new), _asv(r_q_val), _asv(sum_hq)).result
