@@ -128,6 +128,7 @@ def create_fused_preshuffle_gdn_kernel(
     NUM_BLOCKS_PER_V_DIM: int = 1,
     NUM_WARPS: int = 4,
     WARP_THREADS_K: int = 8,
+    USE_PREFETCH: bool = False,
 ):
     _asv = arith.as_value
     _asid = flir.const_index
@@ -252,64 +253,65 @@ def create_fused_preshuffle_gdn_kernel(
 
                 r_A_log = A_log_tensor[hv_i]
                 r_dt_bias = _extf32(dt_bias_tensor[hv_i])
-                scale_vec = vector.BroadcastOp(prefetch_acc_vec_t, _asv(scale))
-
-                for sq_i in range_constexpr(seq_length):
-                    if use_qk_l2norm:
-                        q_val_vec = vector.from_elements(prefetch_acc_vec_t, [_create_f32(0) for i in range_constexpr(PREFETCH_VEC_SIZE)])
-                        k_val_vec = vector.from_elements(prefetch_acc_vec_t, [_create_f32(0) for i in range_constexpr(PREFETCH_VEC_SIZE)])
-                        sum_q_partial_vec = vector.from_elements(prefetch_acc_vec_t, [_create_f32(0) for i in range_constexpr(PREFETCH_VEC_SIZE)])
-                        sum_k_partial_vec = vector.from_elements(prefetch_acc_vec_t, [_create_f32(0) for i in range_constexpr(PREFETCH_VEC_SIZE)])
-                        if k_prefetch_vec_i < TILE_K:
-                            q_val_vec = q_tensor.vec_load((b_i, sq_i, hk_i, k_prefetch_vec_i), PREFETCH_VEC_SIZE)
-                            k_val_vec = k_tensor.vec_load((b_i, sq_i, hk_i, k_prefetch_vec_i), PREFETCH_VEC_SIZE)
-                            q_val_vec = flir.arith.extf(prefetch_acc_vec_t, _asv(q_val_vec))
-                            k_val_vec = flir.arith.extf(prefetch_acc_vec_t, _asv(k_val_vec))
-                            sum_q_partial_vec = q_val_vec * q_val_vec
-                            sum_k_partial_vec = k_val_vec * k_val_vec
-                        sum_q_partial = vector.ReductionOp(T.f32(), vector.CombiningKind.ADD, _asv(sum_q_partial_vec)).dest
-                        sum_k_partial = vector.ReductionOp(T.f32(), vector.CombiningKind.ADD, _asv(sum_k_partial_vec)).dest
-                        for offset in WARP_SIZE_SHFL_OFFSETS:
-                            sum_q_partial = sum_q_partial + gpu.ShuffleOp(_asv(sum_q_partial), _asv(arith.constant(offset, type=T.i32())), width_i32, mode="xor").shuffleResult
-                            sum_k_partial = sum_k_partial + gpu.ShuffleOp(_asv(sum_k_partial), _asv(arith.constant(offset, type=T.i32())), width_i32, mode="xor").shuffleResult
-                        if w_tid == 0:
-                            sr_tensor[wid] = sum_q_partial
-                            sr_tensor[NUM_WARPS + wid] = sum_k_partial
-                        gpu.barrier()
-                        inv_norm_q = _create_f32(0)
-                        inv_norm_k = _create_f32(0)
-                        if wid == 0:
-                            local_sum_q = _create_f32(0)
-                            local_sum_k = _create_f32(0)
-                            if w_tid < NUM_WARPS:
-                                local_sum_q = sr_tensor[w_tid]
-                                local_sum_k = sr_tensor[NUM_WARPS + w_tid]
+                
+                if USE_PREFETCH:
+                    scale_vec = vector.BroadcastOp(prefetch_acc_vec_t, _asv(scale))
+                    for sq_i in range_constexpr(seq_length):
+                        if use_qk_l2norm:
+                            q_val_vec = vector.from_elements(prefetch_acc_vec_t, [_create_f32(0) for i in range_constexpr(PREFETCH_VEC_SIZE)])
+                            k_val_vec = vector.from_elements(prefetch_acc_vec_t, [_create_f32(0) for i in range_constexpr(PREFETCH_VEC_SIZE)])
+                            sum_q_partial_vec = vector.from_elements(prefetch_acc_vec_t, [_create_f32(0) for i in range_constexpr(PREFETCH_VEC_SIZE)])
+                            sum_k_partial_vec = vector.from_elements(prefetch_acc_vec_t, [_create_f32(0) for i in range_constexpr(PREFETCH_VEC_SIZE)])
+                            if k_prefetch_vec_i < TILE_K:
+                                q_val_vec = q_tensor.vec_load((b_i, sq_i, hk_i, k_prefetch_vec_i), PREFETCH_VEC_SIZE)
+                                k_val_vec = k_tensor.vec_load((b_i, sq_i, hk_i, k_prefetch_vec_i), PREFETCH_VEC_SIZE)
+                                q_val_vec = flir.arith.extf(prefetch_acc_vec_t, _asv(q_val_vec))
+                                k_val_vec = flir.arith.extf(prefetch_acc_vec_t, _asv(k_val_vec))
+                                sum_q_partial_vec = q_val_vec * q_val_vec
+                                sum_k_partial_vec = k_val_vec * k_val_vec
+                            sum_q_partial = vector.ReductionOp(T.f32(), vector.CombiningKind.ADD, _asv(sum_q_partial_vec)).dest
+                            sum_k_partial = vector.ReductionOp(T.f32(), vector.CombiningKind.ADD, _asv(sum_k_partial_vec)).dest
                             for offset in WARP_SIZE_SHFL_OFFSETS:
-                                local_sum_q = local_sum_q + gpu.ShuffleOp(_asv(local_sum_q), _asv(arith.constant(offset, type=T.i32())), width_i32, mode="xor").shuffleResult
-                                local_sum_k = local_sum_k + gpu.ShuffleOp(_asv(local_sum_k), _asv(arith.constant(offset, type=T.i32())), width_i32, mode="xor").shuffleResult
+                                sum_q_partial = sum_q_partial + gpu.ShuffleOp(_asv(sum_q_partial), _asv(arith.constant(offset, type=T.i32())), width_i32, mode="xor").shuffleResult
+                                sum_k_partial = sum_k_partial + gpu.ShuffleOp(_asv(sum_k_partial), _asv(arith.constant(offset, type=T.i32())), width_i32, mode="xor").shuffleResult
                             if w_tid == 0:
-                                sr_tensor[0] = _extf32(_asv(flir.math.rsqrt(_extf32(_asv(local_sum_q + 1e-6)).value)))
-                                sr_tensor[1] = _extf32(_asv(flir.math.rsqrt(_extf32(_asv(local_sum_k + 1e-6)).value)))
+                                sr_tensor[wid] = sum_q_partial
+                                sr_tensor[NUM_WARPS + wid] = sum_k_partial
+                            gpu.barrier()
+                            inv_norm_q = _create_f32(0)
+                            inv_norm_k = _create_f32(0)
+                            if wid == 0:
+                                local_sum_q = _create_f32(0)
+                                local_sum_k = _create_f32(0)
+                                if w_tid < NUM_WARPS:
+                                    local_sum_q = sr_tensor[w_tid]
+                                    local_sum_k = sr_tensor[NUM_WARPS + w_tid]
+                                for offset in WARP_SIZE_SHFL_OFFSETS:
+                                    local_sum_q = local_sum_q + gpu.ShuffleOp(_asv(local_sum_q), _asv(arith.constant(offset, type=T.i32())), width_i32, mode="xor").shuffleResult
+                                    local_sum_k = local_sum_k + gpu.ShuffleOp(_asv(local_sum_k), _asv(arith.constant(offset, type=T.i32())), width_i32, mode="xor").shuffleResult
+                                if w_tid == 0:
+                                    sr_tensor[0] = _extf32(_asv(flir.math.rsqrt(_extf32(_asv(local_sum_q + 1e-6)).value)))
+                                    sr_tensor[1] = _extf32(_asv(flir.math.rsqrt(_extf32(_asv(local_sum_k + 1e-6)).value)))
+                            gpu.barrier()
+                            inv_norm_q = sr_tensor[0]
+                            inv_norm_k = sr_tensor[1]
+                            inv_norm_q_vec = vector.BroadcastOp(prefetch_acc_vec_t, _asv(inv_norm_q))
+                            inv_norm_k_vec = vector.BroadcastOp(prefetch_acc_vec_t, _asv(inv_norm_k))
+                            if k_prefetch_vec_i < TILE_K:
+                                q_new_vec = q_val_vec * scale_vec * inv_norm_q_vec
+                                k_new_vec = k_val_vec * inv_norm_k_vec
+                                sq_tensor.vec_store((sq_i, k_prefetch_vec_i), q_new_vec, PREFETCH_VEC_SIZE)
+                                sk_tensor.vec_store((sq_i, k_prefetch_vec_i), k_new_vec, PREFETCH_VEC_SIZE)
+                        else:
+                            if k_prefetch_vec_i < TILE_K:
+                                q_vec = q_tensor.vec_load((b_i, sq_i, hk_i, k_prefetch_vec_i), PREFETCH_VEC_SIZE)
+                                k_vec = k_tensor.vec_load((b_i, sq_i, hk_i, k_prefetch_vec_i), PREFETCH_VEC_SIZE)
+                                q_vec = flir.arith.extf(prefetch_acc_vec_t, _asv(q_vec))
+                                k_vec = flir.arith.extf(prefetch_acc_vec_t, _asv(k_vec))
+                                q_vec = q_vec * scale_vec
+                                sq_tensor.vec_store((sq_i, k_prefetch_vec_i), q_vec, PREFETCH_VEC_SIZE)
+                                sk_tensor.vec_store((sq_i, k_prefetch_vec_i), k_vec, PREFETCH_VEC_SIZE)
                         gpu.barrier()
-                        inv_norm_q = sr_tensor[0]
-                        inv_norm_k = sr_tensor[1]
-                        inv_norm_q_vec = vector.BroadcastOp(prefetch_acc_vec_t, _asv(inv_norm_q))
-                        inv_norm_k_vec = vector.BroadcastOp(prefetch_acc_vec_t, _asv(inv_norm_k))
-                        if k_prefetch_vec_i < TILE_K:
-                            q_new_vec = q_val_vec * scale_vec * inv_norm_q_vec
-                            k_new_vec = k_val_vec * inv_norm_k_vec
-                            sq_tensor.vec_store((sq_i, k_prefetch_vec_i), q_new_vec, PREFETCH_VEC_SIZE)
-                            sk_tensor.vec_store((sq_i, k_prefetch_vec_i), k_new_vec, PREFETCH_VEC_SIZE)
-                    else:
-                        if k_prefetch_vec_i < TILE_K:
-                            q_vec = q_tensor.vec_load((b_i, sq_i, hk_i, k_prefetch_vec_i), PREFETCH_VEC_SIZE)
-                            k_vec = k_tensor.vec_load((b_i, sq_i, hk_i, k_prefetch_vec_i), PREFETCH_VEC_SIZE)
-                            q_vec = flir.arith.extf(prefetch_acc_vec_t, _asv(q_vec))
-                            k_vec = flir.arith.extf(prefetch_acc_vec_t, _asv(k_vec))
-                            q_vec = q_vec * scale_vec
-                            sq_tensor.vec_store((sq_i, k_prefetch_vec_i), q_vec, PREFETCH_VEC_SIZE)
-                            sk_tensor.vec_store((sq_i, k_prefetch_vec_i), k_vec, PREFETCH_VEC_SIZE)
-                    gpu.barrier()
                 
                 state_vecs = [0] * (WARP_TILE_V_ITERS * WARP_TILE_K_ITERS)
                 for vi in range_constexpr(WARP_TILE_V_ITERS):
@@ -341,10 +343,42 @@ def create_fused_preshuffle_gdn_kernel(
 
                     sq_vecs = [0] * WARP_TILE_K_ITERS
                     sk_vecs = [0] * WARP_TILE_K_ITERS
-                    for ki in range_constexpr(WARP_TILE_K_ITERS):
-                        warp_k_vec_i = warp_k_vec_start + ki * WARP_TILE_K
-                        sq_vecs[ki] = sq_tensor.vec_load((sq_i, warp_k_vec_i), VALUES_PER_THREAD_K)
-                        sk_vecs[ki] = sk_tensor.vec_load((sq_i, warp_k_vec_i), VALUES_PER_THREAD_K)
+                    if USE_PREFETCH:
+                        for ki in range_constexpr(WARP_TILE_K_ITERS):
+                            warp_k_vec_i = warp_k_vec_start + ki * WARP_TILE_K
+                            sq_vecs[ki] = sq_tensor.vec_load((sq_i, warp_k_vec_i), VALUES_PER_THREAD_K)
+                            sk_vecs[ki] = sk_tensor.vec_load((sq_i, warp_k_vec_i), VALUES_PER_THREAD_K)
+                    else:
+                        scale_vec = vector.BroadcastOp(acc_vec_t, _asv(scale))
+                        for ki in range_constexpr(WARP_TILE_K_ITERS):
+                            warp_k_vec_i = warp_k_vec_start + ki * WARP_TILE_K
+                            q_vec = q_tensor.vec_load((b_i, sq_i, hk_i, warp_k_vec_i), VALUES_PER_THREAD_K)
+                            k_vec = k_tensor.vec_load((b_i, sq_i, hk_i, warp_k_vec_i), VALUES_PER_THREAD_K)
+                            sq_vecs[ki] = flir.arith.extf(acc_vec_t, _asv(q_vec))
+                            sk_vecs[ki] = flir.arith.extf(acc_vec_t, _asv(k_vec))
+                        if use_qk_l2norm:
+                            sum_q_partial_vec = vector.from_elements(acc_vec_t, [_create_f32(0) for i in range_constexpr(VALUES_PER_THREAD_K)])
+                            sum_k_partial_vec = vector.from_elements(acc_vec_t, [_create_f32(0) for i in range_constexpr(VALUES_PER_THREAD_K)])
+                            for ki in range_constexpr(WARP_TILE_K_ITERS):
+                                sum_q_partial_vec = sum_q_partial_vec + sq_vecs[ki] * sq_vecs[ki]
+                                sum_k_partial_vec = sum_k_partial_vec + sk_vecs[ki] * sk_vecs[ki]
+                            sum_q_partial = vector.ReductionOp(T.f32(), vector.CombiningKind.ADD, _asv(sum_q_partial_vec)).dest
+                            sum_k_partial = vector.ReductionOp(T.f32(), vector.CombiningKind.ADD, _asv(sum_k_partial_vec)).dest
+                            for offset in WARP_THREADS_K_SHFL_OFFSETS:
+                                sum_q_partial = sum_q_partial + gpu.ShuffleOp(_asv(sum_q_partial), _asv(arith.constant(offset, type=T.i32())), width_i32, mode="xor").shuffleResult
+                                sum_k_partial = sum_k_partial + gpu.ShuffleOp(_asv(sum_k_partial), _asv(arith.constant(offset, type=T.i32())), width_i32, mode="xor").shuffleResult
+                            local_sum_q = gpu.ShuffleOp(_asv(sum_q_partial), _asv(arith.index_cast(T.i32(), w_tid // WARP_THREADS_K * WARP_THREADS_K)), width_i32, mode="idx").shuffleResult
+                            local_sum_k = gpu.ShuffleOp(_asv(sum_k_partial), _asv(arith.index_cast(T.i32(), w_tid // WARP_THREADS_K * WARP_THREADS_K)), width_i32, mode="idx").shuffleResult
+                            inv_norm_q = _extf32(_asv(flir.math.rsqrt(_extf32(_asv(local_sum_q + 1e-6)).value)))
+                            inv_norm_k = _extf32(_asv(flir.math.rsqrt(_extf32(_asv(local_sum_k + 1e-6)).value)))
+                            inv_norm_q_vec = vector.BroadcastOp(acc_vec_t, _asv(inv_norm_q))
+                            inv_norm_k_vec = vector.BroadcastOp(acc_vec_t, _asv(inv_norm_k))
+                            for ki in range_constexpr(WARP_TILE_K_ITERS):
+                                sq_vecs[ki] = sq_vecs[ki] * scale_vec * inv_norm_q_vec
+                                sk_vecs[ki] = sk_vecs[ki] * inv_norm_k_vec
+                        else:
+                            for ki in range_constexpr(WARP_TILE_K_ITERS):
+                                sq_vecs[ki] = sq_vecs[ki] * scale_vec
                     
                     for vi in range_constexpr(WARP_TILE_V_ITERS):
 
