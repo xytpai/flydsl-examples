@@ -1,24 +1,24 @@
 import time
 import torch
 import argparse
+import functools
 import numpy as np
 from torch.profiler import profile, ProfilerActivity
 from dataclasses import dataclass
 
 import flydsl
-from flydsl.dialects.ext import flir
-from flydsl.dialects.ext import arith
-from flydsl.runtime.device import get_rocm_arch
-from flydsl.compiler.pipeline import Pipeline, run_pipeline
-from _mlir import ir
-from _mlir.ir import F16Type, BF16Type, F32Type, IntegerType
-import _mlir.extras.types as T
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+from flydsl.expr.typing import T
+from flydsl.expr import range_constexpr, arith
+
+from utils.tensor_shim import GTensor
 
 
 @dataclass
 class Args:
-    n: int
     dtype: torch.dtype
+    n: int
 
 
 def create_inputs(args):
@@ -32,139 +32,85 @@ def create_outputs(args):
     return (c,)
 
 
-def create_add_kernel(dtype, VEC_SIZE: int):
-    # NOTE: dtype is static, n is dynamic
-
-    # NOTE: Kernel operands in the lowered module use dynamic memref types.
-    # Keep the host stub signature dynamic too so gpu.launch_func types match.
-    S = ir.ShapedType.get_dynamic_size()
-    ARCH = get_rocm_arch()
-    BLOCK_SIZE = 256
-    BLOCK_WORK_SIZE = BLOCK_SIZE * VEC_SIZE
-    
-    class PointwiseAdd(flir.MlirModule):
-        GPU_MODULE_NAME = "pointwise_kernels"
-        GPU_MODULE_TARGETS = [f'#rocdl.target<chip = "{ARCH}">']
-
-        @flir.kernel
-        def pointwise_add_kernel(
-            self: flir.T.i64,
-            A: lambda: T.memref(S, dtype.get()),
-            B: lambda: T.memref(S, dtype.get()),
-            C: lambda: T.memref(S, dtype.get()),
-            n: lambda: T.index(),
-        ):
-            # Get index
-            tid_x = flir.thread_idx("x")
-            bid_x = flir.block_idx("x")
-
-            # Create thread/value layouts
-            thread_layout = flir.make_ordered_layout((BLOCK_SIZE,), order=(0,))
-            value_layout = flir.make_ordered_layout((VEC_SIZE,), order=(0,))
-
-            # Create copy atoms
-            copy_atom_load = flir.make_copy_atom(dtype.get(), vector_size=VEC_SIZE)
-            copy_atom_store = flir.make_copy_atom(dtype.get(), vector_size=VEC_SIZE)
-
-            # Tiled Copies
-            tiled_copy_A = flir.make_tiled_copy_tv(copy_atom_load, thread_layout, value_layout, thr_shape=(BLOCK_SIZE,), val_shape=(VEC_SIZE,))
-            tiled_copy_B = flir.make_tiled_copy_tv(copy_atom_load, thread_layout, value_layout, thr_shape=(BLOCK_SIZE,), val_shape=(VEC_SIZE,))
-            tiled_copy_C = flir.make_tiled_copy_tv(copy_atom_store, thread_layout, value_layout, thr_shape=(BLOCK_SIZE,), val_shape=(VEC_SIZE,))
-
-            # Specify input tensor layouts
-            tensor_A = flir.make_tensor(A, shape=(n,), strides=(1,))
-            tensor_B = flir.make_tensor(B, shape=(n,), strides=(1,))
-            tensor_C = flir.make_tensor(C, shape=(n,), strides=(1,))
-
-            # Get per-block coordinates
-            gA = flir.zipped_divide(tensor_A, (BLOCK_WORK_SIZE,))
-            gB = flir.zipped_divide(tensor_B, (BLOCK_WORK_SIZE,))
-            gC = flir.zipped_divide(tensor_C, (BLOCK_WORK_SIZE,))
-            idC = flir.make_identity_tensor((n,)) # For tracking coordinates only
-            cC = flir.zipped_divide(idC, (BLOCK_WORK_SIZE,))
-            blk_coord = (bid_x,)
-            blkA = gA[blk_coord]
-            blkB = gB[blk_coord]
-            blkC = gC[blk_coord]
-            blkCrd = cC[blk_coord]
-
-            # Get per-thread coordinates
-            thr_copy_A = tiled_copy_A.get_slice(tid_x)
-            thr_copy_B = tiled_copy_B.get_slice(tid_x)
-            thr_copy_C = tiled_copy_C.get_slice(tid_x)
-            thrA = thr_copy_A.partition_S(blkA)
-            thrB = thr_copy_B.partition_S(blkB)
-            thrC = thr_copy_C.partition_S(blkC)
-            thrCrd = thr_copy_C.partition_S(blkCrd)
-
-            val_shape = tiled_copy_A.val_shape
-            frgA = flir.make_fragment_like(thrA, dtype.get())
-            frgB = flir.make_fragment_like(thrB, dtype.get())
-            frgC = flir.make_fragment_like(thrC, dtype.get())
-            pred_ty = IntegerType.get_signless(1)
-            frgPred = flir.make_rmem_tensor(val_shape, pred_ty)
-            total_vals = val_shape[0]
-
-            for linear in range(total_vals):
-                linear_idx = flir.const_index(linear)
-                coords = thrCrd.coords_from_linear(linear_idx)
-                pred_val = flir.elem_less(coords, (n,))
-                pred_offsets = tuple(frgPred.offsets_from_linear(linear_idx))
-                frgPred[pred_offsets] = pred_val
-
-            flir.copy(tiled_copy_A, thrA, frgA, pred=frgPred)
-            flir.copy(tiled_copy_B, thrB, frgB, pred=frgPred)
-
-            for v in range_constexpr(VEC_SIZE):
-                idx = flir.const_index(v)
-                coords = (idx, )
-                a_val = frgA[coords]
-                b_val = frgB[coords]
-                c_val = a_val + b_val
-                frgC[coords] = c_val
-
-            flir.copy(tiled_copy_C, frgC, thrC, pred=frgPred)
-
-        @flir.jit
-        def __call__(
-            self: flir.T.i64,
-            A: lambda: T.memref(S, dtype.get()),
-            B: lambda: T.memref(S, dtype.get()),
-            C: lambda: T.memref(S, dtype.get()),
-            n: lambda: T.index(),
-        ):
-            c1 = arith.index(1)
-            c_tile_elems = arith.index(BLOCK_WORK_SIZE)
-            gx = (n + c_tile_elems - c1) // c_tile_elems
-            bx = arith.index(BLOCK_SIZE)
-            flir.gpu_ext.LaunchFuncOp(
-                [self.GPU_MODULE_NAME, "pointwise_add_kernel"],
-                grid_size=(gx, c1, c1),
-                block_size=(bx, c1, c1),
-                kernel_operands=[A, B, C, n],
-            )
-
-    return PointwiseAdd().module
-
-
-EXE = None
-def func(a, b, out):
-    global EXE
-    if not EXE:
-        if a.dtype == torch.float:
-            module = create_add_kernel(F32Type, 4)
-        elif a.dtype == torch.half:
-            module = create_add_kernel(F16Type, 8)
-        elif a.dtype == torch.bfloat16:
-            module = create_add_kernel(BF16Type, 8)
-        optimized = run_pipeline(module, Pipeline().canonicalize().cse())
-        EXE = flydsl.compile(optimized)
-    EXE(a, b, out, out.numel())
-    torch.cuda.synchronize()
-
-
 def ref_func(a, b, out):
     torch.add(a, b, out=out)
+
+
+def get_dtype_in_kernel(dtype: str):
+    if dtype == 'f32':
+        return T.f32
+    elif dtype == 'f16':
+        return T.f16
+    elif dtype == 'bf16':
+        return T.bf16
+
+
+@functools.lru_cache(maxsize=1024)
+def compile_pointwise_add_kernel(dtype: str, n: int):
+    if dtype == 'f32':
+        VEC_SIZE = 4
+    elif dtype in ['f16', 'bf16']:
+        VEC_SIZE = 8
+    BLOCK_SIZE = 256
+    BLOCK_WORK_SIZE = BLOCK_SIZE * VEC_SIZE
+
+    @flyc.kernel
+    def pointwise_add_kernel(
+        A: fx.Tensor,
+        B: fx.Tensor,
+        C: fx.Tensor,
+    ):
+        dtype_ = get_dtype_in_kernel(dtype)
+        bidx = fx.block_idx.x
+        tidx = fx.thread_idx.x
+
+        VEC_SIZE_ = fx.Int32(VEC_SIZE)
+        n_ = fx.Int32(n)
+
+        A_ = GTensor(A, dtype=dtype_, shape=(-1,))
+        B_ = GTensor(B, dtype=dtype_, shape=(-1,))
+        C_ = GTensor(C, dtype=dtype_, shape=(-1,))
+
+        index = bidx * BLOCK_WORK_SIZE + tidx * VEC_SIZE_
+        remaining = n_ - index
+        if arith.cmpi(arith.CmpIPredicate.ult, remaining, VEC_SIZE_):
+            for i in range_constexpr(VEC_SIZE_):
+                if arith.cmpi(arith.CmpIPredicate.ult, index + i, n_):
+                    C_[index + i] = A_[index + i] + B_[index + i]
+        else:
+            vec_a = A_.vec_load((index,), VEC_SIZE_)
+            vec_b = B_.vec_load((index,), VEC_SIZE_)
+            vec_c = vec_a + vec_b
+            C_.vec_store((index,), vec_c, VEC_SIZE_)
+        return
+    
+    @flyc.jit
+    def launch_pointwise_add_kernel(
+        A: fx.Tensor,
+        B: fx.Tensor,
+        C: fx.Tensor,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        nblocks = (n + BLOCK_WORK_SIZE - 1) // BLOCK_WORK_SIZE
+        pointwise_add_kernel(A, B, C).launch(
+            grid=(nblocks, 1, 1), block=(BLOCK_SIZE, 1, 1), stream=stream
+        )
+    
+    return launch_pointwise_add_kernel
+
+
+def func(a, b, out):
+    n = out.numel()
+    if a.dtype == torch.float:
+        exe = compile_pointwise_add_kernel('f32', n)
+    elif a.dtype == torch.half:
+        exe = compile_pointwise_add_kernel('f16', n)
+    elif a.dtype == torch.bfloat16:
+        exe = compile_pointwise_add_kernel('bf16', n)
+    else:
+        raise NotImplementedError()
+    exe(a, b, out, stream=torch.cuda.Stream())
+    torch.cuda.synchronize()
 
 
 def benchmark(args, func, ref_func, warmup=20, niters=100):
