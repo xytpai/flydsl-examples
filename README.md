@@ -2,7 +2,7 @@
 
 This is an unofficial FlyDSL kernel example repository.
 If you are using AMD GPUs, we hope to provide a step-by-step guide to help you get familiar with writing operators using FlyDSL.
-Empowered by https://github.com/rocm/flydsl we are now able to develop high-performance GEMM based operators in Python on AMD GPU, similar to CuteDSL.
+Empowered by https://github.com/rocm/flydsl we are now able to develop high-performance GPU kernels in Python on AMD GPU, similar to CUDA/CuteDSL.
 This repository will provide the following examples from scratch:
 
 - [x] Pointwise Add
