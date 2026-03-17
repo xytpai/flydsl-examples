@@ -14,25 +14,33 @@ This repository will provide the following examples from scratch:
 
 For IR study: https://mlir.llvm.org/docs/
 
-## 0. How to install FlyDSL on AMD GPUs
+## 0. How to build install FlyDSL on AMD GPUs
 
 Check the ROCm version using `amd-smi`. My version is `7.0.1`.
 
 ```bash
 git clone https://github.com/ROCm/FlyDSL
 cd FlyDSL
-git checkout 3f9381207d21920895f64f7453ecd2195bb71e98
-bash scripts/build_llvm.sh
+git checkout 429e6c7f82de4d2bb9a3013946617be2b1a1c791
+bash scripts/build_llvm.sh -j64
 
 # After this you will see the installed path.
-# -- Installing: /home/yuxu/llvm-project/mlir_install/lib/cmake/llvm/LLVMConfigExtensions.cmake
-# Creating tarball...
 # ==============================================
 # LLVM/MLIR build completed successfully!
 
-export MLIR_PATH=/home/yuxu/llvm-project/build
-export MLIR_DIR=/home/yuxu/llvm-project
-./flir/build.sh
+# To configure flydsl, use:
+# cmake .. -DMLIR_DIR=/home/yuxu/llvm-project/build-flydsl/lib/cmake/mlir
+
+# Packaged install prefix:
+#   /home/yuxu/llvm-project/mlir_install
+# Use with:
+#   export MLIR_PATH=/home/yuxu/llvm-project/mlir_install
+# Tarball:
+#   /home/yuxu/llvm-project/mlir_install.tgz
+# ==============================================
+
+export MLIR_PATH=/home/yuxu/llvm-project/mlir_install
+bash scripts/build.sh -j64
 python3 -m pip install -e .
 ```
 
