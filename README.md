@@ -7,7 +7,7 @@ This repository will provide the following examples from scratch:
 
 - [x] Pointwise Add
 - [x] Batch Reduce
-- [ ] RMS Norm (NEED REBASE)
+- [x] RMS Norm
 - [ ] HGEMM (NEED REBASE)
 - [ ] GEMM-FP8
 - [ ] GEMM Fusions
@@ -181,39 +181,37 @@ run: /home/yuxu/flydsl-examples/rms_norm.py, args: Namespace(batch_size=16, norm
 validation passed!
 
 ===================== [REF] =====================
-[W225 07:43:14.141697179 collection.cpp:1116] Warning: ROCTracer produced duplicate flow start: 1 (function operator())
+[W317 17:24:20.785488429 collection.cpp:1116] Warning: ROCTracer produced duplicate flow start: 1 (function operator())
 -------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
                                                    Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
 -------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-void at::native::reduce_kernel<512, 1, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us       1.148ms        21.16%       1.148ms      11.479us           100  
-void at::native::elementwise_kernel<128, 4, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     804.501us        14.83%     804.501us       8.045us           100  
-void at::native::elementwise_kernel_manual_unroll<12...         0.00%       0.000us         0.00%       0.000us       0.000us     630.502us        11.62%     630.502us       6.305us           100  
-void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     547.743us        10.10%     547.743us       5.477us           100  
-void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     508.705us         9.38%     508.705us       5.087us           100  
-void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     506.545us         9.34%     506.545us       5.065us           100  
-void at::native::elementwise_kernel_manual_unroll<12...         0.00%       0.000us         0.00%       0.000us       0.000us     498.064us         9.18%     498.064us       4.981us           100  
-                         Memcpy DtoD (Device -> Device)         0.00%       0.000us         0.00%       0.000us       0.000us     431.584us         7.96%     431.584us       4.316us           100  
-void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     348.464us         6.42%     348.464us       3.485us           100  
-                                        hipLaunchKernel        86.86%       2.928ms        86.86%       2.928ms       3.660us       0.000us         0.00%       0.000us       0.000us           800  
-                                         hipMemcpyAsync        12.51%     421.693us        12.51%     421.693us       4.217us       0.000us         0.00%       0.000us       0.000us           100  
-                                   hipDeviceSynchronize         0.64%      21.434us         0.64%      21.434us      21.434us       0.000us         0.00%       0.000us       0.000us             1  
+void at::native::reduce_kernel<512, 1, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us       1.198ms        21.88%       1.198ms      11.976us           100  
+void at::native::elementwise_kernel<128, 4, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     798.265us        14.58%     798.265us       7.983us           100  
+void at::native::elementwise_kernel_manual_unroll<12...         0.00%       0.000us         0.00%       0.000us       0.000us     634.341us        11.59%     634.341us       6.343us           100  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     563.704us        10.30%     563.704us       5.637us           100  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     507.583us         9.27%     507.583us       5.076us           100  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     503.183us         9.19%     503.183us       5.032us           100  
+void at::native::elementwise_kernel_manual_unroll<12...         0.00%       0.000us         0.00%       0.000us       0.000us     486.582us         8.89%     486.582us       4.866us           100  
+                         Memcpy DtoD (Device -> Device)         0.00%       0.000us         0.00%       0.000us       0.000us     437.222us         7.99%     437.222us       4.372us           100  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     345.622us         6.31%     345.622us       3.456us           100  
+                                        hipLaunchKernel        86.16%       2.937ms        86.16%       2.937ms       3.671us       0.000us         0.00%       0.000us       0.000us           800  
+                                         hipMemcpyAsync        12.46%     424.586us        12.46%     424.586us       4.246us       0.000us         0.00%       0.000us       0.000us           100  
+                                   hipDeviceSynchronize         1.38%      47.052us         1.38%      47.052us      47.052us       0.000us         0.00%       0.000us       0.000us             1  
 -------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-Self CPU time total: 3.371ms
-Self CUDA time total: 5.424ms
+Self CPU time total: 3.409ms
+Self CUDA time total: 5.474ms
 
 ===================== [FLYDSL] =====================
--------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-                     Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
--------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-          rms_norm_kernel         0.00%       0.000us         0.00%       0.000us       0.000us     613.066us       100.00%     613.066us       6.131us           100  
-          hipStreamCreate        68.49%      71.702ms        68.49%      71.702ms     717.024us       0.000us         0.00%       0.000us       0.000us           100  
-    hipModuleLaunchKernel         0.78%     821.251us         0.78%     821.251us       8.213us       0.000us         0.00%       0.000us       0.000us           100  
-     hipStreamSynchronize         3.02%       3.162ms         3.02%       3.162ms      31.625us       0.000us         0.00%       0.000us       0.000us           100  
-         hipStreamDestroy        27.64%      28.939ms        27.64%      28.939ms     289.392us       0.000us         0.00%       0.000us       0.000us           100  
-     hipDeviceSynchronize         0.07%      69.542us         0.07%      69.542us       0.689us       0.000us         0.00%       0.000us       0.000us           101  
--------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-Self CPU time total: 104.695ms
-Self CUDA time total: 613.066us
+-------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                           Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+               rmsnorm_kernel_0         0.00%       0.000us         0.00%       0.000us       0.000us     447.382us       100.00%     447.382us       4.474us           100  
+    hipStreamCreateWithPriority        94.77%      18.165ms        94.77%      18.165ms       1.651ms       0.000us         0.00%       0.000us       0.000us            11  
+          hipModuleLaunchKernel         2.88%     551.394us         2.88%     551.394us       5.514us       0.000us         0.00%       0.000us       0.000us           100  
+           hipDeviceSynchronize         2.35%     450.961us         2.35%     450.961us     450.961us       0.000us         0.00%       0.000us       0.000us             1  
+-------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 19.168ms
+Self CUDA time total: 447.382us
 ```
 
 ## 4. HGEMM
