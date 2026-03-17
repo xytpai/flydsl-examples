@@ -14,6 +14,15 @@ from flydsl.expr.typing import T
 from flydsl.expr import buffer_ops, range_constexpr, vector, memref_load, memref_store
 
 
+def _to_raw(v):
+    """Convert ArithValue / Numeric (Int32, Boolean, …) to raw ir.Value."""
+    if isinstance(v, ir.Value):
+        return v
+    if hasattr(v, "ir_value"):
+        return _to_raw(v.ir_value())
+    return ir.Value._CAPICreate(v._CAPIPtr)
+
+
 def get_dtype_in_kernel(dtype: str):
     if dtype == 'f32':
         return T.f32

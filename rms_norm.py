@@ -1,28 +1,31 @@
 import time
 import torch
 import argparse
+import functools
 import numpy as np
 from torch.profiler import profile, ProfilerActivity
 from dataclasses import dataclass
 
 import flydsl
-from flydsl.dialects.ext import flir, gpu, arith
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+from flydsl.expr.typing import T
+from flydsl.expr import range_constexpr, arith, vector, gpu
+from flydsl._mlir import ir
 from flydsl.runtime.device import get_rocm_arch
-from flydsl.compiler.pipeline import Pipeline, run_pipeline
-from flydsl.dialects.ext.python_control_flow import range_constexpr, lower_range_for_loops
-from flydsl.utils import SmemAllocator
-fm_fast = flir.arith.FastMathFlags.fast
+from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
+from flydsl.compiler.kernel_function import CompilationContext
+import flydsl._mlir.dialects.gpu as mlir_gpu 
 
-from _mlir import ir
-from _mlir.ir import F16Type, BF16Type, F32Type, IntegerType, VectorType
-import _mlir.extras.types as T
+from utils.tensor_shim import get_dtype_in_kernel, GTensor, STensor, _to_raw
+fm_fast = arith.FastMathFlags.fast
 
 
 @dataclass
 class Args:
+    dtype: torch.dtype
     batch_size: int
     norm_size: int
-    dtype: torch.dtype
     eps: float = 1e-6
 
 
@@ -33,7 +36,7 @@ def create_inputs(args):
 
 
 def create_outputs(args):
-    out = torch.randn((args.batch_size, args.norm_size), dtype=args.dtype, device='cuda')
+    out = torch.zeros((args.batch_size, args.norm_size), dtype=args.dtype, device='cuda')
     return (out,)
 
 
@@ -47,195 +50,118 @@ def ref_func(x, weight, eps, out):
     rms_norm_forward(x, weight, eps, out)
 
 
-def make_block_reduce_add(tid, WARP_SIZE, RED_SLOTS):
-    def block_reduce_add(val_f32, scratch_memref):
-        arith_ops = flir.arith
-        zero_idx = flir.const_index(0)
-
-        if RED_SLOTS == 1:
-            # Fast path: single-wave block (RED_SLOTS==1) needs no LDS and no barrier.
-            # After xor-shuffle reduction, all lanes hold the same reduced value.
-            width_i32 = arith.as_value(arith.constant(WARP_SIZE, type=T.i32()))
-            w = arith.as_value(val_f32)
-            for shift in [32, 16, 8, 4, 2, 1]:
-                offset = arith.as_value(arith.constant(shift, type=T.i32()))
-                peer = arith.as_value(gpu.ShuffleOp(arith.as_value(w), offset, width_i32, mode="xor").shuffleResult)
-                w = arith.as_value(arith_ops.AddFOp(arith.as_value(w), peer, fastmath=fm_fast).result)
-            return w
-
-        scratch_tv = flir.make_tensor(scratch_memref, shape=(RED_SLOTS,), strides=(1,))
-        tid_v = tid.value if hasattr(tid, "value") else tid
-        tid_v = arith.as_value(tid_v)
-        tid_i32 = arith.as_value(arith_ops.IndexCastOp(T.i32(), tid_v).result)
-        c_warp_i32 = arith.as_value(arith.constant(WARP_SIZE, type=T.i32()))
-        lane_i32 = arith.as_value(arith_ops.RemUIOp(tid_i32, c_warp_i32).result)
-        wave_i32 = arith.as_value(arith_ops.DivUIOp(tid_i32, c_warp_i32).result)
-        width_i32 = arith.as_value(arith.constant(WARP_SIZE, type=T.i32()))
-        # Use Flir layout algebra to compute LDS indices for the reduction scratch.
-        c_num_waves = flir.const_index(RED_SLOTS)
-        c1 = flir.const_index(1)
-        shape_red = flir.make_shape(c_num_waves)
-        stride_red = flir.make_stride(c1)
-        layout_red = flir.make_layout(shape_red, stride_red)
-
-        w = arith.as_value(val_f32)
-        for sh in [32, 16, 8, 4, 2, 1]:
-            off = arith.as_value(arith.constant(sh, type=T.i32()))
-            peer = arith.as_value(gpu.ShuffleOp(arith.as_value(w), off, width_i32, mode="xor").shuffleResult)
-            w = arith.as_value(arith_ops.AddFOp(arith.as_value(w), peer, fastmath=fm_fast).result)
-        
-        is_lane0 = arith.as_value(arith_ops.CmpIOp(
-            arith_ops.CmpIPredicate.eq,
-            lane_i32,
-            arith.as_value(arith.constant(0, type=T.i32())),
-        ).result)
-        if is_lane0:
-            wave_idx = arith_ops.IndexCastOp(T.index(), wave_i32).result
-            red_idx = flir.crd2idx(flir.make_coord(wave_idx), layout_red)
-            scratch_tv[red_idx] = w
-        gpu.barrier()
-
-        NUM_WAVES = RED_SLOTS
-        is_wave0 = arith.as_value(arith_ops.CmpIOp(
-            arith_ops.CmpIPredicate.eq,
-            wave_i32,
-            arith.as_value(arith.constant(0, type=T.i32())),
-        ).result)
-        # Only wave0 does final reduction and writes scratch[0].
-        if is_wave0:
-            in_range = arith.as_value(arith_ops.CmpIOp(
-                arith_ops.CmpIPredicate.ult,
-                lane_i32,
-                arith.as_value(arith.constant(NUM_WAVES, type=T.i32())),
-            ).result)
-
-            c0_i32 = arith.as_value(arith.constant(0, type=T.i32()))
-            lane_safe_i32 = arith.as_value(flir.arith.SelectOp(in_range, lane_i32, c0_i32).result)
-            lane_safe_idx = arith.as_value(arith_ops.IndexCastOp(T.index(), lane_safe_i32).result)
-            red_idx = flir.crd2idx(flir.make_coord(lane_safe_idx), layout_red)
-            v = scratch_tv[red_idx]
-            z = arith.as_value(arith.constant(0.0, type=T.f32()))
-            ww = arith.as_value(flir.arith.SelectOp(in_range, v, z).result)
-
-            for sh in [32, 16, 8, 4, 2, 1]:
-                off = arith.as_value(arith.constant(sh, type=T.i32()))
-                peer = arith.as_value(gpu.ShuffleOp(arith.as_value(ww), off, width_i32, mode="xor").shuffleResult)
-                ww = arith.as_value(arith_ops.AddFOp(arith.as_value(ww), peer, fastmath=fm_fast).result)
-
-            is_lane0_2 = arith.as_value(arith_ops.CmpIOp(
-                arith_ops.CmpIPredicate.eq,
-                lane_i32,
-                arith.as_value(arith.constant(0, type=T.i32())),
-            ).result)
-            if is_lane0_2:
-                red_idx0 = flir.crd2idx(flir.make_coord(zero_idx), layout_red)
-                scratch_tv[red_idx0] = ww
-
-        gpu.barrier()
-        red_idx0 = flir.crd2idx(flir.make_coord(zero_idx), layout_red)
-        return scratch_tv[red_idx0]
-
-    try:
-        return lower_range_for_loops(block_reduce_add)
-    except Exception:
-        return block_reduce_add
-
-
-def create_rms_norm_kernel(dtype, VEC_SIZE: int, EPS: float):
-    S = ir.ShapedType.get_dynamic_size()
-    ARCH = get_rocm_arch()
-    BLOCK_THREADS = 256
+@functools.lru_cache(maxsize=1024)
+def compile_rmsnorm_kernel(dtype: str, batch_size: int, norm_size: int, eps: float):
+    if dtype == 'f32':
+        VEC_SIZE = 4
+    elif dtype in ['f16', 'bf16']:
+        VEC_SIZE = 8
+    BLOCK_SIZE = 256
+    BLOCK_WORK_SIZE = BLOCK_SIZE * VEC_SIZE
     WARP_SIZE = 64
-    BLOCK_WORK_SIZE = BLOCK_THREADS * VEC_SIZE
-    RED_SLOTS = max(1, (BLOCK_THREADS + WARP_SIZE - 1) // WARP_SIZE)
-    allocator = SmemAllocator(None, arch=ARCH)
+    NUM_WARPS = BLOCK_SIZE // WARP_SIZE
+
+    WARP_SIZE_SHFL_OFFSETS = []
+    offsets_ = WARP_SIZE // 2
+    while offsets_ >= 1:
+        WARP_SIZE_SHFL_OFFSETS.append(int(offsets_))
+        offsets_ /= 2
     
-    class RMSNorm(flir.MlirModule):
-        GPU_MODULE_NAME = "norm_kernels"
-        GPU_MODULE_TARGETS = [f'#rocdl.target<chip = "{ARCH}">']
+    gpu_arch = get_rocm_arch()
+    allocator = SmemAllocator(None, arch=gpu_arch, global_sym_name="smem")
+    smem_offset = allocator._align(allocator.ptr, 16)
+    allocator.ptr = smem_offset + NUM_WARPS * 4
+    
+    @flyc.kernel
+    def rmsnorm_kernel(
+        X: fx.Tensor,
+        GAMMA: fx.Tensor,
+        Y: fx.Tensor,
+    ):
+        dtype_ = get_dtype_in_kernel(dtype)
+        acc_vec_t = T.vec(VEC_SIZE, T.f32)
+        vec_t = T.vec(VEC_SIZE, dtype_)
 
-        def init_gpu_module(self):
-            self.dtype = dtype.get()
-            self.acc_type = T.f32()
-            self.smem = allocator.allocate_array(T.f32(), RED_SLOTS)
+        bidx = fx.block_idx.x
+        tidx = fx.thread_idx.x
+        wid = fx.Index(tidx // WARP_SIZE)
+        w_tid = fx.Int32(tidx % WARP_SIZE)
+
+        X_ = GTensor(X, dtype=dtype_, shape=(batch_size, norm_size))
+        GAMMA_ = GTensor(GAMMA, dtype=dtype_, shape=(norm_size,))
+        Y_ = GTensor(Y, dtype=dtype_, shape=(batch_size, norm_size))
+
+        c_zero_f = arith.constant(0.0, type=T.f32)
+        init_state = [c_zero_f]
+        for vec_idx, state in range(tidx * VEC_SIZE, fx.Int32(norm_size), fx.Int32(BLOCK_WORK_SIZE), init=init_state):
+            value = state[0]
+            x_vec = X_.vec_load((bidx, vec_idx), VEC_SIZE)
+            x_vec = x_vec.extf(acc_vec_t)
+            x_vec = x_vec * x_vec
+            value = value + vector.ReductionOp(T.f32, vector.CombiningKind.ADD, x_vec).dest
+            results = yield [value]
+        
+        for offset in WARP_SIZE_SHFL_OFFSETS:
+            results = results + results.shuffle_xor(fx.Int32(offset), fx.Int32(WARP_SIZE))
+        
+        base_ptr = allocator.get_base()
+        smem_ptr = SmemPtr(base_ptr, smem_offset, T.f32, shape=(NUM_WARPS,))
+        smem_ = STensor(smem_ptr, T.f32, shape=(NUM_WARPS,))
+        smem_[wid] = results
+
+        gpu.barrier()
+        
+        sq_sum = c_zero_f
+        cond = arith.cmpi(arith.CmpIPredicate.eq, w_tid, fx.Int32(0))
+        if cond:
+            for i in range_constexpr(NUM_WARPS):
+                sq_sum = sq_sum + smem_[i]
+        sq_sum = mlir_gpu.ShuffleOp(_to_raw(sq_sum), _to_raw(fx.Int32(0)), _to_raw(fx.Int32(WARP_SIZE)), mode="idx").shuffleResult
+
+        sq_mean = sq_sum / norm_size + eps
+        rrms = sq_mean.rsqrt(fastmath=fm_fast)
+        rrms_vec = vector.broadcast(acc_vec_t, rrms)
+
+        for vec_idx in range(tidx * VEC_SIZE, fx.Int32(norm_size), fx.Int32(BLOCK_WORK_SIZE)):
+            x_vec = X_.vec_load((bidx, vec_idx), VEC_SIZE)
+            w_vec = GAMMA_.vec_load((vec_idx,), VEC_SIZE)
+            x_vec = x_vec.extf(acc_vec_t)
+            w_vec = w_vec.extf(acc_vec_t)
+            y_vec = x_vec * w_vec * rrms_vec
+            y_vec = y_vec.truncf(vec_t)
+            Y_.vec_store((bidx, vec_idx), y_vec, VEC_SIZE)
+        return
+    
+    @flyc.jit
+    def launch_rmsnorm_kernel(
+        X: fx.Tensor,
+        GAMMA: fx.Tensor,
+        Y: fx.Tensor,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        allocator.finalized = False
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
             allocator.finalize()
-
-        @flir.kernel
-        def rms_norm_kernel(
-            self: flir.T.i64,
-            X: lambda: T.memref(S, dtype.get()),
-            GAMMA: lambda: T.memref(S, dtype.get()),
-            Y: lambda: T.memref(S, dtype.get()),
-            batch_size: lambda: T.index(),
-            norm_size: lambda: T.index(),
-        ):
-            tid_x = flir.thread_idx("x")
-            bid_x = flir.block_idx("x")
-            vec_type = VectorType.get([VEC_SIZE], self.dtype)
-            acc_vec_type = VectorType.get([VEC_SIZE], self.acc_type)
-            eps = arith.constant(EPS, type=self.acc_type)
-            dim = arith.index_cast(T.i32(), norm_size)
-            dim = arith.sitofp(self.acc_type, dim)
-            c_zero = arith.constant(0.0, type=self.acc_type)
-            sq_sum = (c_zero)
-            for vec_idx in range(tid_x * VEC_SIZE, norm_size, BLOCK_WORK_SIZE):
-                vec_addr = bid_x * norm_size + vec_idx
-                vec = flir.vector.load(vec_type, X, [arith.as_value(vec_addr)], alignment=16)
-                vec = flir.arith.extf(acc_vec_type, arith.as_value(vec))
-                vec = vec * vec
-                red = flir.vector.reduction(self.acc_type, "add", arith.as_value(vec), fastmath=fm_fast)
-                sq_sum = sq_sum + red
-            block_reduce_add = make_block_reduce_add(tid_x, WARP_SIZE, RED_SLOTS)
-            base_ptr = allocator.get_base()
-            sq_sum = block_reduce_add(sq_sum, self.smem(base_ptr).get())
-            sq_mean = sq_sum / dim + eps
-            rrms = flir.math.rsqrt(arith.as_value(sq_mean))
-            rrms_splat = flir.vector.splat(acc_vec_type, arith.as_value(rrms))
-            for vec_idx in range(tid_x * VEC_SIZE, norm_size, BLOCK_WORK_SIZE):
-                in_vec_addr = bid_x * norm_size + vec_idx
-                vec = flir.vector.load(vec_type, X, [arith.as_value(in_vec_addr)], alignment=16)
-                w_vec = flir.vector.load(vec_type, GAMMA, [arith.as_value(vec_idx)], alignment=16)
-                vec = flir.arith.extf(acc_vec_type, arith.as_value(vec))
-                w_vec = flir.arith.extf(acc_vec_type, arith.as_value(w_vec))
-                y_vec = vec * w_vec * rrms_splat
-                y_vec = flir.arith.truncf(vec_type, arith.as_value(y_vec))
-                flir.vector.store(arith.as_value(y_vec), Y, [arith.as_value(in_vec_addr)], alignment=16)
-
-        @flir.jit
-        def __call__(
-            self: flir.T.i64,
-            X: lambda: T.memref(S, dtype.get()),
-            GAMMA: lambda: T.memref(S, dtype.get()),
-            Y: lambda: T.memref(S, dtype.get()),
-            batch_size: lambda: T.index(),
-            norm_size: lambda: T.index(),
-        ):
-            c1 = arith.index(1)
-            bx = arith.index(BLOCK_THREADS)
-            flir.gpu_ext.LaunchFuncOp(
-                [self.GPU_MODULE_NAME, "rms_norm_kernel"],
-                grid_size=(batch_size, c1, c1),
-                block_size=(bx, c1, c1),
-                kernel_operands=[X, GAMMA, Y, batch_size, norm_size],
-            )
-
-    return RMSNorm().module
+        
+        rmsnorm_kernel(X, GAMMA, Y).launch(
+            grid=(batch_size, 1, 1), block=(BLOCK_SIZE, 1, 1), stream=stream
+        )
+    
+    return launch_rmsnorm_kernel
 
 
-EXE = None
 def func(x, weight, eps, out):
-    global EXE
-    if not EXE:
-        if x.dtype == torch.float:
-            module = create_rms_norm_kernel(F32Type, 4, eps)
-        elif x.dtype == torch.half:
-            module = create_rms_norm_kernel(F16Type, 8, eps)
-        elif x.dtype == torch.bfloat16:
-            module = create_rms_norm_kernel(BF16Type, 8, eps)
-        optimized = run_pipeline(module, Pipeline().canonicalize().cse())
-        EXE = flydsl.compile(optimized)
-    EXE(x, weight, out, x.shape[0], x.shape[1])
-    torch.cuda.synchronize()
+    batch_size, norm_size = x.shape
+    if x.dtype == torch.float:
+        exe = compile_rmsnorm_kernel('f32', batch_size, norm_size, eps)
+    elif x.dtype == torch.half:
+        exe = compile_rmsnorm_kernel('f16', batch_size, norm_size, eps)
+    elif x.dtype == torch.bfloat16:
+        exe = compile_rmsnorm_kernel('bf16', batch_size, norm_size, eps)
+    else:
+        raise NotImplementedError()
+    exe(x, weight, out, stream=torch.cuda.Stream())
 
 
 def benchmark(args, func, ref_func, warmup=20, niters=100):
@@ -248,6 +174,8 @@ def benchmark(args, func, ref_func, warmup=20, niters=100):
     ref_func(*ref_inouts)
     for output, ref_output in zip(outputs, ref_outputs):
         is_allclose = torch.allclose(output, ref_output, atol=1e-3, rtol=1e-3)
+        maxdiff_out = (output - ref_output).abs().max()
+        # print(f"maxdiff_out:{maxdiff_out}")
         assert is_allclose == True
     print("validation passed!\n", flush=True)
 
