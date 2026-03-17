@@ -12,7 +12,7 @@ import flydsl.expr as fx
 from flydsl.expr.typing import T
 from flydsl.expr import range_constexpr, arith
 
-from utils.tensor_shim import GTensor
+from utils.tensor_shim import get_dtype_in_kernel, GTensor
 
 
 @dataclass
@@ -36,15 +36,6 @@ def ref_func(a, b, out):
     torch.add(a, b, out=out)
 
 
-def get_dtype_in_kernel(dtype: str):
-    if dtype == 'f32':
-        return T.f32
-    elif dtype == 'f16':
-        return T.f16
-    elif dtype == 'bf16':
-        return T.bf16
-
-
 @functools.lru_cache(maxsize=1024)
 def compile_pointwise_add_kernel(dtype: str, n: int):
     if dtype == 'f32':
@@ -64,24 +55,21 @@ def compile_pointwise_add_kernel(dtype: str, n: int):
         bidx = fx.block_idx.x
         tidx = fx.thread_idx.x
 
-        VEC_SIZE_ = fx.Int32(VEC_SIZE)
-        n_ = fx.Int32(n)
-
         A_ = GTensor(A, dtype=dtype_, shape=(-1,))
         B_ = GTensor(B, dtype=dtype_, shape=(-1,))
         C_ = GTensor(C, dtype=dtype_, shape=(-1,))
 
-        index = bidx * BLOCK_WORK_SIZE + tidx * VEC_SIZE_
-        remaining = n_ - index
-        if arith.cmpi(arith.CmpIPredicate.ult, remaining, VEC_SIZE_):
-            for i in range_constexpr(VEC_SIZE_):
-                if arith.cmpi(arith.CmpIPredicate.ult, index + i, n_):
+        index = bidx * BLOCK_WORK_SIZE + tidx * VEC_SIZE
+        remaining = n - index
+        if arith.cmpi(arith.CmpIPredicate.ult, remaining, fx.Int32(VEC_SIZE)):
+            for i in range_constexpr(VEC_SIZE):
+                if arith.cmpi(arith.CmpIPredicate.ult, index + i, fx.Int32(n)):
                     C_[index + i] = A_[index + i] + B_[index + i]
         else:
-            vec_a = A_.vec_load((index,), VEC_SIZE_)
-            vec_b = B_.vec_load((index,), VEC_SIZE_)
+            vec_a = A_.vec_load((index,), VEC_SIZE)
+            vec_b = B_.vec_load((index,), VEC_SIZE)
             vec_c = vec_a + vec_b
-            C_.vec_store((index,), vec_c, VEC_SIZE_)
+            C_.vec_store((index,), vec_c, VEC_SIZE)
         return
     
     @flyc.jit
@@ -110,7 +98,6 @@ def func(a, b, out):
     else:
         raise NotImplementedError()
     exe(a, b, out, stream=torch.cuda.Stream())
-    torch.cuda.synchronize()
 
 
 def benchmark(args, func, ref_func, warmup=20, niters=100):

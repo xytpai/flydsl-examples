@@ -14,6 +14,15 @@ from flydsl.expr.typing import T
 from flydsl.expr import buffer_ops, range_constexpr, vector, memref_load, memref_store
 
 
+def get_dtype_in_kernel(dtype: str):
+    if dtype == 'f32':
+        return T.f32
+    elif dtype == 'f16':
+        return T.f16
+    elif dtype == 'bf16':
+        return T.bf16
+
+
 class TensorView:
     def __init__(self, dtype, shape, stride, base_offset, load_impl, store_impl):
         self.dtype = dtype
@@ -201,22 +210,26 @@ class GTensor(TensorBase):
 
 
 class STensor(TensorBase):
-    def __init__(self, fx_tensor, dtype, shape, stride=None, base_offset=0):
+    def __init__(self, memptr, dtype, shape, stride=None, base_offset=0):
         super().__init__(dtype, shape, stride, base_offset)
-        self.fx_tensor = fx_tensor.get()
+        self.memptr = memptr.get()
     
     def load(self, offset, vec_size=1):
+        vec_t = T.vec(vec_size, self.dtype)
+        x = vector.load_op(vec_t, self.memptr, [offset])
         if vec_size > 1:
-            vec_type = VectorType.get([vec_size], self.dtype)
-            return flir.vector.load(vec_type, self.fx_tensor, [flir.const_index(offset)], alignment=16)
+            return x
         else:
-            return fx.memref_load(self.fx_tensor, [flir.const_index(offset)])
+            x = vector.extract(x, static_position=[0], dynamic_position=[])
+            return x
     
     def store(self, offset, value, vec_size=1):
         if vec_size > 1:
-            flir.vector.store(arith.as_value(value), self.fx_tensor, [flir.const_index(offset)], alignment=16)
+            vector.store(value, self.memptr, [offset], alignment=16)
         else:
-            fx.memref_store(arith.as_value(value), self.fx_tensor, [flir.const_index(offset),])
+            vec_t = T.vec(1, self.dtype)
+            vec = vector.from_elements(vec_t, [value])
+            vector.store(vec, self.memptr, [offset], alignment=16)
 
 
 if __name__ == '__main__':

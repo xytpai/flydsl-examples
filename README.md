@@ -7,8 +7,8 @@ This repository will provide the following examples from scratch:
 
 - [x] Pointwise Add
 - [x] Batch Reduce
-- [x] RMS Norm
-- [x] HGEMM
+- [ ] RMS Norm (NEED REBASE)
+- [ ] HGEMM (NEED REBASE)
 - [ ] GEMM-FP8
 - [ ] GEMM Fusions
 
@@ -91,20 +91,20 @@ Self CPU time total: 20.644ms
 Self CUDA time total: 3.697ms
 ```
 
-Take a closer look at details, we just use CUDA like coding style:
+Take a closer look at details, we just use CUDA-like coding style:
 
 ```python
-index = bidx * BLOCK_WORK_SIZE + tidx * VEC_SIZE_
-remaining = n_ - index
-if arith.cmpi(arith.CmpIPredicate.ult, remaining, VEC_SIZE_):
-    for i in range_constexpr(VEC_SIZE_):
-        if arith.cmpi(arith.CmpIPredicate.ult, index + i, n_):
+index = bidx * BLOCK_WORK_SIZE + tidx * VEC_SIZE
+remaining = n - index
+if arith.cmpi(arith.CmpIPredicate.ult, remaining, fx.Int32(VEC_SIZE)):
+    for i in range_constexpr(VEC_SIZE):
+        if arith.cmpi(arith.CmpIPredicate.ult, index + i, fx.Int32(n)):
             C_[index + i] = A_[index + i] + B_[index + i]
-    else:
-        vec_a = A_.vec_load((index,), VEC_SIZE_)
-        vec_b = B_.vec_load((index,), VEC_SIZE_)
-        vec_c = vec_a + vec_b
-        C_.vec_store((index,), vec_c, VEC_SIZE_)
+else:
+    vec_a = A_.vec_load((index,), VEC_SIZE)
+    vec_b = B_.vec_load((index,), VEC_SIZE)
+    vec_c = vec_a + vec_b
+    C_.vec_store((index,), vec_c, VEC_SIZE)
 ```
 
 ## 2. Batch Reduce
@@ -118,60 +118,56 @@ run: /home/yuxu/flydsl-examples/batch_reduce.py, args: Namespace(batch_size=4, r
 validation passed!
 
 ===================== [REF] =====================
-[W225 05:28:18.762480600 collection.cpp:1116] Warning: ROCTracer produced duplicate flow start: 1 (function operator())
+[W317 16:34:50.229649829 collection.cpp:1116] Warning: ROCTracer produced duplicate flow start: 1 (function operator())
 -------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
                                                    Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
 -------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-void at::native::reduce_kernel<512, 1, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us     687.062us       100.00%     687.062us       6.871us           100  
-                                        hipLaunchKernel        95.26%     460.725us        95.26%     460.725us       4.607us       0.000us         0.00%       0.000us       0.000us           100  
-                                   hipDeviceSynchronize         4.74%      22.922us         4.74%      22.922us      22.922us       0.000us         0.00%       0.000us       0.000us             1  
+void at::native::reduce_kernel<512, 1, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us     580.540us       100.00%     580.540us       5.805us           100  
+                                        hipLaunchKernel        92.08%     546.354us        92.08%     546.354us       5.464us       0.000us         0.00%       0.000us       0.000us           100  
+                                   hipDeviceSynchronize         7.92%      47.021us         7.92%      47.021us      47.021us       0.000us         0.00%       0.000us       0.000us             1  
 -------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-Self CPU time total: 483.647us
-Self CUDA time total: 687.062us
+Self CPU time total: 593.375us
+Self CUDA time total: 580.540us
 
 ===================== [FLYDSL] =====================
--------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-                     Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
--------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-      batch_reduce_kernel         0.00%       0.000us         0.00%       0.000us       0.000us     516.783us       100.00%     516.783us       5.168us           100  
-          hipStreamCreate        72.63%      88.464ms        72.63%      88.464ms     884.637us       0.000us         0.00%       0.000us       0.000us           100  
-    hipModuleLaunchKernel         0.84%       1.025ms         0.84%       1.025ms      10.254us       0.000us         0.00%       0.000us       0.000us           100  
-     hipStreamSynchronize         2.17%       2.639ms         2.17%       2.639ms      26.388us       0.000us         0.00%       0.000us       0.000us           100  
-         hipStreamDestroy        24.24%      29.527ms        24.24%      29.527ms     295.267us       0.000us         0.00%       0.000us       0.000us           100  
-     hipDeviceSynchronize         0.11%     138.746us         0.11%     138.746us       1.374us       0.000us         0.00%       0.000us       0.000us           101  
--------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-Self CPU time total: 121.793ms
-Self CUDA time total: 516.783us
+-------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                           Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+          batch_reduce_kernel_0         0.00%       0.000us         0.00%       0.000us       0.000us     333.622us       100.00%     333.622us       3.336us           100  
+    hipStreamCreateWithPriority        94.46%      17.358ms        94.46%      17.358ms       1.578ms       0.000us         0.00%       0.000us       0.000us            11  
+          hipModuleLaunchKernel         2.98%     547.905us         2.98%     547.905us       5.479us       0.000us         0.00%       0.000us       0.000us           100  
+           hipDeviceSynchronize         2.56%     470.132us         2.56%     470.132us     470.132us       0.000us         0.00%       0.000us       0.000us             1  
+-------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 18.376ms
+Self CUDA time total: 333.622us
 ```
 
-Leverage vector utilities to perform vectorized loads and stores, improving code readability:
+Leverage tensor utilities to perform vectorized loads and stores, improving code readability:
 
 ```python
-@flir.kernel
-def batch_reduce_kernel(
-    self: flir.T.i64,
-    X: lambda: T.memref(S, dtype.get()),
-    Y: lambda: T.memref(S, dtype.get()),
-    batch_size: lambda: T.index(),
-    reduce_size: lambda: T.index(),
-):
-    tid_x = flir.thread_idx("x")
-    bid_x = flir.block_idx("x")
-    vec_type = VectorType.get([VEC_SIZE], self.dtype)
-    acc_vec_type = VectorType.get([VEC_SIZE], self.acc_type)
-    c_zero = arith.constant(0.0, type=self.acc_type)
-    thread_sum = (c_zero)
-    for vec_idx in range(tid_x * VEC_SIZE, reduce_size, BLOCK_WORK_SIZE):
-        vec_addr = bid_x * reduce_size + vec_idx
-        vec = flir.vector.load(vec_type, X, [arith.as_value(vec_addr)], alignment=16)
-        vec = flir.arith.extf(acc_vec_type, arith.as_value(vec))
-        red = flir.vector.reduction(self.acc_type, "add", arith.as_value(vec), fastmath=fm_fast)
-        thread_sum = thread_sum + red
-    block_reduce_add = make_block_reduce_add(tid_x, WARP_SIZE, RED_SLOTS)
-    base_ptr = allocator.get_base()
-    sum_val = block_reduce_add(thread_sum, self.smem(base_ptr).get())
-    sum_val = flir.arith.truncf(self.dtype, (sum_val))
-    flir.memref.store(arith.as_value(sum_val), Y, [flir.const_index(bid_x),])
+c_zero_f = arith.constant(0.0, type=T.f32)
+init_state = [c_zero_f]
+for vec_idx, state in range(tidx * VEC_SIZE, fx.Int32(reduce_size), fx.Int32(BLOCK_WORK_SIZE), init=init_state):
+    x_sum = state[0]
+    x_vec = X_.vec_load((bidx, vec_idx), VEC_SIZE)
+    x_vec = x_vec.extf(acc_vec_t)
+    x_sum = x_sum + vector.ReductionOp(T.f32, vector.CombiningKind.ADD, x_vec).dest
+    results = yield [x_sum]
+
+for offset in WARP_SIZE_SHFL_OFFSETS:
+    results = results + results.shuffle_xor(fx.Int32(offset), fx.Int32(WARP_SIZE))
+        
+base_ptr = allocator.get_base()
+smem_ptr = SmemPtr(base_ptr, smem_offset, T.f32, shape=(NUM_WARPS,))
+smem_ = STensor(smem_ptr, T.f32, shape=(NUM_WARPS,))
+smem_[wid] = results
+gpu.barrier()
+
+if arith.cmpi(arith.CmpIPredicate.eq, tidx, fx.Int32(0)):
+    sum_x = c_zero_f
+    for i in range_constexpr(NUM_WARPS):
+        sum_x = sum_x + smem_[i]
+    Y_[bidx] = sum_x.truncf(dtype_)
 ```
 
 ## 3. RMS Norm
