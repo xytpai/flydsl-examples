@@ -9,8 +9,10 @@ This repository will provide the following examples from scratch:
 - [x] Batch Reduce
 - [x] RMS Norm
 - [ ] HGEMM (NEED REBASE)
+- [ ] Allreduce
+- [ ] Flash Attention
+- [ ] Linear Attention (NEED REBASE)
 - [ ] GEMM-FP8
-- [ ] GEMM Fusions
 
 For IR study: https://mlir.llvm.org/docs/
 
