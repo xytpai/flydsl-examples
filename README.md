@@ -7,32 +7,40 @@ This repository will provide the following examples from scratch:
 
 - [x] Pointwise Add
 - [x] Batch Reduce
-- [x] RMS Norm
-- [x] HGEMM
+- [ ] RMS Norm (NEED REBASE)
+- [ ] HGEMM (NEED REBASE)
 - [ ] GEMM-FP8
 - [ ] GEMM Fusions
 
 For IR study: https://mlir.llvm.org/docs/
 
-## 0. How to install FlyDSL on AMD GPUs
+## 0. How to build install FlyDSL on AMD GPUs
 
 Check the ROCm version using `amd-smi`. My version is `7.0.1`.
 
 ```bash
 git clone https://github.com/ROCm/FlyDSL
 cd FlyDSL
-git checkout 3f9381207d21920895f64f7453ecd2195bb71e98
-bash scripts/build_llvm.sh
+git checkout 429e6c7f82de4d2bb9a3013946617be2b1a1c791
+bash scripts/build_llvm.sh -j64
 
 # After this you will see the installed path.
-# -- Installing: /home/yuxu/llvm-project/mlir_install/lib/cmake/llvm/LLVMConfigExtensions.cmake
-# Creating tarball...
 # ==============================================
 # LLVM/MLIR build completed successfully!
 
-export MLIR_PATH=/home/yuxu/llvm-project/build
-export MLIR_DIR=/home/yuxu/llvm-project
-./flir/build.sh
+# To configure flydsl, use:
+# cmake .. -DMLIR_DIR=/home/yuxu/llvm-project/build-flydsl/lib/cmake/mlir
+
+# Packaged install prefix:
+#   /home/yuxu/llvm-project/mlir_install
+# Use with:
+#   export MLIR_PATH=/home/yuxu/llvm-project/mlir_install
+# Tarball:
+#   /home/yuxu/llvm-project/mlir_install.tgz
+# ==============================================
+
+export MLIR_PATH=/home/yuxu/llvm-project/mlir_install
+bash scripts/build.sh -j64
 python3 -m pip install -e .
 ```
 
@@ -42,6 +50,12 @@ To check whether the package works:
 bash scripts/run_tests.sh
 ```
 
+To clean flydsl cache
+
+```bash
+rm -rf ~/.flydsl/
+```
+
 ## 1. Pointwise Add
 
 ```bash
@@ -49,93 +63,48 @@ python3 pointwise_add.py --n 10000000 --dtype f32
 ```
 
 ```txt
-run: /home/yuxu/pointwise_add.py, args: Namespace(n=10000000, dtype='f32')
+run: /home/yuxu/flydsl-examples/pointwise_add.py, args: Namespace(n=10000000, dtype='f32')
 validation passed!
 
 ===================== [REF] =====================
-[W224 07:00:55.984698439 collection.cpp:1116] Warning: ROCTracer produced duplicate flow start: 1 (function operator())
+[W317 14:28:48.993059503 collection.cpp:1116] Warning: ROCTracer produced duplicate flow start: 1 (function operator())
 -------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
                                                    Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
 -------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us       4.369ms       100.00%       4.369ms      43.686us           100  
-                                        hipLaunchKernel         9.44%     386.842us         9.44%     386.842us       3.868us       0.000us         0.00%       0.000us       0.000us           100  
-                                   hipDeviceSynchronize        90.56%       3.710ms        90.56%       3.710ms       3.710ms       0.000us         0.00%       0.000us       0.000us             1  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us       4.138ms       100.00%       4.138ms      41.379us           100  
+                                        hipLaunchKernel         9.68%     373.103us         9.68%     373.103us       3.731us       0.000us         0.00%       0.000us       0.000us           100  
+                                   hipDeviceSynchronize        90.32%       3.481ms        90.32%       3.481ms       3.481ms       0.000us         0.00%       0.000us       0.000us             1  
 -------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-Self CPU time total: 4.097ms
-Self CUDA time total: 4.369ms
+Self CPU time total: 3.855ms
+Self CUDA time total: 4.138ms
 
 ===================== [FLYDSL] =====================
--------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-                     Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
--------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-     pointwise_add_kernel         0.00%       0.000us         0.00%       0.000us       0.000us       3.891ms       100.00%       3.891ms      38.906us           100  
-          hipStreamCreate        69.06%      78.745ms        69.06%      78.745ms     787.451us       0.000us         0.00%       0.000us       0.000us           100  
-    hipModuleLaunchKernel         0.75%     854.424us         0.75%     854.424us       8.544us       0.000us         0.00%       0.000us       0.000us           100  
-     hipStreamSynchronize         5.34%       6.093ms         5.34%       6.093ms      60.934us       0.000us         0.00%       0.000us       0.000us           100  
-         hipStreamDestroy        24.77%      28.247ms        24.77%      28.247ms     282.472us       0.000us         0.00%       0.000us       0.000us           100  
-     hipDeviceSynchronize         0.07%      80.387us         0.07%      80.387us       0.796us       0.000us         0.00%       0.000us       0.000us           101  
--------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-Self CPU time total: 114.020ms
-Self CUDA time total: 3.891ms
+-------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                           Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+         pointwise_add_kernel_0         0.00%       0.000us         0.00%       0.000us       0.000us       3.697ms       100.00%       3.697ms      36.975us           100  
+    hipStreamCreateWithPriority        77.58%      16.016ms        77.58%      16.016ms       1.456ms       0.000us         0.00%       0.000us       0.000us            11  
+          hipModuleLaunchKernel         2.51%     518.197us         2.51%     518.197us       5.182us       0.000us         0.00%       0.000us       0.000us           100  
+           hipDeviceSynchronize        19.91%       4.109ms        19.91%       4.109ms      40.685us       0.000us         0.00%       0.000us       0.000us           101  
+-------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 20.644ms
+Self CUDA time total: 3.697ms
 ```
 
-Let's take a closer look at details:
-
-- Thread/Value Layout
+Take a closer look at details, we just use CUDA-like coding style:
 
 ```python
-# To create a TV layout.
-# thread_layout determines how are threads arranged in a thread block
-thread_layout = flir.make_ordered_layout((BLOCK_SIZE,), order=(0,))
-# value_layout determines how are values arranged in a thread
-value_layout = flir.make_ordered_layout((VEC_SIZE,), order=(0,))
-```
-
-- Get the data for a single thread
-
-```python
-# define vectorized atomic load
-copy_atom_load = flir.make_copy_atom(dtype.get(), vector_size=VEC_SIZE)
-# define tv layout copy
-tiled_copy_A = flir.make_tiled_copy_tv(copy_atom_load, thread_layout, value_layout, thr_shape=(BLOCK_SIZE,), val_shape=(VEC_SIZE,))
-
-# Create a tensor view from a memref with a specific layout and shape.
-tensor_A = flir.make_tensor(A, shape=(n,), strides=(1,))
-# Partition a tensor view.
-gA = flir.zipped_divide(tensor_A, (BLOCK_WORK_SIZE,))
-# Get tensor view of this block
-blkA = gA[(bid_x,)]
-# Get per-thread slice of the tiled copy
-thr_copy_A = tiled_copy_A.get_slice(tid_x)
-# Get tensor view of this thread
-thrA = thr_copy_A.partition_S(blkA)
-
-# Create register in this thread for A fragment
-frgA = flir.make_fragment_like(thrA, dtype.get())
-
-val_shape = tiled_copy_A.val_shape
-# Create tensor in register for mask
-frgPred = flir.make_rmem_tensor(val_shape, IntegerType.get_signless(1))
-for idx_in_vec in range(val_shape[0]): # iter VEC_SIZE
-    idx_in_vec = flir.const_index(idx_in_vec)
-
-    # Return absolute coordinates for a given linear index.
-    # thrCrd is just an identity tensor maps each coordinate to itself, useful for tracking
-    # coordinates during partitioning.
-    coords = thrCrd.coords_from_linear(idx_in_vec) 
-
-    pred_val = flir.elem_less(coords, (n,))
-    pred_offsets = tuple(frgPred.offsets_from_linear(idx_in_vec))
-    frgPred[pred_offsets] = pred_val
-
-# Copy to register
-flir.copy(tiled_copy_A, thrA, frgA, pred=frgPred)
-
-for idx_in_vec in range_constexpr(VEC_SIZE):
-    idx_in_vec = flir.const_index(idx_in_vec)
-    # Get a value
-    a_val = frgA[(idx_in_vec, )]
-
+index = bidx * BLOCK_WORK_SIZE + tidx * VEC_SIZE
+remaining = n - index
+if arith.cmpi(arith.CmpIPredicate.ult, remaining, fx.Int32(VEC_SIZE)):
+    for i in range_constexpr(VEC_SIZE):
+        if arith.cmpi(arith.CmpIPredicate.ult, index + i, fx.Int32(n)):
+            C_[index + i] = A_[index + i] + B_[index + i]
+else:
+    vec_a = A_.vec_load((index,), VEC_SIZE)
+    vec_b = B_.vec_load((index,), VEC_SIZE)
+    vec_c = vec_a + vec_b
+    C_.vec_store((index,), vec_c, VEC_SIZE)
 ```
 
 ## 2. Batch Reduce
@@ -149,60 +118,56 @@ run: /home/yuxu/flydsl-examples/batch_reduce.py, args: Namespace(batch_size=4, r
 validation passed!
 
 ===================== [REF] =====================
-[W225 05:28:18.762480600 collection.cpp:1116] Warning: ROCTracer produced duplicate flow start: 1 (function operator())
+[W317 16:34:50.229649829 collection.cpp:1116] Warning: ROCTracer produced duplicate flow start: 1 (function operator())
 -------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
                                                    Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
 -------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-void at::native::reduce_kernel<512, 1, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us     687.062us       100.00%     687.062us       6.871us           100  
-                                        hipLaunchKernel        95.26%     460.725us        95.26%     460.725us       4.607us       0.000us         0.00%       0.000us       0.000us           100  
-                                   hipDeviceSynchronize         4.74%      22.922us         4.74%      22.922us      22.922us       0.000us         0.00%       0.000us       0.000us             1  
+void at::native::reduce_kernel<512, 1, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us     580.540us       100.00%     580.540us       5.805us           100  
+                                        hipLaunchKernel        92.08%     546.354us        92.08%     546.354us       5.464us       0.000us         0.00%       0.000us       0.000us           100  
+                                   hipDeviceSynchronize         7.92%      47.021us         7.92%      47.021us      47.021us       0.000us         0.00%       0.000us       0.000us             1  
 -------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-Self CPU time total: 483.647us
-Self CUDA time total: 687.062us
+Self CPU time total: 593.375us
+Self CUDA time total: 580.540us
 
 ===================== [FLYDSL] =====================
--------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-                     Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
--------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-      batch_reduce_kernel         0.00%       0.000us         0.00%       0.000us       0.000us     516.783us       100.00%     516.783us       5.168us           100  
-          hipStreamCreate        72.63%      88.464ms        72.63%      88.464ms     884.637us       0.000us         0.00%       0.000us       0.000us           100  
-    hipModuleLaunchKernel         0.84%       1.025ms         0.84%       1.025ms      10.254us       0.000us         0.00%       0.000us       0.000us           100  
-     hipStreamSynchronize         2.17%       2.639ms         2.17%       2.639ms      26.388us       0.000us         0.00%       0.000us       0.000us           100  
-         hipStreamDestroy        24.24%      29.527ms        24.24%      29.527ms     295.267us       0.000us         0.00%       0.000us       0.000us           100  
-     hipDeviceSynchronize         0.11%     138.746us         0.11%     138.746us       1.374us       0.000us         0.00%       0.000us       0.000us           101  
--------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-Self CPU time total: 121.793ms
-Self CUDA time total: 516.783us
+-------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                           Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+          batch_reduce_kernel_0         0.00%       0.000us         0.00%       0.000us       0.000us     333.622us       100.00%     333.622us       3.336us           100  
+    hipStreamCreateWithPriority        94.46%      17.358ms        94.46%      17.358ms       1.578ms       0.000us         0.00%       0.000us       0.000us            11  
+          hipModuleLaunchKernel         2.98%     547.905us         2.98%     547.905us       5.479us       0.000us         0.00%       0.000us       0.000us           100  
+           hipDeviceSynchronize         2.56%     470.132us         2.56%     470.132us     470.132us       0.000us         0.00%       0.000us       0.000us             1  
+-------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 18.376ms
+Self CUDA time total: 333.622us
 ```
 
-Leverage vector utilities to perform vectorized loads and stores, improving code readability:
+Leverage tensor utilities to perform vectorized loads and stores, improving code readability:
 
 ```python
-@flir.kernel
-def batch_reduce_kernel(
-    self: flir.T.i64,
-    X: lambda: T.memref(S, dtype.get()),
-    Y: lambda: T.memref(S, dtype.get()),
-    batch_size: lambda: T.index(),
-    reduce_size: lambda: T.index(),
-):
-    tid_x = flir.thread_idx("x")
-    bid_x = flir.block_idx("x")
-    vec_type = VectorType.get([VEC_SIZE], self.dtype)
-    acc_vec_type = VectorType.get([VEC_SIZE], self.acc_type)
-    c_zero = arith.constant(0.0, type=self.acc_type)
-    thread_sum = (c_zero)
-    for vec_idx in range(tid_x * VEC_SIZE, reduce_size, BLOCK_WORK_SIZE):
-        vec_addr = bid_x * reduce_size + vec_idx
-        vec = flir.vector.load(vec_type, X, [arith.as_value(vec_addr)], alignment=16)
-        vec = flir.arith.extf(acc_vec_type, arith.as_value(vec))
-        red = flir.vector.reduction(self.acc_type, "add", arith.as_value(vec), fastmath=fm_fast)
-        thread_sum = thread_sum + red
-    block_reduce_add = make_block_reduce_add(tid_x, WARP_SIZE, RED_SLOTS)
-    base_ptr = allocator.get_base()
-    sum_val = block_reduce_add(thread_sum, self.smem(base_ptr).get())
-    sum_val = flir.arith.truncf(self.dtype, (sum_val))
-    flir.memref.store(arith.as_value(sum_val), Y, [flir.const_index(bid_x),])
+c_zero_f = arith.constant(0.0, type=T.f32)
+init_state = [c_zero_f]
+for vec_idx, state in range(tidx * VEC_SIZE, fx.Int32(reduce_size), fx.Int32(BLOCK_WORK_SIZE), init=init_state):
+    x_sum = state[0]
+    x_vec = X_.vec_load((bidx, vec_idx), VEC_SIZE)
+    x_vec = x_vec.extf(acc_vec_t)
+    x_sum = x_sum + vector.ReductionOp(T.f32, vector.CombiningKind.ADD, x_vec).dest
+    results = yield [x_sum]
+
+for offset in WARP_SIZE_SHFL_OFFSETS:
+    results = results + results.shuffle_xor(fx.Int32(offset), fx.Int32(WARP_SIZE))
+        
+base_ptr = allocator.get_base()
+smem_ptr = SmemPtr(base_ptr, smem_offset, T.f32, shape=(NUM_WARPS,))
+smem_ = STensor(smem_ptr, T.f32, shape=(NUM_WARPS,))
+smem_[wid] = results
+gpu.barrier()
+
+if arith.cmpi(arith.CmpIPredicate.eq, tidx, fx.Int32(0)):
+    sum_x = c_zero_f
+    for i in range_constexpr(NUM_WARPS):
+        sum_x = sum_x + smem_[i]
+    Y_[bidx] = sum_x.truncf(dtype_)
 ```
 
 ## 3. RMS Norm
