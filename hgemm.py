@@ -101,7 +101,10 @@ def compile_hgemm_kernel(
         C: fx.Tensor,
     ):
         dtype_ = get_dtype_in_kernel(dtype)
-        mfma_fn = rocdl.mfma_f32_16x16x16f16
+        if dtype == 'bf16':
+            mfma_fn = rocdl.mfma_f32_16x16x16bf16_1k
+        else:
+            mfma_fn = rocdl.mfma_f32_16x16x16f16
         c_zero_f = arith.constant(0.0, type=T.f32)
         acc_init = arith.constant_vector(0.0, T.f32x4)
 
@@ -177,6 +180,9 @@ def compile_hgemm_kernel(
                         warp_atom_k_idx = kk * WARP_ATOM_K
                         a_frag_vec = a_frags[kk * WARP_M_STEPS + ii]
                         b_frag_vec = b_frags[kk * WARP_N_STEPS + jj]
+                        if dtype == 'bf16':
+                            a_frag_vec = vector.bitcast(T.vec(WMMA_FRAG_VALUES, T.i16), a_frag_vec)
+                            b_frag_vec = vector.bitcast(T.vec(WMMA_FRAG_VALUES, T.i16), b_frag_vec)
                         acc_in = c_frags[ii * WARP_N_STEPS + jj]
                         c_frags[ii * WARP_N_STEPS + jj] = mfma_fn(T.f32x4, [a_frag_vec, b_frag_vec, acc_in, 0, 0, 0])
         
