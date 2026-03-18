@@ -60,7 +60,7 @@ def compile_hgemm_kernel(
     BLOCK_K: int = 32,
     BLOCK_M_WARPS: int = 1,
     BLOCK_N_WARPS: int = 4,
-    WARP_M_STEPS: int = 4,
+    WARP_M_STEPS: int = 8,
     WARP_N_STEPS: int = 2,
     STAGES : int = 1,
 ):
@@ -169,7 +169,7 @@ def compile_hgemm_kernel(
         ldmatrix_b_k_vec_idx = w_tid // WARP_ATOM_N * WMMA_FRAG_VALUES * 2
         c_frags = [acc_init] * (WARP_M_STEPS * WARP_N_STEPS)
 
-        def block_mma_sync(lds_stage):
+        def block_mma_sync(lds_stage, direct_ldg_b=True, b_offset=None, k_offset=None):
             s = fx.Index(lds_stage)
             a_frags = [0] * (WARP_K_STEPS * WARP_M_STEPS)
             b_frags = [0] * (WARP_K_STEPS * WARP_N_STEPS)
@@ -189,10 +189,15 @@ def compile_hgemm_kernel(
                 for kk in range_constexpr(WARP_K_STEPS):
                     warp_atom_k_idx = kk * WARP_ATOM_K
                     row = warp_atom_n_idx + ldmatrix_b_n_idx
-                    col_in_bytes = (warp_atom_k_idx + ldmatrix_b_k_vec_idx) * DTYPE_BYTES
-                    col_in_bytes = swizzle_xor16(row, col_in_bytes, k_blocks16)
-                    vec = bs_.vec_load((s, row, col_in_bytes // DTYPE_BYTES), WMMA_FRAG_VALUES * 2)
-                    b_frags[kk * WARP_N_STEPS + ii] = vec
+                    if not direct_ldg_b:
+                        col_in_bytes = (warp_atom_k_idx + ldmatrix_b_k_vec_idx) * DTYPE_BYTES
+                        col_in_bytes = swizzle_xor16(row, col_in_bytes, k_blocks16)
+                        vec = bs_.vec_load((s, row, col_in_bytes // DTYPE_BYTES), WMMA_FRAG_VALUES * 2)
+                        b_frags[kk * WARP_N_STEPS + ii] = vec
+                    else:
+                        col = warp_atom_k_idx + ldmatrix_b_k_vec_idx
+                        vec = B_.vec_load((b_offset + row, k_offset + col), WMMA_FRAG_VALUES * 2)
+                        b_frags[kk * WARP_N_STEPS + ii] = vec
             # wmma
             for ii in range_constexpr(WARP_M_STEPS):
                 warp_atom_m_idx = warp_m_idx + ii * WARP_ATOM_M
@@ -227,9 +232,9 @@ def compile_hgemm_kernel(
         
         for bki in range_constexpr(BLOCK_K_LOOPS):
             ldg_a_copy(m_offset, k_offset, 0)
-            ldg_b_copy(n_offset, k_offset, 0)
+            # ldg_b_copy(n_offset, k_offset, 0)
             gpu.barrier()
-            block_mma_sync(0)
+            block_mma_sync(0, direct_ldg_b=True, b_offset=n_offset, k_offset=k_offset)
             k_offset += fx.Int32(BLOCK_K)
             gpu.barrier()
         
