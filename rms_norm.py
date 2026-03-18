@@ -161,7 +161,7 @@ def func(x, weight, eps, out):
         exe = compile_rmsnorm_kernel('bf16', batch_size, norm_size, eps)
     else:
         raise NotImplementedError()
-    exe(x, weight, out, stream=torch.cuda.Stream())
+    exe(x, weight, out, stream=torch.cuda.current_stream())
 
 
 def benchmark(args, func, ref_func, warmup=20, niters=100):

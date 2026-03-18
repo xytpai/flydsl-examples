@@ -97,7 +97,7 @@ def func(a, b, out):
         exe = compile_pointwise_add_kernel('bf16', n)
     else:
         raise NotImplementedError()
-    exe(a, b, out, stream=torch.cuda.Stream())
+    exe(a, b, out, stream=torch.cuda.current_stream())
 
 
 def benchmark(args, func, ref_func, warmup=20, niters=100):

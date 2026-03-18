@@ -130,7 +130,7 @@ def func(x, y):
         exe = compile_batch_reduce_kernel('bf16', batch_size, reduce_size)
     else:
         raise NotImplementedError()
-    exe(x, y, stream=torch.cuda.Stream())
+    exe(x, y, stream=torch.cuda.current_stream())
 
 
 def benchmark(args, func, ref_func, warmup=20, niters=100):
