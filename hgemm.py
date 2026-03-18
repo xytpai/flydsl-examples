@@ -47,6 +47,10 @@ def ref_func(a, b, c):
     F.linear(a, b, out=c)
 
 
+def swizzle_xor16(row, col_in_bytes, k_blocks16):
+    return col_in_bytes ^ ((row % k_blocks16) * 16)
+
+
 @functools.lru_cache(maxsize=1024)
 def compile_hgemm_kernel(
     dtype: str,
@@ -85,6 +89,7 @@ def compile_hgemm_kernel(
     LDG_REG_A_COUNT = BLOCK_MK_SIZE // LDG_VEC_SIZE // BLOCK_THREADS
     LDG_REG_B_COUNT = BLOCK_NK_SIZE // LDG_VEC_SIZE // BLOCK_THREADS
     assert (LDG_REG_A_COUNT >= 1) and (LDG_REG_B_COUNT >= 1)
+    BLOCK_K_BYTES = BLOCK_K * 2
 
     gpu_arch = get_rocm_arch()
     allocator = SmemAllocator(None, arch=gpu_arch, global_sym_name="smem")
@@ -127,6 +132,8 @@ def compile_hgemm_kernel(
         m_offset = fx.Index(block_m_idx * BLOCK_M)
         n_offset = fx.Index(block_n_idx * BLOCK_N)
         k_offset = fx.Int32(0)
+
+        k_blocks16 = fx.Int32(BLOCK_K_BYTES // 16)
     
         def ldg_a_copy(a_offset, k_offset, lds_stage, async_mode=False):
             if not async_mode:
@@ -135,7 +142,9 @@ def compile_hgemm_kernel(
                     m_local_idx = global_tid // LDG_A_X_THREADS
                     k_local_idx = global_tid % LDG_A_X_THREADS * LDG_VEC_SIZE
                     vec = A_.vec_load((a_offset + m_local_idx, k_offset + k_local_idx), LDG_VEC_SIZE)
-                    as_.vec_store((fx.Index(lds_stage), m_local_idx, k_local_idx), vec, LDG_VEC_SIZE)
+                    col_in_bytes = k_local_idx * 2
+                    col_in_bytes = swizzle_xor16(m_local_idx, col_in_bytes, k_blocks16)
+                    as_.vec_store((fx.Index(lds_stage), m_local_idx, col_in_bytes // 2), vec, LDG_VEC_SIZE)
         
         def ldg_b_copy(b_offset, k_offset, lds_stage, async_mode=False):
             if not async_mode:
@@ -144,7 +153,9 @@ def compile_hgemm_kernel(
                     n_local_idx = global_tid // LDG_B_X_THREADS
                     k_local_idx = global_tid % LDG_B_X_THREADS * LDG_VEC_SIZE
                     vec = B_.vec_load((b_offset + n_local_idx, k_offset + k_local_idx), LDG_VEC_SIZE)
-                    bs_.vec_store((fx.Index(lds_stage), n_local_idx, k_local_idx), vec, LDG_VEC_SIZE)
+                    col_in_bytes = k_local_idx * 2
+                    col_in_bytes = swizzle_xor16(n_local_idx, col_in_bytes, k_blocks16)
+                    bs_.vec_store((fx.Index(lds_stage), n_local_idx, col_in_bytes // 2), vec, LDG_VEC_SIZE)
         
         c_frags = [acc_init] * (WARP_M_STEPS * WARP_N_STEPS)
         warp_m_idx = wid // BLOCK_N_WARPS * WARP_M
@@ -162,14 +173,20 @@ def compile_hgemm_kernel(
                 warp_atom_m_idx = warp_m_idx + ii * WARP_ATOM_M
                 for kk in range_constexpr(WARP_K_STEPS):
                     warp_atom_k_idx = kk * WARP_ATOM_K
-                    vec = as_.vec_load((s, warp_atom_m_idx + ldmatrix_a_m_idx, warp_atom_k_idx + ldmatrix_a_k_vec_idx), WMMA_FRAG_VALUES)
+                    row = warp_atom_m_idx + ldmatrix_a_m_idx
+                    col_in_bytes = (warp_atom_k_idx + ldmatrix_a_k_vec_idx) * 2
+                    col_in_bytes = swizzle_xor16(row, col_in_bytes, k_blocks16)
+                    vec = as_.vec_load((s, row, col_in_bytes // 2), WMMA_FRAG_VALUES)
                     a_frags[kk * WARP_M_STEPS + ii] = vec
             # load matrix b
             for ii in range_constexpr(WARP_N_STEPS):
                 warp_atom_n_idx = warp_n_idx + ii * WARP_ATOM_N
                 for kk in range_constexpr(WARP_K_STEPS):
                     warp_atom_k_idx = kk * WARP_ATOM_K
-                    vec = bs_.vec_load((s, warp_atom_n_idx + ldmatrix_b_n_idx, warp_atom_k_idx + ldmatrix_b_k_vec_idx), WMMA_FRAG_VALUES)
+                    row = warp_atom_n_idx + ldmatrix_b_n_idx
+                    col_in_bytes = (warp_atom_k_idx + ldmatrix_b_k_vec_idx) * 2
+                    col_in_bytes = swizzle_xor16(row, col_in_bytes, k_blocks16)
+                    vec = bs_.vec_load((s, row, col_in_bytes // 2), WMMA_FRAG_VALUES)
                     b_frags[kk * WARP_N_STEPS + ii] = vec
             # wmma
             for ii in range_constexpr(WARP_M_STEPS):
