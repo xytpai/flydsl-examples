@@ -58,10 +58,10 @@ def compile_hgemm_kernel(
     n: int,
     k: int,
     BLOCK_K: int = 32,
-    BLOCK_M_WARPS: int = 2,
-    BLOCK_N_WARPS: int = 2,
+    BLOCK_M_WARPS: int = 1,
+    BLOCK_N_WARPS: int = 4,
     WARP_M_STEPS: int = 4,
-    WARP_N_STEPS: int = 4,
+    WARP_N_STEPS: int = 2,
     STAGES : int = 1,
 ):
     assert k % BLOCK_K == 0

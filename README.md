@@ -8,7 +8,7 @@ This repository will provide the following examples from scratch:
 - [x] Pointwise Add
 - [x] Batch Reduce
 - [x] RMS Norm
-- [ ] HGEMM (NEED REBASE)
+- [x] HGEMM (wmma)
 - [ ] Allreduce
 - [ ] Flash Attention
 - [ ] Linear Attention (NEED REBASE)
