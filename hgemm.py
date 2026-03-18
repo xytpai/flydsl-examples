@@ -60,23 +60,28 @@ def compile_hgemm_kernel(
     BLOCK_K: int = 32,
     BLOCK_M_WARPS: int = 2,
     BLOCK_N_WARPS: int = 2,
-    WARP_M_STEPS: int = 2,
-    WARP_N_STEPS: int = 2,
+    WARP_M_STEPS: int = 4,
+    WARP_N_STEPS: int = 4,
     STAGES : int = 1,
 ):
     assert k % BLOCK_K == 0
     assert k // BLOCK_K >= 1
     assert BLOCK_M_WARPS * BLOCK_N_WARPS == 4
     # Fixed parameters:
-    WARP_ATOM_M = 16
-    WARP_ATOM_N = 16
-    WARP_ATOM_K = 16
+    WMMA_M = 16
+    WMMA_N = 16
+    WMMA_K = 16
+    WMMA_FRAG_VALUES = 4
     WARP_SIZE = 64
+    DTYPE_BYTES = 2
     LDG_VEC_SIZE = 8
-    WMMA_FRAG_VALUES = 4 # WARP_ATOM_M * WARP_ATOM_K // WARP_SIZE
     # Propagated parameters:
+    WARP_ATOM_M = WMMA_M
+    WARP_ATOM_N = WMMA_N
+    WARP_ATOM_K = WMMA_K * 2
     BLOCK_K_LOOPS = k // BLOCK_K
     WARP_K_STEPS = BLOCK_K // WARP_ATOM_K
+    assert (BLOCK_K % WARP_ATOM_K == 0) and (WARP_K_STEPS >= 1)
     BLOCK_THREADS = BLOCK_M_WARPS * BLOCK_N_WARPS * WARP_SIZE
     WARP_M = WARP_M_STEPS * WARP_ATOM_M
     WARP_N = WARP_N_STEPS * WARP_ATOM_N
@@ -89,12 +94,11 @@ def compile_hgemm_kernel(
     LDG_REG_A_COUNT = BLOCK_MK_SIZE // LDG_VEC_SIZE // BLOCK_THREADS
     LDG_REG_B_COUNT = BLOCK_NK_SIZE // LDG_VEC_SIZE // BLOCK_THREADS
     assert (LDG_REG_A_COUNT >= 1) and (LDG_REG_B_COUNT >= 1)
-    BLOCK_K_BYTES = BLOCK_K * 2
+    BLOCK_K_BYTES = BLOCK_K * DTYPE_BYTES
 
     gpu_arch = get_rocm_arch()
     allocator = SmemAllocator(None, arch=gpu_arch, global_sym_name="smem")
     smem_a_offset = allocator._align(allocator.ptr, 16)
-    DTYPE_BYTES = 2
     allocator.ptr = smem_a_offset + STAGES * BLOCK_M * BLOCK_K * DTYPE_BYTES
     smem_b_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = smem_b_offset + STAGES * BLOCK_N * BLOCK_K * DTYPE_BYTES
@@ -142,9 +146,9 @@ def compile_hgemm_kernel(
                     m_local_idx = global_tid // LDG_A_X_THREADS
                     k_local_idx = global_tid % LDG_A_X_THREADS * LDG_VEC_SIZE
                     vec = A_.vec_load((a_offset + m_local_idx, k_offset + k_local_idx), LDG_VEC_SIZE)
-                    col_in_bytes = k_local_idx * 2
+                    col_in_bytes = k_local_idx * DTYPE_BYTES
                     col_in_bytes = swizzle_xor16(m_local_idx, col_in_bytes, k_blocks16)
-                    as_.vec_store((fx.Index(lds_stage), m_local_idx, col_in_bytes // 2), vec, LDG_VEC_SIZE)
+                    as_.vec_store((fx.Index(lds_stage), m_local_idx, col_in_bytes // DTYPE_BYTES), vec, LDG_VEC_SIZE)
         
         def ldg_b_copy(b_offset, k_offset, lds_stage, async_mode=False):
             if not async_mode:
@@ -153,17 +157,18 @@ def compile_hgemm_kernel(
                     n_local_idx = global_tid // LDG_B_X_THREADS
                     k_local_idx = global_tid % LDG_B_X_THREADS * LDG_VEC_SIZE
                     vec = B_.vec_load((b_offset + n_local_idx, k_offset + k_local_idx), LDG_VEC_SIZE)
-                    col_in_bytes = k_local_idx * 2
+                    col_in_bytes = k_local_idx * DTYPE_BYTES
                     col_in_bytes = swizzle_xor16(n_local_idx, col_in_bytes, k_blocks16)
-                    bs_.vec_store((fx.Index(lds_stage), n_local_idx, col_in_bytes // 2), vec, LDG_VEC_SIZE)
+                    bs_.vec_store((fx.Index(lds_stage), n_local_idx, col_in_bytes // DTYPE_BYTES), vec, LDG_VEC_SIZE)
         
-        c_frags = [acc_init] * (WARP_M_STEPS * WARP_N_STEPS)
         warp_m_idx = wid // BLOCK_N_WARPS * WARP_M
         warp_n_idx = wid % BLOCK_N_WARPS * WARP_N
         ldmatrix_a_m_idx = w_tid % WARP_ATOM_M
-        ldmatrix_a_k_vec_idx = w_tid // WARP_ATOM_M * WMMA_FRAG_VALUES
+        ldmatrix_a_k_vec_idx = w_tid // WARP_ATOM_M * WMMA_FRAG_VALUES * 2
         ldmatrix_b_n_idx = w_tid % WARP_ATOM_N
-        ldmatrix_b_k_vec_idx = w_tid // WARP_ATOM_N * WMMA_FRAG_VALUES
+        ldmatrix_b_k_vec_idx = w_tid // WARP_ATOM_N * WMMA_FRAG_VALUES * 2
+        c_frags = [acc_init] * (WARP_M_STEPS * WARP_N_STEPS)
+
         def block_mma_sync(lds_stage):
             s = fx.Index(lds_stage)
             a_frags = [0] * (WARP_K_STEPS * WARP_M_STEPS)
@@ -174,9 +179,9 @@ def compile_hgemm_kernel(
                 for kk in range_constexpr(WARP_K_STEPS):
                     warp_atom_k_idx = kk * WARP_ATOM_K
                     row = warp_atom_m_idx + ldmatrix_a_m_idx
-                    col_in_bytes = (warp_atom_k_idx + ldmatrix_a_k_vec_idx) * 2
+                    col_in_bytes = (warp_atom_k_idx + ldmatrix_a_k_vec_idx) * DTYPE_BYTES
                     col_in_bytes = swizzle_xor16(row, col_in_bytes, k_blocks16)
-                    vec = as_.vec_load((s, row, col_in_bytes // 2), WMMA_FRAG_VALUES)
+                    vec = as_.vec_load((s, row, col_in_bytes // DTYPE_BYTES), WMMA_FRAG_VALUES * 2)
                     a_frags[kk * WARP_M_STEPS + ii] = vec
             # load matrix b
             for ii in range_constexpr(WARP_N_STEPS):
@@ -184,9 +189,9 @@ def compile_hgemm_kernel(
                 for kk in range_constexpr(WARP_K_STEPS):
                     warp_atom_k_idx = kk * WARP_ATOM_K
                     row = warp_atom_n_idx + ldmatrix_b_n_idx
-                    col_in_bytes = (warp_atom_k_idx + ldmatrix_b_k_vec_idx) * 2
+                    col_in_bytes = (warp_atom_k_idx + ldmatrix_b_k_vec_idx) * DTYPE_BYTES
                     col_in_bytes = swizzle_xor16(row, col_in_bytes, k_blocks16)
-                    vec = bs_.vec_load((s, row, col_in_bytes // 2), WMMA_FRAG_VALUES)
+                    vec = bs_.vec_load((s, row, col_in_bytes // DTYPE_BYTES), WMMA_FRAG_VALUES * 2)
                     b_frags[kk * WARP_N_STEPS + ii] = vec
             # wmma
             for ii in range_constexpr(WARP_M_STEPS):
@@ -195,13 +200,30 @@ def compile_hgemm_kernel(
                     warp_atom_n_idx = warp_n_idx + jj * WARP_ATOM_N
                     for kk in range_constexpr(WARP_K_STEPS):
                         warp_atom_k_idx = kk * WARP_ATOM_K
-                        a_frag_vec = a_frags[kk * WARP_M_STEPS + ii]
-                        b_frag_vec = b_frags[kk * WARP_N_STEPS + jj]
+                        a_frag_vec_pack = a_frags[kk * WARP_M_STEPS + ii]
+                        b_frag_vec_pack = b_frags[kk * WARP_N_STEPS + jj]
+                        # split a
+                        a_i64x2 = vector.bitcast(T.i64x2, a_frag_vec_pack)
+                        a0_i64 = vector.extract(a_i64x2, static_position=[0], dynamic_position=[])
+                        a1_i64 = vector.extract(a_i64x2, static_position=[1], dynamic_position=[])
+                        a_v0 = vector.bitcast(T.f16x4, vector.from_elements(T.vec(1, T.i64), [a0_i64]))
+                        a_v1 = vector.bitcast(T.f16x4, vector.from_elements(T.vec(1, T.i64), [a1_i64]))
+                        # split b
+                        b_i64x2 = vector.bitcast(T.i64x2, b_frag_vec_pack)
+                        b0_i64 = vector.extract(b_i64x2, static_position=[0], dynamic_position=[])
+                        b1_i64 = vector.extract(b_i64x2, static_position=[1], dynamic_position=[])
+                        b_v0 = vector.bitcast(T.f16x4, vector.from_elements(T.vec(1, T.i64), [b0_i64]))
+                        b_v1 = vector.bitcast(T.f16x4, vector.from_elements(T.vec(1, T.i64), [b1_i64]))
+                        # handle bf16
                         if dtype == 'bf16':
-                            a_frag_vec = vector.bitcast(T.vec(WMMA_FRAG_VALUES, T.i16), a_frag_vec)
-                            b_frag_vec = vector.bitcast(T.vec(WMMA_FRAG_VALUES, T.i16), b_frag_vec)
+                            a_v0 = vector.bitcast(T.vec(4, T.i16), a_v0)
+                            a_v1 = vector.bitcast(T.vec(4, T.i16), a_v1)
+                            b_v0 = vector.bitcast(T.vec(4, T.i16), b_v0)
+                            b_v1 = vector.bitcast(T.vec(4, T.i16), b_v1)
+                        # wmma
                         acc_in = c_frags[ii * WARP_N_STEPS + jj]
-                        c_frags[ii * WARP_N_STEPS + jj] = mfma_fn(T.f32x4, [a_frag_vec, b_frag_vec, acc_in, 0, 0, 0])
+                        acc_mid = mfma_fn(T.f32x4, [a_v0, b_v0, acc_in, 0, 0, 0])
+                        c_frags[ii * WARP_N_STEPS + jj] = mfma_fn(T.f32x4, [a_v1, b_v1, acc_mid, 0, 0, 0])
         
         for bki in range_constexpr(BLOCK_K_LOOPS):
             ldg_a_copy(m_offset, k_offset, 0)
