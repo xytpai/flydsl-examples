@@ -63,6 +63,7 @@ def compile_hgemm_kernel(
     WARP_M_STEPS: int = 8,
     WARP_N_STEPS: int = 2,
     STAGES : int = 1,
+    B_TO_LDS: bool = False,
 ):
     assert k % BLOCK_K == 0
     assert k // BLOCK_K >= 1
@@ -100,8 +101,9 @@ def compile_hgemm_kernel(
     allocator = SmemAllocator(None, arch=gpu_arch, global_sym_name="smem")
     smem_a_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = smem_a_offset + STAGES * BLOCK_M * BLOCK_K * DTYPE_BYTES
-    smem_b_offset = allocator._align(allocator.ptr, 16)
-    allocator.ptr = smem_b_offset + STAGES * BLOCK_N * BLOCK_K * DTYPE_BYTES
+    if B_TO_LDS:
+        smem_b_offset = allocator._align(allocator.ptr, 16)
+        allocator.ptr = smem_b_offset + STAGES * BLOCK_N * BLOCK_K * DTYPE_BYTES
 
     @flyc.kernel
     def hgemm_kernel(
@@ -122,9 +124,10 @@ def compile_hgemm_kernel(
         C_ = GTensor(C, dtype=dtype_, shape=(m, n))
         base_ptr = allocator.get_base()
         smem_a_ptr = SmemPtr(base_ptr, smem_a_offset, dtype_, shape=(STAGES * BLOCK_M * BLOCK_K,))
-        smem_b_ptr = SmemPtr(base_ptr, smem_b_offset, dtype_, shape=(STAGES * BLOCK_N * BLOCK_K,))
         as_ = STensor(smem_a_ptr, dtype_, shape=(STAGES, BLOCK_M, BLOCK_K))
-        bs_ = STensor(smem_b_ptr, dtype_, shape=(STAGES, BLOCK_N, BLOCK_K))
+        if B_TO_LDS:
+            smem_b_ptr = SmemPtr(base_ptr, smem_b_offset, dtype_, shape=(STAGES * BLOCK_N * BLOCK_K,))
+            bs_ = STensor(smem_b_ptr, dtype_, shape=(STAGES, BLOCK_N, BLOCK_K))
         
         tid = fx.Int32(fx.thread_idx.x)
         wid = tid // WARP_SIZE
@@ -232,9 +235,13 @@ def compile_hgemm_kernel(
         
         for bki in range_constexpr(BLOCK_K_LOOPS):
             ldg_a_copy(m_offset, k_offset, 0)
-            # ldg_b_copy(n_offset, k_offset, 0)
-            gpu.barrier()
-            block_mma_sync(0, direct_ldg_b=True, b_offset=n_offset, k_offset=k_offset)
+            if B_TO_LDS:
+                ldg_b_copy(n_offset, k_offset, 0)
+                gpu.barrier()
+                block_mma_sync(0, direct_ldg_b=False)
+            else:
+                gpu.barrier()
+                block_mma_sync(0, direct_ldg_b=True, b_offset=n_offset, k_offset=k_offset)
             k_offset += fx.Int32(BLOCK_K)
             gpu.barrier()
         
