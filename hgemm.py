@@ -63,7 +63,7 @@ def compile_hgemm_kernel(
     WARP_M_STEPS: int = 8,
     WARP_N_STEPS: int = 2,
     STAGES : int = 1,
-    B_TO_LDS: bool = False,
+    ASYNC_COPY: bool = False,
 ):
     assert k % BLOCK_K == 0
     assert k // BLOCK_K >= 1
@@ -99,21 +99,7 @@ def compile_hgemm_kernel(
     LDG_REG_B_COUNT = BLOCK_NK_SIZE // LDG_VEC_SIZE // BLOCK_THREADS
     assert (LDG_REG_A_COUNT >= 1) and (LDG_REG_B_COUNT >= 1)
     BLOCK_K_BYTES = BLOCK_K * DTYPE_BYTES
-
-    # Scheduling parameters:
-    # Total MFMA instructions per block_mma_sync call
-    MFMA_TOTAL = WARP_M_STEPS * WARP_N_STEPS * WARP_K_STEPS * MFMA_PER_WARP_K
-    # Group size for interleaving: one full N-step worth of MFMAs
-    MFMA_GROUP = WARP_N_STEPS * MFMA_PER_WARP_K
-    # Number of scheduler iterations
-    SCHED_ITERS = MFMA_TOTAL // (2 * MFMA_GROUP) if (2 * MFMA_GROUP) > 0 else 0
-    # DS write tail for LDS store overlap
-    DSWR_TAIL = min(LDG_REG_A_COUNT + (LDG_REG_B_COUNT if B_TO_LDS else 0), SCHED_ITERS)
-    DSWR_START = max(SCHED_ITERS - DSWR_TAIL, 0)
-    # Number of DS reads per tile (A loads from LDS)
-    NUM_DS_READS = WARP_K_STEPS * WARP_M_STEPS + (WARP_K_STEPS * WARP_N_STEPS if B_TO_LDS else 0)
-    # Number of VMEM loads (B direct loads from global if not B_TO_LDS)
-    NUM_VMEM_LOADS = WARP_K_STEPS * WARP_N_STEPS if not B_TO_LDS else 0
+    B_TO_LDS = ASYNC_COPY
 
     # LDS parameters:
     gpu_arch = get_rocm_arch()
@@ -161,7 +147,26 @@ def compile_hgemm_kernel(
 
         k_blocks16 = fx.Int32(BLOCK_K_BYTES // 16)
     
-        def ldg_a_copy(a_offset, k_offset, lds_stage, async_mode=False):
+        def ldg_a(a_offset, k_offset):
+            vecs = []
+            for i in range_constexpr(LDG_REG_A_COUNT):
+                global_tid = BLOCK_THREADS * i + tid
+                m_local_idx = global_tid // LDG_A_X_THREADS
+                k_local_idx = global_tid % LDG_A_X_THREADS * LDG_VEC_SIZE
+                vec = A_.vec_load((a_offset + m_local_idx, k_offset + k_local_idx), LDG_VEC_SIZE)
+                vecs.append(vec)
+            return vecs
+        
+        def sts_a(vecs, lds_stage):
+            for i in range_constexpr(LDG_REG_A_COUNT):
+                global_tid = BLOCK_THREADS * i + tid
+                m_local_idx = global_tid // LDG_A_X_THREADS
+                k_local_idx = global_tid % LDG_A_X_THREADS * LDG_VEC_SIZE
+                col_in_bytes = k_local_idx * DTYPE_BYTES
+                col_in_bytes = swizzle_xor16(m_local_idx, col_in_bytes, k_blocks16)
+                as_.vec_store((fx.Index(lds_stage), m_local_idx, col_in_bytes // DTYPE_BYTES), vecs[i], LDG_VEC_SIZE)
+        
+        def ldg_sts_a(a_offset, k_offset, lds_stage, async_mode=False):
             if not async_mode:
                 for i in range_constexpr(LDG_REG_A_COUNT):
                     global_tid = BLOCK_THREADS * i + tid
@@ -172,7 +177,7 @@ def compile_hgemm_kernel(
                     col_in_bytes = swizzle_xor16(m_local_idx, col_in_bytes, k_blocks16)
                     as_.vec_store((fx.Index(lds_stage), m_local_idx, col_in_bytes // DTYPE_BYTES), vec, LDG_VEC_SIZE)
         
-        def ldg_b_copy(b_offset, k_offset, lds_stage, async_mode=False):
+        def ldg_sts_b(b_offset, k_offset, lds_stage, async_mode=False):
             if not async_mode:
                 for i in range_constexpr(LDG_REG_B_COUNT):
                     global_tid = BLOCK_THREADS * i + tid
@@ -221,11 +226,11 @@ def compile_hgemm_kernel(
                         vec = B_.vec_load((b_offset + row, k_offset + col), WMMA_FRAG_VALUES * MFMA_PER_WARP_K)
                         b_frags[kk * WARP_N_STEPS + ii] = vec
             # wmma
-            for ii in range_constexpr(WARP_M_STEPS):
-                warp_atom_m_idx = warp_m_idx + ii * WARP_ATOM_M
-                for jj in range_constexpr(WARP_N_STEPS):
-                    warp_atom_n_idx = warp_n_idx + jj * WARP_ATOM_N
-                    for kk in range_constexpr(WARP_K_STEPS):
+            for kk in range_constexpr(WARP_K_STEPS):
+                for ii in range_constexpr(WARP_M_STEPS):
+                    warp_atom_m_idx = warp_m_idx + ii * WARP_ATOM_M
+                    for jj in range_constexpr(WARP_N_STEPS):
+                        warp_atom_n_idx = warp_n_idx + jj * WARP_ATOM_N
                         warp_atom_k_idx = kk * WARP_ATOM_K
                         a_frag_vec_pack = a_frags[kk * WARP_M_STEPS + ii]
                         b_frag_vec_pack = b_frags[kk * WARP_N_STEPS + jj]
@@ -252,65 +257,23 @@ def compile_hgemm_kernel(
                         acc_mid = mfma_fn(T.f32x4, [a_v0, b_v0, acc_in, 0, 0, 0])
                         c_frags[ii * WARP_N_STEPS + jj] = mfma_fn(T.f32x4, [a_v1, b_v1, acc_mid, 0, 0, 0])
         
-        def hot_loop_scheduler():
-            """Emit scheduling hints to overlap MFMA with DS read/write and VMEM loads."""
-            mfma_group = MFMA_GROUP
-            
-            # Initial DS read prefetch: allow 2 DS reads to issue before first MFMA
-            rocdl.sched_dsrd(2)
-            rocdl.sched_mfma(1)
-            if not B_TO_LDS:
-                rocdl.sched_vmem(1)
-            rocdl.sched_mfma(1)
-            if not B_TO_LDS:
-                rocdl.sched_vmem(1)
-            
-            # For small accumulator counts, add extra DS read / MFMA interleaving
-            if mfma_group < 4:
-                rocdl.sched_dsrd(1)
-                rocdl.sched_mfma(1)
-                if not B_TO_LDS:
-                    rocdl.sched_vmem(1)
-                rocdl.sched_dsrd(1)
-                rocdl.sched_mfma(1)
-                if not B_TO_LDS:
-                    rocdl.sched_vmem(1)
-                rocdl.sched_mfma(1)
-            
-            # Main scheduling loop: interleave VMEM/DS reads with MFMA groups
-            # and insert DS write hints near the end for next-tile store overlap
-            for sche_i in range_constexpr(SCHED_ITERS):
-                if not B_TO_LDS:
-                    rocdl.sched_vmem(1)
-                rocdl.sched_mfma(mfma_group)
-                rocdl.sched_dsrd(1)
-                rocdl.sched_mfma(mfma_group)
-                if sche_i >= DSWR_START - 1:
-                    rocdl.sched_dswr(1)
-            
-            rocdl.sched_barrier(0)
-        
         # ============ Main K-loop with scheduling ============
         # Initial scheduling barrier to reset hardware scheduler state
-        rocdl.sched_barrier(0)
+        # rocdl.sched_barrier(0)
 
-        for bki in range_constexpr(BLOCK_K_LOOPS):
-            
-            ldg_a_copy(m_offset, k_offset, 0)
-            if B_TO_LDS:
-                ldg_b_copy(n_offset, k_offset, 0)
-                gpu.barrier()
-                block_mma_sync(0, direct_ldg_b=False)
-            else:
-                gpu.barrier()
-                block_mma_sync(0, direct_ldg_b=True, b_offset=n_offset, k_offset=k_offset)
-            
-            # Emit scheduling hints after compute to overlap next iteration's
-            # memory operations with any remaining MFMA drain
-            hot_loop_scheduler()
-
-            k_offset += fx.Int32(BLOCK_K)
+        a_regs = ldg_a(m_offset, k_offset)
+        sts_a(a_regs, 0)
+        gpu.barrier()
+        
+        for bki in range_constexpr(1, BLOCK_K_LOOPS):
+            a_regs_next = ldg_a(m_offset, k_offset + BLOCK_K)
+            block_mma_sync(0, direct_ldg_b=True, b_offset=n_offset, k_offset=k_offset)
             gpu.barrier()
+            sts_a(a_regs_next, 0)
+            gpu.barrier()
+            k_offset += fx.Int32(BLOCK_K)
+        
+        block_mma_sync(0, direct_ldg_b=True, b_offset=n_offset, k_offset=k_offset)
         
         # store results
         stmatrix_c_m_vec_idx = w_tid // WARP_ATOM_N * WMMA_FRAG_VALUES
