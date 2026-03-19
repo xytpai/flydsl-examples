@@ -143,8 +143,6 @@ def compile_hgemm_kernel(
         current_stage = 0
         m_offset = fx.Index(block_m_idx * BLOCK_M)
         n_offset = fx.Index(block_n_idx * BLOCK_N)
-        k_offset = fx.Int32(0)
-
         k_blocks16 = fx.Int32(BLOCK_K_BYTES // 16)
     
         def ldg_a(a_offset, k_offset):
@@ -196,7 +194,19 @@ def compile_hgemm_kernel(
         ldmatrix_b_k_vec_idx = w_tid // WARP_ATOM_N * WMMA_FRAG_VALUES * MFMA_PER_WARP_K
         c_frags = [acc_init] * (WARP_M_STEPS * WARP_N_STEPS)
 
-        def block_mma_sync(lds_stage, direct_ldg_b=True, b_offset=None, k_offset=None):
+        def ldg_b(b_offset, k_offset):
+            vecs = []
+            for kk in range_constexpr(WARP_K_STEPS):
+                for ii in range_constexpr(WARP_N_STEPS):
+                    warp_atom_n_idx = warp_n_idx + ii * WARP_ATOM_N
+                    warp_atom_k_idx = kk * WARP_ATOM_K
+                    row = warp_atom_n_idx + ldmatrix_b_n_idx
+                    col = warp_atom_k_idx + ldmatrix_b_k_vec_idx
+                    vec = B_.vec_load((b_offset + row, k_offset + col), WMMA_FRAG_VALUES * MFMA_PER_WARP_K)
+                    vecs.append(vec)
+            return vecs
+
+        def block_mma_sync(lds_stage, b_vecs=None):
             s = fx.Index(lds_stage)
             a_frags = [0] * (WARP_K_STEPS * WARP_M_STEPS)
             b_frags = [0] * (WARP_K_STEPS * WARP_N_STEPS)
@@ -211,20 +221,18 @@ def compile_hgemm_kernel(
                     vec = as_.vec_load((s, row, col_in_bytes // DTYPE_BYTES), WMMA_FRAG_VALUES * MFMA_PER_WARP_K)
                     a_frags[kk * WARP_M_STEPS + ii] = vec
             # load matrix b
-            for ii in range_constexpr(WARP_N_STEPS):
-                warp_atom_n_idx = warp_n_idx + ii * WARP_ATOM_N
-                for kk in range_constexpr(WARP_K_STEPS):
-                    warp_atom_k_idx = kk * WARP_ATOM_K
-                    row = warp_atom_n_idx + ldmatrix_b_n_idx
-                    if not direct_ldg_b:
+            if b_vecs is None:
+                for ii in range_constexpr(WARP_N_STEPS):
+                    warp_atom_n_idx = warp_n_idx + ii * WARP_ATOM_N
+                    for kk in range_constexpr(WARP_K_STEPS):
+                        warp_atom_k_idx = kk * WARP_ATOM_K
+                        row = warp_atom_n_idx + ldmatrix_b_n_idx
                         col_in_bytes = (warp_atom_k_idx + ldmatrix_b_k_vec_idx) * DTYPE_BYTES
                         col_in_bytes = swizzle_xor16(row, col_in_bytes, k_blocks16)
                         vec = bs_.vec_load((s, row, col_in_bytes // DTYPE_BYTES), WMMA_FRAG_VALUES * MFMA_PER_WARP_K)
                         b_frags[kk * WARP_N_STEPS + ii] = vec
-                    else:
-                        col = warp_atom_k_idx + ldmatrix_b_k_vec_idx
-                        vec = B_.vec_load((b_offset + row, k_offset + col), WMMA_FRAG_VALUES * MFMA_PER_WARP_K)
-                        b_frags[kk * WARP_N_STEPS + ii] = vec
+            else:
+                b_frags = b_vecs
             # wmma
             for kk in range_constexpr(WARP_K_STEPS):
                 for ii in range_constexpr(WARP_M_STEPS):
@@ -261,19 +269,29 @@ def compile_hgemm_kernel(
         # Initial scheduling barrier to reset hardware scheduler state
         # rocdl.sched_barrier(0)
 
-        a_regs = ldg_a(m_offset, k_offset)
+        a_regs = ldg_a(m_offset, 0)
         sts_a(a_regs, 0)
         gpu.barrier()
         
-        for bki in range_constexpr(1, BLOCK_K_LOOPS):
+        c_frags = [acc_init] * (WARP_M_STEPS * WARP_N_STEPS)
+        init_state = [arith.constant(0, type=T.i32)] + c_frags
+
+        for bki, state in range(1, BLOCK_K_LOOPS, init=init_state):
+            k_offset = state[0]
+            c_frags = state[1:]
             a_regs_next = ldg_a(m_offset, k_offset + BLOCK_K)
-            block_mma_sync(0, direct_ldg_b=True, b_offset=n_offset, k_offset=k_offset)
+            b_regs = ldg_b(n_offset, k_offset)
+            block_mma_sync(0, b_vecs=b_regs)
             gpu.barrier()
             sts_a(a_regs_next, 0)
             gpu.barrier()
-            k_offset += fx.Int32(BLOCK_K)
+            k_offset = k_offset + fx.Int32(BLOCK_K)
+            results = yield [k_offset] + c_frags
         
-        block_mma_sync(0, direct_ldg_b=True, b_offset=n_offset, k_offset=k_offset)
+        k_offset = results[0]
+        c_frags = results[1:]
+        b_regs = ldg_b(n_offset, k_offset)
+        block_mma_sync(0, b_vecs=b_regs)
         
         # store results
         stmatrix_c_m_vec_idx = w_tid // WARP_ATOM_N * WMMA_FRAG_VALUES
@@ -309,17 +327,17 @@ def compile_hgemm_kernel(
     return launch_hgemm_kernel
 
 
-# def shuffle_b(x, layout=(16, 16), k_steps=2):
-#     x_shape = x.shape
-#     VEC_SIZE = 16 // x.element_size()
-#     BN = layout[0]
-#     BK = layout[1] * k_steps
-#     assert x.shape[-2] % BN == 0, f"{x.shape[-2]} % {BN} == {x.shape[-2] % BN }"
-#     assert x.shape[-1] % BK == 0, f"{x.shape[-1]} % {BK} == {x.shape[-1] % BK }"
-#     x = x.view(-1, x.shape[-2] // BN, BN, x.shape[-1] // BK, BK // VEC_SIZE, VEC_SIZE)
-#     x = x.permute(0, 1, 3, 4, 2, 5).contiguous().view(*x_shape)
-#     x.is_shuffled = True
-#     return x
+def shuffle_b(x, layout=(16, 16), k_steps=2):
+    x_shape = x.shape
+    VEC_SIZE = 16 // x.element_size()
+    BN = layout[0]
+    BK = layout[1] * k_steps
+    assert x.shape[-2] % BN == 0, f"{x.shape[-2]} % {BN} == {x.shape[-2] % BN }"
+    assert x.shape[-1] % BK == 0, f"{x.shape[-1]} % {BK} == {x.shape[-1] % BK }"
+    x = x.view(-1, x.shape[-2] // BN, BN, x.shape[-1] // BK, BK // VEC_SIZE, VEC_SIZE)
+    x = x.permute(0, 1, 3, 4, 2, 5).contiguous().view(*x_shape)
+    x.is_shuffled = True
+    return x
 
 
 def func(a, b, c):
@@ -331,6 +349,7 @@ def func(a, b, c):
         exe = compile_hgemm_kernel('bf16', m, n, k)
     else:
         raise NotImplementedError()
+    # b = shuffle_b(b)
     exe(a, b, c, stream=torch.cuda.current_stream())
 
 
