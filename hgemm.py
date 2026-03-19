@@ -61,13 +61,14 @@ def compile_hgemm_kernel(
     BLOCK_M_WARPS: int = 1,
     BLOCK_N_WARPS: int = 4,
     WARP_M_STEPS: int = 8,
-    WARP_N_STEPS: int = 2,
-    STAGES : int = 1,
+    WARP_N_STEPS: int = 4,
+    STAGES : int = 2,
     ASYNC_COPY: bool = False,
 ):
     assert k % BLOCK_K == 0
     assert k // BLOCK_K >= 1
     assert BLOCK_M_WARPS * BLOCK_N_WARPS == 4
+    assert STAGES == 2
 
     # Fixed parameters:
     WMMA_M = 16
@@ -91,6 +92,8 @@ def compile_hgemm_kernel(
     WARP_N = WARP_N_STEPS * WARP_ATOM_N
     BLOCK_M = BLOCK_M_WARPS * WARP_M
     BLOCK_N = BLOCK_N_WARPS * WARP_N
+    assert (m >= BLOCK_M) and (m % BLOCK_M == 0)
+    assert (n >= BLOCK_N) and (n % BLOCK_N == 0)
     BLOCK_MK_SIZE = BLOCK_M * BLOCK_K
     BLOCK_NK_SIZE = BLOCK_N * BLOCK_K
     LDG_A_X_THREADS = BLOCK_K // LDG_VEC_SIZE
@@ -140,7 +143,6 @@ def compile_hgemm_kernel(
         block_m_idx = fx.block_idx.x
         block_n_idx = fx.block_idx.y
 
-        current_stage = 0
         m_offset = fx.Index(block_m_idx * BLOCK_M)
         n_offset = fx.Index(block_n_idx * BLOCK_N)
         k_blocks16 = fx.Int32(BLOCK_K_BYTES // 16)
@@ -199,28 +201,6 @@ def compile_hgemm_kernel(
                     vecs.append(vec)
             return vecs
         
-        # def ldg_sts_a(a_offset, k_offset, lds_stage, async_mode=False):
-        #     if not async_mode:
-        #         for i in range_constexpr(LDG_REG_A_COUNT):
-        #             global_tid = BLOCK_THREADS * i + tid
-        #             m_local_idx = global_tid // LDG_A_X_THREADS
-        #             k_local_idx = global_tid % LDG_A_X_THREADS * LDG_VEC_SIZE
-        #             vec = A_.vec_load((a_offset + m_local_idx, k_offset + k_local_idx), LDG_VEC_SIZE)
-        #             col_in_bytes = k_local_idx * DTYPE_BYTES
-        #             col_in_bytes = swizzle_xor16(m_local_idx, col_in_bytes, k_blocks16)
-        #             as_.vec_store((fx.Index(lds_stage), m_local_idx, col_in_bytes // DTYPE_BYTES), vec, LDG_VEC_SIZE)
-        
-        # def ldg_sts_b(b_offset, k_offset, lds_stage, async_mode=False):
-        #     if not async_mode:
-        #         for i in range_constexpr(LDG_REG_B_COUNT):
-        #             global_tid = BLOCK_THREADS * i + tid
-        #             n_local_idx = global_tid // LDG_B_X_THREADS
-        #             k_local_idx = global_tid % LDG_B_X_THREADS * LDG_VEC_SIZE
-        #             vec = B_.vec_load((b_offset + n_local_idx, k_offset + k_local_idx), LDG_VEC_SIZE)
-        #             col_in_bytes = k_local_idx * DTYPE_BYTES
-        #             col_in_bytes = swizzle_xor16(n_local_idx, col_in_bytes, k_blocks16)
-        #             bs_.vec_store((fx.Index(lds_stage), n_local_idx, col_in_bytes // DTYPE_BYTES), vec, LDG_VEC_SIZE)
-        
         def block_mma_sync(a_frags, b_frags, c_frags):
             # wmma
             for kk in range_constexpr(WARP_K_STEPS):
@@ -255,7 +235,7 @@ def compile_hgemm_kernel(
                         c_frags[ii * WARP_N_STEPS + jj] = mfma_fn(T.f32x4, [a_v1, b_v1, acc_mid, 0, 0, 0])
         
         a_regs = ldg_a(0)
-        sts_a(a_regs, current_stage)
+        sts_a(a_regs, 0)
         b_frags = ldg_matrix_b(0)
         gpu.barrier()
 
@@ -267,34 +247,40 @@ def compile_hgemm_kernel(
             mfma_group = WARP_M_STEPS * WARP_N_STEPS
             # mfma_total = WARP_K_STEPS * mfma_group * MFMA_PER_WARP_K
             LDG_REG_A_COUNT_PART = LDG_REG_A_COUNT // WARP_K_STEPS
-            assert LDG_REG_A_COUNT_PART >= 1
+            if LDG_REG_A_COUNT_PART == 0:
+                rocdl.sched_vmem(LDG_REG_A_COUNT)
             for sche_i in range_constexpr(WARP_K_STEPS):
                 rocdl.sched_vmem(LDG_REG_A_COUNT_PART) # ldg_a next
                 rocdl.sched_dsrd(WARP_M_STEPS) # lds_matrix_a
                 rocdl.sched_mfma(mfma_group)
                 rocdl.sched_vmem(WARP_N_STEPS) # ldg_b next
                 rocdl.sched_mfma(mfma_group)
+                rocdl.sched_dswr(LDG_REG_A_COUNT_PART) # sts a next
+            if LDG_REG_A_COUNT_PART == 0:
+                rocdl.sched_dswr(LDG_REG_A_COUNT)
             rocdl.sched_barrier(0)
 
-        init_state = [arith.constant(0, type=T.i32)] + c_frags + b_frags
+        init_state = [arith.constant(0, type=T.i32), arith.constant(0, index=True)] + c_frags + b_frags
         for bki, state in range(1, BLOCK_K_LOOPS, init=init_state):
             k_offset = state[0]
-            c_frags = state[1 : 1 + C_FRAGS_LEN]
-            b_frags = state[1 + C_FRAGS_LEN :]
+            current_stage = state[1]
+            next_stage = 1 - current_stage
+            c_frags = state[2 : 2 + C_FRAGS_LEN]
+            b_frags = state[2 + C_FRAGS_LEN :]
             a_regs_next = ldg_a(k_offset + BLOCK_K)
             b_frags_next = ldg_matrix_b(k_offset + BLOCK_K)
             a_frags = lds_matrix_a(current_stage)
             block_mma_sync(a_frags, b_frags, c_frags)
-            gpu.barrier()
-            sts_a(a_regs_next, current_stage)
+            sts_a(a_regs_next, next_stage)
             hot_loop_scheduler()
             gpu.barrier()
             k_offset = k_offset + fx.Int32(BLOCK_K)
-            results = yield [k_offset] + c_frags + b_frags_next
+            results = yield [k_offset, next_stage] + c_frags + b_frags_next
         
         k_offset = results[0]
-        c_frags = results[1 : 1 + C_FRAGS_LEN]
-        b_frags = results[1 + C_FRAGS_LEN :]
+        current_stage = results[1]
+        c_frags = results[2 : 2 + C_FRAGS_LEN]
+        b_frags = results[2 + C_FRAGS_LEN :]
         a_frags = lds_matrix_a(current_stage)
         block_mma_sync(a_frags, b_frags, c_frags)
         
@@ -325,8 +311,10 @@ def compile_hgemm_kernel(
         with ir.InsertionPoint(ctx.gpu_module_body):
             allocator.finalize()
         
-        bm = (m + BLOCK_M - 1) // BLOCK_M
-        bn = (n + BLOCK_N - 1) // BLOCK_N
+        # bm = (m + BLOCK_M - 1) // BLOCK_M
+        # bn = (n + BLOCK_N - 1) // BLOCK_N
+        bm = m // BLOCK_M
+        bn = n // BLOCK_N
         hgemm_kernel(A, B, C).launch(grid=(bm, bn, 1), block=(BLOCK_THREADS, 1, 1), stream=stream)
     
     return launch_hgemm_kernel
