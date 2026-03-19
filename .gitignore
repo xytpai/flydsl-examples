@@ -157,3 +157,4 @@ gpucore.*
 log
 *_logs
 *dumps
+*.s
