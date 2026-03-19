@@ -247,7 +247,8 @@ def compile_hgemm_kernel(
             mfma_group = WARP_M_STEPS * WARP_N_STEPS
             # mfma_total = WARP_K_STEPS * mfma_group * MFMA_PER_WARP_K
             LDG_REG_A_COUNT_PART = LDG_REG_A_COUNT // WARP_K_STEPS
-            assert LDG_REG_A_COUNT_PART >= 1
+            if LDG_REG_A_COUNT_PART == 0:
+                rocdl.sched_vmem(LDG_REG_A_COUNT)
             for sche_i in range_constexpr(WARP_K_STEPS):
                 rocdl.sched_vmem(LDG_REG_A_COUNT_PART) # ldg_a next
                 rocdl.sched_dsrd(WARP_M_STEPS) # lds_matrix_a
@@ -255,6 +256,8 @@ def compile_hgemm_kernel(
                 rocdl.sched_vmem(WARP_N_STEPS) # ldg_b next
                 rocdl.sched_mfma(mfma_group)
                 rocdl.sched_dswr(LDG_REG_A_COUNT_PART) # sts a next
+            if LDG_REG_A_COUNT_PART == 0:
+                rocdl.sched_dswr(LDG_REG_A_COUNT)
             rocdl.sched_barrier(0)
 
         init_state = [arith.constant(0, type=T.i32), arith.constant(0, index=True)] + c_frags + b_frags
@@ -308,8 +311,10 @@ def compile_hgemm_kernel(
         with ir.InsertionPoint(ctx.gpu_module_body):
             allocator.finalize()
         
-        bm = (m + BLOCK_M - 1) // BLOCK_M
-        bn = (n + BLOCK_N - 1) // BLOCK_N
+        # bm = (m + BLOCK_M - 1) // BLOCK_M
+        # bn = (n + BLOCK_N - 1) // BLOCK_N
+        bm = m // BLOCK_M
+        bn = n // BLOCK_N
         hgemm_kernel(A, B, C).launch(grid=(bm, bn, 1), block=(BLOCK_THREADS, 1, 1), stream=stream)
     
     return launch_hgemm_kernel
