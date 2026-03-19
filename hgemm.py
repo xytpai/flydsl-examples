@@ -151,7 +151,8 @@ def compile_hgemm_kernel(
         ldmatrix_a_k_vec_idx = w_tid // WARP_ATOM_M * WMMA_FRAG_VALUES * MFMA_PER_WARP_K
         ldmatrix_b_n_idx = w_tid % WARP_ATOM_N
         ldmatrix_b_k_vec_idx = w_tid // WARP_ATOM_N * WMMA_FRAG_VALUES * MFMA_PER_WARP_K
-        c_frags = [acc_init] * (WARP_M_STEPS * WARP_N_STEPS)
+        C_FRAGS_LEN = WARP_M_STEPS * WARP_N_STEPS
+        c_frags = [acc_init] * C_FRAGS_LEN
     
         def ldg_a(k_offset):
             vecs = []
@@ -253,39 +254,48 @@ def compile_hgemm_kernel(
                         acc_mid = mfma_fn(T.f32x4, [a_v0, b_v0, acc_in, 0, 0, 0])
                         c_frags[ii * WARP_N_STEPS + jj] = mfma_fn(T.f32x4, [a_v1, b_v1, acc_mid, 0, 0, 0])
         
-        init_state = [arith.constant(0, type=T.i32)] + c_frags
         a_regs = ldg_a(0)
         sts_a(a_regs, current_stage)
+        b_frags = ldg_matrix_b(0)
         gpu.barrier()
 
         # ============ Main K-loop with scheduling ============
         # Initial scheduling barrier to reset hardware scheduler state
-        # rocdl.sched_barrier(0)
+        rocdl.sched_barrier(0)
+        def hot_loop_scheduler():
+            assert MFMA_PER_WARP_K == 2
+            mfma_group = WARP_M_STEPS * WARP_N_STEPS
+            # mfma_total = WARP_K_STEPS * mfma_group * MFMA_PER_WARP_K
+            LDG_REG_A_COUNT_PART = LDG_REG_A_COUNT // WARP_K_STEPS
+            assert LDG_REG_A_COUNT_PART >= 1
+            for sche_i in range_constexpr(WARP_K_STEPS):
+                rocdl.sched_vmem(LDG_REG_A_COUNT_PART) # ldg_a next
+                rocdl.sched_dsrd(WARP_M_STEPS) # lds_matrix_a
+                rocdl.sched_mfma(mfma_group)
+                rocdl.sched_vmem(WARP_N_STEPS) # ldg_b next
+                rocdl.sched_mfma(mfma_group)
+            rocdl.sched_barrier(0)
 
-        # def hot_loop_scheduler():
-        #     mfma_group = WARP_N_STEPS
-        #     mfma_total = WARP_K_STEPS * WARP_M_STEPS * WARP_N_STEPS * MFMA_PER_WARP_K
-        #     mfma_per_iter = WARP_N_STEPS * MFMA_PER_WARP_K
-        #     sche_iters = 0 if mfma_per_iter == 0 else (mfma_total // mfma_per_iter)
-        #     rocdl.sched_barrier(0)
-
+        init_state = [arith.constant(0, type=T.i32)] + c_frags + b_frags
         for bki, state in range(1, BLOCK_K_LOOPS, init=init_state):
             k_offset = state[0]
-            c_frags = state[1:]
+            c_frags = state[1 : 1 + C_FRAGS_LEN]
+            b_frags = state[1 + C_FRAGS_LEN :]
             a_regs_next = ldg_a(k_offset + BLOCK_K)
+            b_frags_next = ldg_matrix_b(k_offset + BLOCK_K)
             a_frags = lds_matrix_a(current_stage)
-            b_frags = ldg_matrix_b(k_offset)
             block_mma_sync(a_frags, b_frags, c_frags)
             gpu.barrier()
             sts_a(a_regs_next, current_stage)
+            hot_loop_scheduler()
             gpu.barrier()
             k_offset = k_offset + fx.Int32(BLOCK_K)
-            results = yield [k_offset] + c_frags
+            results = yield [k_offset] + c_frags + b_frags_next
         
         k_offset = results[0]
-        c_frags = results[1:]
+        c_frags = results[1 : 1 + C_FRAGS_LEN]
+        b_frags = results[1 + C_FRAGS_LEN :]
         a_frags = lds_matrix_a(current_stage)
-        b_frags = ldg_matrix_b(k_offset)
         block_mma_sync(a_frags, b_frags, c_frags)
         
         # store results
