@@ -294,9 +294,9 @@ def compile_hgemm_kernel(
         if B_TO_LDS:
             # SLOW PATH
             
-            a_regs = ldg_a(0)
+            a_regs = ldg_a(ks_begin)
             sts_a(a_regs, 0)
-            b_regs = ldg_b(0)
+            b_regs = ldg_b(ks_begin)
             sts_b(b_regs, 0)
             gpu.barrier()
 
@@ -326,9 +326,9 @@ def compile_hgemm_kernel(
         
         else:
 
-            a_regs = ldg_a(0)
+            a_regs = ldg_a(ks_begin)
             sts_a(a_regs, 0)
-            b_frags = ldg_matrix_b(0)
+            b_frags = ldg_matrix_b(ks_begin)
             gpu.barrier()
 
             # ============ Main K-loop with scheduling ============
@@ -466,6 +466,8 @@ def func(a, b, c):
         raise NotImplementedError()
     b = shuffle_b(b)
     exe(a, b, c, scratchpad, stream=torch.cuda.current_stream())
+    if split_k > 1:
+        c.copy_(scratchpad.sum(dim=0))
 
 
 def benchmark(args, func, ref_func, warmup=20, niters=100):
