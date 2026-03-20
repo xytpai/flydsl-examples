@@ -219,41 +219,39 @@ Self CUDA time total: 447.382us
 ## 4. HGEMM
 
 ```bash
-python3 hgemm.py --m=8192 --n=8192 --k=8192 --dtype=f16
+python3 hgemm.py --m=4096 --n=4096 --k=4096 --dtype=f16
 ```
 
 ```txt
-run: /home/yuxu/flydsl-examples/hgemm.py, args: Namespace(m=8192, n=8192, k=8192, dtype='f16')
+run: /home/yuxu/flydsl-examples/hgemm.py, args: Namespace(m=4096, n=4096, k=4096, dtype='f16')
+maxdiff_out:0.0625
 validation passed!
 
 ===================== [REF] =====================
-[W227 12:33:28.617539313 collection.cpp:1116] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
+[W320 06:20:36.581391711 collection.cpp:1116] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
 -------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
                                                    Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
 -------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-Cijk_Alik_Bljk_HHS_BH_UserArgs_MT256x224x64_MI16x16x...         0.00%       0.000us         0.00%       0.000us       0.000us     531.365ms       100.00%     531.365ms       5.314ms           100  
-                            hipGetDevicePropertiesR0600         0.02%     103.111us         0.02%     103.111us       0.344us       0.000us         0.00%       0.000us       0.000us           300  
-                               hipExtModuleLaunchKernel         0.10%     529.805us         0.10%     529.805us       5.298us       0.000us         0.00%       0.000us       0.000us           100  
-                                   hipDeviceSynchronize        99.88%     531.702ms        99.88%     531.702ms       5.264ms       0.000us         0.00%       0.000us       0.000us           101  
+Cijk_Alik_Bljk_HHS_BH_UserArgs_MT256x224x64_MI16x16x...         0.00%       0.000us         0.00%       0.000us       0.000us      73.268ms       100.00%      73.268ms     732.680us           100  
+                            hipGetDevicePropertiesR0600         0.20%     138.970us         0.20%     138.970us       0.463us       0.000us         0.00%       0.000us       0.000us           300  
+                               hipExtModuleLaunchKernel         0.69%     490.480us         0.69%     490.480us       4.905us       0.000us         0.00%       0.000us       0.000us           100  
+                                   hipDeviceSynchronize        99.11%      70.341ms        99.11%      70.341ms      70.341ms       0.000us         0.00%       0.000us       0.000us             1  
 -------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-Self CPU time total: 532.335ms
-Self CUDA time total: 531.365ms
+Self CPU time total: 70.970ms
+Self CUDA time total: 73.268ms
 
 ===================== [FLYDSL] =====================
 -------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
                                                    Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
 -------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-                                           hgemm_kernel         0.00%       0.000us         0.00%       0.000us       0.000us     576.349ms        95.32%     576.349ms       5.763ms           100  
-void at::native::elementwise_kernel_manual_unroll<12...         0.00%       0.000us         0.00%       0.000us       0.000us      28.318ms         4.68%      28.318ms     283.183us           100  
-                                        hipLaunchKernel         0.12%     846.279us         0.12%     846.279us       8.463us       0.000us         0.00%       0.000us       0.000us           100  
-                                        hipStreamCreate        10.32%      70.744ms        10.32%      70.744ms     707.441us       0.000us         0.00%       0.000us       0.000us           100  
-                                  hipModuleLaunchKernel         0.13%     891.809us         0.13%     891.809us       8.918us       0.000us         0.00%       0.000us       0.000us           100  
-                                   hipStreamSynchronize        84.43%     578.859ms        84.43%     578.859ms       5.789ms       0.000us         0.00%       0.000us       0.000us           100  
-                                       hipStreamDestroy         4.63%      31.726ms         4.63%      31.726ms     317.264us       0.000us         0.00%       0.000us       0.000us           100  
-                                   hipDeviceSynchronize         0.37%       2.506ms         0.37%       2.506ms      24.816us       0.000us         0.00%       0.000us       0.000us           101  
+                                         hgemm_kernel_0         0.00%       0.000us         0.00%       0.000us       0.000us      81.338ms        91.61%      81.338ms     813.381us           100  
+void at::native::elementwise_kernel_manual_unroll<12...         0.00%       0.000us         0.00%       0.000us       0.000us       7.452ms         8.39%       7.452ms      74.516us           100  
+                                        hipLaunchKernel         0.96%     660.944us         0.96%     660.944us       6.609us       0.000us         0.00%       0.000us       0.000us           100  
+                                  hipModuleLaunchKernel         0.75%     516.513us         0.75%     516.513us       5.165us       0.000us         0.00%       0.000us       0.000us           100  
+                                   hipDeviceSynchronize        98.29%      67.814ms        98.29%      67.814ms      67.814ms       0.000us         0.00%       0.000us       0.000us             1  
 -------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-Self CPU time total: 685.574ms
-Self CUDA time total: 604.668ms
+Self CPU time total: 68.992ms
+Self CUDA time total: 88.790ms
 ```
 
 ---

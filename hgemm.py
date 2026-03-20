@@ -65,11 +65,14 @@ def compile_hgemm_kernel(
     STAGES : int = 2,
     ASYNC_COPY: bool = False,
     B_TO_LDS: bool = False,
+    B_PRE_SHUFFLE: bool = True,
 ):
     assert k % BLOCK_K == 0
     assert k // BLOCK_K >= 1
     assert BLOCK_M_WARPS * BLOCK_N_WARPS == 4
     assert STAGES == 2
+    if B_PRE_SHUFFLE == True:
+        assert B_TO_LDS == False
 
     # Fixed parameters:
     WMMA_M = 16
@@ -136,6 +139,9 @@ def compile_hgemm_kernel(
         if B_TO_LDS:
             smem_b_ptr = SmemPtr(base_ptr, smem_b_offset, dtype_, shape=(STAGES * BLOCK_N * BLOCK_K,))
             bs_ = STensor(smem_b_ptr, dtype_, shape=(STAGES, BLOCK_N, BLOCK_K))
+        if B_PRE_SHUFFLE:
+            # B_ = GTensor(B, dtype=dtype_, shape=(n // 16, 16, k // 32, 4, 8))
+            SHUFFLED_B_ = GTensor(B, dtype=dtype_, shape=(n // 16, k // 32, 4, 16, 8))
         
         tid = fx.Int32(fx.thread_idx.x)
         wid = tid // WARP_SIZE
@@ -228,10 +234,19 @@ def compile_hgemm_kernel(
                 for ii in range_constexpr(WARP_N_STEPS):
                     warp_atom_n_idx = warp_n_idx + ii * WARP_ATOM_N
                     warp_atom_k_idx = kk * WARP_ATOM_K
-                    row = warp_atom_n_idx + ldmatrix_b_n_idx
-                    col = warp_atom_k_idx + ldmatrix_b_k_vec_idx
-                    vec = B_.vec_load((n_offset + row, k_offset + col), WMMA_FRAG_VALUES * MFMA_PER_WARP_K)
-                    vecs.append(vec)
+                    n_idx = n_offset + warp_atom_n_idx + ldmatrix_b_n_idx
+                    k_idx = k_offset + warp_atom_k_idx + ldmatrix_b_k_vec_idx
+                    if not B_PRE_SHUFFLE:
+                        vec = B_.vec_load((n_idx, k_idx), WMMA_FRAG_VALUES * MFMA_PER_WARP_K)
+                        vecs.append(vec)
+                    else:
+                        idx_0 = n_idx // 16
+                        idx_1 = n_idx % 16
+                        idx_2 = k_idx // 32
+                        idx_2_temp = k_idx % 32
+                        idx_3 = idx_2_temp // 8
+                        vec = SHUFFLED_B_.vec_load((idx_0, idx_2, idx_3, idx_1, 0), 8)
+                        vecs.append(vec)
             return vecs
         
         def block_mma_sync(a_frags, b_frags, c_frags):
@@ -397,7 +412,8 @@ def shuffle_b(x, layout=(16, 16), k_steps=2):
     assert x.shape[-2] % BN == 0, f"{x.shape[-2]} % {BN} == {x.shape[-2] % BN }"
     assert x.shape[-1] % BK == 0, f"{x.shape[-1]} % {BK} == {x.shape[-1] % BK }"
     x = x.view(-1, x.shape[-2] // BN, BN, x.shape[-1] // BK, BK // VEC_SIZE, VEC_SIZE)
-    x = x.permute(0, 1, 3, 4, 2, 5).contiguous().view(*x_shape)
+    x = x.permute(0, 1, 3, 4, 2, 5).contiguous()
+    x = x.view(*x_shape)
     x.is_shuffled = True
     return x
 
@@ -411,7 +427,7 @@ def func(a, b, c):
         exe = compile_hgemm_kernel('bf16', m, n, k)
     else:
         raise NotImplementedError()
-    # b = shuffle_b(b)
+    b = shuffle_b(b)
     exe(a, b, c, stream=torch.cuda.current_stream())
 
 
