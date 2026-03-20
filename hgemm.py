@@ -419,13 +419,33 @@ def shuffle_b(x, layout=(16, 16), k_steps=2):
     return x
 
 
+def get_kwargs(m, n, k):
+    kwargs = {
+        'BLOCK_K': 64,
+        'BLOCK_M_WARPS': 1,
+        'BLOCK_N_WARPS': 4,
+        'WARP_M_STEPS': 8,
+        'WARP_N_STEPS': 4,
+        'STAGES' : 2,
+        'ASYNC_COPY': False,
+        'B_TO_LDS': False,
+        'B_PRE_SHUFFLE': True,
+    }
+    if m == 32 and n == 7168 and k == 2048:
+        kwargs['BLOCK_K'] = 128
+        kwargs['WARP_M_STEPS'] = 1
+        kwargs['WARP_N_STEPS'] = 8
+    return kwargs
+
+
 def func(a, b, c):
     m, k = a.shape
     n = b.shape[0]
+    kwargs = get_kwargs(m, n, k)
     if a.dtype == torch.half:
-        exe = compile_hgemm_kernel('f16', m, n, k)
+        exe = compile_hgemm_kernel('f16', m, n, k, **kwargs)
     elif a.dtype == torch.bfloat16:
-        exe = compile_hgemm_kernel('bf16', m, n, k)
+        exe = compile_hgemm_kernel('bf16', m, n, k, **kwargs)
     else:
         raise NotImplementedError()
     b = shuffle_b(b)
