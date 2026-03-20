@@ -69,8 +69,9 @@ def compile_hgemm_kernel(
 ):
     assert k % BLOCK_K == 0
     assert k // BLOCK_K >= 1
+    assert BLOCK_K >= 32
     assert BLOCK_M_WARPS * BLOCK_N_WARPS == 4
-    assert STAGES == 2
+    assert STAGES in [2,]
     if B_PRE_SHUFFLE == True:
         assert B_TO_LDS == False
 
