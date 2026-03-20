@@ -66,9 +66,11 @@ def compile_hgemm_kernel(
     ASYNC_COPY: bool = False,
     B_TO_LDS: bool = False,
     B_PRE_SHUFFLE: bool = True,
+    SPLIT_K: int = 1,
 ):
-    assert k % BLOCK_K == 0
-    assert k // BLOCK_K >= 1
+    assert (k % SPLIT_K == 0) and (k // SPLIT_K >= 1)
+    ks = k // SPLIT_K
+    assert (ks % BLOCK_K == 0) and (ks // BLOCK_K >= 1)
     assert BLOCK_K >= 32
     assert BLOCK_M_WARPS * BLOCK_N_WARPS == 4
     assert STAGES in [2,]
@@ -89,7 +91,7 @@ def compile_hgemm_kernel(
     WARP_ATOM_M = WMMA_M
     WARP_ATOM_N = WMMA_N
     WARP_ATOM_K = WMMA_K * MFMA_PER_WARP_K
-    BLOCK_K_LOOPS = k // BLOCK_K
+    BLOCK_K_LOOPS = ks // BLOCK_K
     WARP_K_STEPS = BLOCK_K // WARP_ATOM_K
     assert (BLOCK_K % WARP_ATOM_K == 0) and (WARP_K_STEPS >= 1)
     BLOCK_THREADS = BLOCK_M_WARPS * BLOCK_N_WARPS * WARP_SIZE
@@ -122,6 +124,7 @@ def compile_hgemm_kernel(
         A: fx.Tensor,
         B: fx.Tensor,
         C: fx.Tensor,
+        S: fx.Tensor,
     ):
         dtype_ = get_dtype_in_kernel(dtype)
         if dtype == 'bf16':
@@ -134,6 +137,8 @@ def compile_hgemm_kernel(
         A_ = GTensor(A, dtype=dtype_, shape=(m, k))
         B_ = GTensor(B, dtype=dtype_, shape=(n, k))
         C_ = GTensor(C, dtype=dtype_, shape=(m, n))
+        if SPLIT_K > 1:
+            S_ = GTensor(S, dtype=dtype_, shape=(SPLIT_K, m, n))
         base_ptr = allocator.get_base()
         smem_a_ptr = SmemPtr(base_ptr, smem_a_offset, dtype_, shape=(STAGES * BLOCK_M * BLOCK_K,))
         as_ = STensor(smem_a_ptr, dtype_, shape=(STAGES, BLOCK_M, BLOCK_K))
@@ -149,6 +154,8 @@ def compile_hgemm_kernel(
         w_tid = tid % WARP_SIZE
         block_m_idx = fx.block_idx.x
         block_n_idx = fx.block_idx.y
+        ks_idx = fx.Index(fx.block_idx.z)
+        ks_begin = arith.index_cast(T.i32, ks_idx * ks)
 
         m_offset = fx.Index(block_m_idx * BLOCK_M)
         n_offset = fx.Index(block_n_idx * BLOCK_N)
@@ -293,7 +300,7 @@ def compile_hgemm_kernel(
             sts_b(b_regs, 0)
             gpu.barrier()
 
-            init_state = [arith.constant(0, type=T.i32), arith.constant(0, index=True)] + c_frags
+            init_state = [ks_begin, arith.constant(0, index=True)] + c_frags
             for bki, state in range(1, BLOCK_K_LOOPS, init=init_state):
                 k_offset = state[0]
                 current_stage = fx.Index(state[1])
@@ -343,7 +350,7 @@ def compile_hgemm_kernel(
                     rocdl.sched_dswr(LDG_REG_A_COUNT_PART) # sts a next
                 rocdl.sched_barrier(0)
 
-            init_state = [arith.constant(0, type=T.i32), arith.constant(0, index=True)] + c_frags + b_frags
+            init_state = [ks_begin, arith.constant(0, index=True)] + c_frags + b_frags
             for bki, state in range(1, BLOCK_K_LOOPS, init=init_state):
                 k_offset = state[0]
                 current_stage = fx.Index(state[1])
@@ -379,7 +386,10 @@ def compile_hgemm_kernel(
                     out_m_idx = g_warp_atom_m_idx + stmatrix_c_m_vec_idx + kk
                     out_n_idx = g_warp_atom_n_idx + stmatrix_c_n_idx
                     val = vector.extract(out_vec, static_position=[kk], dynamic_position=[])
-                    C_[out_m_idx, out_n_idx] = val.truncf(dtype_)
+                    if SPLIT_K > 1:
+                        S_[ks_idx, out_m_idx, out_n_idx] = val.truncf(dtype_)
+                    else:
+                        C_[out_m_idx, out_n_idx] = val.truncf(dtype_)
         return
     
     @flyc.jit
@@ -387,6 +397,7 @@ def compile_hgemm_kernel(
         A: fx.Tensor,
         B: fx.Tensor,
         C: fx.Tensor,
+        S: fx.Tensor,
         stream: fx.Stream = fx.Stream(None),
     ):
         allocator.finalized = False
@@ -398,7 +409,7 @@ def compile_hgemm_kernel(
         # bn = (n + BLOCK_N - 1) // BLOCK_N
         bm = m // BLOCK_M
         bn = n // BLOCK_N
-        hgemm_kernel(A, B, C).launch(grid=(bm, bn, 1), block=(BLOCK_THREADS, 1, 1), stream=stream)
+        hgemm_kernel(A, B, C, S).launch(grid=(bm, bn, SPLIT_K), block=(BLOCK_THREADS, 1, 1), stream=stream)
     
     return launch_hgemm_kernel
 
@@ -428,11 +439,13 @@ def get_kwargs(m, n, k):
         'ASYNC_COPY': False,
         'B_TO_LDS': False,
         'B_PRE_SHUFFLE': True,
+        'SPLIT_K': 1,
     }
     if m == 32 and n == 7168 and k == 2048:
         kwargs['BLOCK_K'] = 128
         kwargs['WARP_M_STEPS'] = 1
         kwargs['WARP_N_STEPS'] = 4
+        kwargs['SPLIT_K'] = 4
     return kwargs
 
 
@@ -440,6 +453,11 @@ def func(a, b, c):
     m, k = a.shape
     n = b.shape[0]
     kwargs = get_kwargs(m, n, k)
+    split_k = kwargs['SPLIT_K']
+    if split_k > 1:
+        scratchpad = torch.empty((split_k, m, n), dtype=a.dtype, device='cuda')
+    else:
+        scratchpad = torch.empty(32, dtype=a.dtype, device='cuda')
     if a.dtype == torch.half:
         exe = compile_hgemm_kernel('f16', m, n, k, **kwargs)
     elif a.dtype == torch.bfloat16:
@@ -447,7 +465,7 @@ def func(a, b, c):
     else:
         raise NotImplementedError()
     b = shuffle_b(b)
-    exe(a, b, c, stream=torch.cuda.current_stream())
+    exe(a, b, c, scratchpad, stream=torch.cuda.current_stream())
 
 
 def benchmark(args, func, ref_func, warmup=20, niters=100):
