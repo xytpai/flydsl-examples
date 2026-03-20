@@ -333,7 +333,7 @@ def compile_hgemm_kernel(
                 # mfma_total = WARP_K_STEPS * mfma_group * MFMA_PER_WARP_K
                 LDG_REG_A_COUNT_PART = LDG_REG_A_COUNT // WARP_K_STEPS
                 if LDG_REG_A_COUNT_PART == 0:
-                    rocdl.sched_vmem(LDG_REG_A_COUNT)
+                    rocdl.sched_vmem(1)
                 for sche_i in range_constexpr(WARP_K_STEPS):
                     rocdl.sched_vmem(LDG_REG_A_COUNT_PART) # ldg_a next
                     rocdl.sched_dsrd(WARP_M_STEPS) # lds_matrix_a
@@ -341,8 +341,6 @@ def compile_hgemm_kernel(
                     rocdl.sched_vmem(WARP_N_STEPS) # ldg_b next
                     rocdl.sched_mfma(mfma_group)
                     rocdl.sched_dswr(LDG_REG_A_COUNT_PART) # sts a next
-                if LDG_REG_A_COUNT_PART == 0:
-                    rocdl.sched_dswr(LDG_REG_A_COUNT)
                 rocdl.sched_barrier(0)
 
             init_state = [arith.constant(0, type=T.i32), arith.constant(0, index=True)] + c_frags + b_frags
@@ -434,7 +432,7 @@ def get_kwargs(m, n, k):
     if m == 32 and n == 7168 and k == 2048:
         kwargs['BLOCK_K'] = 128
         kwargs['WARP_M_STEPS'] = 1
-        kwargs['WARP_N_STEPS'] = 8
+        kwargs['WARP_N_STEPS'] = 4
     return kwargs
 
 
