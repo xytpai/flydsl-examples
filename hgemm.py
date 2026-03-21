@@ -348,9 +348,10 @@ def compile_hgemm_kernel(
                 for sche_i in range_constexpr(WARP_K_STEPS):
                     rocdl.sched_vmem(LDG_REG_A_COUNT_PART) # ldg_a next
                     rocdl.sched_dsrd(WARP_M_STEPS) # lds_matrix_a
-                    rocdl.sched_mfma(mfma_group)
-                    rocdl.sched_vmem(WARP_N_STEPS) # ldg_b next
-                    rocdl.sched_mfma(mfma_group)
+                    for pki in range_constexpr(PACK_N):
+                        rocdl.sched_mfma(mfma_group)
+                        rocdl.sched_vmem(WARP_N_STEPS) # ldg_b next
+                        rocdl.sched_mfma(mfma_group)
                     rocdl.sched_dswr(LDG_REG_A_COUNT_PART) # sts a next
                 rocdl.sched_barrier(0)
 
