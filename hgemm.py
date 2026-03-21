@@ -40,7 +40,7 @@ def create_inputs(args):
 
 
 def create_outputs(args):
-    c = torch.zeros((args.m, args.n), dtype=args.dtype, device='cuda')
+    c = torch.randn((args.m, args.n), dtype=args.dtype, device='cuda')
     return (c,)
 
 
@@ -109,8 +109,10 @@ def compile_hgemm_kernel(
     BLOCK_NK_SIZE = BLOCK_N * BLOCK_K
     LDG_A_X_THREADS = BLOCK_K // LDG_VEC_SIZE
     LDG_B_X_THREADS = BLOCK_K // LDG_VEC_SIZE
+    LDG_C_X_THREADS = BLOCK_N // LDG_VEC_SIZE
     LDG_REG_A_COUNT = BLOCK_MK_SIZE // LDG_VEC_SIZE // BLOCK_THREADS
     LDG_REG_B_COUNT = BLOCK_NK_SIZE // LDG_VEC_SIZE // BLOCK_THREADS
+    LDG_REG_C_COUNT = BLOCK_M * BLOCK_N // LDG_VEC_SIZE // BLOCK_THREADS
     assert (LDG_REG_A_COUNT >= 1) and (LDG_REG_B_COUNT >= 1)
     BLOCK_K_BYTES = BLOCK_K * DTYPE_BYTES
 
@@ -135,6 +137,7 @@ def compile_hgemm_kernel(
         else:
             mfma_fn = rocdl.mfma_f32_16x16x16f16
         c_zero_f = arith.constant(0.0, type=T.f32)
+        c_zero_d = arith.constant(0.0, type=dtype_)
         acc_init = arith.constant_vector(0.0, T.f32x4)
 
         A_ = GTensor(A, dtype=dtype_, shape=(m, k))
@@ -171,7 +174,17 @@ def compile_hgemm_kernel(
         ldmatrix_b_k_vec_idx = w_tid // WMMA_N * WMMA_FRAG_VALUES * MFMA_PER_WARP_K
         C_FRAGS_LEN = WARP_M_STEPS * WARP_N_STEPS * PACK_N
         c_frags = [acc_init] * C_FRAGS_LEN
-    
+
+        def zero_c():
+            cond = arith.cmpi(arith.CmpIPredicate.eq, ks_idx, fx.Index(0))
+            zero_vec = vector.broadcast(T.vec(LDG_VEC_SIZE, dtype_), c_zero_d)
+            if cond:
+                for i in range_constexpr(LDG_REG_C_COUNT):
+                    global_tid = BLOCK_THREADS * i + tid
+                    m_local_idx = global_tid // LDG_C_X_THREADS
+                    n_local_idx = global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE
+                    C_.vec_store((m_offset + m_local_idx, n_offset + n_local_idx), zero_vec, LDG_VEC_SIZE)
+        
         def ldg_a(k_offset):
             vecs = []
             for i in range_constexpr(LDG_REG_A_COUNT):
@@ -294,6 +307,9 @@ def compile_hgemm_kernel(
                             acc_in = c_frags[c_idx]
                             acc_mid = mfma_fn(T.f32x4, [a_v0, b_v0, acc_in, 0, 0, 0])
                             c_frags[c_idx] = mfma_fn(T.f32x4, [a_v1, b_v1, acc_mid, 0, 0, 0])
+        
+        if SPLIT_K > 1:
+            zero_c()
         
         if B_TO_LDS:
             # SLOW PATH
