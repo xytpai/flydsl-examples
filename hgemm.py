@@ -114,6 +114,8 @@ def compile_hgemm_kernel(
     LDG_REG_B_COUNT = BLOCK_NK_SIZE // LDG_VEC_SIZE // BLOCK_THREADS
     LDG_REG_C_COUNT = BLOCK_M * BLOCK_N // LDG_VEC_SIZE // BLOCK_THREADS
     assert (LDG_REG_A_COUNT >= 1) and (LDG_REG_B_COUNT >= 1)
+    if SPLIT_K > 1:
+        assert LDG_REG_C_COUNT >= 1
     BLOCK_K_BYTES = BLOCK_K * DTYPE_BYTES
 
     # LDS parameters:
@@ -491,11 +493,11 @@ def get_kwargs(m, n, k):
         'SPLIT_K': 1,
     }
     if m == 32 and n == 7168 and k == 2048:
-        kwargs['BLOCK_K'] = 128
+        kwargs['BLOCK_K'] = 64
         kwargs['WARP_M_STEPS'] = 2
         kwargs['WARP_N_STEPS'] = 2
         kwargs['PACK_N'] = 2
-        kwargs['SPLIT_K'] = 4
+        kwargs['SPLIT_K'] = 8
     return kwargs
 
 
