@@ -127,6 +127,12 @@ def compile_hgemm_kernel(
         smem_b_offset = allocator._align(allocator.ptr, 16)
         allocator.ptr = smem_b_offset + STAGES * BLOCK_N * BLOCK_K * DTYPE_BYTES
 
+    KERNEL_NAME = f"hgemm_{dtype}_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_S{STAGES}TN"
+    if B_PRE_SHUFFLE:
+        KERNEL_NAME += "_BP"
+    if SPLIT_K > 1:
+        KERNEL_NAME += f"_SPK{SPLIT_K}"
+
     @flyc.kernel
     def hgemm_kernel(
         A: fx.Tensor,
@@ -459,6 +465,7 @@ def compile_hgemm_kernel(
         # bn = (n + BLOCK_N - 1) // BLOCK_N
         bm = m // BLOCK_M
         bn = n // BLOCK_N
+        hgemm_kernel._func.__name__ = KERNEL_NAME
         hgemm_kernel(A, B, C).launch(grid=(bm, bn, SPLIT_K), block=(BLOCK_THREADS, 1, 1), stream=stream)
     
     return launch_hgemm_kernel
