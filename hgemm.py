@@ -99,7 +99,7 @@ def compile_hgemm_kernel(
     WARP_N_STEPS: int = 2,
     PACK_N: int = 2,
     STAGES : int = 2,
-    ASYNC_COPY: bool = True,
+    ASYNC_COPY: bool = False,
     B_TO_LDS: bool = False,
     B_PRE_SHUFFLE: bool = True,
     SPLIT_K: int = 1,
@@ -423,11 +423,8 @@ def compile_hgemm_kernel(
         
         else:
 
-            if not ASYNC_COPY:
-                a_regs = ldg_a(ks_begin)
-                sts_a(a_regs, 0)
-            else:
-                ldg_sts_a_async(ks_begin, 0)
+            a_regs = ldg_a(ks_begin)
+            sts_a(a_regs, 0)
             b_frags = ldg_matrix_b(ks_begin)
             gpu.barrier()
 
@@ -571,7 +568,7 @@ def get_kwargs(m, n, k):
         'WARP_N_STEPS': 2,
         'PACK_N': 2,
         'STAGES' : 2,
-        'ASYNC_COPY': True,
+        'ASYNC_COPY': False,
         'B_TO_LDS': False,
         'B_PRE_SHUFFLE': True,
         'SPLIT_K': 1,
