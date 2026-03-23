@@ -39,7 +39,41 @@ def create_inputs(args):
     return (a, b)
 
 
+C_OUT_TABLE = {}
+class HGEMMOut:
+    def __init__(self, m, n, dtype, device):
+        global C_OUT_TABLE
+        lookup_key = f"{m}x{n}:{dtype}:{device}"
+        if C_OUT_TABLE.get(lookup_key, None) is None:
+            C_OUT_TABLE[lookup_key] = [
+                torch.zeros(m, n, dtype=dtype, device=device),
+                torch.zeros(m, n, dtype=dtype, device=device),
+                int(0)
+            ]
+        self.lookup_key = lookup_key
+    
+    def get(self):
+        values = C_OUT_TABLE[self.lookup_key]
+        data_idx = values[2]
+        return values[data_idx]
+    
+    def get_next(self):
+        values = C_OUT_TABLE[self.lookup_key]
+        data_idx = values[2]
+        next_data_idx = 1 - data_idx
+        return values[next_data_idx]
+    
+    def switch(self):
+        values = C_OUT_TABLE[self.lookup_key]
+        values[2] = int(1 - values[2])
+
+
 def create_outputs(args):
+    c = HGEMMOut(args.m, args.n, args.dtype, 'cuda')
+    return (c,)
+
+
+def create_ref_outputs(args):
     c = torch.randn((args.m, args.n), dtype=args.dtype, device='cuda')
     return (c,)
 
@@ -138,6 +172,7 @@ def compile_hgemm_kernel(
         A: fx.Tensor,
         B: fx.Tensor,
         C: fx.Tensor,
+        CLEAN: fx.Tensor,
     ):
         dtype_ = get_dtype_in_kernel(dtype)
         if dtype == 'bf16':
@@ -184,6 +219,7 @@ def compile_hgemm_kernel(
         c_frags = [acc_init] * C_FRAGS_LEN
 
         def zero_c():
+            CLEAN_ = GTensor(CLEAN, dtype=dtype_, shape=(m, n))
             cond = arith.cmpi(arith.CmpIPredicate.eq, ks_idx, fx.Index(0))
             zero_vec = vector.broadcast(T.vec(LDG_VEC_SIZE, dtype_), c_zero_d)
             if cond:
@@ -191,7 +227,7 @@ def compile_hgemm_kernel(
                     global_tid = BLOCK_THREADS * i + tid
                     m_local_idx = global_tid // LDG_C_X_THREADS
                     n_local_idx = global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE
-                    C_.vec_store((m_offset + m_local_idx, n_offset + n_local_idx), zero_vec, LDG_VEC_SIZE)
+                    CLEAN_.vec_store((m_offset + m_local_idx, n_offset + n_local_idx), zero_vec, LDG_VEC_SIZE)
         
         def ldg_a(k_offset):
             vecs = []
@@ -454,6 +490,7 @@ def compile_hgemm_kernel(
         A: fx.Tensor,
         B: fx.Tensor,
         C: fx.Tensor,
+        CLEAN: fx.Tensor,
         stream: fx.Stream = fx.Stream(None),
     ):
         allocator.finalized = False
@@ -466,7 +503,7 @@ def compile_hgemm_kernel(
         bm = m // BLOCK_M
         bn = n // BLOCK_N
         hgemm_kernel._func.__name__ = KERNEL_NAME
-        hgemm_kernel(A, B, C).launch(grid=(bm, bn, SPLIT_K), block=(BLOCK_THREADS, 1, 1), stream=stream)
+        hgemm_kernel(A, B, C, CLEAN).launch(grid=(bm, bn, SPLIT_K), block=(BLOCK_THREADS, 1, 1), stream=stream)
     
     return launch_hgemm_kernel
 
@@ -500,11 +537,11 @@ def get_kwargs(m, n, k):
         'SPLIT_K': 1,
     }
     if m == 32 and n == 7168 and k == 2048:
-        kwargs['BLOCK_K'] = 64
+        kwargs['BLOCK_K'] = 128
         kwargs['WARP_M_STEPS'] = 2
         kwargs['WARP_N_STEPS'] = 2
         kwargs['PACK_N'] = 2
-        kwargs['SPLIT_K'] = 8
+        kwargs['SPLIT_K'] = 4
     return kwargs
 
 
@@ -520,25 +557,30 @@ def func(a, b, c):
         raise NotImplementedError()
     if kwargs['B_PRE_SHUFFLE']:
         b = shuffle_b(b, pack_n=kwargs['PACK_N'])
-    exe(a, b, c, stream=torch.cuda.current_stream())
+    if kwargs['SPLIT_K'] > 1:
+        exe(a, b, c.get(), c.get_next(), stream=torch.cuda.current_stream())
+    else:
+        exe(a, b, c.get(), c.get(), stream=torch.cuda.current_stream())
 
 
 def benchmark(args, func, ref_func, warmup=20, niters=100):
     inputs = create_inputs(args)
     outputs = create_outputs(args)
-    ref_outputs = create_outputs(args)
+    ref_outputs = create_ref_outputs(args)
     inouts = inputs + outputs
     ref_inouts = inputs + ref_outputs
-    func(*inouts)
-    ref_func(*ref_inouts)
-    for output, ref_output in zip(outputs, ref_outputs):
-        is_allclose = torch.allclose(output, ref_output, atol=1e-2, rtol=1e-2)
-        # print(output)
-        # print(ref_output)
-        maxdiff_out = (output - ref_output).abs().max()
-        print(f"maxdiff_out:{maxdiff_out}")
-        # assert is_allclose == True
-    print("validation passed!\n", flush=True)
+    for i in range(5):
+        func(*inouts)
+        ref_func(*ref_inouts)
+        for output_, ref_output in zip(outputs, ref_outputs):
+            output = output_.get()
+            is_allclose = torch.allclose(output, ref_output, atol=1e-2, rtol=1e-2)
+            # print(output)
+            # print(ref_output)
+            maxdiff_out = (output - ref_output).abs().max()
+            print(f"maxdiff_out:{maxdiff_out}")
+            # assert is_allclose == True
+            output_.switch()
 
     # get ref_func perf
     print("===================== [REF] =====================")
@@ -554,9 +596,11 @@ def benchmark(args, func, ref_func, warmup=20, niters=100):
     print("===================== [FLYDSL] =====================")
     for i in range(warmup):
         func(*inouts)
+        inouts[-1].switch()
     with profile(activities=[ProfilerActivity.CUDA], ) as prof:
         for i in range(niters):
             func(*inouts)
+            inouts[-1].switch()
     table = prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1)
     print(table)
 
