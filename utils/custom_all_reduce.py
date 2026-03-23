@@ -29,7 +29,7 @@ def _is_weak_contiguous(t) -> bool:
 _FLYDSL_AITER_GLOO_GROUP = None
 
 
-def init_custom_ar(meta, rank_data, handles, offsets, rank: int, full_nvlink: bool, out=None):
+def init_custom_ar(meta, rank_data, handles, offsets, rank: int, full_nvlink: bool = False):
     """Initialize allreduce with FlyDSL backend."""
     import os
     import torch.distributed as dist
@@ -380,7 +380,7 @@ class FlyDSLAllreduce:
         return result
 
     def _compile(self, *, N: int, dtype_str: str):
-        from custom_all_reduce_kernel import make_allreduce_kernels
+        from .custom_all_reduce_kernel import make_allreduce_kernels
 
         key = (N, dtype_str, self.world_size)
         fns = self._exe_cache.get(key)

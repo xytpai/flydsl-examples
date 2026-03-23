@@ -8,6 +8,8 @@ from dataclasses import dataclass
 import torch.multiprocessing as mp
 import torch.distributed as dist
 
+from utils.custom_all_reduce import init_custom_ar
+
 
 def init_world(device_id, num_devices, parts, port=24514):
     torch.cuda.set_device(device_id)
@@ -96,9 +98,31 @@ def golden_ref_func(args, inputs, outputs):
                 outputs[device_id * args.nsamples + i] = outputs_part.cuda(device_id)
 
 
+def worker(device_id, num_devices, parts, nsamples, inputs, outputs):
+    group = init_world(device_id, num_devices, parts)
+    rank = dist.get_rank(group=group)
+    world_size = dist.get_world_size(group=group)
+    meta = torch.empty((0,), device=device_id, dtype=torch.int8)
+    rank_data = inputs[device_id * nsamples]
+    handles = [torch.empty((1,), device="cpu", dtype=torch.uint8) for _ in range(world_size)]
+    offsets = [0 for _ in range(world_size)]
+    fa = init_custom_ar(meta, rank_data, handles, offsets, rank=rank)
+    for i in range(nsamples):
+        input = inputs[device_id * nsamples + i]
+        output = outputs[device_id * nsamples + i]
+        fa.custom_all_reduce(input, open_fp8_quant=False, out=output)
+    torch.cuda.synchronize()
+    dist.barrier(group=group)
+    dist.destroy_process_group()
+
+
 def func(args, inputs, outputs):
-    golden_ref_func(args, inputs, outputs)
-    pass
+    mp.spawn(
+        worker,
+        args=(args.num_devices, args.parts, args.nsamples, inputs, outputs),
+        nprocs=args.num_devices,
+        join=True
+    )
 
 
 def benchmark(args, func, ref_func):

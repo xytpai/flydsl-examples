@@ -10,6 +10,7 @@ from __future__ import annotations
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import arith as ea, gpu, range_constexpr, signal_ops
+# Need https://github.com/ROCm/FlyDSL/blob/d40a5e23755cc014303749716e9b973ecd66cbf9/python/flydsl/expr/signal_ops.py
 from flydsl._mlir.dialects import gpu as _raw_gpu
 from flydsl.expr.typing import T, Int32, Int64, Stream
 from flydsl.expr.buffer_ops import _unwrap_value
