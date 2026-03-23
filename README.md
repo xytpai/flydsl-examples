@@ -9,7 +9,7 @@ This repository will provide the following examples from scratch:
 - [x] Batch Reduce
 - [x] RMS Norm
 - [x] HGEMM (wmma)
-- [ ] Allreduce
+- [x] Allreduce
 - [ ] Flash Attention
 - [ ] Linear Attention (NEED REBASE)
 - [ ] GEMM-FP8
@@ -252,6 +252,12 @@ void at::native::elementwise_kernel_manual_unroll<12...         0.00%       0.00
 -------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
 Self CPU time total: 68.992ms
 Self CUDA time total: 88.790ms
+```
+
+## 5. Allreduce
+
+```bash
+python3 allreduce.py --nsamples=10 --parts=2 --num_devices=8 --dtype=f16 --n=16384
 ```
 
 ---
