@@ -16,7 +16,7 @@ from flydsl._mlir import ir
 from flydsl.runtime.device import get_rocm_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl._mlir.dialects import llvm, fly
+from flydsl._mlir.dialects import llvm, fly, memref
 from flydsl.compiler.protocol import fly_values
 
 from utils.tensor_shim import get_dtype_in_kernel, GTensor, STensor, _to_raw
@@ -99,7 +99,7 @@ def compile_hgemm_kernel(
     WARP_N_STEPS: int = 2,
     PACK_N: int = 2,
     STAGES : int = 2,
-    ASYNC_COPY: bool = False,
+    ASYNC_COPY: bool = True,
     B_TO_LDS: bool = False,
     B_PRE_SHUFFLE: bool = True,
     SPLIT_K: int = 1,
@@ -248,6 +248,36 @@ def compile_hgemm_kernel(
                 col_in_bytes = swizzle_xor16(m_local_idx, col_in_bytes, k_blocks16)
                 as_.vec_store((fx.Index(lds_stage), m_local_idx, col_in_bytes // DTYPE_BYTES), vecs[i], LDG_VEC_SIZE)
         
+        def ldg_sts_a_async(k_offset, lds_stage):
+            for i in range_constexpr(LDG_REG_A_COUNT):
+                global_tid = BLOCK_THREADS * i + tid
+                m_local_idx = global_tid // LDG_A_X_THREADS
+                k_local_idx = global_tid % LDG_A_X_THREADS * LDG_VEC_SIZE
+                col_in_bytes = k_local_idx * DTYPE_BYTES
+                col_in_bytes = swizzle_xor16(m_local_idx, col_in_bytes, k_blocks16)
+                # get offset
+                global_offset = A_.linear_offset((m_offset + m_local_idx, k_offset + k_local_idx)) * DTYPE_BYTES
+                global_offset = arith.index_cast(T.i32, global_offset)
+                lds_offset = as_.linear_offset((fx.Index(lds_stage), m_local_idx, col_in_bytes // DTYPE_BYTES)) * DTYPE_BYTES
+                # get lds ptr
+                lds_ptr_type = ir.Type.parse("!llvm.ptr<3>")
+                lds_addr = memref.extract_aligned_pointer_as_index(as_.memptr) + lds_offset
+                lds_addr_ = rocdl.readfirstlane(T.i64, arith.index_cast(T.i64, lds_addr))
+                lds_ptr = llvm.inttoptr(lds_ptr_type, lds_addr_)
+                # dma copy
+                rocdl.raw_ptr_buffer_load_lds(
+                    A_.rsrc,
+                    lds_ptr,
+                    arith.constant(16, type=T.i32),
+                    global_offset,
+                    arith.constant(0, type=T.i32),
+                    arith.constant(0, type=T.i32),
+                    arith.constant(1, type=T.i32),
+                )
+                # vec = A_.vec_load((m_offset + m_local_idx, k_offset + k_local_idx), LDG_VEC_SIZE)
+                # as_.vec_store((fx.Index(lds_stage), m_local_idx, col_in_bytes // DTYPE_BYTES), vec, LDG_VEC_SIZE)
+            pass
+        
         def ldg_b(k_offset):
             vecs = []
             for i in range_constexpr(LDG_REG_B_COUNT):
@@ -390,8 +420,11 @@ def compile_hgemm_kernel(
         
         else:
 
-            a_regs = ldg_a(ks_begin)
-            sts_a(a_regs, 0)
+            if not ASYNC_COPY:
+                a_regs = ldg_a(ks_begin)
+                sts_a(a_regs, 0)
+            else:
+                ldg_sts_a_async(ks_begin, 0)
             b_frags = ldg_matrix_b(ks_begin)
             gpu.barrier()
 
@@ -422,11 +455,15 @@ def compile_hgemm_kernel(
                 next_stage = 1 - current_stage
                 c_frags = state[2 : 2 + C_FRAGS_LEN]
                 b_frags = state[2 + C_FRAGS_LEN :]
-                a_regs_next = ldg_a(k_offset + BLOCK_K)
+                if not ASYNC_COPY:
+                    a_regs_next = ldg_a(k_offset + BLOCK_K)
+                else:
+                    ldg_sts_a_async(k_offset + BLOCK_K, next_stage)
                 b_frags_next = ldg_matrix_b(k_offset + BLOCK_K)
                 a_frags = lds_matrix_a(current_stage)
                 block_mma_sync(a_frags, b_frags, c_frags)
-                sts_a(a_regs_next, next_stage)
+                if not ASYNC_COPY:
+                    sts_a(a_regs_next, next_stage)
                 hot_loop_scheduler()
                 gpu.barrier()
                 k_offset = k_offset + fx.Int32(BLOCK_K)
@@ -531,7 +568,7 @@ def get_kwargs(m, n, k):
         'WARP_N_STEPS': 2,
         'PACK_N': 2,
         'STAGES' : 2,
-        'ASYNC_COPY': False,
+        'ASYNC_COPY': True,
         'B_TO_LDS': False,
         'B_PRE_SHUFFLE': True,
         'SPLIT_K': 1,
