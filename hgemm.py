@@ -154,6 +154,7 @@ def compile_hgemm_kernel(
 
     # LDS parameters:
     gpu_arch = get_rocm_arch()
+    DMA_BYTES = 4 if gpu_arch == "gfx942" else 16
     allocator = SmemAllocator(None, arch=gpu_arch, global_sym_name="smem")
     smem_a_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = smem_a_offset + STAGES * BLOCK_M * BLOCK_K * DTYPE_BYTES
@@ -249,16 +250,19 @@ def compile_hgemm_kernel(
                 as_.vec_store((fx.Index(lds_stage), m_local_idx, col_in_bytes // DTYPE_BYTES), vecs[i], LDG_VEC_SIZE)
         
         def ldg_sts_a_async(k_offset, lds_stage):
-            for i in range_constexpr(LDG_REG_A_COUNT):
+            LDG_ASYNC_VEC_SIZE = DMA_BYTES // DTYPE_BYTES
+            LDG_A_X_THREADS_AS = BLOCK_K // LDG_ASYNC_VEC_SIZE
+            LDG_REG_A_COUNT_AS = BLOCK_MK_SIZE // LDG_ASYNC_VEC_SIZE // BLOCK_THREADS
+            for i in range_constexpr(LDG_REG_A_COUNT_AS):
                 global_tid = BLOCK_THREADS * i + tid
-                m_local_idx = global_tid // LDG_A_X_THREADS
-                k_local_idx = global_tid % LDG_A_X_THREADS * LDG_VEC_SIZE
+                m_local_idx = global_tid // LDG_A_X_THREADS_AS
+                k_local_idx = global_tid % LDG_A_X_THREADS_AS * LDG_ASYNC_VEC_SIZE
                 col_in_bytes = k_local_idx * DTYPE_BYTES
                 col_in_bytes = swizzle_xor16(m_local_idx, col_in_bytes, k_blocks16)
                 # get offset
-                global_offset = A_.linear_offset((m_offset + m_local_idx, k_offset + k_local_idx)) * DTYPE_BYTES
+                global_offset = A_.linear_offset((m_offset + m_local_idx, k_offset + col_in_bytes // DTYPE_BYTES)) * DTYPE_BYTES
                 global_offset = arith.index_cast(T.i32, global_offset)
-                lds_offset = as_.linear_offset((fx.Index(lds_stage), m_local_idx, col_in_bytes // DTYPE_BYTES)) * DTYPE_BYTES
+                lds_offset = as_.linear_offset((fx.Index(lds_stage), m_local_idx, k_local_idx)) * DTYPE_BYTES
                 # get lds ptr
                 lds_ptr_type = ir.Type.parse("!llvm.ptr<3>")
                 lds_addr = memref.extract_aligned_pointer_as_index(as_.memptr) + lds_offset
@@ -268,15 +272,14 @@ def compile_hgemm_kernel(
                 rocdl.raw_ptr_buffer_load_lds(
                     A_.rsrc,
                     lds_ptr,
-                    arith.constant(16, type=T.i32),
+                    arith.constant(DMA_BYTES, type=T.i32),
                     global_offset,
                     arith.constant(0, type=T.i32),
                     arith.constant(0, type=T.i32),
                     arith.constant(1, type=T.i32),
                 )
-                # vec = A_.vec_load((m_offset + m_local_idx, k_offset + k_local_idx), LDG_VEC_SIZE)
-                # as_.vec_store((fx.Index(lds_stage), m_local_idx, col_in_bytes // DTYPE_BYTES), vec, LDG_VEC_SIZE)
-            pass
+                # vec = A_.vec_load((m_offset + m_local_idx, k_offset + col_in_bytes // DTYPE_BYTES), LDG_ASYNC_VEC_SIZE)
+                # as_.vec_store((fx.Index(lds_stage), m_local_idx, k_local_idx), vec, LDG_ASYNC_VEC_SIZE)
         
         def ldg_b(k_offset):
             vecs = []
