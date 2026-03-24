@@ -92,11 +92,11 @@ def compile_hgemm_kernel(
     m: int,
     n: int,
     k: int,
-    BLOCK_K: int = 64,
+    TILE_K: int = 64,
     BLOCK_M_WARPS: int = 1,
     BLOCK_N_WARPS: int = 4,
-    WARP_M_STEPS: int = 8,
-    WARP_N_STEPS: int = 2,
+    TILE_M: int = 128,
+    TILE_N: int = 128,
     PACK_N: int = 2,
     STAGES : int = 2,
     ASYNC_COPY: bool = False,
@@ -104,6 +104,7 @@ def compile_hgemm_kernel(
     B_PRE_SHUFFLE: bool = True,
     SPLIT_K: int = 1,
 ):
+    BLOCK_K = TILE_K
     assert (k % SPLIT_K == 0) and (k // SPLIT_K >= 1)
     ks = k // SPLIT_K
     assert (ks % BLOCK_K == 0) and (ks // BLOCK_K >= 1)
@@ -133,6 +134,11 @@ def compile_hgemm_kernel(
     WARP_K_STEPS = BLOCK_K // WARP_ATOM_K
     assert (BLOCK_K % WARP_ATOM_K == 0) and (WARP_K_STEPS >= 1)
     BLOCK_THREADS = BLOCK_M_WARPS * BLOCK_N_WARPS * WARP_SIZE
+    WARP_M_STEPS = TILE_M // BLOCK_M_WARPS // WARP_ATOM_M
+    WARP_N_STEPS = TILE_N // BLOCK_N_WARPS // WARP_ATOM_N
+    assert (WARP_M_STEPS >= 1) and (WARP_N_STEPS >= 1)
+    assert TILE_M % (BLOCK_M_WARPS * WARP_ATOM_M) == 0
+    assert TILE_N % (BLOCK_N_WARPS * WARP_ATOM_N) == 0
     WARP_M = WARP_M_STEPS * WARP_ATOM_M
     WARP_N = WARP_N_STEPS * WARP_ATOM_N
     BLOCK_M = BLOCK_M_WARPS * WARP_M
@@ -170,10 +176,11 @@ def compile_hgemm_kernel(
 
     @flyc.kernel
     def hgemm_kernel(
+        C: fx.Tensor,
         A: fx.Tensor,
         B: fx.Tensor,
-        C: fx.Tensor,
         CLEAN: fx.Tensor,
+        raster_factor: fx.Constexpr[int],
     ):
         dtype_ = get_dtype_in_kernel(dtype)
         if dtype == 'bf16':
@@ -201,8 +208,8 @@ def compile_hgemm_kernel(
         tid = fx.Int32(fx.thread_idx.x)
         wid = tid // WARP_SIZE
         w_tid = tid % WARP_SIZE
-        block_m_idx = fx.block_idx.x
-        block_n_idx = fx.block_idx.y
+        block_m_idx = fx.block_idx.x // raster_factor
+        block_n_idx = fx.block_idx.x % raster_factor + fx.block_idx.y * raster_factor
         ks_idx = fx.Index(fx.block_idx.z)
         ks_begin = arith.index_cast(T.i32, ks_idx * ks)
 
@@ -524,9 +531,9 @@ def compile_hgemm_kernel(
     
     @flyc.jit
     def launch_hgemm_kernel(
+        C: fx.Tensor,
         A: fx.Tensor,
         B: fx.Tensor,
-        C: fx.Tensor,
         CLEAN: fx.Tensor,
         stream: fx.Stream = fx.Stream(None),
     ):
@@ -535,17 +542,24 @@ def compile_hgemm_kernel(
         with ir.InsertionPoint(ctx.gpu_module_body):
             allocator.finalize()
         
-        # bm = (m + BLOCK_M - 1) // BLOCK_M
-        # bn = (n + BLOCK_N - 1) // BLOCK_N
-        bm = m // BLOCK_M
-        bn = n // BLOCK_N
+        bm = (m + BLOCK_M - 1) // BLOCK_M
+        bn = (n + BLOCK_N - 1) // BLOCK_N
+        raster_factor = 1
+        if bn > 5:
+            raster_factor = 8
+        elif bn > 2:
+            raster_factor = 4
+        elif bn > 1:
+            raster_factor = 2
+        bm = bm * raster_factor
+        bn = (bn + raster_factor - 1) // raster_factor
         hgemm_kernel._func.__name__ = KERNEL_NAME
-        hgemm_kernel(A, B, C, CLEAN).launch(grid=(bm, bn, SPLIT_K), block=(BLOCK_THREADS, 1, 1), stream=stream)
+        hgemm_kernel(C, A, B, CLEAN, raster_factor).launch(grid=(bm, bn, SPLIT_K), block=(BLOCK_THREADS, 1, 1), stream=stream)
     
     return launch_hgemm_kernel
 
 
-def shuffle_b(x, layout=(16, 16), pack_n=1, k_steps=2):
+def hgemm_spk_shuffle_b(x, layout=(16, 16), pack_n=1, k_steps=2):
     x_shape = x.shape
     VEC_SIZE = 16 // x.element_size()
     BN = layout[0] * pack_n
@@ -561,11 +575,11 @@ def shuffle_b(x, layout=(16, 16), pack_n=1, k_steps=2):
 
 def get_kwargs(m, n, k):
     kwargs = {
-        'BLOCK_K': 64,
+        'TILE_K': 64,
         'BLOCK_M_WARPS': 1,
         'BLOCK_N_WARPS': 4,
-        'WARP_M_STEPS': 8,
-        'WARP_N_STEPS': 2,
+        'TILE_M': 128,
+        'TILE_N': 256,
         'PACK_N': 2,
         'STAGES' : 2,
         'ASYNC_COPY': False,
@@ -574,15 +588,15 @@ def get_kwargs(m, n, k):
         'SPLIT_K': 1,
     }
     if m == 32 and n == 7168 and k == 2048:
-        kwargs['BLOCK_K'] = 128
-        kwargs['WARP_M_STEPS'] = 2
-        kwargs['WARP_N_STEPS'] = 2
+        kwargs['TILE_K'] = 128
+        kwargs['TILE_M'] = 32
+        kwargs['TILE_N'] = 256
         kwargs['PACK_N'] = 2
         kwargs['SPLIT_K'] = 4
     if m == 32 and n == 384 and k == 7168:
-        kwargs['BLOCK_K'] = 128
-        kwargs['WARP_M_STEPS'] = 1
-        kwargs['WARP_N_STEPS'] = 1
+        kwargs['TILE_K'] = 128
+        kwargs['TILE_M'] = 16
+        kwargs['TILE_N'] = 128
         kwargs['PACK_N'] = 2
         kwargs['SPLIT_K'] = 1
     return kwargs
@@ -599,11 +613,11 @@ def func(a, b, c):
     else:
         raise NotImplementedError()
     if kwargs['B_PRE_SHUFFLE']:
-        b = shuffle_b(b, pack_n=kwargs['PACK_N'])
+        b = hgemm_spk_shuffle_b(b, pack_n=kwargs['PACK_N'])
     if kwargs['SPLIT_K'] > 1:
-        exe(a, b, c.get(), c.get_next(), stream=torch.cuda.current_stream())
+        exe(c.get(), a, b, c.get_next(), stream=torch.cuda.current_stream())
     else:
-        exe(a, b, c.get(), c.get(), stream=torch.cuda.current_stream())
+        exe(c.get(), a, b, c.get(), stream=torch.cuda.current_stream())
 
 
 def benchmark(args, func, ref_func, warmup=20, niters=100):
@@ -660,3 +674,6 @@ if __name__ == '__main__':
     args.dtype = dtype_convert[args.dtype]
     args = Args(**vars(args))
     benchmark(args, func, ref_func)
+    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=4096 --n=4096 --k=4096 --dtype=bf16
+    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=32 --n=7168 --k=2048 --dtype=bf16
+    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8192 --n=8192 --k=8192 --dtype=bf16
