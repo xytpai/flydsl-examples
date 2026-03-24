@@ -180,6 +180,7 @@ def compile_hgemm_kernel(
         A: fx.Tensor,
         B: fx.Tensor,
         CLEAN: fx.Tensor,
+        raster_factor: fx.Constexpr[int],
     ):
         dtype_ = get_dtype_in_kernel(dtype)
         if dtype == 'bf16':
@@ -207,8 +208,8 @@ def compile_hgemm_kernel(
         tid = fx.Int32(fx.thread_idx.x)
         wid = tid // WARP_SIZE
         w_tid = tid % WARP_SIZE
-        block_m_idx = fx.block_idx.x
-        block_n_idx = fx.block_idx.y
+        block_m_idx = fx.block_idx.x // raster_factor
+        block_n_idx = fx.block_idx.x % raster_factor + fx.block_idx.y * raster_factor
         ks_idx = fx.Index(fx.block_idx.z)
         ks_begin = arith.index_cast(T.i32, ks_idx * ks)
 
@@ -543,8 +544,17 @@ def compile_hgemm_kernel(
         
         bm = (m + BLOCK_M - 1) // BLOCK_M
         bn = (n + BLOCK_N - 1) // BLOCK_N
+        raster_factor = 1
+        if bn > 5:
+            raster_factor = 8
+        elif bn > 2:
+            raster_factor = 4
+        elif bn > 1:
+            raster_factor = 2
+        bm = bm * raster_factor
+        bn = (bn + raster_factor - 1) // raster_factor
         hgemm_kernel._func.__name__ = KERNEL_NAME
-        hgemm_kernel(C, A, B, CLEAN).launch(grid=(bm, bn, SPLIT_K), block=(BLOCK_THREADS, 1, 1), stream=stream)
+        hgemm_kernel(C, A, B, CLEAN, raster_factor).launch(grid=(bm, bn, SPLIT_K), block=(BLOCK_THREADS, 1, 1), stream=stream)
     
     return launch_hgemm_kernel
 
