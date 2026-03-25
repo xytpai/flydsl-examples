@@ -28,7 +28,7 @@ from utils.tensor_shim import get_dtype_in_kernel, GTensor, STensor, _to_raw
 fm_fast = arith.FastMathFlags.fast
 
 
-def init_world(device_id, num_devices, parts, port=24515):
+def init_world(device_id, num_devices, parts, port=24517):
     torch.cuda.set_device(device_id)
     dist.init_process_group(
         backend="nccl",
@@ -501,7 +501,7 @@ def compile_hgemm_ar_kernel(
 
         sgs = [signal_ops.load_ptr_from_array(sg_ptrs_i64, arith.constant(i, type=T.i32)) for i in range(8)]
         out_ptrs_arr = [signal_ops.load_ptr_from_array(out_ptrs_i64, arith.constant(i, type=T.i32)) for i in range(8)]
-        dst_ptr_i64 = out_ptrs_arr[0]
+        dst_ptr_i64 = signal_ops.select_by_lane(rank_i32, out_ptrs_arr)
 
         stmatrix_c_m_vec_idx = w_tid // WMMA_N * WMMA_FRAG_VALUES
         stmatrix_c_n_pk_idx = w_tid % WMMA_N * PACK_N
@@ -557,6 +557,35 @@ def compile_hgemm_ar_kernel(
                             llvm.StoreOp(val_, out_ptr)
 
         _signal_start_sync(lane_i32=lane_i32, rank_i32=rank_i32, bid_i32=bid_i32, self_sg_i64=self_sg_i64, sgs_i64=sgs, ngpus=world_size)
+
+        # for wi in range_constexpr(world_size):
+        #     peer_ptr = signal_ops.select_by_lane(arith.constant(wi, type=T.i32), out_ptrs_arr)
+        #     for i in range_constexpr(LDG_REG_C_COUNT):
+        #         global_tid = BLOCK_THREADS * i + tid
+        #         m_local_idx = global_tid // LDG_C_X_THREADS
+        #         n_local_idx = global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE
+        #         linear_bytes_offset = C_.linear_offset((m_offset + m_local_idx, n_offset + n_local_idx)) * DTYPE_BYTES
+        #         byte_offset_i64 = arith.index_cast(T.i64, linear_bytes_offset)
+        #         # 请在这里补充
+        #         addr_i64_rd = llvm.AddOp(peer_ptr, byte_offset_i64, llvm.IntegerOverflowFlags(0)).result
+        #         rd_ptr = llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<1>"), addr_i64_rd).result
+        #         peer_vec = llvm.LoadOp(T.vec(LDG_VEC_SIZE, dtype_), rd_ptr, alignment=16).result
+        #         peer_f32 = arith.extf(T.vec(LDG_VEC_SIZE, T.f32), peer_vec)
+        #         if wi == 0:
+        #             acc_vec = peer_f32
+        #         else:
+        #             acc_vec = acc_vec + peer_f32
+        #     final_vec = acc_vec.truncf(T.vec(LDG_VEC_SIZE, dtype_))
+        #     C_.vec_store((m_offset + m_local_idx, n_offset + n_local_idx), final_vec, LDG_VEC_SIZE)
+        
+        # _signal_end_sync(
+        #     lane_i32=lane_i32,
+        #     rank_i32=rank_i32,
+        #     bid_i32=bid_i32,
+        #     self_sg_i64=self_sg_i64,
+        #     sgs_i64=sgs,
+        #     ngpus=world_size,
+        # )
 
         return
     
@@ -676,7 +705,7 @@ class GEMMARBackend(FlyDSLAllreduce):
         else:
             out_ptrs = Int64(int(self._gpu_output_buffer_ptrs_array.data_ptr()))
             hgemm_ar_impl(a, b, c, world_size, rank, self_sg, sg_ptrs, out_ptrs)
-            c.view(-1).view(torch.uint8)[:bytes_mn].copy_(self.output_buffer[:bytes_mn])
+            # c.view(-1).view(torch.uint8)[:bytes_mn].copy_(self.output_buffer[:bytes_mn])
             return c
 
 
@@ -748,3 +777,20 @@ if __name__ == '__main__':
     args = Args(**vars(args))
     benchmark(args, func, ref_func)
     # rm -rf ~/.flydsl/ ; python3 hgemm_ar.py --nsamples=10 --num_devices=4 --m=32 --n=7168 --k=2048 --dtype=bf16
+
+
+CMD_FOR_KILL = '''
+PIDS=$(for gpu_id in $(seq 0 7); do
+    amd-smi process --gpu $gpu_id 2>/dev/null | grep "PID:" | awk '{print $2}'
+done | sort -u)
+
+echo "The following PIDs will be deleted"
+echo "$PIDS"
+
+if [ -n "$PIDS" ]; then
+    echo "$PIDS" | xargs sudo kill -9
+    echo "All killed"
+else
+    echo "Nop"
+fi
+'''
