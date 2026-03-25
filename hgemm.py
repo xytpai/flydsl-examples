@@ -339,24 +339,25 @@ def compile_hgemm_kernel(
         
         def ldg_matrix_b(k_offset):
             vecs = []
+            b_n_intra_base = ldmatrix_b_n_pk_idx
+            b_k_intra_vec = ldmatrix_b_k_vec_idx // LDG_VEC_SIZE
+            b_n0_base = n_offset // WARP_ATOM_N + warp_n_idx // WARP_ATOM_N
+            b_k0_base = k_offset // WARP_ATOM_K
             for kk in range_constexpr(WARP_K_STEPS):
+                b_k0 = b_k0_base + kk
                 for ii in range_constexpr(WARP_N_STEPS):
-                    warp_atom_n_idx = warp_n_idx + ii * WARP_ATOM_N
-                    warp_atom_k_idx = kk * WARP_ATOM_K
-                    n_pk_idx = n_offset + warp_atom_n_idx + ldmatrix_b_n_pk_idx
+                    b_n0 = b_n0_base + ii
                     for pki in range_constexpr(PACK_N):
-                        n_idx = n_pk_idx + pki
-                        k_idx = k_offset + warp_atom_k_idx + ldmatrix_b_k_vec_idx
                         if not B_PRE_SHUFFLE:
+                            warp_atom_n_idx = warp_n_idx + ii * WARP_ATOM_N
+                            warp_atom_k_idx = kk * WARP_ATOM_K
+                            n_idx = n_offset + warp_atom_n_idx + ldmatrix_b_n_pk_idx + pki
+                            k_idx = k_offset + warp_atom_k_idx + ldmatrix_b_k_vec_idx
                             vec = B_.vec_load((n_idx, k_idx), WMMA_FRAG_VALUES * MFMA_PER_WARP_K)
                             vecs.append(vec)
                         else:
-                            idx_0 = n_idx // WARP_ATOM_N
-                            idx_1 = n_idx % WARP_ATOM_N
-                            idx_2 = k_idx // WARP_ATOM_K
-                            idx_2_temp = k_idx % WARP_ATOM_K
-                            idx_3 = idx_2_temp // LDG_VEC_SIZE
-                            vec = SHUFFLED_B_.vec_load((idx_0, idx_2, idx_3, idx_1, 0), LDG_VEC_SIZE)
+                            b_n_intra = b_n_intra_base + pki  # idx_1
+                            vec = SHUFFLED_B_.vec_load((b_n0, b_k0, b_k_intra_vec, b_n_intra, 0), LDG_VEC_SIZE)
                             vecs.append(vec)
             return vecs
         
@@ -430,30 +431,87 @@ def compile_hgemm_kernel(
         
         else:
 
+            if SPLIT_K == 1:
+                # ============ Main K-loop with scheduling ============
+                # Initial scheduling barrier to reset hardware scheduler state
+                rocdl.sched_barrier(0)
+                def hot_loop_scheduler():
+                    import math as _math
+
+                    def _build_scheduler(numer: int, denom: int):
+                        if denom <= 0:
+                            return []
+                        if numer <= 0:
+                            return [0] * denom
+                        out = []
+                        prev = 0
+                        for i in range_constexpr(denom):
+                            cur = ((i + 1) * numer + (denom - 1)) // denom
+                            out.append(cur - prev)
+                            prev = cur
+                        return out
+
+                    if (gpu_arch == "gfx942") or (not ASYNC_COPY):
+                        mfma_group =  WARP_N_STEPS * PACK_N
+                        mfma_total = (WARP_K_STEPS  * 2) * WARP_M_STEPS * mfma_group
+                        mfma_per_iter = 2 * mfma_group
+                        sche_iters = 0 if mfma_per_iter == 0 else (mfma_total // mfma_per_iter)
+                        rocdl.sched_dsrd(2)
+                        rocdl.sched_mfma(1)
+                        if TILE_M == 16:
+                            rocdl.sched_vmem(1)
+                        rocdl.sched_mfma(1)
+                        if TILE_M == 16:
+                            rocdl.sched_vmem(1)
+                        if mfma_group < 4:
+                            rocdl.sched_dsrd(1)
+                            rocdl.sched_mfma(1)
+                            if TILE_M == 16:
+                                rocdl.sched_vmem(1)
+                            rocdl.sched_dsrd(1)
+                            rocdl.sched_mfma(1)
+                            if TILE_M == 16:
+                                rocdl.sched_vmem(1)
+                            rocdl.sched_mfma(1)
+                        dswr_tail = LDG_REG_A_COUNT
+                        dstr_advance = 2
+                        if dswr_tail > sche_iters:
+                            dswr_tail = sche_iters
+                        dswr_start = max(sche_iters - dswr_tail - dstr_advance, 0)
+                        for sche_i in range_constexpr(sche_iters):
+                            rocdl.sched_vmem(1)
+                            rocdl.sched_mfma(mfma_group)
+                            rocdl.sched_dsrd(1)
+                            rocdl.sched_mfma(mfma_group)
+                            if sche_i >= dswr_start - 1:
+                                rocdl.sched_dswr(1)
+                    rocdl.sched_barrier(0)
+
             a_regs = ldg_a(ks_begin)
             sts_a(a_regs, 0)
             b_frags = ldg_matrix_b(ks_begin)
             gpu.barrier()
 
-            # ============ Main K-loop with scheduling ============
-            # Initial scheduling barrier to reset hardware scheduler state
-            rocdl.sched_barrier(0)
-            def hot_loop_scheduler():
-                assert MFMA_PER_WARP_K == 2
-                mfma_group = WARP_M_STEPS * WARP_N_STEPS
-                # mfma_total = WARP_K_STEPS * mfma_group * MFMA_PER_WARP_K
-                LDG_REG_A_COUNT_PART = LDG_REG_A_COUNT // WARP_K_STEPS
-                if LDG_REG_A_COUNT_PART == 0:
-                    rocdl.sched_vmem(1)
-                for sche_i in range_constexpr(WARP_K_STEPS):
-                    rocdl.sched_vmem(LDG_REG_A_COUNT_PART) # ldg_a next
-                    rocdl.sched_dsrd(WARP_M_STEPS) # lds_matrix_a
-                    for pki in range_constexpr(PACK_N):
-                        rocdl.sched_mfma(mfma_group)
-                        rocdl.sched_vmem(WARP_N_STEPS) # ldg_b next
-                        rocdl.sched_mfma(mfma_group)
-                    rocdl.sched_dswr(LDG_REG_A_COUNT_PART) # sts a next
+            if SPLIT_K > 1:
+                # ============ Main K-loop with scheduling ============
+                # Initial scheduling barrier to reset hardware scheduler state
                 rocdl.sched_barrier(0)
+                def hot_loop_scheduler():
+                    assert MFMA_PER_WARP_K == 2
+                    mfma_group = WARP_M_STEPS * WARP_N_STEPS
+                    # mfma_total = WARP_K_STEPS * mfma_group * MFMA_PER_WARP_K
+                    LDG_REG_A_COUNT_PART = LDG_REG_A_COUNT // WARP_K_STEPS
+                    if LDG_REG_A_COUNT_PART == 0:
+                        rocdl.sched_vmem(1)
+                    for sche_i in range_constexpr(WARP_K_STEPS):
+                        rocdl.sched_vmem(LDG_REG_A_COUNT_PART) # ldg_a next
+                        rocdl.sched_dsrd(WARP_M_STEPS) # lds_matrix_a
+                        for pki in range_constexpr(PACK_N):
+                            rocdl.sched_mfma(mfma_group)
+                            rocdl.sched_vmem(WARP_N_STEPS) # ldg_b next
+                            rocdl.sched_mfma(mfma_group)
+                        rocdl.sched_dswr(LDG_REG_A_COUNT_PART) # sts a next
+                    rocdl.sched_barrier(0)
 
             init_state = [ks_begin, arith.constant(0, index=True)] + c_frags + b_frags
             for bki, state in range(1, BLOCK_K_LOOPS, init=init_state):
@@ -545,12 +603,6 @@ def compile_hgemm_kernel(
         bm = (m + BLOCK_M - 1) // BLOCK_M
         bn = (n + BLOCK_N - 1) // BLOCK_N
         raster_factor = 1
-        if bn > 5:
-            raster_factor = 8
-        elif bn > 2:
-            raster_factor = 4
-        elif bn > 1:
-            raster_factor = 2
         bm = bm * raster_factor
         bn = (bn + raster_factor - 1) // raster_factor
         hgemm_kernel._func.__name__ = KERNEL_NAME
@@ -579,8 +631,8 @@ def get_kwargs(m, n, k):
         'BLOCK_M_WARPS': 1,
         'BLOCK_N_WARPS': 4,
         'TILE_M': 128,
-        'TILE_N': 256,
-        'PACK_N': 2,
+        'TILE_N': 128,
+        'PACK_N': 1,
         'STAGES' : 2,
         'ASYNC_COPY': False,
         'B_TO_LDS': False,
