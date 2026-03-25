@@ -239,7 +239,7 @@ def compile_hgemm_ar_kernel(
         w_tid = tid % WARP_SIZE
         block_m_idx = fx.block_idx.x // raster_factor
         block_n_idx = fx.block_idx.x % raster_factor + fx.block_idx.y * raster_factor
-        bid_linear = block_m_idx * (n // BLOCK_N) + block_n_idx
+        # bid_linear = fx.block_idx.y * (m // BLOCK_M) + fx.block_idx.x #TODO
         ks_idx = fx.Index(fx.block_idx.z)
         ks_begin = arith.index_cast(T.i32, ks_idx * ks)
 
@@ -558,34 +558,34 @@ def compile_hgemm_ar_kernel(
 
         _signal_start_sync(lane_i32=lane_i32, rank_i32=rank_i32, bid_i32=bid_i32, self_sg_i64=self_sg_i64, sgs_i64=sgs, ngpus=world_size)
 
-        # for wi in range_constexpr(world_size):
-        #     peer_ptr = signal_ops.select_by_lane(arith.constant(wi, type=T.i32), out_ptrs_arr)
-        #     for i in range_constexpr(LDG_REG_C_COUNT):
-        #         global_tid = BLOCK_THREADS * i + tid
-        #         m_local_idx = global_tid // LDG_C_X_THREADS
-        #         n_local_idx = global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE
-        #         linear_bytes_offset = C_.linear_offset((m_offset + m_local_idx, n_offset + n_local_idx)) * DTYPE_BYTES
-        #         byte_offset_i64 = arith.index_cast(T.i64, linear_bytes_offset)
-        #         # 请在这里补充
-        #         addr_i64_rd = llvm.AddOp(peer_ptr, byte_offset_i64, llvm.IntegerOverflowFlags(0)).result
-        #         rd_ptr = llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<1>"), addr_i64_rd).result
-        #         peer_vec = llvm.LoadOp(T.vec(LDG_VEC_SIZE, dtype_), rd_ptr, alignment=16).result
-        #         peer_f32 = arith.extf(T.vec(LDG_VEC_SIZE, T.f32), peer_vec)
-        #         if wi == 0:
-        #             acc_vec = peer_f32
-        #         else:
-        #             acc_vec = acc_vec + peer_f32
-        #     final_vec = acc_vec.truncf(T.vec(LDG_VEC_SIZE, dtype_))
-        #     C_.vec_store((m_offset + m_local_idx, n_offset + n_local_idx), final_vec, LDG_VEC_SIZE)
+        for i in range_constexpr(LDG_REG_C_COUNT):
+            global_tid = BLOCK_THREADS * i + tid
+            m_local_idx = global_tid // LDG_C_X_THREADS
+            n_local_idx = global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE
+            linear_bytes_offset = C_.linear_offset((m_offset + m_local_idx, n_offset + n_local_idx)) * DTYPE_BYTES
+            byte_offset_i64 = arith.index_cast(T.i64, linear_bytes_offset)
+
+            acc_vec = arith.constant_vector(0.0, T.vec(LDG_VEC_SIZE, T.f32))
+
+            # for wi in range_constexpr(world_size):
+            #     peer_ptr = signal_ops.select_by_lane(arith.constant(wi, type=T.i32), out_ptrs_arr)
+                
+            #     # 请在这里补充
+            #     addr_i64_rd = llvm.AddOp(peer_ptr, byte_offset_i64, llvm.IntegerOverflowFlags(0)).result
+            #     # raw = signal_ops.ld_global_16b(addr_i64_rd)
+
+            #     # peer_vec = vector.bitcast(T.vec(LDG_VEC_SIZE, dtype_), raw)
+            #     # peer_f32 = arith.extf(T.vec(LDG_VEC_SIZE, T.f32), peer_vec)
+            #     # acc_vec = arith.addf(acc_vec, peer_f32, fastmath=fm_fast)
+
+            final_vec = acc_vec.truncf(T.vec(LDG_VEC_SIZE, dtype_))
+            # C_.vec_store((m_offset + m_local_idx, n_offset + n_local_idx), final_vec, LDG_VEC_SIZE)
+            # 如何 st_global_16b 到 当前的out_ptr
+            final_i32x4 = vector.bitcast(T.i32x4, final_vec)
+            dst_addr_i64 = llvm.AddOp(dst_ptr_i64, byte_offset_i64, llvm.IntegerOverflowFlags(0)).result
+            signal_ops.st_global_16b(dst_addr_i64, final_i32x4)
         
-        # _signal_end_sync(
-        #     lane_i32=lane_i32,
-        #     rank_i32=rank_i32,
-        #     bid_i32=bid_i32,
-        #     self_sg_i64=self_sg_i64,
-        #     sgs_i64=sgs,
-        #     ngpus=world_size,
-        # )
+        _signal_end_sync(lane_i32=lane_i32, rank_i32=rank_i32, bid_i32=bid_i32, self_sg_i64=self_sg_i64, sgs_i64=sgs, ngpus=world_size)
 
         return
     
@@ -612,6 +612,7 @@ def compile_hgemm_ar_kernel(
         bm = bm * raster_factor
         bn = (bn + raster_factor - 1) // raster_factor
         hgemm_kernel._func.__name__ = KERNEL_NAME
+        assert (bm * bn) <= 80
         hgemm_kernel(
             C, A, B, CLEAN, raster_factor, 
             rank, self_sg, sg_ptrs, out_ptrs
@@ -650,7 +651,7 @@ def get_kwargs(m, n, k):
     }
     if m <= 32 and n == 7168 and k == 2048:
         kwargs['TILE_K'] = 128
-        kwargs['TILE_M'] = 16
+        kwargs['TILE_M'] = 32
         kwargs['TILE_N'] = 128
         kwargs['PACK_N'] = 1
     if m <= 32 and n == 384 and k == 7168:
