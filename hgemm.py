@@ -521,7 +521,8 @@ def compile_hgemm_kernel(
             allocator.finalize()
         
         bm = (m + BLOCK_M - 1) // BLOCK_M
-        bn = (n + BLOCK_N - 1) // BLOCK_N
+        # bn = (n + BLOCK_N - 1) // BLOCK_N
+        bn = n // BLOCK_N
         raster_factor = 1
         bm = bm * raster_factor
         bn = (bn + raster_factor - 1) // raster_factor
@@ -561,10 +562,10 @@ def get_kwargs(m, n, k):
     }
     if m <= 32 and n == 7168 and k == 2048:
         kwargs['TILE_K'] = 128
-        kwargs['TILE_M'] = 32
-        kwargs['TILE_N'] = 256
+        kwargs['TILE_M'] = 16
+        kwargs['TILE_N'] = 128
         kwargs['PACK_N'] = 2
-        kwargs['SPLIT_K'] = 4
+        kwargs['SPLIT_K'] = 1
     if m <= 32 and n == 384 and k == 7168:
         kwargs['TILE_K'] = 128
         kwargs['TILE_M'] = 16
