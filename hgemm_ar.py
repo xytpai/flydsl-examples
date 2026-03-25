@@ -22,7 +22,7 @@ from flydsl._mlir.dialects import llvm, fly, memref
 from flydsl.compiler.protocol import fly_values
 from flydsl.expr.buffer_ops import _unwrap_value
 
-from utils.custom_all_reduce import init_custom_ar
+from utils.custom_all_reduce import init_custom_ar, FlyDSLAllreduce
 from utils.tensor_shim import get_dtype_in_kernel, GTensor, STensor, _to_raw
 fm_fast = arith.FastMathFlags.fast
 
@@ -638,11 +638,17 @@ def hgemm_impl(a, b, c):
         exe(c, a, b, c, stream=torch.cuda.current_stream())
 
 
+class GEMMARBackend(FlyDSLAllreduce):
+    def hello(self):
+        print('hello', flush=True)
+
+
 def worker(device_id, num_devices, parts, nsamples, inputs, outputs):
     group = init_world(device_id, num_devices, parts)
     rank = dist.get_rank(group=group)
     world_size = dist.get_world_size(group=group)
-    fa = init_custom_ar(torch.device(device_id), world_size=world_size, rank=rank)
+    fa = init_custom_ar(torch.device(device_id), world_size=world_size, rank=rank, backend=GEMMARBackend)
+    fa.hello()
     for i in range(nsamples):
         input = inputs[device_id * nsamples + i]
         output = outputs[device_id * nsamples + i]

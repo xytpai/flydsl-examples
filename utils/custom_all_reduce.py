@@ -26,7 +26,7 @@ def _is_weak_contiguous(t) -> bool:
 _FLYDSL_AITER_GLOO_GROUP = None
 
 
-def init_custom_ar(device, world_size: int, rank: int, full_nvlink: bool=True, out=None):
+def init_custom_ar(device, world_size: int, rank: int, full_nvlink: bool=True, out=None, backend=None):
     if world_size > 8:
         raise ValueError("world size > 8 is not supported")
     if world_size > 1 and (world_size % 2 != 0):
@@ -45,7 +45,8 @@ def init_custom_ar(device, world_size: int, rank: int, full_nvlink: bool=True, o
     
     max_size = int(os.environ.get("FLYDSL_AITER_MAX_SIZE_BYTES", str(64 * 1024 * 1024)))
 
-    return FlyDSLAllreduce(
+    backend_ = backend if backend is not None else FlyDSLAllreduce
+    return backend_(
         group=_FLYDSL_AITER_GLOO_GROUP,
         device=device,
         max_size=max_size,
