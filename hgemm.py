@@ -143,7 +143,7 @@ def compile_hgemm_kernel(
     WARP_N = WARP_N_STEPS * WARP_ATOM_N
     BLOCK_M = BLOCK_M_WARPS * WARP_M
     BLOCK_N = BLOCK_N_WARPS * WARP_N
-    assert (m >= BLOCK_M) and (m % BLOCK_M == 0)
+    # assert (m >= BLOCK_M) and (m % BLOCK_M == 0)
     assert (n >= BLOCK_N) and (n % BLOCK_N == 0)
     BLOCK_MK_SIZE = BLOCK_M * BLOCK_K
     BLOCK_NK_SIZE = BLOCK_N * BLOCK_K
@@ -288,25 +288,6 @@ def compile_hgemm_kernel(
                 # vec = A_.vec_load((m_offset + m_local_idx, k_offset + col_in_bytes // DTYPE_BYTES), LDG_ASYNC_VEC_SIZE)
                 # as_.vec_store((fx.Index(lds_stage), m_local_idx, k_local_idx), vec, LDG_ASYNC_VEC_SIZE)
         
-        def ldg_b(k_offset):
-            vecs = []
-            for i in range_constexpr(LDG_REG_B_COUNT):
-                global_tid = BLOCK_THREADS * i + tid
-                n_local_idx = global_tid // LDG_B_X_THREADS
-                k_local_idx = global_tid % LDG_B_X_THREADS * LDG_VEC_SIZE
-                vec = B_.vec_load((n_offset + n_local_idx, k_offset + k_local_idx), LDG_VEC_SIZE)
-                vecs.append(vec)
-            return vecs
-        
-        def sts_b(vecs, lds_stage):
-            for i in range_constexpr(LDG_REG_B_COUNT):
-                global_tid = BLOCK_THREADS * i + tid
-                n_local_idx = global_tid // LDG_B_X_THREADS
-                k_local_idx = global_tid % LDG_B_X_THREADS * LDG_VEC_SIZE
-                col_in_bytes = k_local_idx * DTYPE_BYTES
-                col_in_bytes = swizzle_xor16(n_local_idx, col_in_bytes, k_blocks16)
-                bs_.vec_store((fx.Index(lds_stage), n_local_idx, col_in_bytes // DTYPE_BYTES), vecs[i], LDG_VEC_SIZE)
-        
         def lds_matrix_a(lds_stage):
             s = fx.Index(lds_stage)
             a_frags = [0] * (WARP_K_STEPS * WARP_M_STEPS)
@@ -320,22 +301,6 @@ def compile_hgemm_kernel(
                     vec = as_.vec_load((s, row, col_in_bytes // DTYPE_BYTES), WMMA_FRAG_VALUES * MFMA_PER_WARP_K)
                     a_frags[kk * WARP_M_STEPS + ii] = vec
             return a_frags
-        
-        def lds_matrix_b(lds_stage):
-            s = fx.Index(lds_stage)
-            b_frags = [0] * (WARP_K_STEPS * WARP_N_STEPS * PACK_N)
-            for ii in range_constexpr(WARP_N_STEPS):
-                warp_atom_n_idx = warp_n_idx + ii * WARP_ATOM_N
-                for kk in range_constexpr(WARP_K_STEPS):
-                    warp_atom_k_idx = kk * WARP_ATOM_K
-                    row_pk = warp_atom_n_idx + ldmatrix_b_n_pk_idx
-                    for pki in range_constexpr(PACK_N):
-                        row = row_pk + pki
-                        col_in_bytes = (warp_atom_k_idx + ldmatrix_b_k_vec_idx) * DTYPE_BYTES
-                        col_in_bytes = swizzle_xor16(row, col_in_bytes, k_blocks16)
-                        vec = bs_.vec_load((s, row, col_in_bytes // DTYPE_BYTES), WMMA_FRAG_VALUES * MFMA_PER_WARP_K)
-                        b_frags[(kk * WARP_N_STEPS + ii) * PACK_N + pki] = vec
-            return b_frags
         
         def ldg_matrix_b(k_offset):
             vecs = []
@@ -504,41 +469,42 @@ def compile_hgemm_kernel(
                 g_warp_atom_n_idx = n_offset + warp_n_idx + jj * WARP_ATOM_N
                 for kk in range_constexpr(WMMA_FRAG_VALUES):
                     out_m_idx = g_warp_atom_m_idx + stmatrix_c_m_vec_idx + kk
-                    if PACK_N > 1:
-                        pk_val = []
-                        for pki in range_constexpr(PACK_N):
-                            vec_ = c_frags[(ii * WARP_N_STEPS + jj) * PACK_N + pki]
-                            val_ = vector.extract(vec_, static_position=[kk], dynamic_position=[])
-                            pk_val.append(val_)
-                        pk_val = vector.from_elements(T.vec(PACK_N, T.f32), pk_val)
-                        pk_val = pk_val.truncf(T.vec(PACK_N, dtype_))
-                        out_n_pk_idx = g_warp_atom_n_idx + stmatrix_c_n_pk_idx
-                        if SPLIT_K > 1:
-                            _ptr_type = ir.Type.parse("!llvm.ptr<1>")
-                            _i64_type = T.i64
-                            out_raw = fly_values(C)[0]
-                            out_base_ptr = fly.extract_aligned_pointer_as_index(_ptr_type, out_raw)
-                            out_base_int = llvm.PtrToIntOp(_i64_type, out_base_ptr).result
-                            linear_bytes_offset = C_.linear_offset((out_m_idx, out_n_pk_idx)) * DTYPE_BYTES
-                            byte_offset_i64 = arith.index_cast(T.i64, linear_bytes_offset)
-                            addr_i64 = llvm.AddOp(out_base_int, byte_offset_i64, llvm.IntegerOverflowFlags(0)).result
-                            out_ptr = llvm.IntToPtrOp(_ptr_type, addr_i64).result
-                            out_ptr_v = out_ptr._value if hasattr(out_ptr, "_value") else out_ptr
-                            pk_val_v = pk_val._value if hasattr(pk_val, "_value") else pk_val
-                            llvm.AtomicRMWOp(
-                                llvm.AtomicBinOp.fadd,
-                                out_ptr_v,
-                                pk_val_v,
-                                llvm.AtomicOrdering.monotonic,
-                                syncscope="agent",
-                                alignment=4,
-                            )
+                    if arith.cmpi(arith.CmpIPredicate.ult, out_m_idx, fx.Index(m)):
+                        if PACK_N > 1:
+                            pk_val = []
+                            for pki in range_constexpr(PACK_N):
+                                vec_ = c_frags[(ii * WARP_N_STEPS + jj) * PACK_N + pki]
+                                val_ = vector.extract(vec_, static_position=[kk], dynamic_position=[])
+                                pk_val.append(val_)
+                            pk_val = vector.from_elements(T.vec(PACK_N, T.f32), pk_val)
+                            pk_val = pk_val.truncf(T.vec(PACK_N, dtype_))
+                            out_n_pk_idx = g_warp_atom_n_idx + stmatrix_c_n_pk_idx
+                            if SPLIT_K > 1:
+                                _ptr_type = ir.Type.parse("!llvm.ptr<1>")
+                                _i64_type = T.i64
+                                out_raw = fly_values(C)[0]
+                                out_base_ptr = fly.extract_aligned_pointer_as_index(_ptr_type, out_raw)
+                                out_base_int = llvm.PtrToIntOp(_i64_type, out_base_ptr).result
+                                linear_bytes_offset = C_.linear_offset((out_m_idx, out_n_pk_idx)) * DTYPE_BYTES
+                                byte_offset_i64 = arith.index_cast(T.i64, linear_bytes_offset)
+                                addr_i64 = llvm.AddOp(out_base_int, byte_offset_i64, llvm.IntegerOverflowFlags(0)).result
+                                out_ptr = llvm.IntToPtrOp(_ptr_type, addr_i64).result
+                                out_ptr_v = out_ptr._value if hasattr(out_ptr, "_value") else out_ptr
+                                pk_val_v = pk_val._value if hasattr(pk_val, "_value") else pk_val
+                                llvm.AtomicRMWOp(
+                                    llvm.AtomicBinOp.fadd,
+                                    out_ptr_v,
+                                    pk_val_v,
+                                    llvm.AtomicOrdering.monotonic,
+                                    syncscope="agent",
+                                    alignment=4,
+                                )
+                            else:
+                                C_.vec_store((out_m_idx, out_n_pk_idx), pk_val, PACK_N)
                         else:
-                            C_.vec_store((out_m_idx, out_n_pk_idx), pk_val, PACK_N)
-                    else:
-                        out_n_idx = g_warp_atom_n_idx + stmatrix_c_n_pk_idx
-                        val = vector.extract(c_frags[ii * WARP_N_STEPS + jj], static_position=[kk], dynamic_position=[])
-                        C_[out_m_idx, out_n_idx] = val.truncf(dtype_)
+                            out_n_idx = g_warp_atom_n_idx + stmatrix_c_n_pk_idx
+                            val = vector.extract(c_frags[ii * WARP_N_STEPS + jj], static_position=[kk], dynamic_position=[])
+                            C_[out_m_idx, out_n_idx] = val.truncf(dtype_)
         return
     
     @flyc.jit
@@ -593,13 +559,13 @@ def get_kwargs(m, n, k):
         'B_PRE_SHUFFLE': True,
         'SPLIT_K': 1,
     }
-    if m == 32 and n == 7168 and k == 2048:
+    if m <= 32 and n == 7168 and k == 2048:
         kwargs['TILE_K'] = 128
         kwargs['TILE_M'] = 32
         kwargs['TILE_N'] = 256
         kwargs['PACK_N'] = 2
         kwargs['SPLIT_K'] = 4
-    if m == 32 and n == 384 and k == 7168:
+    if m <= 32 and n == 384 and k == 7168:
         kwargs['TILE_K'] = 128
         kwargs['TILE_M'] = 16
         kwargs['TILE_N'] = 128
