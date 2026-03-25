@@ -102,11 +102,7 @@ def worker(device_id, num_devices, parts, nsamples, inputs, outputs):
     group = init_world(device_id, num_devices, parts)
     rank = dist.get_rank(group=group)
     world_size = dist.get_world_size(group=group)
-    meta = torch.empty((0,), device=device_id, dtype=torch.int8)
-    rank_data = inputs[device_id * nsamples]
-    handles = [torch.empty((1,), device="cpu", dtype=torch.uint8) for _ in range(world_size)]
-    offsets = [0 for _ in range(world_size)]
-    fa = init_custom_ar(meta, rank_data, handles, offsets, rank=rank)
+    fa = init_custom_ar(torch.device(device_id), world_size=world_size, rank=rank)
     for i in range(nsamples):
         input = inputs[device_id * nsamples + i]
         output = outputs[device_id * nsamples + i]
