@@ -39,37 +39,8 @@ def create_inputs(args):
     return (a, b)
 
 
-C_OUT_TABLE = {}
-class HGEMMOut:
-    def __init__(self, m, n, dtype, device):
-        global C_OUT_TABLE
-        lookup_key = f"{m}x{n}:{dtype}:{device}"
-        if C_OUT_TABLE.get(lookup_key, None) is None:
-            C_OUT_TABLE[lookup_key] = [
-                torch.zeros(m, n, dtype=dtype, device=device),
-                torch.zeros(m, n, dtype=dtype, device=device),
-                int(0)
-            ]
-        self.lookup_key = lookup_key
-    
-    def get(self):
-        values = C_OUT_TABLE[self.lookup_key]
-        data_idx = values[2]
-        return values[data_idx]
-    
-    def get_next(self):
-        values = C_OUT_TABLE[self.lookup_key]
-        data_idx = values[2]
-        next_data_idx = 1 - data_idx
-        return values[next_data_idx]
-    
-    def switch(self):
-        values = C_OUT_TABLE[self.lookup_key]
-        values[2] = int(1 - values[2])
-
-
 def create_outputs(args):
-    c = HGEMMOut(args.m, args.n, args.dtype, 'cuda')
+    c = torch.randn((args.m, args.n), dtype=args.dtype, device='cuda')
     return (c,)
 
 
@@ -103,6 +74,7 @@ def compile_hgemm_kernel(
     B_TO_LDS: bool = False,
     B_PRE_SHUFFLE: bool = True,
     SPLIT_K: int = 1,
+    SPLIT_K_CLEAN: bool = False,
 ):
     BLOCK_K = TILE_K
     assert (k % SPLIT_K == 0) and (k // SPLIT_K >= 1)
@@ -358,7 +330,7 @@ def compile_hgemm_kernel(
                             acc_mid = mfma_fn(T.f32x4, [a_v0, b_v0, acc_in, 0, 0, 0])
                             c_frags[c_idx] = mfma_fn(T.f32x4, [a_v1, b_v1, acc_mid, 0, 0, 0])
         
-        if SPLIT_K > 1:
+        if SPLIT_K_CLEAN and SPLIT_K > 1:
             zero_c()
         
         if B_TO_LDS:
@@ -521,7 +493,6 @@ def compile_hgemm_kernel(
             allocator.finalize()
         
         bm = (m + BLOCK_M - 1) // BLOCK_M
-        # bn = (n + BLOCK_N - 1) // BLOCK_N
         bn = n // BLOCK_N
         raster_factor = 1
         bm = bm * raster_factor
@@ -532,7 +503,7 @@ def compile_hgemm_kernel(
     return launch_hgemm_kernel
 
 
-def hgemm_spk_shuffle_b(x, layout=(16, 16), pack_n=1, k_steps=2):
+def hgemm_shuffle_b(x, layout=(16, 16), pack_n=1, k_steps=2):
     x_shape = x.shape
     VEC_SIZE = 16 // x.element_size()
     BN = layout[0] * pack_n
@@ -564,14 +535,12 @@ def get_kwargs(m, n, k):
         kwargs['TILE_K'] = 128
         kwargs['TILE_M'] = 16
         kwargs['TILE_N'] = 128
-        kwargs['PACK_N'] = 2
-        kwargs['SPLIT_K'] = 1
+        kwargs['PACK_N'] = 1
     if m <= 32 and n == 384 and k == 7168:
         kwargs['TILE_K'] = 128
         kwargs['TILE_M'] = 16
         kwargs['TILE_N'] = 128
-        kwargs['PACK_N'] = 2
-        kwargs['SPLIT_K'] = 1
+        kwargs['PACK_N'] = 1
     return kwargs
 
 
@@ -586,11 +555,12 @@ def func(a, b, c):
     else:
         raise NotImplementedError()
     if kwargs['B_PRE_SHUFFLE']:
-        b = hgemm_spk_shuffle_b(b, pack_n=kwargs['PACK_N'])
+        b = hgemm_shuffle_b(b, pack_n=kwargs['PACK_N'])
     if kwargs['SPLIT_K'] > 1:
-        exe(c.get(), a, b, c.get_next(), stream=torch.cuda.current_stream())
+        c.zero_()
+        exe(c, a, b, c, stream=torch.cuda.current_stream())
     else:
-        exe(c.get(), a, b, c.get(), stream=torch.cuda.current_stream())
+        exe(c, a, b, c, stream=torch.cuda.current_stream())
 
 
 def benchmark(args, func, ref_func, warmup=20, niters=100):
@@ -602,15 +572,13 @@ def benchmark(args, func, ref_func, warmup=20, niters=100):
     for i in range(5):
         func(*inouts)
         ref_func(*ref_inouts)
-        for output_, ref_output in zip(outputs, ref_outputs):
-            output = output_.get()
+        for output, ref_output in zip(outputs, ref_outputs):
             is_allclose = torch.allclose(output, ref_output, atol=1e-2, rtol=1e-2)
             # print(output)
             # print(ref_output)
             maxdiff_out = (output - ref_output).abs().max()
             print(f"maxdiff_out:{maxdiff_out}")
             # assert is_allclose == True
-            output_.switch()
 
     # get ref_func perf
     print("===================== [REF] =====================")
@@ -626,11 +594,9 @@ def benchmark(args, func, ref_func, warmup=20, niters=100):
     print("===================== [FLYDSL] =====================")
     for i in range(warmup):
         func(*inouts)
-        inouts[-1].switch()
     with profile(activities=[ProfilerActivity.CUDA], ) as prof:
         for i in range(niters):
             func(*inouts)
-            inouts[-1].switch()
     table = prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1)
     print(table)
 
