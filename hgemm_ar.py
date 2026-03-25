@@ -23,6 +23,7 @@ from flydsl.compiler.protocol import fly_values
 from flydsl.expr.buffer_ops import _unwrap_value
 
 from utils.custom_all_reduce import init_custom_ar, FlyDSLAllreduce
+from utils.custom_all_reduce_kernel import _signal_start_sync, _signal_end_sync
 from utils.tensor_shim import get_dtype_in_kernel, GTensor, STensor, _to_raw
 fm_fast = arith.FastMathFlags.fast
 
@@ -108,7 +109,8 @@ def swizzle_xor16(row, col_in_bytes, k_blocks16):
 
 
 @functools.lru_cache(maxsize=1024)
-def compile_hgemm_kernel(
+def compile_hgemm_ar_kernel(
+    world_size: int,
     dtype: str,
     m: int,
     n: int,
@@ -177,6 +179,7 @@ def compile_hgemm_kernel(
     LDG_REG_C_COUNT = BLOCK_M * BLOCK_N // LDG_VEC_SIZE // BLOCK_THREADS
     assert (LDG_REG_A_COUNT >= 1) and (LDG_REG_B_COUNT >= 1)
     if SPLIT_K > 1:
+        assert False
         assert LDG_REG_C_COUNT >= 1
     BLOCK_K_BYTES = BLOCK_K * DTYPE_BYTES
 
@@ -236,6 +239,7 @@ def compile_hgemm_kernel(
         w_tid = tid % WARP_SIZE
         block_m_idx = fx.block_idx.x // raster_factor
         block_n_idx = fx.block_idx.x % raster_factor + fx.block_idx.y * raster_factor
+        bid_linear = block_m_idx * (n // BLOCK_N) + block_n_idx
         ks_idx = fx.Index(fx.block_idx.z)
         ks_begin = arith.index_cast(T.i32, ks_idx * ks)
 
@@ -532,13 +536,17 @@ def compile_hgemm_kernel(
                             val = vector.extract(c_frags[ii * WARP_N_STEPS + jj], static_position=[kk], dynamic_position=[])
                             C_[out_m_idx, out_n_idx] = val.truncf(dtype_)
         
-        rank_i32    = _unwrap_value(rank)
+        rank_i32 = _unwrap_value(rank)
         self_sg_i64 = _unwrap_value(self_sg)
         sg_ptrs_i64 = _unwrap_value(sg_ptrs)
         out_ptrs_i64 = _unwrap_value(out_ptrs)
+        bid_i32 = arith.index_cast(T.i32, fx.Index(bid_linear))
+        lane_i32 = arith.index_cast(T.i32, fx.Index(fx.thread_idx.x))
 
         sgs = [signal_ops.load_ptr_from_array(sg_ptrs_i64, arith.constant(i, type=T.i32)) for i in range(8)]
         out_ptrs_arr = [signal_ops.load_ptr_from_array(out_ptrs_i64, arith.constant(i, type=T.i32)) for i in range(8)]
+
+        _signal_start_sync(lane_i32=lane_i32, rank_i32=rank_i32, bid_i32=bid_i32, self_sg_i64=self_sg_i64, sgs_i64=sgs, ngpus=world_size)
 
         return
     
@@ -614,14 +622,14 @@ def get_kwargs(m, n, k):
     return kwargs
 
 
-def hgemm_ar_impl(a, b, c, rank, self_sg, sg_ptrs, out_ptrs):
+def hgemm_ar_impl(a, b, c, world_size, rank, self_sg, sg_ptrs, out_ptrs):
     m, k = a.shape
     n = b.shape[0]
     kwargs = get_kwargs(m, n, k)
     if a.dtype == torch.half:
-        exe = compile_hgemm_kernel('f16', m, n, k, **kwargs)
+        exe = compile_hgemm_ar_kernel(world_size, 'f16', m, n, k, **kwargs)
     elif a.dtype == torch.bfloat16:
-        exe = compile_hgemm_kernel('bf16', m, n, k, **kwargs)
+        exe = compile_hgemm_ar_kernel(world_size, 'bf16', m, n, k, **kwargs)
     else:
         raise NotImplementedError()
     if kwargs['B_PRE_SHUFFLE']:
@@ -635,6 +643,7 @@ def hgemm_ar_impl(a, b, c, rank, self_sg, sg_ptrs, out_ptrs):
 
 class GEMMARBackend(FlyDSLAllreduce):
     def hgemm_ar_fusion(self, a, b, c):
+        world_size = self.world_size
         m, k = a.shape
         n = b.shape[0]
         bytes_mn = m * n * 2
@@ -647,16 +656,16 @@ class GEMMARBackend(FlyDSLAllreduce):
                 self._graph_out = c.view(-1)
                 self._graph_bytes_n = bytes_mn
                 out_ptrs = Int64(int(self._gpu_graph_out_ptrs_array.data_ptr()))
-                hgemm_ar_impl(a, b, c, rank, self_sg, sg_ptrs, out_ptrs)
+                hgemm_ar_impl(a, b, c, world_size, rank, self_sg, sg_ptrs, out_ptrs)
                 return c
             else:
                 out_ptrs = Int64(int(self._gpu_output_buffer_ptrs_array.data_ptr()))
-                hgemm_ar_impl(a, b, c, rank, self_sg, sg_ptrs, out_ptrs)
+                hgemm_ar_impl(a, b, c, world_size, rank, self_sg, sg_ptrs, out_ptrs)
                 c.view(-1).view(torch.uint8)[:bytes_mn].copy_(self.output_buffer[:bytes_mn])
                 return c
         else:
             out_ptrs = Int64(int(self._gpu_output_buffer_ptrs_array.data_ptr()))
-            hgemm_ar_impl(a, b, c, rank, self_sg, sg_ptrs, out_ptrs)
+            hgemm_ar_impl(a, b, c, world_size, rank, self_sg, sg_ptrs, out_ptrs)
             c.view(-1).view(torch.uint8)[:bytes_mn].copy_(self.output_buffer[:bytes_mn])
             return c
 
