@@ -9,7 +9,7 @@ This repository will provide the following examples from scratch:
 - [x] Batch Reduce
 - [x] RMS Norm
 - [x] HGEMM (wmma)
-- [ ] Allreduce
+- [x] Allreduce
 - [ ] Flash Attention
 - [ ] Linear Attention (NEED REBASE)
 - [ ] GEMM-FP8
@@ -23,7 +23,7 @@ Check the ROCm version using `amd-smi`. My version is `7.0.1`.
 ```bash
 git clone https://github.com/ROCm/FlyDSL
 cd FlyDSL
-git checkout 429e6c7f82de4d2bb9a3013946617be2b1a1c791
+git checkout 76c924b4d25b3c18242535139583eeeee2708d08
 bash scripts/build_llvm.sh -j64
 
 # After this you will see the installed path.
@@ -225,33 +225,75 @@ python3 hgemm.py --m=4096 --n=4096 --k=4096 --dtype=f16
 ```txt
 run: /home/yuxu/flydsl-examples/hgemm.py, args: Namespace(m=4096, n=4096, k=4096, dtype='f16')
 maxdiff_out:0.0625
-validation passed!
-
+maxdiff_out:0.0625
+maxdiff_out:0.0625
+maxdiff_out:0.0625
+maxdiff_out:0.0625
 ===================== [REF] =====================
-[W320 06:20:36.581391711 collection.cpp:1116] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
+[W325 08:58:44.666889393 collection.cpp:1116] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
 -------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
                                                    Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
 -------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-Cijk_Alik_Bljk_HHS_BH_UserArgs_MT256x224x64_MI16x16x...         0.00%       0.000us         0.00%       0.000us       0.000us      73.268ms       100.00%      73.268ms     732.680us           100  
-                            hipGetDevicePropertiesR0600         0.20%     138.970us         0.20%     138.970us       0.463us       0.000us         0.00%       0.000us       0.000us           300  
-                               hipExtModuleLaunchKernel         0.69%     490.480us         0.69%     490.480us       4.905us       0.000us         0.00%       0.000us       0.000us           100  
-                                   hipDeviceSynchronize        99.11%      70.341ms        99.11%      70.341ms      70.341ms       0.000us         0.00%       0.000us       0.000us             1  
+Cijk_Alik_Bljk_HHS_BH_UserArgs_MT256x224x64_MI16x16x...         0.00%       0.000us         0.00%       0.000us       0.000us      73.170ms       100.00%      73.170ms     731.697us           100  
+                            hipGetDevicePropertiesR0600         0.13%      96.362us         0.13%      96.362us       0.321us       0.000us         0.00%       0.000us       0.000us           300  
+                               hipExtModuleLaunchKernel         0.57%     408.387us         0.57%     408.387us       4.084us       0.000us         0.00%       0.000us       0.000us           100  
+                                   hipDeviceSynchronize        99.30%      71.121ms        99.30%      71.121ms      71.121ms       0.000us         0.00%       0.000us       0.000us             1  
 -------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-Self CPU time total: 70.970ms
-Self CUDA time total: 73.268ms
+Self CPU time total: 71.626ms
+Self CUDA time total: 73.170ms
 
 ===================== [FLYDSL] =====================
 -------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
                                                    Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
 -------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-                         hgemm_f16_128x256x64_S2TN_BP_0         0.00%       0.000us         0.00%       0.000us       0.000us      81.338ms        91.61%      81.338ms     813.381us           100  
-void at::native::elementwise_kernel_manual_unroll<12...         0.00%       0.000us         0.00%       0.000us       0.000us       7.452ms         8.39%       7.452ms      74.516us           100  
-                                        hipLaunchKernel         0.96%     660.944us         0.96%     660.944us       6.609us       0.000us         0.00%       0.000us       0.000us           100  
-                                  hipModuleLaunchKernel         0.75%     516.513us         0.75%     516.513us       5.165us       0.000us         0.00%       0.000us       0.000us           100  
-                                   hipDeviceSynchronize        98.29%      67.814ms        98.29%      67.814ms      67.814ms       0.000us         0.00%       0.000us       0.000us             1  
+                         hgemm_f16_128x128x64_S1TN_BP_0         0.00%       0.000us         0.00%       0.000us       0.000us      73.178ms        90.42%      73.178ms     731.779us           100  
+void at::native::elementwise_kernel_manual_unroll<12...         0.00%       0.000us         0.00%       0.000us       0.000us       7.751ms         9.58%       7.751ms      77.512us           100  
+                                        hipLaunchKernel         0.66%     448.365us         0.66%     448.365us       4.484us       0.000us         0.00%       0.000us       0.000us           100  
+                                  hipModuleLaunchKernel         0.63%     427.903us         0.63%     427.903us       4.279us       0.000us         0.00%       0.000us       0.000us           100  
+                                   hipDeviceSynchronize        98.70%      66.616ms        98.70%      66.616ms      66.616ms       0.000us         0.00%       0.000us       0.000us             1  
 -------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-Self CPU time total: 68.992ms
-Self CUDA time total: 88.790ms
+Self CPU time total: 67.492ms
+Self CUDA time total: 80.929ms
+```
+
+## 5. Allreduce
+
+```bash
+python3 allreduce.py --nsamples=10 --num_devices=4 --dtype=bf16 --n=16384
+```
+
+```txt
+run: /home/yuxu/flydsl-examples/allreduce.py, args: Namespace(n=16384, dtype='bf16', num_devices=4, parts=1, nsamples=10)
+
+max_diff_global:0.0625
+
+===================== [REF] =====================
+[init_world] device_id:0, group_ranks:[0, 1, 2, 3]
+[init_world] device_id:1, group_ranks:[0, 1, 2, 3]
+[init_world] device_id:2, group_ranks:[0, 1, 2, 3]
+[init_world] device_id:3, group_ranks:[0, 1, 2, 3]
+------------------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                    Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg    # of Calls  
+------------------------  ------------  ------------  ------------  ------------  ------------  ------------  
+      hipIpcGetMemHandle        64.20%     529.977us        64.20%     529.977us       1.656us           320  
+    hipStreamSynchronize        33.94%     280.182us        33.94%     280.182us       0.876us           320  
+    hipDeviceSynchronize         1.86%      15.379us         1.86%      15.379us      15.379us             1  
+------------------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 825.538us
+
+===================== [FLYDSL] =====================
+[init_world] device_id:0, group_ranks:[0, 1, 2, 3]
+[init_world] device_id:3, group_ranks:[0, 1, 2, 3]
+[init_world] device_id:1, group_ranks:[0, 1, 2, 3]
+[init_world] device_id:2, group_ranks:[0, 1, 2, 3]
+------------------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                    Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg    # of Calls  
+------------------------  ------------  ------------  ------------  ------------  ------------  ------------  
+      hipIpcGetMemHandle        73.38%     494.781us        73.38%     494.781us       1.546us           320  
+    hipStreamSynchronize        23.94%     161.413us        23.94%     161.413us       0.504us           320  
+    hipDeviceSynchronize         2.68%      18.090us         2.68%      18.090us      18.090us             1  
+------------------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 674.284us
 ```
 
 ---
