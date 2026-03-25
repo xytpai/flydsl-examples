@@ -159,7 +159,7 @@ if __name__ == '__main__':
     parser.add_argument("--n", type=int, required=True)
     parser.add_argument("--dtype", type=str, required=True)
     parser.add_argument("--num_devices", type=int, required=True)
-    parser.add_argument("--parts", type=int, required=True)
+    parser.add_argument("--parts", type=int, default=1)
     parser.add_argument("--nsamples", type=int, required=True)
     args = parser.parse_args()
     print(f"run: {__file__}, args: {args}")
@@ -167,3 +167,4 @@ if __name__ == '__main__':
     args.dtype = dtype_convert[args.dtype]
     args = Args(**vars(args))
     benchmark(args, func, ref_func)
+    # rm -rf ~/.flydsl/ ; python3 allreduce.py --nsamples=10 --num_devices=4 --dtype=bf16 --n=16384
