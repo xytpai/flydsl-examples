@@ -203,12 +203,10 @@ def compile_hgemm_kernel(
         B: fx.Tensor,
         CLEAN: fx.Tensor,
         raster_factor: fx.Constexpr[int],
-        # rank: Int32,
-        # self_sg: Int64,
-        # sg_ptrs: Int64,
-        # in_ptrs: Int64,
-        # tmp_ptrs: Int64,
-        # out_ptr: Int64,
+        rank: Int32,
+        self_sg: Int64,
+        sg_ptrs: Int64,
+        out_ptrs: Int64,
     ):
         dtype_ = get_dtype_in_kernel(dtype)
         if dtype == 'bf16':
@@ -534,14 +532,13 @@ def compile_hgemm_kernel(
                             val = vector.extract(c_frags[ii * WARP_N_STEPS + jj], static_position=[kk], dynamic_position=[])
                             C_[out_m_idx, out_n_idx] = val.truncf(dtype_)
         
-        # rank_i32    = _unwrap_value(rank)
-        # self_sg_i64 = _unwrap_value(self_sg)
-        # sg_ptrs_i64 = _unwrap_value(sg_ptrs)
-        # in_ptrs_i64 = _unwrap_value(in_ptrs)
-        # out_ptr_i64 = _unwrap_value(out_ptr)
+        rank_i32    = _unwrap_value(rank)
+        self_sg_i64 = _unwrap_value(self_sg)
+        sg_ptrs_i64 = _unwrap_value(sg_ptrs)
+        out_ptrs_i64 = _unwrap_value(out_ptrs)
 
-        # sgs         = [signal_ops.load_ptr_from_array(sg_ptrs_i64, arith.constant(i, type=T.i32)) for i in range(8)]
-        # in_ptrs_arr = [signal_ops.load_ptr_from_array(in_ptrs_i64, arith.constant(i, type=T.i32)) for i in range(8)]
+        sgs = [signal_ops.load_ptr_from_array(sg_ptrs_i64, arith.constant(i, type=T.i32)) for i in range(8)]
+        out_ptrs_arr = [signal_ops.load_ptr_from_array(out_ptrs_i64, arith.constant(i, type=T.i32)) for i in range(8)]
 
         return
     
@@ -551,12 +548,10 @@ def compile_hgemm_kernel(
         A: fx.Tensor,
         B: fx.Tensor,
         CLEAN: fx.Tensor,
-        # rank: Int32,
-        # self_sg: Int64,
-        # sg_ptrs: Int64,
-        # in_ptrs: Int64,
-        # tmp_ptrs: Int64,
-        # out_ptr: Int64,
+        rank: Int32,
+        self_sg: Int64,
+        sg_ptrs: Int64,
+        out_ptrs: Int64,
         stream: fx.Stream = fx.Stream(None),
     ):
         allocator.finalized = False
@@ -572,7 +567,7 @@ def compile_hgemm_kernel(
         hgemm_kernel._func.__name__ = KERNEL_NAME
         hgemm_kernel(
             C, A, B, CLEAN, raster_factor, 
-            # rank, self_sg, sg_ptrs, in_ptrs, tmp_ptrs, out_ptr
+            rank, self_sg, sg_ptrs, out_ptrs
         ).launch(grid=(bm, bn, SPLIT_K), block=(BLOCK_THREADS, 1, 1), stream=stream)
     
     return launch_hgemm_kernel
@@ -619,7 +614,7 @@ def get_kwargs(m, n, k):
     return kwargs
 
 
-def hgemm_impl(a, b, c):
+def hgemm_ar_impl(a, b, c, rank, self_sg, sg_ptrs, out_ptrs):
     m, k = a.shape
     n = b.shape[0]
     kwargs = get_kwargs(m, n, k)
@@ -633,14 +628,37 @@ def hgemm_impl(a, b, c):
         b = hgemm_shuffle_b(b, pack_n=kwargs['PACK_N'])
     if kwargs['SPLIT_K'] > 1:
         c.zero_()
-        exe(c, a, b, c, stream=torch.cuda.current_stream())
+        exe(c, a, b, c, rank, self_sg, sg_ptrs, out_ptrs, stream=torch.cuda.current_stream())
     else:
-        exe(c, a, b, c, stream=torch.cuda.current_stream())
+        exe(c, a, b, c, rank, self_sg, sg_ptrs, out_ptrs, stream=torch.cuda.current_stream())
 
 
 class GEMMARBackend(FlyDSLAllreduce):
-    def hello(self):
-        print('hello', flush=True)
+    def hgemm_ar_fusion(self, a, b, c):
+        m, k = a.shape
+        n = b.shape[0]
+        bytes_mn = m * n * 2
+        rank = Int32(self.rank)
+        self_sg = Int64(self._self_sg)
+        sg_ptrs = Int64(int(self._gpu_sg_ptrs_array.data_ptr()))
+        if self._IS_CAPTURING:
+            if torch.cuda.is_current_stream_capturing():
+                self._graph_inp = None
+                self._graph_out = c.view(-1)
+                self._graph_bytes_n = bytes_mn
+                out_ptrs = Int64(int(self._gpu_graph_out_ptrs_array.data_ptr()))
+                hgemm_ar_impl(a, b, c, rank, self_sg, sg_ptrs, out_ptrs)
+                return c
+            else:
+                out_ptrs = Int64(int(self._gpu_output_buffer_ptrs_array.data_ptr()))
+                hgemm_ar_impl(a, b, c, rank, self_sg, sg_ptrs, out_ptrs)
+                c.view(-1).view(torch.uint8)[:bytes_mn].copy_(self.output_buffer[:bytes_mn])
+                return c
+        else:
+            out_ptrs = Int64(int(self._gpu_output_buffer_ptrs_array.data_ptr()))
+            hgemm_ar_impl(a, b, c, rank, self_sg, sg_ptrs, out_ptrs)
+            c.view(-1).view(torch.uint8)[:bytes_mn].copy_(self.output_buffer[:bytes_mn])
+            return c
 
 
 def worker(device_id, num_devices, parts, nsamples, inputs, outputs):
@@ -648,13 +666,10 @@ def worker(device_id, num_devices, parts, nsamples, inputs, outputs):
     rank = dist.get_rank(group=group)
     world_size = dist.get_world_size(group=group)
     fa = init_custom_ar(torch.device(device_id), world_size=world_size, rank=rank, backend=GEMMARBackend)
-    fa.hello()
     for i in range(nsamples):
         input = inputs[device_id * nsamples + i]
         output = outputs[device_id * nsamples + i]
-        hgemm_impl(input[0], input[1], output)
-        output_plat = output.view(-1)
-        fa.custom_all_reduce(output_plat, open_fp8_quant=False, out=output_plat)
+        fa.hgemm_ar_fusion(input[0], input[1], output)
     torch.cuda.synchronize()
     dist.barrier(group=group)
     dist.destroy_process_group()
