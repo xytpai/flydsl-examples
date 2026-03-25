@@ -110,7 +110,7 @@ def compile_hgemm_kernel(
     assert (ks % BLOCK_K == 0) and (ks // BLOCK_K >= 1)
     assert BLOCK_K >= 32
     assert BLOCK_M_WARPS * BLOCK_N_WARPS == 4
-    assert STAGES in [2,]
+    assert STAGES in [2, 1]
     if B_PRE_SHUFFLE == True:
         assert B_TO_LDS == False
     if SPLIT_K > 1:
@@ -398,40 +398,10 @@ def compile_hgemm_kernel(
         
         if B_TO_LDS:
             # SLOW PATH
-            
-            a_regs = ldg_a(ks_begin)
-            sts_a(a_regs, 0)
-            b_regs = ldg_b(ks_begin)
-            sts_b(b_regs, 0)
-            gpu.barrier()
-
-            init_state = [ks_begin, arith.constant(0, index=True)] + c_frags
-            for bki, state in range(1, BLOCK_K_LOOPS, init=init_state):
-                k_offset = state[0]
-                current_stage = fx.Index(state[1])
-                next_stage = 1 - current_stage
-                c_frags = state[2 :]
-                a_regs_next = ldg_a(k_offset + BLOCK_K)
-                b_regs_next = ldg_b(k_offset + BLOCK_K)
-                a_frags = lds_matrix_a(current_stage)
-                b_frags = lds_matrix_b(current_stage)
-                block_mma_sync(a_frags, b_frags, c_frags)
-                sts_a(a_regs_next, next_stage)
-                sts_b(b_regs_next, next_stage)
-                gpu.barrier()
-                k_offset = k_offset + fx.Int32(BLOCK_K)
-                results = yield [k_offset, next_stage] + c_frags
-            
-            k_offset = results[0]
-            current_stage = results[1]
-            c_frags = results[2 :]
-            a_frags = lds_matrix_a(current_stage)
-            b_frags = lds_matrix_b(current_stage)
-            block_mma_sync(a_frags, b_frags, c_frags)
-        
+            raise NotImplementedError("B_TO_LDS not supported yet")
         else:
 
-            if SPLIT_K == 1:
+            if True:
                 # ============ Main K-loop with scheduling ============
                 # Initial scheduling barrier to reset hardware scheduler state
                 rocdl.sched_barrier(0)
@@ -492,32 +462,14 @@ def compile_hgemm_kernel(
             b_frags = ldg_matrix_b(ks_begin)
             gpu.barrier()
 
-            if SPLIT_K > 1:
-                # ============ Main K-loop with scheduling ============
-                # Initial scheduling barrier to reset hardware scheduler state
-                rocdl.sched_barrier(0)
-                def hot_loop_scheduler():
-                    assert MFMA_PER_WARP_K == 2
-                    mfma_group = WARP_M_STEPS * WARP_N_STEPS
-                    # mfma_total = WARP_K_STEPS * mfma_group * MFMA_PER_WARP_K
-                    LDG_REG_A_COUNT_PART = LDG_REG_A_COUNT // WARP_K_STEPS
-                    if LDG_REG_A_COUNT_PART == 0:
-                        rocdl.sched_vmem(1)
-                    for sche_i in range_constexpr(WARP_K_STEPS):
-                        rocdl.sched_vmem(LDG_REG_A_COUNT_PART) # ldg_a next
-                        rocdl.sched_dsrd(WARP_M_STEPS) # lds_matrix_a
-                        for pki in range_constexpr(PACK_N):
-                            rocdl.sched_mfma(mfma_group)
-                            rocdl.sched_vmem(WARP_N_STEPS) # ldg_b next
-                            rocdl.sched_mfma(mfma_group)
-                        rocdl.sched_dswr(LDG_REG_A_COUNT_PART) # sts a next
-                    rocdl.sched_barrier(0)
-
             init_state = [ks_begin, arith.constant(0, index=True)] + c_frags + b_frags
             for bki, state in range(1, BLOCK_K_LOOPS, init=init_state):
                 k_offset = state[0]
-                current_stage = fx.Index(state[1])
-                next_stage = 1 - current_stage
+                if STAGES == 2:
+                    current_stage = fx.Index(state[1])
+                    next_stage = 1 - current_stage
+                else:
+                    current_stage = next_stage = 0
                 c_frags = state[2 : 2 + C_FRAGS_LEN]
                 b_frags = state[2 + C_FRAGS_LEN :]
                 if not ASYNC_COPY:
@@ -527,15 +479,17 @@ def compile_hgemm_kernel(
                 b_frags_next = ldg_matrix_b(k_offset + BLOCK_K)
                 a_frags = lds_matrix_a(current_stage)
                 block_mma_sync(a_frags, b_frags, c_frags)
+                if STAGES == 1:
+                    gpu.barrier()
                 if not ASYNC_COPY:
                     sts_a(a_regs_next, next_stage)
                 hot_loop_scheduler()
                 gpu.barrier()
                 k_offset = k_offset + fx.Int32(BLOCK_K)
-                results = yield [k_offset, next_stage] + c_frags + b_frags_next
+                results = yield [k_offset, next_stage if STAGES == 2 else arith.constant(0, index=True)] + c_frags + b_frags_next
             
             k_offset = results[0]
-            current_stage = results[1]
+            current_stage = results[1] if STAGES == 2 else 0
             c_frags = results[2 : 2 + C_FRAGS_LEN]
             b_frags = results[2 + C_FRAGS_LEN :]
             a_frags = lds_matrix_a(current_stage)
@@ -633,7 +587,7 @@ def get_kwargs(m, n, k):
         'TILE_M': 128,
         'TILE_N': 128,
         'PACK_N': 1,
-        'STAGES' : 2,
+        'STAGES' : 1,
         'ASYNC_COPY': False,
         'B_TO_LDS': False,
         'B_PRE_SHUFFLE': True,
