@@ -6,11 +6,15 @@ import functools
 import itertools
 import numpy as np
 from tqdm import tqdm
+from pathlib import Path
 import torch.nn.functional as F
 from torch.profiler import profile, ProfilerActivity
 from dataclasses import dataclass
 from flydsl.runtime.device import get_rocm_arch
 gpu_arch = get_rocm_arch()
+base_dir = Path(__file__).resolve().parent
+temp_dir = base_dir / 'temp'
+temp_dir.mkdir(parents=True, exist_ok=True)
 
 from hgemm import hgemm_, selections
 
@@ -107,31 +111,30 @@ def tune_all(
     ns = [384, 1024, 2048, 4096, 5120, 6144, 7168, 8192],
     ks = [384, 1024, 2048, 4096, 5120, 6144, 7168, 8192],
 ):
-    results = []
     args = Args(dtype=dtype, m=0, n=0, k=0)
     # ms = ms[:2]
     # ns = ns[:1]
     # ks = ks[:1]
-    for m in ms:
-        for n in ns:
-            for k in ks:
-                args.m = m
-                args.n = n
-                args.k = k
-                result = tune_single(args)
-                results.append(result)
     with open(f"{out_prefix}.jsonl", "w", encoding="utf-8") as f:
-        for item in results:
-            item = vars(item)
-            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        for m in ms:
+            for n in ns:
+                for k in ks:
+                    args.m = m
+                    args.n = n
+                    args.k = k
+                    result = tune_single(args)
+                    result = vars(result)
+                    f.write(json.dumps(result, ensure_ascii=False) + "\n")
+                    f.flush()
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Examples")
-    parser.add_argument("--out", type=str, default='hgemm_tunned')
+    parser.add_argument("--out", type=str, default='temp/hgemm_tunned')
     parser.add_argument("--dtype", type=str, default='bf16')
     args = parser.parse_args()
     print(f"run: {__file__}, args: {args}")
     dtype_convert = {'f16': torch.half, 'bf16': torch.bfloat16}
     args.dtype = dtype_convert[args.dtype]
     tune_all(args.dtype, args.out)
+    # rm -rf ~/.flydsl/ ; python3 hgemm_tunned.py
