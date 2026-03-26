@@ -517,7 +517,7 @@ def hgemm_shuffle_b(x, layout=(16, 16), pack_n=1, k_steps=2):
     return x
 
 
-def get_kwargs(m, n, k):
+def get_default_kwargs(m, n, k):
     kwargs = {
         'TILE_K': 64,
         'BLOCK_M_WARPS': 1,
@@ -535,32 +535,53 @@ def get_kwargs(m, n, k):
         kwargs['TILE_K'] = 128
         kwargs['TILE_M'] = 16
         kwargs['TILE_N'] = 128
-        kwargs['PACK_N'] = 1
     if m <= 32 and n == 384 and k == 7168:
         kwargs['TILE_K'] = 128
         kwargs['TILE_M'] = 16
         kwargs['TILE_N'] = 128
-        kwargs['PACK_N'] = 1
     return kwargs
 
 
-def func(a, b, c):
-    m, k = a.shape
+selections = {
+    'TILE_K': [64, 128],
+    'TILE_M': [16, 32, 64, 128],
+    'TILE_N': [64, 128, 256],
+}
+
+
+def hgemm_(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    c: torch.Tensor,
+    shuffle_b: bool=True,
+    hgemm_kwargs: dict={},
+):
+    k = a.shape[-1]
+    a = a.view(-1, k)
+    m = a.shape[0]
     n = b.shape[0]
-    kwargs = get_kwargs(m, n, k)
+    assert b.shape[1] == k
+    c = c.view(-1, n)
+    assert c.shape[0] == m
+    kwargs = get_default_kwargs(m, n, k)
+    kwargs.update(hgemm_kwargs)
     if a.dtype == torch.half:
         exe = compile_hgemm_kernel('f16', m, n, k, **kwargs)
     elif a.dtype == torch.bfloat16:
         exe = compile_hgemm_kernel('bf16', m, n, k, **kwargs)
     else:
         raise NotImplementedError()
-    if kwargs['B_PRE_SHUFFLE']:
+    if kwargs['B_PRE_SHUFFLE'] and shuffle_b:
         b = hgemm_shuffle_b(b, pack_n=kwargs['PACK_N'])
     if kwargs['SPLIT_K'] > 1:
         c.zero_()
         exe(c, a, b, c, stream=torch.cuda.current_stream())
     else:
         exe(c, a, b, c, stream=torch.cuda.current_stream())
+
+
+def func(a, b, c):
+    hgemm_(a, b, c, shuffle_b=True)
 
 
 def benchmark(args, func, ref_func, warmup=20, niters=100):
