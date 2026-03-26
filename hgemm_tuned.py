@@ -16,7 +16,7 @@ base_dir = Path(__file__).resolve().parent
 temp_dir = base_dir / 'temp'
 temp_dir.mkdir(parents=True, exist_ok=True)
 
-from hgemm import hgemm_, selections
+from hgemm import hgemm_, selections, benchmark, ref_func
 
 
 @dataclass
@@ -28,7 +28,7 @@ class Args:
 
 
 @dataclass
-class TunnedArgs:
+class TunedArgs:
     arch: str
     dtype: str
     m: int
@@ -52,7 +52,7 @@ def create_outputs(args):
     return (c,)
 
 
-def benchmark(args, hgemm_kwargs={}, warmup=5, niters=50):
+def tuning_benchmark(args, hgemm_kwargs={}, warmup=5, niters=50):
     a, b = create_inputs(args)
     c = create_outputs(args)[0]
     c_ref = create_outputs(args)[0]
@@ -82,7 +82,7 @@ def tune_single(args):
     pbar = tqdm(total=len(configs), desc=f"{args}")
     for i, config in enumerate(configs):
         try:
-            dur = benchmark(args, hgemm_kwargs=config)
+            dur = tuning_benchmark(args, hgemm_kwargs=config)
         except:
             dur = float(1e10)
         if dur < best_duration:
@@ -90,7 +90,7 @@ def tune_single(args):
             best_idx = i
         pbar.update(1)
     tflops = 2.0 * args.m * args.n * args.k / best_duration * 1e-6
-    result = TunnedArgs(
+    result = TunedArgs(
         arch = gpu_arch,
         dtype = str(args.dtype),
         m = args.m,
@@ -129,11 +129,40 @@ def tune_all(
                     f.flush()
 
 
+TUNED_CONFIGS = None
+MAP_CONFIGS = {}
+SHOW_TUNED_LOG = False
+def hgemm_tuned(a, b, c):
+    global TUNED_CONFIGS
+    global MAP_CONFIGS
+    global SHOW_TUNED_LOG
+    dtype = a.dtype
+    k = a.shape[-1]
+    a = a.view(-1, k)
+    m = a.shape[0]
+    n = b.shape[0]
+    if TUNED_CONFIGS is None:
+        with open('hgemm_tuned.jsonl', 'r', encoding='utf-8') as f:
+            TUNED_CONFIGS = [json.loads(line) for line in f]
+            for line in TUNED_CONFIGS:
+                key = (line['arch'], line['dtype'], line['m'], line['n'], line['k'])
+                MAP_CONFIGS[key] = line['config']
+    if MAP_CONFIGS.get((gpu_arch, str(dtype), m, n, k), None) is not None:
+        config = MAP_CONFIGS[(gpu_arch, str(dtype), m, n, k)]
+        if SHOW_TUNED_LOG:
+            print(f"Found tuned config for m={m}, n={n}, k={k}: {config}")
+    else:
+        config = {}
+    hgemm_(a, b, c, hgemm_kwargs=config)
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Examples")
-    parser.add_argument("--out", type=str, default='temp/hgemm_tunned')
+    parser.add_argument("--out", type=str, default='temp/hgemm_tuned')
     parser.add_argument("--dtype", type=str, default='bf16')
     parser.add_argument("--single", action='store_true')
+    parser.add_argument("--eval", action='store_true')
+    parser.add_argument("--tune_all", action='store_true')
     parser.add_argument("--m", type=int, default=4096)
     parser.add_argument("--n", type=int, default=4096)
     parser.add_argument("--k", type=int, default=4096)
@@ -143,7 +172,11 @@ if __name__ == '__main__':
     args.dtype = dtype_convert[args.dtype]
     if args.single:
         tune_single(args)
-    else:
+    elif args.eval:
+        args = Args(dtype=args.dtype, m=args.m, n=args.n, k=args.k)
+        benchmark(args, hgemm_tuned, ref_func)
+    elif args.tune_all:
         tune_all(args.dtype, args.out)
-    # rm -rf ~/.flydsl/ ; python3 hgemm_tunned.py --single --dtype bf16 --m 4096 --n 4096 --k 4096
-    # rm -rf ~/.flydsl/ ; python3 hgemm_tunned.py
+    # rm -rf ~/.flydsl/ ; python3 hgemm_tuned.py --single --dtype bf16 --m 4096 --n 4096 --k 4096
+    # rm -rf ~/.flydsl/ ; python3 hgemm_tuned.py --eval --dtype bf16 --m 256 --n 8192 --k 384
+    # rm -rf ~/.flydsl/ ; python3 hgemm_tuned.py --tune_all
