@@ -16,7 +16,7 @@ from flydsl._mlir import ir
 from flydsl.runtime.device import get_rocm_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl._mlir.dialects import llvm, fly, memref
+from flydsl._mlir.dialects import llvm, fly, memref, scf
 from flydsl.compiler.protocol import fly_values
 
 from utils.tensor_shim import get_dtype_in_kernel, GTensor, STensor, _to_raw
@@ -75,6 +75,7 @@ def compile_hgemm_kernel(
     SPLIT_K: int = 1,
     C_TO_LDS: bool = False,
 ):
+    IS_SPLIT_K = SPLIT_K > 1
     BLOCK_K = TILE_K
     assert (k % SPLIT_K == 0) and (k // SPLIT_K >= 1)
     ks = k // SPLIT_K
@@ -123,7 +124,7 @@ def compile_hgemm_kernel(
     LDG_REG_B_COUNT = BLOCK_NK_SIZE // LDG_VEC_SIZE // BLOCK_THREADS
     LDG_REG_C_COUNT = BLOCK_M * BLOCK_N // LDG_VEC_SIZE // BLOCK_THREADS
     assert (LDG_REG_A_COUNT >= 1) and (LDG_REG_B_COUNT >= 1)
-    if SPLIT_K > 1:
+    if IS_SPLIT_K:
         assert LDG_REG_C_COUNT >= 1
         C_TO_LDS = True
     BLOCK_K_BYTES = BLOCK_K * DTYPE_BYTES
@@ -144,7 +145,7 @@ def compile_hgemm_kernel(
     KERNEL_NAME = f"hgemm_{dtype}_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_S{STAGES}TN"
     if B_PRE_SHUFFLE:
         KERNEL_NAME += "_BP"
-    if SPLIT_K > 1:
+    if IS_SPLIT_K:
         KERNEL_NAME += f"_SPK{SPLIT_K}"
 
     @flyc.kernel
@@ -456,7 +457,7 @@ def compile_hgemm_kernel(
                         val = vector.extract(c_frags[ii * WARP_N_STEPS + jj], static_position=[kk], dynamic_position=[])
                         cs_[lds_m_idx, lds_n_idx] = val.truncf(dtype_)
             gpu.barrier()
-            if SPLIT_K > 1:
+            if IS_SPLIT_K:
                 _ptr_type = ir.Type.parse("!llvm.ptr<1>")
                 _i64_type = T.i64
                 out_raw = fly_values(C)[0]
@@ -600,7 +601,7 @@ def hgemm_(
     if kwargs['B_PRE_SHUFFLE'] and shuffle_b:
         b = hgemm_shuffle_b(b)
     if kwargs['SPLIT_K'] > 1:
-        c.zero_()
+        c.zero_() # TODO: remove it
     exe(c, a, b, stream=torch.cuda.current_stream())
 
 
