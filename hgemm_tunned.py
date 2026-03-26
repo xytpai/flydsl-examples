@@ -100,6 +100,7 @@ def tune_single(args):
         duration = best_duration,
         tflops = tflops
     )
+    pbar.close()
     print(result, flush=True)
     return result
 
@@ -132,9 +133,17 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Examples")
     parser.add_argument("--out", type=str, default='temp/hgemm_tunned')
     parser.add_argument("--dtype", type=str, default='bf16')
+    parser.add_argument("--single", action='store_true')
+    parser.add_argument("--m", type=int, default=4096)
+    parser.add_argument("--n", type=int, default=4096)
+    parser.add_argument("--k", type=int, default=4096)
     args = parser.parse_args()
     print(f"run: {__file__}, args: {args}")
     dtype_convert = {'f16': torch.half, 'bf16': torch.bfloat16}
     args.dtype = dtype_convert[args.dtype]
-    tune_all(args.dtype, args.out)
+    if args.single:
+        tune_single(args)
+    else:
+        tune_all(args.dtype, args.out)
+    # rm -rf ~/.flydsl/ ; python3 hgemm_tunned.py --single --dtype bf16 --m 4096 --n 4096 --k 4096
     # rm -rf ~/.flydsl/ ; python3 hgemm_tunned.py
