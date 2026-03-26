@@ -147,6 +147,8 @@ def compile_hgemm_kernel(
         KERNEL_NAME += "_BP"
     if IS_SPLIT_K:
         KERNEL_NAME += f"_SPK{SPLIT_K}"
+    elif C_TO_LDS:
+        KERNEL_NAME += f"_CL"
 
     @flyc.kernel
     def hgemm_kernel(
@@ -556,12 +558,12 @@ def get_default_kwargs(m, n, k):
         'B_TO_LDS': False,
         'B_PRE_SHUFFLE': True,
         'SPLIT_K': 1,
+        'C_TO_LDS': False,
     }
     if m <= 32 and n == 7168 and k == 2048:
         kwargs['TILE_K'] = 128
         kwargs['TILE_M'] = 32
         kwargs['TILE_N'] = 128
-        kwargs['SPLIT_K'] = 4
     if m <= 32 and n == 384 and k == 7168:
         kwargs['TILE_K'] = 128
         kwargs['TILE_M'] = 16
@@ -573,6 +575,7 @@ selections = {
     'TILE_K': [64, 128],
     'TILE_M': [16, 32, 64, 128],
     'TILE_N': [64, 128, 256],
+    'C_TO_LDS': [False, True],
 }
 
 
