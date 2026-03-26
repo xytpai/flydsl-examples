@@ -1,5 +1,6 @@
 import time
 import json
+import bisect
 import torch
 import argparse
 import functools
@@ -131,10 +132,12 @@ def tune_all(
 
 TUNED_CONFIGS = None
 MAP_CONFIGS = {}
+M_LIST_GLOBAL = None
 SHOW_TUNED_LOG = False
 def hgemm_tuned(a, b, c):
     global TUNED_CONFIGS
     global MAP_CONFIGS
+    global M_LIST_GLOBAL
     global SHOW_TUNED_LOG
     dtype = a.dtype
     k = a.shape[-1]
@@ -142,17 +145,22 @@ def hgemm_tuned(a, b, c):
     m = a.shape[0]
     n = b.shape[0]
     if TUNED_CONFIGS is None:
+        ms = set()
         with open('hgemm_tuned.jsonl', 'r', encoding='utf-8') as f:
             TUNED_CONFIGS = [json.loads(line) for line in f]
             for line in TUNED_CONFIGS:
                 key = (line['arch'], line['dtype'], line['m'], line['n'], line['k'])
                 MAP_CONFIGS[key] = line['config']
-    if MAP_CONFIGS.get((gpu_arch, str(dtype), m, n, k), None) is not None:
-        config = MAP_CONFIGS[(gpu_arch, str(dtype), m, n, k)]
-        if SHOW_TUNED_LOG:
-            print(f"Found tuned config for m={m}, n={n}, k={k}: {config}")
-    else:
-        config = {}
+                ms.add(int(line['m']))
+        M_LIST_GLOBAL = sorted(list(ms))
+    config = {}
+    if m <= M_LIST_GLOBAL[-1]:
+        m_lb = M_LIST_GLOBAL[bisect.bisect_left(M_LIST_GLOBAL, m)]
+        search_key = (gpu_arch, str(dtype), m_lb, n, k)
+        if MAP_CONFIGS.get(search_key, None) is not None:
+            config = MAP_CONFIGS[search_key]
+            if SHOW_TUNED_LOG:
+                print(f"Found tuned config for m={m_lb}, n={n}, k={k}: {config}")
     hgemm_(a, b, c, hgemm_kwargs=config)
 
 
