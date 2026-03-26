@@ -147,7 +147,7 @@ def hgemm_tuned(a, b, c):
     if TUNED_CONFIGS is None:
         ms = set()
         with open('hgemm_tuned.jsonl', 'r', encoding='utf-8') as f:
-            TUNED_CONFIGS = [json.loads(line) for line in f]
+            TUNED_CONFIGS = [json.loads(line) for line in f if ('arch' in line and 'tflops' in line)]
             for line in TUNED_CONFIGS:
                 key = (line['arch'], line['dtype'], line['m'], line['n'], line['k'])
                 MAP_CONFIGS[key] = line['config']
