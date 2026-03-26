@@ -573,9 +573,8 @@ def get_default_kwargs(m, n, k):
 
 selections = {
     'TILE_K': [64, 128],
-    'TILE_M': [16, 32, 64, 128],
+    'TILE_M': [16, 32, 48, 64, 96, 128],
     'TILE_N': [64, 128, 256],
-    'C_TO_LDS': [False, True],
 }
 
 

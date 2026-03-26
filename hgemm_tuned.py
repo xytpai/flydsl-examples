@@ -108,16 +108,16 @@ def tune_single(args):
 def tune_all(
     dtype,
     out_prefix,
-    ms = [2, 4, 8, 16, 32, 64, 128, 256],
-    ns = [384, 1024, 2048, 4096, 5120, 6144, 7168, 8192],
-    ks = [384, 1024, 2048, 4096, 5120, 6144, 7168, 8192],
+    ms = [2, 4, 8, 16, 24, 32, 48, 64, 72, 128, 256, 384, 448, 512],
+    ns = [384, 512, 1024, 2048, 2112, 3072, 4096, 5120, 6144, 7168, 8192],
+    ks = [384, 512, 1024, 1536, 2048, 4096, 5120, 6144, 7168, 8192],
 ):
     args = Args(dtype=dtype, m=0, n=0, k=0)
     # ms = ms[:2]
-    # ns = ns[:1]
+    # ns = ns[:2]
     # ks = ks[:1]
-    with open(f"{out_prefix}.jsonl", "w", encoding="utf-8") as f:
-        for m in ms:
+    for m in ms:
+        with open(f"{out_prefix}_m_{m}.jsonl", "w", encoding="utf-8") as f:
             for n in ns:
                 for k in ks:
                     args.m = m
