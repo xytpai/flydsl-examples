@@ -1,0 +1,2 @@
+{"arch": "gfx942", "dtype": "torch.bfloat16", "m": 2, "n": 384, "k": 384, "config": {"TILE_K": 128, "TILE_M": 16, "TILE_N": 64}, "duration": 4.5590000000001965, "tflops": 0.12937574029391852}
+{"arch": "gfx942", "dtype": "torch.bfloat16", "m": 4, "n": 384, "k": 384, "config": {"TILE_K": 128, "TILE_M": 16, "TILE_N": 64}, "duration": 4.638999999999214, "tflops": 0.25428928648419913}
