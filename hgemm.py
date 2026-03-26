@@ -133,13 +133,13 @@ def compile_hgemm_kernel(
     DMA_BYTES = 4 if gpu_arch == "gfx942" else 16
     allocator = SmemAllocator(None, arch=gpu_arch, global_sym_name="smem")
     smem_a_offset = allocator._align(allocator.ptr, 16)
-    allocator.ptr = smem_a_offset + STAGES * BLOCK_M * BLOCK_K * DTYPE_BYTES
+    AS_BYTES = STAGES * BLOCK_M * BLOCK_K * DTYPE_BYTES
+    if C_TO_LDS:
+        AS_BYTES = max(AS_BYTES, BLOCK_M * BLOCK_N * DTYPE_BYTES)
+    allocator.ptr = smem_a_offset + AS_BYTES
     if B_TO_LDS:
         smem_b_offset = allocator._align(allocator.ptr, 16)
         allocator.ptr = smem_b_offset + STAGES * BLOCK_N * BLOCK_K * DTYPE_BYTES
-    if C_TO_LDS:
-        smem_c_offset = allocator._align(allocator.ptr, 16)
-        allocator.ptr = smem_c_offset + BLOCK_M * BLOCK_N * DTYPE_BYTES
 
     KERNEL_NAME = f"hgemm_{dtype}_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_S{STAGES}TN"
     if B_PRE_SHUFFLE:
@@ -173,7 +173,7 @@ def compile_hgemm_kernel(
             smem_b_ptr = SmemPtr(base_ptr, smem_b_offset, dtype_, shape=(STAGES * BLOCK_N * BLOCK_K,))
             bs_ = STensor(smem_b_ptr, dtype_, shape=(STAGES, BLOCK_N, BLOCK_K))
         if C_TO_LDS:
-            smem_c_ptr = SmemPtr(base_ptr, smem_c_offset, dtype_, shape=(BLOCK_M * BLOCK_N,))
+            smem_c_ptr = SmemPtr(base_ptr, smem_a_offset, dtype_, shape=(BLOCK_M * BLOCK_N,))
             cs_ = STensor(smem_c_ptr, dtype_, shape=(BLOCK_M, BLOCK_N))
         if B_PRE_SHUFFLE:
             # origin: n // WARP_ATOM_N, WARP_ATOM_N, k // WARP_ATOM_K, WARP_ATOM_K // LDG_VEC_SIZE, LDG_VEC_SIZE
@@ -448,6 +448,7 @@ def compile_hgemm_kernel(
                             val = vector.extract(c_frags[ii * WARP_N_STEPS + jj], static_position=[kk], dynamic_position=[])
                             C_[out_m_idx, out_n_idx] = val.truncf(dtype_)
         else:
+            gpu.barrier()
             for ii in range_constexpr(WARP_M_STEPS):
                 warp_atom_m_idx = warp_m_idx + ii * WARP_ATOM_M
                 for jj in range_constexpr(WARP_N_STEPS):
@@ -601,11 +602,7 @@ def hgemm_(
         raise NotImplementedError()
     if kwargs['B_PRE_SHUFFLE'] and shuffle_b:
         b = hgemm_shuffle_b(b)
-    if kwargs['SPLIT_K'] > 1:
-        c.zero_()
-        exe(c, a, b, stream=torch.cuda.current_stream())
-    else:
-        exe(c, a, b, stream=torch.cuda.current_stream())
+    exe(c, a, b, stream=torch.cuda.current_stream())
 
 
 def func(a, b, c):
