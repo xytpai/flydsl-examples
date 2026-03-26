@@ -331,9 +331,6 @@ def compile_hgemm_kernel(
                         acc_mid = mfma_fn(T.f32x4, [a_v0, b_v0, acc_in, 0, 0, 0])
                         c_frags[c_idx] = mfma_fn(T.f32x4, [a_v1, b_v1, acc_mid, 0, 0, 0])
         
-        if SPLIT_K > 1:
-            zero_c()
-        
         if B_TO_LDS:
             # SLOW PATH
             raise NotImplementedError("B_TO_LDS not supported yet")
@@ -602,6 +599,8 @@ def hgemm_(
         raise NotImplementedError()
     if kwargs['B_PRE_SHUFFLE'] and shuffle_b:
         b = hgemm_shuffle_b(b)
+    if kwargs['SPLIT_K'] > 1:
+        c.zero_()
     exe(c, a, b, stream=torch.cuda.current_stream())
 
 
