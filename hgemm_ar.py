@@ -112,7 +112,6 @@ def swizzle_xor16(row, col_in_bytes, k_blocks16):
 def compile_hgemm_ar_kernel(
     world_size: int,
     dtype: str,
-    m: int,
     n: int,
     k: int,
     TILE_K: int = 64,
@@ -164,7 +163,6 @@ def compile_hgemm_ar_kernel(
     WARP_N = WARP_N_STEPS * WARP_ATOM_N
     BLOCK_M = BLOCK_M_WARPS * WARP_M
     BLOCK_N = BLOCK_N_WARPS * WARP_N
-    # assert (m >= BLOCK_M) and (m % BLOCK_M == 0)
     assert (n >= BLOCK_N) and (n % BLOCK_N == 0)
     BLOCK_MK_SIZE = BLOCK_M * BLOCK_K
     BLOCK_NK_SIZE = BLOCK_N * BLOCK_K
@@ -203,6 +201,7 @@ def compile_hgemm_ar_kernel(
         C: fx.Tensor,
         A: fx.Tensor,
         B: fx.Tensor,
+        m: fx.Int32,
         raster_factor: fx.Constexpr[int],
         rank: Int32,
         self_sg: Int64,
@@ -219,9 +218,9 @@ def compile_hgemm_ar_kernel(
         c_zero_d = arith.constant(0.0, type=dtype_)
         acc_init = arith.constant_vector(0.0, T.f32x4)
 
-        A_ = GTensor(A, dtype=dtype_, shape=(m, k))
+        A_ = GTensor(A, dtype=dtype_, shape=(-1, k))
         B_ = GTensor(B, dtype=dtype_, shape=(n, k))
-        C_ = GTensor(C, dtype=dtype_, shape=(m, n))
+        C_ = GTensor(C, dtype=dtype_, shape=(-1, n))
         base_ptr = allocator.get_base()
         smem_a_ptr = SmemPtr(base_ptr, smem_a_offset, dtype_, shape=(STAGES * BLOCK_M * BLOCK_K,))
         as_ = STensor(smem_a_ptr, dtype_, shape=(STAGES, BLOCK_M, BLOCK_K))
@@ -240,9 +239,10 @@ def compile_hgemm_ar_kernel(
         w_tid = tid % WARP_SIZE
         block_m_idx = fx.block_idx.x // raster_factor
         block_n_idx = fx.block_idx.x % raster_factor + fx.block_idx.y * raster_factor
-        bid_linear = fx.block_idx.x * (n // BLOCK_N) + fx.block_idx.y
         ks_idx = fx.Index(fx.block_idx.z)
         ks_begin = arith.index_cast(T.i32, ks_idx * ks)
+
+        bid_linear = fx.block_idx.x * (n // BLOCK_N) + fx.block_idx.y
 
         m_offset = fx.Index(block_m_idx * BLOCK_M)
         n_offset = fx.Index(block_n_idx * BLOCK_N)
@@ -263,7 +263,14 @@ def compile_hgemm_ar_kernel(
                 global_tid = BLOCK_THREADS * i + tid
                 m_local_idx = global_tid // LDG_A_X_THREADS
                 k_local_idx = global_tid % LDG_A_X_THREADS * LDG_VEC_SIZE
-                vec = A_.vec_load((m_offset + m_local_idx, k_offset + k_local_idx), LDG_VEC_SIZE)
+                row_idx = m_offset + fx.Index(m_local_idx)
+                safe_row_idx = arith.select(
+                    arith.cmpi(arith.CmpIPredicate.ult, row_idx, fx.Index(m)),
+                    row_idx,
+                    fx.Index(0),
+                )
+                col_idx = fx.Index(k_offset + k_local_idx)
+                vec = A_.vec_load((safe_row_idx, col_idx), LDG_VEC_SIZE)
                 vecs.append(vec)
             return vecs
         
@@ -505,7 +512,7 @@ def compile_hgemm_ar_kernel(
                 byte_offset_i64 = arith.index_cast(T.i64, linear_byte_offset)
 
                 peer_vecs = []
-                for wi in range_constexpr(world_size):
+                for wi in range_constexpr(1):
                     peer_ptr = signal_ops.select_by_lane(_unwrap_value(fx.Int32(wi)), tmp_ptrs_arr)
                     addr_i64 = llvm.AddOp(peer_ptr, byte_offset_i64, llvm.IntegerOverflowFlags(0)).result
                     raw = signal_ops.ld_global_16b(addr_i64)
@@ -514,7 +521,7 @@ def compile_hgemm_ar_kernel(
                     peer_vecs.append(peer_f32)
 
                 acc_f32 = arith.constant_vector(0.0, T.vec(LDG_VEC_SIZE, T.f32))
-                for wi in range_constexpr(world_size):
+                for wi in range_constexpr(1):
                     acc_f32 = arith.addf(acc_f32, peer_vecs[wi], fastmath=fm_fast)
                 
                 final_vec = acc_f32.truncf(T.vec(LDG_VEC_SIZE, dtype_))
@@ -532,6 +539,7 @@ def compile_hgemm_ar_kernel(
         C: fx.Tensor,
         A: fx.Tensor,
         B: fx.Tensor,
+        m: fx.Int32,
         rank: Int32,
         self_sg: Int64,
         sg_ptrs: Int64,
@@ -550,9 +558,8 @@ def compile_hgemm_ar_kernel(
         bm = bm * raster_factor
         bn = (bn + raster_factor - 1) // raster_factor
         hgemm_kernel._func.__name__ = KERNEL_NAME
-        assert (bm * bn) <= 80
         hgemm_kernel(
-            C, A, B, raster_factor, 
+            C, A, B, m, raster_factor, 
             rank, self_sg, sg_ptrs, tmp_ptrs, out_ptrs
         ).launch(grid=(bm, bn, SPLIT_K), block=(BLOCK_THREADS, 1, 1), stream=stream)
     
@@ -627,9 +634,9 @@ def hgemm_ar_(
     kwargs = get_default_kwargs(m, n, k)
     kwargs.update(hgemm_kwargs)
     if a.dtype == torch.half:
-        exe = compile_hgemm_ar_kernel(world_size, 'f16', m, n, k, **kwargs)
+        exe = compile_hgemm_ar_kernel(world_size, 'f16', n, k, **kwargs)
     elif a.dtype == torch.bfloat16:
-        exe = compile_hgemm_ar_kernel(world_size, 'bf16', m, n, k, **kwargs)
+        exe = compile_hgemm_ar_kernel(world_size, 'bf16', n, k, **kwargs)
     else:
         raise NotImplementedError()
     if kwargs['B_PRE_SHUFFLE'] and shuffle_b:
@@ -637,7 +644,10 @@ def hgemm_ar_(
     if kwargs['SPLIT_K'] > 1:
         c.zero_() # TODO: remove it
         assert False
-    exe(c, a, b, rank, self_sg, sg_ptrs, tmp_ptrs, out_ptrs, stream=torch.cuda.current_stream())
+    bm = (m + kwargs['TILE_M'] - 1) // kwargs['TILE_M']
+    bn = n // kwargs['TILE_N']
+    assert bm * bn <= 80
+    exe(c, a, b, m, rank, self_sg, sg_ptrs, tmp_ptrs, out_ptrs, stream=torch.cuda.current_stream())
 
 
 class GEMMARBackend(FlyDSLAllreduce):
@@ -681,7 +691,7 @@ def worker(device_id, num_devices, parts, nsamples, inputs, outputs):
         input = inputs[device_id * nsamples + i]
         output = outputs[device_id * nsamples + i]
         fa.hgemm_ar_fusion(input[0], input[1], output)
-        # fa.custom_all_reduce(output.view(-1), open_fp8_quant=False, out=output.view(-1))
+        fa.custom_all_reduce(output.view(-1), open_fp8_quant=False, out=output.view(-1))
     torch.cuda.synchronize()
     dist.barrier(group=group)
     dist.destroy_process_group()
