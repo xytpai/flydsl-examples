@@ -23,6 +23,9 @@ from utils.tensor_shim import get_dtype_in_kernel, GTensor, STensor, _to_raw
 fm_fast = arith.FastMathFlags.fast
 
 
+SPLIT_K_COUNTER_MAX_LEN = 1024
+
+
 @dataclass
 class Args:
     dtype: torch.dtype
@@ -139,6 +142,9 @@ def compile_hgemm_kernel(
     if B_TO_LDS:
         smem_b_offset = allocator._align(allocator.ptr, 16)
         allocator.ptr = smem_b_offset + STAGES * BLOCK_N * BLOCK_K * DTYPE_BYTES
+    if IS_SPLIT_K:
+        smem_ilb_offset = allocator._align(allocator.ptr, 16)
+        allocator.ptr = smem_ilb_offset + 16
 
     KERNEL_NAME = f"hgemm_{dtype}_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_S{STAGES}TN"
     if B_PRE_SHUFFLE:
@@ -154,6 +160,7 @@ def compile_hgemm_kernel(
         A: fx.Tensor,
         B: fx.Tensor,
         m: fx.Int32,
+        COUNTER: fx.Tensor,
         raster_factor: fx.Constexpr[int],
     ):
         dtype_ = get_dtype_in_kernel(dtype)
@@ -202,6 +209,118 @@ def compile_hgemm_kernel(
         ldmatrix_b_k_vec_idx = w_tid // WMMA_N * WMMA_FRAG_VALUES * MFMA_PER_WARP_K
         C_FRAGS_LEN = WARP_M_STEPS * WARP_N_STEPS
         c_frags = [acc_init] * C_FRAGS_LEN
+
+        def split_k_barrier():
+            gpu.barrier()
+            counter_idx = block_m_idx * fx.Int32(n // BLOCK_N) + block_n_idx
+            is_last_block_smem = SmemPtr(base_ptr, smem_ilb_offset, T.i32, shape=(1,))
+            is_last_block_lds = is_last_block_smem.get()
+            rocdl.s_waitcnt(0)
+            is_t0_cond = arith.cmpi(arith.CmpIPredicate.eq, fx.Index(tid), fx.Index(0))
+            if is_t0_cond:
+                # int prev = atomicAdd(counter, 1);
+                _ptr_type = ir.Type.parse("!llvm.ptr<1>")
+                _i64_type = T.i64
+                counter_raw = fly_values(COUNTER)[0]
+                counter_base_ptr = fly.extract_aligned_pointer_as_index(_ptr_type, counter_raw)
+                counter_base_int = llvm.PtrToIntOp(_i64_type, counter_base_ptr).result
+                byte_offset = arith.index_cast(T.i64, fx.Index(counter_idx) * fx.Index(4))
+                addr_i64 = llvm.AddOp(counter_base_int, byte_offset, llvm.IntegerOverflowFlags(0)).result
+                counter_ptr = llvm.IntToPtrOp(_ptr_type, addr_i64).result
+                counter_ptr_v = counter_ptr._value if hasattr(counter_ptr, "_value") else counter_ptr
+                one_i32 = arith.constant(1, type=T.i32)
+                one_v = one_i32._value if hasattr(one_i32, "_value") else one_i32
+                prev_op = llvm.AtomicRMWOp(
+                    llvm.AtomicBinOp.add,
+                    counter_ptr_v,
+                    one_v,
+                    llvm.AtomicOrdering.monotonic,
+                    syncscope="agent",
+                    alignment=4,
+                )
+                prev = prev_op.result
+                vector.store(
+                    vector.from_elements(T.vec(1, T.i32), [prev]),
+                    is_last_block_lds,
+                    [fx.Index(0)],
+                )
+            gpu.barrier()
+            flag_vec = vector.load_op(T.vec(1, T.i32), is_last_block_lds, [fx.Index(0)])
+            flag_loaded = vector.extract(flag_vec, static_position=[0], dynamic_position=[])
+            grid_z_minus_1 = arith.constant(SPLIT_K - 1, type=T.i32)
+            is_last_block_all = arith.cmpi(arith.CmpIPredicate.eq, flag_loaded, grid_z_minus_1)
+            if is_last_block_all:
+                is_t0_2 = arith.cmpi(arith.CmpIPredicate.eq, fx.Index(tid), fx.Index(0))
+                if is_t0_2:
+                    _ptr_type2 = ir.Type.parse("!llvm.ptr<1>")
+                    _i64_type2 = T.i64
+                    counter_raw2 = fly_values(COUNTER)[0]
+                    counter_base_ptr_v2 = fly.extract_aligned_pointer_as_index(_ptr_type2, counter_raw2)
+                    counter_base_int2 = llvm.PtrToIntOp(_i64_type2, counter_base_ptr_v2).result
+                    byte_offset2 = arith.index_cast(T.i64, fx.Index(counter_idx) * fx.Index(4))
+                    addr_i64_2 = llvm.AddOp(counter_base_int2, byte_offset2, llvm.IntegerOverflowFlags(0)).result
+                    counter_ptr2 = llvm.IntToPtrOp(_ptr_type2, addr_i64_2).result
+                    counter_ptr2_v = counter_ptr2._value if hasattr(counter_ptr2, "_value") else counter_ptr2
+                    zero_v = arith.constant(0, type=T.i32)
+                    zero_vv = zero_v._value if hasattr(zero_v, "_value") else zero_v
+                    # Atomic store (exchange with 0) to reset counter
+                    llvm.AtomicRMWOp(
+                        llvm.AtomicBinOp.xchg,
+                        counter_ptr2_v,
+                        zero_vv,
+                        llvm.AtomicOrdering.monotonic,
+                        syncscope="agent",
+                        alignment=4,
+                    )
+            else:
+                def ld_uncached_u32(addr_i64):
+                    """Load u32 from uncached global address (signal buffer, bypasses L1).
+
+                    Uses ``global_load_dword ... sc1`` on GFX942.
+                    """
+                    v = llvm.InlineAsmOp(
+                        T.i32, [addr_i64],
+                        "global_load_dword $0, $1, off sc1", "=v,v",
+                        has_side_effects=True,
+                    ).result
+                    rocdl.s_waitcnt(0)
+                    return v
+                def spin_wait_ne(addr_i64, target_u32):
+                    """Spin-wait until ``*addr >= target`` (uncachable signal buffer)."""
+                    i32 = T.i32
+                    init_cur = ld_uncached_u32(addr_i64)
+                    w = scf.WhileOp([i32], [init_cur])
+                    before = ir.Block.create_at_start(w.before, [i32])
+                    after = ir.Block.create_at_start(w.after, [i32])
+                    with ir.InsertionPoint(before):
+                        cur = before.arguments[0]
+                        need_wait = arith.CmpIOp(arith.CmpIPredicate.ne, cur, target_u32).result
+                        scf.ConditionOp(need_wait, [cur])
+                    with ir.InsertionPoint(after):
+                        scf.YieldOp([ld_uncached_u32(addr_i64)])
+                if True:
+                    _ptr_type3 = ir.Type.parse("!llvm.ptr<1>")
+                    _i64_type3 = T.i64
+                    counter_raw3 = fly_values(COUNTER)[0]
+                    counter_base_ptr_v3 = fly.extract_aligned_pointer_as_index(_ptr_type3, counter_raw3)
+                    counter_base_int3 = llvm.PtrToIntOp(_i64_type3, counter_base_ptr_v3).result
+                    byte_offset3 = arith.index_cast(T.i64, fx.Index(counter_idx) * fx.Index(4))
+                    addr_i64_3 = llvm.AddOp(counter_base_int3, byte_offset3, llvm.IntegerOverflowFlags(0)).result
+                    zero__ = arith.constant(0, type=T.i32)
+                    spin_wait_ne(addr_i64_3, zero__)
+                gpu.barrier()
+
+        def zero_c():
+            cond = arith.cmpi(arith.CmpIPredicate.eq, ks_idx, fx.Index(0))
+            zero_vec = vector.broadcast(T.vec(LDG_VEC_SIZE, dtype_), c_zero_d)
+            if cond:
+                for i in range_constexpr(LDG_REG_C_COUNT):
+                    global_tid = BLOCK_THREADS * i + tid
+                    m_local_idx = global_tid // LDG_C_X_THREADS
+                    n_local_idx = global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE
+                    row_idx = m_offset + fx.Index(m_local_idx)
+                    if arith.cmpi(arith.CmpIPredicate.ult, row_idx, fx.Index(m)):
+                        C_.vec_store((row_idx, n_offset + n_local_idx), zero_vec, LDG_VEC_SIZE)
         
         def ldg_a(k_offset):
             vecs = []
@@ -336,6 +455,9 @@ def compile_hgemm_kernel(
                         acc_mid = mfma_fn(T.f32x4, [a_v0, b_v0, acc_in, 0, 0, 0])
                         c_frags[c_idx] = mfma_fn(T.f32x4, [a_v1, b_v1, acc_mid, 0, 0, 0])
         
+        if IS_SPLIT_K:
+            zero_c()
+        
         if B_TO_LDS:
             # SLOW PATH
             raise NotImplementedError("B_TO_LDS not supported yet")
@@ -460,6 +582,8 @@ def compile_hgemm_kernel(
                         lds_n_idx = fx.Index(warp_atom_n_idx + stmatrix_c_n_idx)
                         val = vector.extract(c_frags[ii * WARP_N_STEPS + jj], static_position=[kk], dynamic_position=[])
                         cs_[lds_m_idx, lds_n_idx] = val.truncf(dtype_)
+            if IS_SPLIT_K:
+                split_k_barrier()
             gpu.barrier()
             if IS_SPLIT_K:
                 _ptr_type = ir.Type.parse("!llvm.ptr<1>")
@@ -517,6 +641,7 @@ def compile_hgemm_kernel(
         A: fx.Tensor,
         B: fx.Tensor,
         m: fx.Int32,
+        COUNTER: fx.Tensor,
         stream: fx.Stream = fx.Stream(None),
     ):
         allocator.finalized = False
@@ -530,7 +655,7 @@ def compile_hgemm_kernel(
         bm = bm * raster_factor
         bn = (bn + raster_factor - 1) // raster_factor
         hgemm_kernel._func.__name__ = KERNEL_NAME
-        hgemm_kernel(C, A, B, m, raster_factor).launch(grid=(bm, bn, SPLIT_K), block=(BLOCK_THREADS, 1, 1), stream=stream)
+        hgemm_kernel(C, A, B, m, COUNTER, raster_factor).launch(grid=(bm, bn, SPLIT_K), block=(BLOCK_THREADS, 1, 1), stream=stream)
     
     return launch_hgemm_kernel
 
@@ -567,6 +692,7 @@ def get_default_kwargs(m, n, k):
         kwargs['TILE_K'] = 128
         kwargs['TILE_M'] = 32
         kwargs['TILE_N'] = 128
+        kwargs['SPLIT_K'] = 4
     if m <= 32 and n == 384 and k == 7168:
         kwargs['TILE_K'] = 128
         kwargs['TILE_M'] = 16
@@ -581,6 +707,7 @@ selections = {
 }
 
 
+SPLIT_K_GLOBAL_COUNTERS = {}
 def hgemm_(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -588,6 +715,12 @@ def hgemm_(
     shuffle_b: bool=True,
     hgemm_kwargs: dict={},
 ):
+    device = a.device
+    global SPLIT_K_COUNTER_MAX_LEN
+    global SPLIT_K_GLOBAL_COUNTERS
+    if SPLIT_K_GLOBAL_COUNTERS.get(device, None) is None:
+        SPLIT_K_GLOBAL_COUNTERS[device] = torch.zeros(
+            (SPLIT_K_COUNTER_MAX_LEN,), dtype=torch.int32, device=device)
     k = a.shape[-1]
     a = a.view(-1, k)
     m = a.shape[0]
@@ -605,9 +738,12 @@ def hgemm_(
         raise NotImplementedError()
     if kwargs['B_PRE_SHUFFLE'] and shuffle_b:
         b = hgemm_shuffle_b(b)
+    counter = SPLIT_K_GLOBAL_COUNTERS[device]
     if kwargs['SPLIT_K'] > 1:
-        c.zero_() # TODO: remove it
-    exe(c, a, b, m, stream=torch.cuda.current_stream())
+        bm = (m + kwargs['TILE_M'] - 1) // kwargs['TILE_M']
+        bn = n // kwargs['TILE_N']
+        assert bm * bn <= SPLIT_K_COUNTER_MAX_LEN
+    exe(c, a, b, m, counter, stream=torch.cuda.current_stream())
 
 
 def func(a, b, c):
