@@ -221,7 +221,14 @@ def compile_hgemm_kernel(
                 global_tid = BLOCK_THREADS * i + tid
                 m_local_idx = global_tid // LDG_A_X_THREADS
                 k_local_idx = global_tid % LDG_A_X_THREADS * LDG_VEC_SIZE
-                vec = A_.vec_load((m_offset + m_local_idx, k_offset + k_local_idx), LDG_VEC_SIZE)
+                row_idx = m_offset + fx.Index(m_local_idx)
+                safe_row_idx = arith.select(
+                    arith.cmpi(arith.CmpIPredicate.ult, row_idx, fx.Index(m)),
+                    row_idx,
+                    fx.Index(0),
+                )
+                col_idx = fx.Index(k_offset + k_local_idx)
+                vec = A_.vec_load((safe_row_idx, col_idx), LDG_VEC_SIZE)
                 vecs.append(vec)
             return vecs
         
@@ -244,8 +251,15 @@ def compile_hgemm_kernel(
                 k_local_idx = global_tid % LDG_A_X_THREADS_AS * LDG_ASYNC_VEC_SIZE
                 col_in_bytes = k_local_idx * DTYPE_BYTES
                 col_in_bytes = swizzle_xor16(m_local_idx, col_in_bytes, k_blocks16)
+                row_idx = m_offset + fx.Index(m_local_idx)
+                safe_row_idx = arith.select(
+                    arith.cmpi(arith.CmpIPredicate.ult, row_idx, fx.Index(m)),
+                    row_idx,
+                    fx.Index(0),
+                )
+                col_idx = fx.Index(k_offset + col_in_bytes // DTYPE_BYTES)
                 # get offset
-                global_offset = A_.linear_offset((m_offset + m_local_idx, k_offset + col_in_bytes // DTYPE_BYTES)) * DTYPE_BYTES
+                global_offset = A_.linear_offset((safe_row_idx, col_idx)) * DTYPE_BYTES
                 global_offset = arith.index_cast(T.i32, global_offset)
                 lds_offset = as_.linear_offset((fx.Index(lds_stage), m_local_idx, k_local_idx)) * DTYPE_BYTES
                 # get lds ptr
