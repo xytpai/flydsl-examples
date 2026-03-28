@@ -1,11 +1,8 @@
-"""Custom all-reduce kernel + Python-facing shim.
-
-Provides FlyDSL-generated allreduce kernels following the AIter signal
-protocol for multi-GPU communication on ROCm.
-"""
-
-from contextlib import contextmanager
+import os
 import torch
+import torch.distributed as dist
+from contextlib import contextmanager
+
 
 _AITER_KMAXBLOCKS = 80
 
@@ -29,31 +26,13 @@ def _is_weak_contiguous(t) -> bool:
 _FLYDSL_AITER_GLOO_GROUP = None
 
 
-def init_custom_ar(meta, rank_data, handles, offsets, rank: int, full_nvlink: bool=True, out=None):
-    """Initialize allreduce with AIter or FlyDSL backend.
-
-    Backend controlled by env var FLYDSL_AITER_IMPL:
-    - "aiter" (default): use AIter kernel
-    - "flydsl": use FlyDSL kernel with AIter signal protocol
-    """
-    import os
-    import torch.distributed as dist
-
-    _ = meta
-    world_size = len(offsets)
+def init_custom_ar(device, world_size: int, rank: int, full_nvlink: bool=True, out=None, backend=None):
     if world_size > 8:
         raise ValueError("world size > 8 is not supported")
     if world_size > 1 and (world_size % 2 != 0):
         raise ValueError("Odd num gpus is not supported for now")
-    if world_size != len(handles):
-        raise ValueError("handles length should equal to offsets length")
     if rank < 0 or rank >= world_size:
         raise ValueError("invalid rank passed in")
-
-    impl = str(os.environ.get("FLYDSL_AITER_IMPL", "flydsl")).strip().lower()
-    if impl not in {"aiter", "flydsl"}:
-        raise ValueError(f"unsupported FLYDSL_AITER_IMPL={impl!r}")
-
     if not dist.is_initialized():
         raise RuntimeError("torch.distributed must be initialized")
 
@@ -63,38 +42,18 @@ def init_custom_ar(meta, rank_data, handles, offsets, rank: int, full_nvlink: bo
             _FLYDSL_AITER_GLOO_GROUP = dist.new_group(backend="gloo")
         except Exception:
             _FLYDSL_AITER_GLOO_GROUP = dist.group.WORLD
-
-    dev = getattr(rank_data, "device", None) or torch.device(f"cuda:{rank}")
+    
     max_size = int(os.environ.get("FLYDSL_AITER_MAX_SIZE_BYTES", str(64 * 1024 * 1024)))
 
-    if impl == "flydsl":
-        return FlyDSLAllreduce(
-            group=_FLYDSL_AITER_GLOO_GROUP,
-            device=dev,
-            max_size=max_size,
-            world_size=world_size,
-            rank=rank,
-            full_nvlink=bool(full_nvlink),
-        )
-
-    # impl == "aiter"
-    try:
-        from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce as AIterCustomAllreduce
-    except ModuleNotFoundError:
-        try:
-            from aiter.dist.custom_all_reduce import CustomAllreduce as AIterCustomAllreduce
-        except ModuleNotFoundError as e:
-            raise ModuleNotFoundError("Cannot import AIter CustomAllreduce") from e
-
-    aiter_ar = AIterCustomAllreduce(_FLYDSL_AITER_GLOO_GROUP, dev, max_size=max_size)
-    try:
-        if hasattr(rank_data, "is_cuda") and bool(rank_data.is_cuda):
-            aiter_ar.register_input_buffer(rank_data)
-        if out is not None and hasattr(out, "is_cuda") and bool(out.is_cuda):
-            aiter_ar.register_output_buffer(out)
-    except Exception:
-        pass
-    return aiter_ar
+    backend_ = backend if backend is not None else FlyDSLAllreduce
+    return backend_(
+        group=_FLYDSL_AITER_GLOO_GROUP,
+        device=device,
+        max_size=max_size,
+        world_size=world_size,
+        rank=rank,
+        full_nvlink=bool(full_nvlink),
+    )
 
 
 class FlyDSLAllreduce:
