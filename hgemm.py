@@ -23,7 +23,7 @@ from utils.tensor_shim import get_dtype_in_kernel, GTensor, STensor, _to_raw
 fm_fast = arith.FastMathFlags.fast
 
 
-SPLIT_K_COUNTER_MAX_LEN = 1024
+SPLIT_K_COUNTER_MAX_LEN = 80
 
 
 @dataclass
@@ -188,6 +188,8 @@ def compile_hgemm_kernel(
             # origin: n // WARP_ATOM_N, WARP_ATOM_N, k // WARP_ATOM_K, WARP_ATOM_K // LDG_VEC_SIZE, LDG_VEC_SIZE
             SHUFFLED_B_ = GTensor(B, dtype=dtype_, shape=(
                 n // WARP_ATOM_N, k // WARP_ATOM_K, WARP_ATOM_K // LDG_VEC_SIZE, WARP_ATOM_N, LDG_VEC_SIZE))
+        if IS_SPLIT_K:
+            COUNTER_ = GTensor(COUNTER, dtype=T.i32, shape=(-1,))
         
         tid = fx.Int32(fx.thread_idx.x)
         wid = tid // WARP_SIZE
@@ -211,25 +213,23 @@ def compile_hgemm_kernel(
         c_frags = [acc_init] * C_FRAGS_LEN
 
         def split_k_barrier():
-            gpu.barrier()
-            counter_idx = block_m_idx * fx.Int32(n // BLOCK_N) + block_n_idx
-            is_last_block_smem = SmemPtr(base_ptr, smem_ilb_offset, T.i32, shape=(1,))
-            is_last_block_lds = is_last_block_smem.get()
+            _ptr_type = ir.Type.parse("!llvm.ptr<1>")
+            _i64_type = T.i64
+            one_i32 = arith.constant(1, type=T.i32)
+            one_v = one_i32._value if hasattr(one_i32, "_value") else one_i32
+            counter_idx = fx.block_idx.x * fx.Int32(n // BLOCK_N) + fx.block_idx.y
+            smem_ilb_ptr = SmemPtr(base_ptr, smem_ilb_offset, T.i32, shape=(1,))
+            ilb_ = STensor(smem_ilb_ptr, T.i32, shape=(1,))
             rocdl.s_waitcnt(0)
-            is_t0_cond = arith.cmpi(arith.CmpIPredicate.eq, fx.Index(tid), fx.Index(0))
-            if is_t0_cond:
-                # int prev = atomicAdd(counter, 1);
-                _ptr_type = ir.Type.parse("!llvm.ptr<1>")
-                _i64_type = T.i64
-                counter_raw = fly_values(COUNTER)[0]
-                counter_base_ptr = fly.extract_aligned_pointer_as_index(_ptr_type, counter_raw)
-                counter_base_int = llvm.PtrToIntOp(_i64_type, counter_base_ptr).result
-                byte_offset = arith.index_cast(T.i64, fx.Index(counter_idx) * fx.Index(4))
-                addr_i64 = llvm.AddOp(counter_base_int, byte_offset, llvm.IntegerOverflowFlags(0)).result
-                counter_ptr = llvm.IntToPtrOp(_ptr_type, addr_i64).result
+            is_t0_cond = arith.cmpi(arith.CmpIPredicate.ult, fx.Index(tid), fx.Index(1))
+            is_t0_cond_if = scf.IfOp(is_t0_cond, results_=[], has_else=False)
+            with ir.InsertionPoint(is_t0_cond_if.then_block):
+                counter_base_ptr = fly.extract_aligned_pointer_as_index(_ptr_type, fly_values(COUNTER)[0])
+                counter_base_ptr = llvm.PtrToIntOp(_i64_type, counter_base_ptr).result
+                counter_byte_offset = arith.index_cast(T.i64, fx.Index(counter_idx) * fx.Index(4))
+                counter_ptr = llvm.AddOp(counter_base_ptr, counter_byte_offset, llvm.IntegerOverflowFlags(0)).result
+                counter_ptr = llvm.IntToPtrOp(_ptr_type, counter_ptr).result
                 counter_ptr_v = counter_ptr._value if hasattr(counter_ptr, "_value") else counter_ptr
-                one_i32 = arith.constant(1, type=T.i32)
-                one_v = one_i32._value if hasattr(one_i32, "_value") else one_i32
                 prev_op = llvm.AtomicRMWOp(
                     llvm.AtomicBinOp.add,
                     counter_ptr_v,
@@ -239,76 +239,35 @@ def compile_hgemm_kernel(
                     alignment=4,
                 )
                 prev = prev_op.result
-                vector.store(
-                    vector.from_elements(T.vec(1, T.i32), [prev]),
-                    is_last_block_lds,
-                    [fx.Index(0)],
-                )
+                ilb_[0] = prev
+                scf.YieldOp([])
             gpu.barrier()
-            flag_vec = vector.load_op(T.vec(1, T.i32), is_last_block_lds, [fx.Index(0)])
-            flag_loaded = vector.extract(flag_vec, static_position=[0], dynamic_position=[])
-            grid_z_minus_1 = arith.constant(SPLIT_K - 1, type=T.i32)
-            is_last_block_all = arith.cmpi(arith.CmpIPredicate.eq, flag_loaded, grid_z_minus_1)
-            if is_last_block_all:
-                is_t0_2 = arith.cmpi(arith.CmpIPredicate.eq, fx.Index(tid), fx.Index(0))
-                if is_t0_2:
-                    _ptr_type2 = ir.Type.parse("!llvm.ptr<1>")
-                    _i64_type2 = T.i64
-                    counter_raw2 = fly_values(COUNTER)[0]
-                    counter_base_ptr_v2 = fly.extract_aligned_pointer_as_index(_ptr_type2, counter_raw2)
-                    counter_base_int2 = llvm.PtrToIntOp(_i64_type2, counter_base_ptr_v2).result
-                    byte_offset2 = arith.index_cast(T.i64, fx.Index(counter_idx) * fx.Index(4))
-                    addr_i64_2 = llvm.AddOp(counter_base_int2, byte_offset2, llvm.IntegerOverflowFlags(0)).result
-                    counter_ptr2 = llvm.IntToPtrOp(_ptr_type2, addr_i64_2).result
-                    counter_ptr2_v = counter_ptr2._value if hasattr(counter_ptr2, "_value") else counter_ptr2
-                    zero_v = arith.constant(0, type=T.i32)
-                    zero_vv = zero_v._value if hasattr(zero_v, "_value") else zero_v
-                    # Atomic store (exchange with 0) to reset counter
-                    llvm.AtomicRMWOp(
-                        llvm.AtomicBinOp.xchg,
-                        counter_ptr2_v,
-                        zero_vv,
-                        llvm.AtomicOrdering.monotonic,
-                        syncscope="agent",
-                        alignment=4,
-                    )
-            else:
-                def ld_uncached_u32(addr_i64):
-                    """Load u32 from uncached global address (signal buffer, bypasses L1).
-
-                    Uses ``global_load_dword ... sc1`` on GFX942.
-                    """
-                    v = llvm.InlineAsmOp(
-                        T.i32, [addr_i64],
-                        "global_load_dword $0, $1, off sc1", "=v,v",
-                        has_side_effects=True,
-                    ).result
+            is_last_block_all = arith.cmpi(
+                arith.CmpIPredicate.eq, ilb_[0],
+                 arith.constant(SPLIT_K - 1, type=T.i32))
+            is_last_block_all_if = scf.IfOp(is_last_block_all, results_=[], has_else=True)
+            with ir.InsertionPoint(is_last_block_all_if.then_block):
+                is_t0_cond = arith.cmpi(arith.CmpIPredicate.ult, fx.Index(tid), fx.Index(1))
+                is_t0_cond_if = scf.IfOp(is_t0_cond, results_=[], has_else=False)
+                with ir.InsertionPoint(is_t0_cond_if.then_block):
+                    COUNTER_[counter_idx] = arith.constant(0, type=T.i32)
                     rocdl.s_waitcnt(0)
-                    return v
-                def spin_wait_ne(addr_i64, target_u32):
-                    """Spin-wait until ``*addr >= target`` (uncachable signal buffer)."""
-                    i32 = T.i32
-                    init_cur = ld_uncached_u32(addr_i64)
-                    w = scf.WhileOp([i32], [init_cur])
-                    before = ir.Block.create_at_start(w.before, [i32])
-                    after = ir.Block.create_at_start(w.after, [i32])
-                    with ir.InsertionPoint(before):
-                        cur = before.arguments[0]
-                        need_wait = arith.CmpIOp(arith.CmpIPredicate.ne, cur, target_u32).result
-                        scf.ConditionOp(need_wait, [cur])
-                    with ir.InsertionPoint(after):
-                        scf.YieldOp([ld_uncached_u32(addr_i64)])
-                if True:
-                    _ptr_type3 = ir.Type.parse("!llvm.ptr<1>")
-                    _i64_type3 = T.i64
-                    counter_raw3 = fly_values(COUNTER)[0]
-                    counter_base_ptr_v3 = fly.extract_aligned_pointer_as_index(_ptr_type3, counter_raw3)
-                    counter_base_int3 = llvm.PtrToIntOp(_i64_type3, counter_base_ptr_v3).result
-                    byte_offset3 = arith.index_cast(T.i64, fx.Index(counter_idx) * fx.Index(4))
-                    addr_i64_3 = llvm.AddOp(counter_base_int3, byte_offset3, llvm.IntegerOverflowFlags(0)).result
-                    zero__ = arith.constant(0, type=T.i32)
-                    spin_wait_ne(addr_i64_3, zero__)
-                gpu.barrier()
+                    scf.YieldOp([])
+                scf.YieldOp([])
+            with ir.InsertionPoint(is_last_block_all_if.else_block):
+                init_cur = COUNTER_[counter_idx]
+                w = scf.WhileOp([T.i32], [init_cur])
+                before = ir.Block.create_at_start(w.before, [T.i32])
+                after = ir.Block.create_at_start(w.after, [T.i32])
+                with ir.InsertionPoint(before):
+                    cur = before.arguments[0]
+                    need_wait = arith.CmpIOp(arith.CmpIPredicate.ne, cur, arith.constant(0, type=T.i32)).result
+                    scf.ConditionOp(need_wait, [cur])
+                with ir.InsertionPoint(after):
+                    data = COUNTER_[counter_idx]
+                    scf.YieldOp([data])
+                scf.YieldOp([])
+            gpu.barrier()
 
         def zero_c():
             cond = arith.cmpi(arith.CmpIPredicate.eq, ks_idx, fx.Index(0))
@@ -582,9 +541,12 @@ def compile_hgemm_kernel(
                         lds_n_idx = fx.Index(warp_atom_n_idx + stmatrix_c_n_idx)
                         val = vector.extract(c_frags[ii * WARP_N_STEPS + jj], static_position=[kk], dynamic_position=[])
                         cs_[lds_m_idx, lds_n_idx] = val.truncf(dtype_)
+            
             if IS_SPLIT_K:
                 split_k_barrier()
-            gpu.barrier()
+            else:
+                gpu.barrier()
+            
             if IS_SPLIT_K:
                 _ptr_type = ir.Type.parse("!llvm.ptr<1>")
                 _i64_type = T.i64
