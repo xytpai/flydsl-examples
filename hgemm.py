@@ -23,7 +23,7 @@ from utils.tensor_shim import get_dtype_in_kernel, GTensor, STensor, _to_raw
 fm_fast = arith.FastMathFlags.fast
 
 
-SPLIT_K_COUNTER_MAX_LEN = 80
+SPLIT_K_COUNTER_MAX_LEN = 128
 
 
 @dataclass
@@ -666,10 +666,11 @@ selections = {
     'TILE_K': [64, 128],
     'TILE_M': [16, 32, 48, 64, 96, 128],
     'TILE_N': [64, 128, 256],
+    'SPLIT_K': [1, 2, 4],
 }
 
 
-SPLIT_K_GLOBAL_COUNTERS = {}
+SPLIT_K_GLOBAL_SEMAPHORE = {}
 def hgemm_(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -679,9 +680,9 @@ def hgemm_(
 ):
     device = a.device
     global SPLIT_K_COUNTER_MAX_LEN
-    global SPLIT_K_GLOBAL_COUNTERS
-    if SPLIT_K_GLOBAL_COUNTERS.get(device, None) is None:
-        SPLIT_K_GLOBAL_COUNTERS[device] = torch.zeros(
+    global SPLIT_K_GLOBAL_SEMAPHORE
+    if SPLIT_K_GLOBAL_SEMAPHORE.get(device, None) is None:
+        SPLIT_K_GLOBAL_SEMAPHORE[device] = torch.zeros(
             (SPLIT_K_COUNTER_MAX_LEN,), dtype=torch.int32, device=device)
     k = a.shape[-1]
     a = a.view(-1, k)
@@ -700,12 +701,12 @@ def hgemm_(
         raise NotImplementedError()
     if kwargs['B_PRE_SHUFFLE'] and shuffle_b:
         b = hgemm_shuffle_b(b)
-    counter = SPLIT_K_GLOBAL_COUNTERS[device]
+    semaphore = SPLIT_K_GLOBAL_SEMAPHORE[device]
     if kwargs['SPLIT_K'] > 1:
         bm = (m + kwargs['TILE_M'] - 1) // kwargs['TILE_M']
         bn = n // kwargs['TILE_N']
         assert bm * bn <= SPLIT_K_COUNTER_MAX_LEN
-    exe(c, a, b, m, counter, stream=torch.cuda.current_stream())
+    exe(c, a, b, m, semaphore, stream=torch.cuda.current_stream())
 
 
 def func(a, b, c):
