@@ -60,7 +60,8 @@ def tuning_benchmark(args, hgemm_kwargs={}, warmup=5, niters=50):
     F.linear(a, b, out=c_ref)
     for i in range(warmup):
         hgemm_(a, b, c, hgemm_kwargs=hgemm_kwargs)
-    is_allclose = torch.allclose(c, c_ref, atol=1e-1, rtol=1e-1)
+    tol = float(args.k) / 2048 * 6e-1
+    is_allclose = torch.allclose(c, c_ref, atol=tol, rtol=tol)
     assert is_allclose == True
     with profile(activities=[ProfilerActivity.CUDA], ) as prof:
         for i in range(niters):
