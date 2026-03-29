@@ -198,6 +198,7 @@ def compile_hgemm_kernel(
         block_n_idx = fx.block_idx.x % raster_factor + fx.block_idx.y * raster_factor
         ks_idx = fx.Index(fx.block_idx.z)
         ks_begin = arith.index_cast(T.i32, ks_idx * ks)
+        counter_idx = fx.block_idx.x * fx.Int32(n // BLOCK_N) + fx.block_idx.y
 
         m_offset = fx.Index(block_m_idx * BLOCK_M)
         n_offset = fx.Index(block_n_idx * BLOCK_N)
@@ -217,7 +218,6 @@ def compile_hgemm_kernel(
             _i64_type = T.i64
             one_i32 = arith.constant(1, type=T.i32)
             one_v = one_i32._value if hasattr(one_i32, "_value") else one_i32
-            counter_idx = fx.block_idx.x * fx.Int32(n // BLOCK_N) + fx.block_idx.y
             smem_ilb_ptr = SmemPtr(base_ptr, smem_ilb_offset, T.i32, shape=(1,))
             ilb_ = STensor(smem_ilb_ptr, T.i32, shape=(1,))
             rocdl.s_waitcnt(0)
@@ -264,22 +264,38 @@ def compile_hgemm_kernel(
                     need_wait = arith.CmpIOp(arith.CmpIPredicate.ne, cur, arith.constant(0, type=T.i32)).result
                     scf.ConditionOp(need_wait, [cur])
                 with ir.InsertionPoint(after):
-                    data = COUNTER_[counter_idx]
+                    counter_base_ptr = fly.extract_aligned_pointer_as_index(_ptr_type, fly_values(COUNTER)[0])
+                    counter_base_ptr = llvm.PtrToIntOp(_i64_type, counter_base_ptr).result
+                    counter_byte_offset = arith.index_cast(T.i64, fx.Index(counter_idx) * fx.Index(4))
+                    counter_ptr = llvm.AddOp(counter_base_ptr, counter_byte_offset, llvm.IntegerOverflowFlags(0)).result
+                    counter_ptr = llvm.IntToPtrOp(_ptr_type, counter_ptr).result
+                    counter_ptr_v = counter_ptr._value if hasattr(counter_ptr, "_value") else counter_ptr
+                    data = llvm.InlineAsmOp(
+                        T.i32, [counter_ptr_v],
+                        "global_load_dword $0, $1, off sc1", "=v,v",
+                        has_side_effects=True,
+                    ).result
+                    rocdl.s_waitcnt(0)
                     scf.YieldOp([data])
                 scf.YieldOp([])
             gpu.barrier()
 
         def zero_c():
             cond = arith.cmpi(arith.CmpIPredicate.eq, ks_idx, fx.Index(0))
-            zero_vec = vector.broadcast(T.vec(LDG_VEC_SIZE, dtype_), c_zero_d)
-            if cond:
+            cond_if = scf.IfOp(cond, results_=[], has_else=False)
+            with ir.InsertionPoint(cond_if.then_block):
+                zero_vec = vector.broadcast(T.vec(LDG_VEC_SIZE, dtype_), c_zero_d)
                 for i in range_constexpr(LDG_REG_C_COUNT):
                     global_tid = BLOCK_THREADS * i + tid
                     m_local_idx = global_tid // LDG_C_X_THREADS
                     n_local_idx = global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE
                     row_idx = m_offset + fx.Index(m_local_idx)
-                    if arith.cmpi(arith.CmpIPredicate.ult, row_idx, fx.Index(m)):
+                    cond_boundary = arith.cmpi(arith.CmpIPredicate.ult, row_idx, fx.Index(m))
+                    cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
+                    with ir.InsertionPoint(cond_boundary_if.then_block):
                         C_.vec_store((row_idx, n_offset + n_local_idx), zero_vec, LDG_VEC_SIZE)
+                        scf.YieldOp([])
+                scf.YieldOp([])
         
         def ldg_a(k_offset):
             vecs = []
@@ -526,10 +542,13 @@ def compile_hgemm_kernel(
                     g_warp_atom_n_idx = n_offset + warp_n_idx + jj * WARP_ATOM_N
                     for kk in range_constexpr(WMMA_FRAG_VALUES):
                         out_m_idx = g_warp_atom_m_idx + stmatrix_c_m_vec_idx + kk
-                        if arith.cmpi(arith.CmpIPredicate.ult, out_m_idx, fx.Index(m)):
+                        cond_boundary = arith.cmpi(arith.CmpIPredicate.ult, out_m_idx, fx.Index(m))
+                        cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
+                        with ir.InsertionPoint(cond_boundary_if.then_block):
                             out_n_idx = g_warp_atom_n_idx + stmatrix_c_n_idx
                             val = vector.extract(c_frags[ii * WARP_N_STEPS + jj], static_position=[kk], dynamic_position=[])
                             C_[out_m_idx, out_n_idx] = val.truncf(dtype_)
+                            scf.YieldOp([])
         else:
             gpu.barrier()
             for ii in range_constexpr(WARP_M_STEPS):
@@ -559,7 +578,9 @@ def compile_hgemm_kernel(
                     n_local_idx = fx.Index(global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE)
                     m_global_idx = m_offset + m_local_idx
                     n_global_idx = n_offset + n_local_idx
-                    if arith.cmpi(arith.CmpIPredicate.ult, m_global_idx, fx.Index(m)):
+                    cond_boundary = arith.cmpi(arith.CmpIPredicate.ult, m_global_idx, fx.Index(m))
+                    cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
+                    with ir.InsertionPoint(cond_boundary_if.then_block):
                         pk_val = cs_.vec_load((m_local_idx, n_local_idx), LDG_VEC_SIZE)
                         linear_bytes_offset = C_.linear_offset((m_global_idx, n_global_idx)) * DTYPE_BYTES
                         byte_offset_i64 = arith.index_cast(T.i64, linear_bytes_offset)
@@ -586,15 +607,19 @@ def compile_hgemm_kernel(
                                 syncscope="agent",
                                 alignment=4,
                             )
+                        scf.YieldOp([])
             else:
                 for i in range_constexpr(LDG_REG_C_COUNT):
                     global_tid = BLOCK_THREADS * i + tid
                     m_local_idx = fx.Index(global_tid // LDG_C_X_THREADS)
                     n_local_idx = fx.Index(global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE)
                     m_global_idx = m_offset + m_local_idx
-                    if arith.cmpi(arith.CmpIPredicate.ult, m_global_idx, fx.Index(m)):
+                    cond_boundary = arith.cmpi(arith.CmpIPredicate.ult, m_global_idx, fx.Index(m))
+                    cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
+                    with ir.InsertionPoint(cond_boundary_if.then_block):
                         vec = cs_.vec_load((m_local_idx, n_local_idx), LDG_VEC_SIZE)
                         C_.vec_store((m_global_idx, n_offset + n_local_idx), vec, LDG_VEC_SIZE)
+                        scf.YieldOp([])
         return
     
     @flyc.jit
