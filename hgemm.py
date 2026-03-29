@@ -168,6 +168,8 @@ def compile_hgemm_kernel(
             mfma_fn = rocdl.mfma_f32_16x16x16bf16_1k
         else:
             mfma_fn = rocdl.mfma_f32_16x16x16f16
+        _ptr_type = ir.Type.parse("!llvm.ptr<1>")
+        _i64_type = T.i64
         c_zero_f = arith.constant(0.0, type=T.f32)
         c_zero_d = arith.constant(0.0, type=dtype_)
         acc_init = arith.constant_vector(0.0, T.f32x4)
@@ -190,6 +192,8 @@ def compile_hgemm_kernel(
                 n // WARP_ATOM_N, k // WARP_ATOM_K, WARP_ATOM_K // LDG_VEC_SIZE, WARP_ATOM_N, LDG_VEC_SIZE))
         if IS_SPLIT_K:
             COUNTER_ = GTensor(COUNTER, dtype=T.i32, shape=(-1,))
+            smem_ilb_ptr = SmemPtr(base_ptr, smem_ilb_offset, T.i32, shape=(1,))
+            ilb_ = STensor(smem_ilb_ptr, T.i32, shape=(1,))
         
         tid = fx.Int32(fx.thread_idx.x)
         wid = tid // WARP_SIZE
@@ -214,34 +218,6 @@ def compile_hgemm_kernel(
         c_frags = [acc_init] * C_FRAGS_LEN
 
         def split_k_barrier():
-            _ptr_type = ir.Type.parse("!llvm.ptr<1>")
-            _i64_type = T.i64
-            one_i32 = arith.constant(1, type=T.i32)
-            one_v = one_i32._value if hasattr(one_i32, "_value") else one_i32
-            smem_ilb_ptr = SmemPtr(base_ptr, smem_ilb_offset, T.i32, shape=(1,))
-            ilb_ = STensor(smem_ilb_ptr, T.i32, shape=(1,))
-            rocdl.s_waitcnt(0)
-            is_t0_cond = arith.cmpi(arith.CmpIPredicate.ult, fx.Index(tid), fx.Index(1))
-            is_t0_cond_if = scf.IfOp(is_t0_cond, results_=[], has_else=False)
-            with ir.InsertionPoint(is_t0_cond_if.then_block):
-                counter_base_ptr = fly.extract_aligned_pointer_as_index(_ptr_type, fly_values(COUNTER)[0])
-                counter_base_ptr = llvm.PtrToIntOp(_i64_type, counter_base_ptr).result
-                counter_byte_offset = arith.index_cast(T.i64, fx.Index(counter_idx) * fx.Index(4))
-                counter_ptr = llvm.AddOp(counter_base_ptr, counter_byte_offset, llvm.IntegerOverflowFlags(0)).result
-                counter_ptr = llvm.IntToPtrOp(_ptr_type, counter_ptr).result
-                counter_ptr_v = counter_ptr._value if hasattr(counter_ptr, "_value") else counter_ptr
-                prev_op = llvm.AtomicRMWOp(
-                    llvm.AtomicBinOp.add,
-                    counter_ptr_v,
-                    one_v,
-                    llvm.AtomicOrdering.monotonic,
-                    syncscope="agent",
-                    alignment=4,
-                )
-                prev = prev_op.result
-                ilb_[0] = prev
-                scf.YieldOp([])
-            gpu.barrier()
             is_last_block_all = arith.cmpi(
                 arith.CmpIPredicate.eq, ilb_[0],
                  arith.constant(SPLIT_K - 1, type=T.i32))
@@ -295,6 +271,29 @@ def compile_hgemm_kernel(
                     with ir.InsertionPoint(cond_boundary_if.then_block):
                         C_.vec_store((row_idx, n_offset + n_local_idx), zero_vec, LDG_VEC_SIZE)
                         scf.YieldOp([])
+                scf.YieldOp([])
+            # update counter
+            one_i32 = arith.constant(1, type=T.i32)
+            one_v = one_i32._value if hasattr(one_i32, "_value") else one_i32
+            is_t0_cond = arith.cmpi(arith.CmpIPredicate.ult, fx.Index(tid), fx.Index(1))
+            is_t0_cond_if = scf.IfOp(is_t0_cond, results_=[], has_else=False)
+            with ir.InsertionPoint(is_t0_cond_if.then_block):
+                counter_base_ptr = fly.extract_aligned_pointer_as_index(_ptr_type, fly_values(COUNTER)[0])
+                counter_base_ptr = llvm.PtrToIntOp(_i64_type, counter_base_ptr).result
+                counter_byte_offset = arith.index_cast(T.i64, fx.Index(counter_idx) * fx.Index(4))
+                counter_ptr = llvm.AddOp(counter_base_ptr, counter_byte_offset, llvm.IntegerOverflowFlags(0)).result
+                counter_ptr = llvm.IntToPtrOp(_ptr_type, counter_ptr).result
+                counter_ptr_v = counter_ptr._value if hasattr(counter_ptr, "_value") else counter_ptr
+                prev_op = llvm.AtomicRMWOp(
+                    llvm.AtomicBinOp.add,
+                    counter_ptr_v,
+                    one_v,
+                    llvm.AtomicOrdering.monotonic,
+                    syncscope="agent",
+                    alignment=4,
+                )
+                prev = prev_op.result
+                ilb_[0] = prev
                 scf.YieldOp([])
         
         def ldg_a(k_offset):
@@ -567,8 +566,6 @@ def compile_hgemm_kernel(
                 gpu.barrier()
             
             if IS_SPLIT_K:
-                _ptr_type = ir.Type.parse("!llvm.ptr<1>")
-                _i64_type = T.i64
                 out_raw = fly_values(C)[0]
                 out_base_ptr = fly.extract_aligned_pointer_as_index(_ptr_type, out_raw)
                 out_base_int = llvm.PtrToIntOp(_i64_type, out_base_ptr).result
