@@ -63,7 +63,6 @@ def swizzle_xor16(row, col_in_bytes, k_blocks16):
 @functools.lru_cache(maxsize=1024)
 def compile_hgemm_kernel(
     dtype: str,
-    signal_state: int,
     n: int,
     k: int,
     TILE_K: int = 64,
@@ -190,6 +189,7 @@ def compile_hgemm_kernel(
                 n // WARP_ATOM_N, k // WARP_ATOM_K, WARP_ATOM_K // LDG_VEC_SIZE, WARP_ATOM_N, LDG_VEC_SIZE))
         if IS_SPLIT_K:
             COUNTER_ = GTensor(COUNTER, dtype=T.i32, shape=(-1,))
+            signal_status = COUNTER_[fx.Int32(0)]
         
         tid = fx.Int32(fx.thread_idx.x)
         wid = tid // WARP_SIZE
@@ -198,7 +198,7 @@ def compile_hgemm_kernel(
         block_n_idx = fx.block_idx.x % raster_factor + fx.block_idx.y * raster_factor
         ks_idx = fx.Index(fx.block_idx.z)
         ks_begin = arith.index_cast(T.i32, ks_idx * ks)
-        counter_idx = fx.Int32(signal_state * SPLIT_K_COUNTER_MAX_LEN) + fx.block_idx.x * fx.Int32(n // BLOCK_N) + fx.block_idx.y
+        counter_idx = 4 + fx.Int32(signal_status * SPLIT_K_COUNTER_MAX_LEN) + fx.block_idx.x * fx.Int32(n // BLOCK_N) + fx.block_idx.y
 
         m_offset = fx.Index(block_m_idx * BLOCK_M)
         n_offset = fx.Index(block_n_idx * BLOCK_N)
@@ -261,7 +261,7 @@ def compile_hgemm_kernel(
                 clean_cond = arith.cmpi(arith.CmpIPredicate.ult, fx.Index(tid), fx.Index(SPLIT_K_COUNTER_MAX_LEN))
                 clean_cond_if = scf.IfOp(clean_cond, results_=[], has_else=False)
                 with ir.InsertionPoint(clean_cond_if.then_block):
-                    clean_counter_idx = fx.Int32(((signal_state + 2) % 3) * SPLIT_K_COUNTER_MAX_LEN) + fx.Index(tid)
+                    clean_counter_idx = 4 + fx.Int32(((signal_status + 2) % 3) * SPLIT_K_COUNTER_MAX_LEN) + fx.Index(tid)
                     COUNTER_[fx.Index(clean_counter_idx)] = arith.constant(0, type=T.i32)
                     scf.YieldOp([])
                 scf.YieldOp([])
@@ -615,6 +615,15 @@ def compile_hgemm_kernel(
                         vec = cs_.vec_load((m_local_idx, n_local_idx), LDG_VEC_SIZE)
                         C_.vec_store((m_global_idx, n_offset + n_local_idx), vec, LDG_VEC_SIZE)
                         scf.YieldOp([])
+        
+        if IS_SPLIT_K:
+            bid_linear = (fx.block_idx.x * fx.Int32(n // BLOCK_N) + fx.block_idx.y) * fx.Int32(SPLIT_K) + ks_idx
+            cond = arith.cmpi(arith.CmpIPredicate.eq, bid_linear, fx.Index(0))
+            cond_if = scf.IfOp(cond, results_=[], has_else=False)
+            with ir.InsertionPoint(cond_if.then_block):
+                signal_status_next = (signal_status + 1) % 3
+                COUNTER_[fx.Int32(0)] = signal_status_next
+                scf.YieldOp([])
         return
     
     @flyc.jit
@@ -692,7 +701,6 @@ selections = {
 
 
 SPLIT_K_GLOBAL_SEMAPHORE = {}
-SPLIT_K_GLOBAL_SEMAPHORE_STATE = {}
 def hgemm_(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -703,12 +711,9 @@ def hgemm_(
     device = a.device
     global SPLIT_K_COUNTER_MAX_LEN
     global SPLIT_K_GLOBAL_SEMAPHORE
-    global SPLIT_K_GLOBAL_SEMAPHORE_STATE
     if SPLIT_K_GLOBAL_SEMAPHORE.get(device, None) is None:
         SPLIT_K_GLOBAL_SEMAPHORE[device] = torch.zeros(
-            (3 * SPLIT_K_COUNTER_MAX_LEN,), dtype=torch.int32, device=device)
-        SPLIT_K_GLOBAL_SEMAPHORE_STATE[device] = int(0)
-    signal_state = SPLIT_K_GLOBAL_SEMAPHORE_STATE[device]
+            (4 + 3 * SPLIT_K_COUNTER_MAX_LEN,), dtype=torch.int32, device=device)
     k = a.shape[-1]
     a = a.view(-1, k)
     m = a.shape[0]
@@ -719,9 +724,9 @@ def hgemm_(
     kwargs = get_default_kwargs(m, n, k)
     kwargs.update(hgemm_kwargs)
     if a.dtype == torch.half:
-        exe = compile_hgemm_kernel('f16', signal_state, n, k, **kwargs)
+        exe = compile_hgemm_kernel('f16', n, k, **kwargs)
     elif a.dtype == torch.bfloat16:
-        exe = compile_hgemm_kernel('bf16', signal_state, n, k, **kwargs)
+        exe = compile_hgemm_kernel('bf16', n, k, **kwargs)
     else:
         raise NotImplementedError()
     if kwargs['B_PRE_SHUFFLE'] and shuffle_b:
@@ -732,8 +737,6 @@ def hgemm_(
         bn = n // kwargs['TILE_N']
         assert bm * bn <= SPLIT_K_COUNTER_MAX_LEN
     exe(c, a, b, m, semaphore, stream=torch.cuda.current_stream())
-    if kwargs['SPLIT_K'] > 1:
-        SPLIT_K_GLOBAL_SEMAPHORE_STATE[device] = (SPLIT_K_GLOBAL_SEMAPHORE_STATE[device] + 1) % 3
 
 
 def func(a, b, c):
@@ -791,5 +794,5 @@ if __name__ == '__main__':
     args = Args(**vars(args))
     benchmark(args, func, ref_func)
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=4096 --n=4096 --k=4096 --dtype=bf16
-    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=32 --n=7168 --k=2048 --dtype=bf16
+    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=32 --n=384 --k=7168 --dtype=bf16
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8192 --n=8192 --k=8192 --dtype=bf16
