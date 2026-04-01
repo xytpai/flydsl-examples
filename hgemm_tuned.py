@@ -187,5 +187,7 @@ if __name__ == '__main__':
     elif args.tune_all:
         tune_all(args.dtype, args.out)
     # rm -rf ~/.flydsl/ ; python3 hgemm_tuned.py --single --dtype bf16 --m 4096 --n 4096 --k 4096
-    # rm -rf ~/.flydsl/ ; python3 hgemm_tuned.py --eval --dtype bf16 --m 256 --n 8192 --k 384
+    # rm -rf ~/.flydsl/ ; python3 hgemm_tuned.py --single --dtype bf16 --m 8192 --n 8192 --k 8192
+    # rm -rf ~/.flydsl/ ; python3 hgemm_tuned.py --single --dtype bf16 --m 32 --n 384 --k 7168
+    # rm -rf ~/.flydsl/ ; python3 hgemm_tuned.py --eval --dtype bf16 --m 32 --n 384 --k 7168
     # rm -rf ~/.flydsl/ ; python3 hgemm_tuned.py --tune_all
