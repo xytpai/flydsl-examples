@@ -223,37 +223,37 @@ python3 hgemm.py --m=4096 --n=4096 --k=4096 --dtype=f16
 ```
 
 ```txt
-run: /home/yuxu/flydsl-examples/hgemm.py, args: Namespace(m=4096, n=4096, k=4096, dtype='f16')
-maxdiff_out:0.0625
-maxdiff_out:0.0625
-maxdiff_out:0.0625
-maxdiff_out:0.0625
-maxdiff_out:0.0625
+run: /home/yuxu/flydsl-examples/hgemm.py, args: Namespace(m=4096, n=4096, k=4096, dtype='bf16')
+maxdiff_out:0.0
+maxdiff_out:0.0
+maxdiff_out:0.0
+maxdiff_out:0.0
+maxdiff_out:0.0
 ===================== [REF] =====================
-[W325 08:58:44.666889393 collection.cpp:1116] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
+[W401 06:24:33.414437859 collection.cpp:1133] Warning: ROCTracer produced duplicate flow start: 4 (function operator())
 -------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
                                                    Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
 -------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-Cijk_Alik_Bljk_HHS_BH_UserArgs_MT256x224x64_MI16x16x...         0.00%       0.000us         0.00%       0.000us       0.000us      73.170ms       100.00%      73.170ms     731.697us           100  
-                            hipGetDevicePropertiesR0600         0.13%      96.362us         0.13%      96.362us       0.321us       0.000us         0.00%       0.000us       0.000us           300  
-                               hipExtModuleLaunchKernel         0.57%     408.387us         0.57%     408.387us       4.084us       0.000us         0.00%       0.000us       0.000us           100  
-                                   hipDeviceSynchronize        99.30%      71.121ms        99.30%      71.121ms      71.121ms       0.000us         0.00%       0.000us       0.000us             1  
+Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT256x2...         0.00%       0.000us         0.00%       0.000us       0.000us      11.083ms       100.00%      11.083ms     110.830us           100  
+                            hipGetDevicePropertiesR0600         0.61%      62.241us         0.61%      62.241us       0.207us       0.000us         0.00%       0.000us       0.000us           300  
+                               hipExtModuleLaunchKernel         4.30%     441.614us         4.30%     441.614us       4.416us       0.000us         0.00%       0.000us       0.000us           100  
+                                   hipDeviceSynchronize        95.09%       9.766ms        95.09%       9.766ms       9.766ms       0.000us         0.00%       0.000us       0.000us             1  
 -------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-Self CPU time total: 71.626ms
-Self CUDA time total: 73.170ms
+Self CPU time total: 10.270ms
+Self CUDA time total: 11.083ms
 
 ===================== [FLYDSL] =====================
 -------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
                                                    Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
 -------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-                         hgemm_f16_128x128x64_S1TN_BP_0         0.00%       0.000us         0.00%       0.000us       0.000us      73.178ms        90.42%      73.178ms     731.779us           100  
-void at::native::elementwise_kernel_manual_unroll<12...         0.00%       0.000us         0.00%       0.000us       0.000us       7.751ms         9.58%       7.751ms      77.512us           100  
-                                        hipLaunchKernel         0.66%     448.365us         0.66%     448.365us       4.484us       0.000us         0.00%       0.000us       0.000us           100  
-                                  hipModuleLaunchKernel         0.63%     427.903us         0.63%     427.903us       4.279us       0.000us         0.00%       0.000us       0.000us           100  
-                                   hipDeviceSynchronize        98.70%      66.616ms        98.70%      66.616ms      66.616ms       0.000us         0.00%       0.000us       0.000us             1  
+                     hgemm_bf16_128x256x64_S2TN_AS_BP_0         0.00%       0.000us         0.00%       0.000us       0.000us      10.954ms        82.01%      10.954ms     109.539us           100  
+void at::native::elementwise_kernel_manual_unroll<12...         0.00%       0.000us         0.00%       0.000us       0.000us       2.403ms        17.99%       2.403ms      24.031us           100  
+                                        hipLaunchKernel         3.16%     362.386us         3.16%     362.386us       3.624us       0.000us         0.00%       0.000us       0.000us           100  
+                                  hipModuleLaunchKernel         2.80%     321.137us         2.80%     321.137us       3.211us       0.000us         0.00%       0.000us       0.000us           100  
+                                   hipDeviceSynchronize        94.03%      10.768ms        94.03%      10.768ms      10.768ms       0.000us         0.00%       0.000us       0.000us             1  
 -------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
-Self CPU time total: 67.492ms
-Self CUDA time total: 80.929ms
+Self CPU time total: 11.452ms
+Self CUDA time total: 13.357ms
 ```
 
 ## 5. Allreduce
