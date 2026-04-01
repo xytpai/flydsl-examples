@@ -578,13 +578,24 @@ def compile_hgemm_kernel(
             b_frags = lds_matrix_b(0)
             rocdl.sched_barrier(0)
             def hot_loop_scheduler():
-                MFMA_GROUP = WARP_K_STEPS * WARP_M_STEPS * WARP_N_STEPS * MFMA_PER_WARP_K // (LDG_REG_A_COUNT_AS + LDG_REG_B_COUNT_AS)
-                for sche_i in range_constexpr(LDG_REG_A_COUNT_AS):
-                    rocdl.sched_vmem(1) # ldg_a next
-                    rocdl.sched_mfma(MFMA_GROUP)
-                for sche_i in range_constexpr(LDG_REG_B_COUNT_AS):
-                    rocdl.sched_vmem(1) # ldg_b next
-                    rocdl.sched_mfma(MFMA_GROUP)
+                MFMA_TOTAL = WARP_K_STEPS * WARP_M_STEPS * WARP_N_STEPS * MFMA_PER_WARP_K
+                LDG_REG_A_COUNT_ = LDG_REG_A_COUNT_AS if ASYNC_COPY else LDG_REG_A_COUNT
+                LDG_REG_B_COUNT_ = LDG_REG_B_COUNT_AS if ASYNC_COPY else LDG_REG_B_COUNT
+                LDG_TOTAL = LDG_REG_A_COUNT_ + LDG_REG_B_COUNT_ + WARP_K_STEPS * WARP_N_STEPS
+                # ================ Ordered ================
+                # for i in range_constexpr(LDG_REG_A_COUNT_AS or LDG_REG_A_COUNT):
+                #     rocdl.sched_vmem(1) # ldg_sts_a_async next
+                # for i in range_constexpr(LDG_REG_B_COUNT_AS or LDG_REG_B_COUNT):
+                #     rocdl.sched_vmem(1) # ldg_sts_b_async next
+                # for i in range_constexpr(WARP_K_STEPS * WARP_M_STEPS * WARP_N_STEPS * MFMA_PER_WARP_K):
+                #     rocdl.sched_mfma(1)
+                # ================ Reordered ================
+                mfma_ = OnlineScheduler(MFMA_TOTAL, MFMA_TOTAL)
+                ldg_ = OnlineScheduler(LDG_TOTAL, LDG_TOTAL)
+                AVG_MFMA_COUNT = (MFMA_TOTAL + LDG_TOTAL - 1)  // LDG_TOTAL
+                for i in range_constexpr(LDG_TOTAL):
+                    rocdl.sched_vmem(ldg_.consume(1))
+                    rocdl.sched_mfma(mfma_.consume(AVG_MFMA_COUNT))
                 rocdl.sched_barrier(0)
             init_state = [ks_begin, arith.constant(0, index=True)] + c_frags + a_frags + b_frags
             for bki, state in range(1, BLOCK_K_LOOPS, init=init_state):
@@ -618,8 +629,8 @@ def compile_hgemm_kernel(
             rocdl.sched_barrier(0)
             def hot_loop_scheduler():
                 MFMA_TOTAL = WARP_K_STEPS * WARP_M_STEPS * WARP_N_STEPS * MFMA_PER_WARP_K
-                DG_REG_A_COUNT_ = LDG_REG_A_COUNT_AS if ASYNC_COPY else LDG_REG_A_COUNT
-                LDG_TOTAL = DG_REG_A_COUNT_ + WARP_K_STEPS * WARP_N_STEPS
+                LDG_REG_A_COUNT_ = LDG_REG_A_COUNT_AS if ASYNC_COPY else LDG_REG_A_COUNT
+                LDG_TOTAL = LDG_REG_A_COUNT_ + WARP_K_STEPS * WARP_N_STEPS
                 # ================ Ordered ================
                 # for i in range_constexpr(LDG_REG_A_COUNT_AS or LDG_REG_A_COUNT):
                 #     rocdl.sched_vmem(1) # ldg_sts_a_async next
@@ -773,7 +784,7 @@ def hgemm_shuffle_b(x, layout=(16, 16), k_steps=2):
 def get_default_kwargs(m, n, k):
     kwargs = {
         'TILE_M': 128,
-        'TILE_N': 128,
+        'TILE_N': 256,
         'TILE_K': 64,
         'SPLIT_K': 1,
         'BLOCK_M_WARPS': 1,
