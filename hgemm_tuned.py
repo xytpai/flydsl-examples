@@ -17,7 +17,7 @@ base_dir = Path(__file__).resolve().parent
 temp_dir = base_dir / 'temp'
 temp_dir.mkdir(parents=True, exist_ok=True)
 
-from hgemm import hgemm_, selections, benchmark, ref_func
+from hgemm import hgemm_splitk_, selections, benchmark, ref_func
 
 
 @dataclass
@@ -59,12 +59,13 @@ def tuning_benchmark(args, hgemm_kwargs={}, warmup=5, niters=50):
     c_ref = create_outputs(args)[0]
     F.linear(a, b, out=c_ref)
     for i in range(warmup):
-        hgemm_(a, b, c, hgemm_kwargs=hgemm_kwargs)
-    is_allclose = torch.allclose(c, c_ref, atol=1e-1, rtol=1e-1)
+        hgemm_splitk_(c, a, b, hgemm_kwargs=hgemm_kwargs, shuffle_b=True)
+    tol = float(args.k) / 2048 * 6e-1
+    is_allclose = torch.allclose(c, c_ref, atol=tol, rtol=tol)
     assert is_allclose == True
     with profile(activities=[ProfilerActivity.CUDA], ) as prof:
         for i in range(niters):
-            hgemm_(a, b, c, hgemm_kwargs=hgemm_kwargs)
+            hgemm_splitk_(c, a, b, hgemm_kwargs=hgemm_kwargs, shuffle_b=True)
     table = prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1)
     hgemm_durations = []
     for event in prof.events():
@@ -161,7 +162,7 @@ def hgemm_tuned(a, b, c):
             config = MAP_CONFIGS[search_key]
             if SHOW_TUNED_LOG:
                 print(f"Found tuned config for m={m_lb}, n={n}, k={k}: {config}")
-    hgemm_(a, b, c, hgemm_kwargs=config)
+    hgemm_splitk_(c, a, b, hgemm_kwargs=config, shuffle_b=True)
 
 
 if __name__ == '__main__':
@@ -186,5 +187,7 @@ if __name__ == '__main__':
     elif args.tune_all:
         tune_all(args.dtype, args.out)
     # rm -rf ~/.flydsl/ ; python3 hgemm_tuned.py --single --dtype bf16 --m 4096 --n 4096 --k 4096
-    # rm -rf ~/.flydsl/ ; python3 hgemm_tuned.py --eval --dtype bf16 --m 256 --n 8192 --k 384
+    # rm -rf ~/.flydsl/ ; python3 hgemm_tuned.py --single --dtype bf16 --m 8192 --n 8192 --k 8192
+    # rm -rf ~/.flydsl/ ; python3 hgemm_tuned.py --single --dtype bf16 --m 32 --n 384 --k 7168
+    # rm -rf ~/.flydsl/ ; python3 hgemm_tuned.py --eval --dtype bf16 --m 32 --n 384 --k 7168
     # rm -rf ~/.flydsl/ ; python3 hgemm_tuned.py --tune_all
