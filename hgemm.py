@@ -811,7 +811,7 @@ def get_default_kwargs(m, n, k):
         kwargs['TILE_N'] = 128
         kwargs['TILE_K'] = 64
         kwargs['SPLIT_K'] = 4
-    if m <= 32 and n == 384 and k == 7168:
+    if m <= 32 and n == 384 and k >= 7168:
         kwargs['TILE_M'] = 16
         kwargs['TILE_N'] = 128
         kwargs['TILE_K'] = 128
@@ -929,3 +929,4 @@ if __name__ == '__main__':
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=4096 --n=4096 --k=4096 --dtype=bf16
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8192 --n=8192 --k=8192 --dtype=bf16
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=32 --n=384 --k=7168 --dtype=bf16
+    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=32 --n=384 --k=16384 --dtype=bf16
