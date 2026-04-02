@@ -807,14 +807,14 @@ def get_default_kwargs(m, n, k):
         'B_TO_LDS': False,
     }
     if m <= 32 and n == 7168 and k == 2048:
-        kwargs['TILE_K'] = 64
         kwargs['TILE_M'] = 32
         kwargs['TILE_N'] = 128
+        kwargs['TILE_K'] = 64
         kwargs['SPLIT_K'] = 4
     if m <= 32 and n == 384 and k == 7168:
+        kwargs['TILE_M'] = 16
+        kwargs['TILE_N'] = 128
         kwargs['TILE_K'] = 128
-        kwargs['TILE_M'] = 32
-        kwargs['TILE_N'] = 64
         kwargs['SPLIT_K'] = 8
     return kwargs
 
@@ -829,22 +829,22 @@ selections = {
 
 SPLIT_K_GLOBAL_SEMAPHORE = {}
 SPLIT_K_GLOBAL_SEMAPHORE_STATE = {}
-def hgemm_(
+def hgemm_splitk_(
+    c: torch.Tensor,
     a: torch.Tensor,
     b: torch.Tensor,
-    c: torch.Tensor,
-    shuffle_b: bool=True,
-    hgemm_kwargs: dict={},
+    shuffle_b: bool = False,
+    hgemm_kwargs: dict = {},
+    stream: torch.cuda.Stream = torch.cuda.current_stream(),
 ):
-    device = a.device
     global SPLIT_K_COUNTER_MAX_LEN
     global SPLIT_K_GLOBAL_SEMAPHORE
     global SPLIT_K_GLOBAL_SEMAPHORE_STATE
-    if SPLIT_K_GLOBAL_SEMAPHORE.get(device, None) is None:
-        SPLIT_K_GLOBAL_SEMAPHORE[device] = torch.zeros(
-            (3 * SPLIT_K_COUNTER_MAX_LEN,), dtype=torch.int32, device=device)
-        SPLIT_K_GLOBAL_SEMAPHORE_STATE[device] = int(0)
-    signal_state = SPLIT_K_GLOBAL_SEMAPHORE_STATE[device]
+    if SPLIT_K_GLOBAL_SEMAPHORE.get(stream, None) is None:
+        SPLIT_K_GLOBAL_SEMAPHORE[stream] = torch.zeros(
+            (3 * SPLIT_K_COUNTER_MAX_LEN,), dtype=torch.int32, device=stream.device)
+        SPLIT_K_GLOBAL_SEMAPHORE_STATE[stream] = int(0)
+    signal_state = SPLIT_K_GLOBAL_SEMAPHORE_STATE[stream]
     k = a.shape[-1]
     a = a.view(-1, k)
     m = a.shape[0]
@@ -862,18 +862,18 @@ def hgemm_(
         raise NotImplementedError()
     if kwargs['B_PRE_SHUFFLE'] and shuffle_b:
         b = hgemm_shuffle_b(b)
-    semaphore = SPLIT_K_GLOBAL_SEMAPHORE[device]
+    semaphore = SPLIT_K_GLOBAL_SEMAPHORE[stream]
     if kwargs['SPLIT_K'] > 1:
         bm = (m + kwargs['TILE_M'] - 1) // kwargs['TILE_M']
         bn = n // kwargs['TILE_N']
         assert bm * bn <= SPLIT_K_COUNTER_MAX_LEN
-    exe(c, a, b, m, semaphore, signal_state, stream=torch.cuda.current_stream())
+    exe(c, a, b, m, semaphore, signal_state, stream)
     if kwargs['SPLIT_K'] > 1:
-        SPLIT_K_GLOBAL_SEMAPHORE_STATE[device] = (signal_state + 1) % 3
+        SPLIT_K_GLOBAL_SEMAPHORE_STATE[stream] = (signal_state + 1) % 3
 
 
 def func(a, b, c):
-    hgemm_(a, b, c, shuffle_b=True)
+    hgemm_splitk_(c, a, b, shuffle_b=True)
 
 
 def benchmark(args, func, ref_func, warmup=20, niters=100):
