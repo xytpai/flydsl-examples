@@ -20,13 +20,14 @@ class CooperativeGroup:
         _ptr_type = ir.Type.parse("!llvm.ptr<1>")
         counter_base_ptr = fly.extract_aligned_pointer_as_index(_ptr_type, fly_values(self.counter)[0])
         counter_base_ptr = llvm.PtrToIntOp(T.i64, counter_base_ptr).result
-        counter_byte_offset = arith.index_cast(T.i64, fx.Index(self.group_id))
+        counter_byte_offset = arith.index_cast(T.i64, fx.Index(self.group_id) * fx.Index(4))
         counter_ptr = llvm.AddOp(counter_base_ptr, counter_byte_offset, llvm.IntegerOverflowFlags(0)).result
         counter_ptr = llvm.IntToPtrOp(_ptr_type, counter_ptr).result
         self.counter_ptr_v = counter_ptr._value if hasattr(counter_ptr, "_value") else counter_ptr
     
     def fetch_add_counter(self):
         rocdl.sched_barrier(0)
+        gpu.barrier()
         is_t0_cond = arith.cmpi(arith.CmpIPredicate.eq, fx.Index(self.tidx), fx.Index(0))
         is_t0_cond_if = scf.IfOp(is_t0_cond, results_=[], has_else=False)
         with ir.InsertionPoint(is_t0_cond_if.then_block):
@@ -48,7 +49,7 @@ class CooperativeGroup:
         ilb_cond = arith.cmpi(arith.CmpIPredicate.eq, fx.Index(flag), fx.Index(self.group_size - 1))
         ilb_cond_if = scf.IfOp(ilb_cond, results_=[], has_else=True)
         with ir.InsertionPoint(ilb_cond_if.then_block):
-            self.counter_[fx.Int32(0)] = arith.constant(0, type=T.i32)
+            self.counter_[fx.Int32(self.group_id)] = arith.constant(0, type=T.i32)
             rocdl.s_waitcnt(0)
             rocdl.sched_barrier(0)
             scf.YieldOp([])
