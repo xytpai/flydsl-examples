@@ -1,14 +1,10 @@
 import flydsl
-import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr.typing import T
 from flydsl._mlir import ir
 from flydsl.expr import range_constexpr, arith, vector, gpu, rocdl
 from flydsl._mlir.dialects import llvm, fly, memref, scf
 from flydsl.compiler.protocol import fly_values
-from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
-from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.runtime.device import get_rocm_arch
 
 from .tensor_shim import GTensor
 
