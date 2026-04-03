@@ -23,7 +23,7 @@ from flydsl.compiler.protocol import fly_values
 from flydsl.expr.buffer_ops import _unwrap_value
 
 from utils.custom_all_reduce import init_custom_ar, FlyDSLAllreduce
-from utils.custom_all_reduce_kernel import _signal_start_sync, _signal_end_sync, load_device_ptr, select_by_lane, load_v4i32
+from utils.custom_all_reduce_kernel import _signal_start_sync, _signal_end_sync, load_device_ptr, select_by_index, load_v4i32, store_v4i32, store_v4i32_nt
 from utils.tensor_shim import get_dtype_in_kernel, GTensor, STensor, _to_raw
 fm_fast = arith.FastMathFlags.fast
 
@@ -478,8 +478,8 @@ def compile_hgemm_ar_kernel(
         
         gpu.barrier()
 
-        self_tmp_ptr = select_by_lane(_unwrap_value(fx.Int32(0)), tmp_ptrs_arr)
-        self_out_ptr = select_by_lane(rank_i32, out_ptrs_arr)
+        self_tmp_ptr = select_by_index(_unwrap_value(fx.Int32(0)), tmp_ptrs_arr)
+        self_out_ptr = select_by_index(rank_i32, out_ptrs_arr)
 
         for i in range_constexpr(LDG_REG_C_COUNT):
             global_tid = BLOCK_THREADS * i + tid
@@ -494,12 +494,15 @@ def compile_hgemm_ar_kernel(
                 byte_offset_i64 = arith.index_cast(T.i64, linear_byte_offset)
                 dst_addr = llvm.AddOp(self_tmp_ptr, byte_offset_i64, llvm.IntegerOverflowFlags(0)).result
                 vec_i32x4 = vector.bitcast(T.i32x4, vec)
-                signal_ops.st_global_16b(dst_addr, vec_i32x4)
+                store_v4i32_nt(dst_addr, vec_i32x4)
         
+        rocdl.sched_barrier(0)
+        gpu.barrier()
+
         _signal_start_sync(lane_i32=lane_i32, rank_i32=rank_i32, bid_i32=bid_i32, self_sg_i64=self_sg_i64, sgs_i64=sgs, ngpus=world_size)
-        # _signal_end_sync(lane_i32=lane_i32, rank_i32=rank_i32, bid_i32=bid_i32, self_sg_i64=self_sg_i64, sgs_i64=sgs, ngpus=world_size)
-        # rocdl.s_waitcnt(0)
-        # gpu.barrier()
+        
+        rocdl.sched_barrier(0)
+        gpu.barrier()
 
         for i in range_constexpr(LDG_REG_C_COUNT):
             global_tid = BLOCK_THREADS * i + tid
@@ -512,8 +515,8 @@ def compile_hgemm_ar_kernel(
                 byte_offset_i64 = arith.index_cast(T.i64, linear_byte_offset)
 
                 peer_vecs = []
-                for wi in range_constexpr(1):
-                    peer_ptr = select_by_lane(_unwrap_value(fx.Int32(wi)), tmp_ptrs_arr)
+                for wi in range_constexpr(world_size):
+                    peer_ptr = select_by_index(_unwrap_value(fx.Int32(wi)), tmp_ptrs_arr)
                     addr_i64 = llvm.AddOp(peer_ptr, byte_offset_i64, llvm.IntegerOverflowFlags(0)).result
                     raw = load_v4i32(addr_i64)
                     peer_vec = vector.bitcast(T.vec(LDG_VEC_SIZE, dtype_), raw)
@@ -521,14 +524,16 @@ def compile_hgemm_ar_kernel(
                     peer_vecs.append(peer_f32)
 
                 acc_f32 = arith.constant_vector(0.0, T.vec(LDG_VEC_SIZE, T.f32))
-                for wi in range_constexpr(1):
+                for wi in range_constexpr(world_size):
                     acc_f32 = arith.addf(acc_f32, peer_vecs[wi], fastmath=fm_fast)
                 
                 final_vec = acc_f32.truncf(T.vec(LDG_VEC_SIZE, dtype_))
                 dst_addr = llvm.AddOp(self_out_ptr, byte_offset_i64, llvm.IntegerOverflowFlags(0)).result
                 vec_i32x4 = vector.bitcast(T.i32x4, final_vec)
-                signal_ops.st_global_16b(dst_addr, vec_i32x4)
+                store_v4i32(dst_addr, vec_i32x4)
                 
+        rocdl.sched_barrier(0)
+        gpu.barrier()
         
         _signal_end_sync(lane_i32=lane_i32, rank_i32=rank_i32, bid_i32=bid_i32, self_sg_i64=self_sg_i64, sgs_i64=sgs, ngpus=world_size)
 
@@ -695,7 +700,7 @@ def worker(device_id, num_devices, parts, nsamples, inputs, outputs):
         input = inputs[device_id * nsamples + i]
         output = outputs[device_id * nsamples + i]
         fa.hgemm_ar_fusion(input[0], input[1], output)
-        fa.custom_all_reduce(output.view(-1), open_fp8_quant=False, out=output.view(-1))
+        # fa.custom_all_reduce(output.view(-1), open_fp8_quant=False, out=output.view(-1))
     torch.cuda.synchronize()
     dist.barrier(group=group)
     dist.destroy_process_group()
@@ -756,6 +761,7 @@ if __name__ == '__main__':
     args = Args(**vars(args))
     benchmark(args, func, ref_func)
     # rm -rf ~/.flydsl/ ; python3 hgemm_ar.py --nsamples=10 --num_devices=4 --m=32 --n=7168 --k=2048 --dtype=bf16
+    # rm -rf ~/.flydsl/ ; python3 hgemm_ar.py --nsamples=1 --num_devices=4 --m=128 --n=128 --k=128 --dtype=bf16
 
 
 CMD_FOR_KILL = '''
