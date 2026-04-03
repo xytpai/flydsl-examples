@@ -13,7 +13,7 @@ import flydsl
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr.typing import T, Int32, Int64, Stream
-from flydsl.expr import range_constexpr, arith, vector, gpu, rocdl, signal_ops
+from flydsl.expr import range_constexpr, arith, vector, gpu, rocdl
 from flydsl._mlir import ir
 from flydsl.runtime.device import get_rocm_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
@@ -23,7 +23,7 @@ from flydsl.compiler.protocol import fly_values
 from flydsl.expr.buffer_ops import _unwrap_value
 
 from utils.custom_all_reduce import init_custom_ar, FlyDSLAllreduce
-from utils.custom_all_reduce_kernel import _signal_start_sync, _signal_end_sync
+from utils.custom_all_reduce_kernel import _signal_start_sync, _signal_end_sync, load_device_ptr, select_by_lane, load_v4i32
 from utils.tensor_shim import get_dtype_in_kernel, GTensor, STensor, _to_raw
 fm_fast = arith.FastMathFlags.fast
 
@@ -457,9 +457,9 @@ def compile_hgemm_ar_kernel(
         out_ptrs_i64 = _unwrap_value(out_ptrs)
         bid_i32 = arith.index_cast(T.i32, fx.Index(bid_linear))
         lane_i32 = arith.index_cast(T.i32, fx.Index(fx.thread_idx.x))
-        sgs = [signal_ops.load_ptr_from_array(sg_ptrs_i64, arith.constant(i, type=T.i32)) for i in range(8)]
-        tmp_ptrs_arr = [signal_ops.load_ptr_from_array(tmp_ptrs_i64, arith.constant(i, type=T.i32)) for i in range(8)]
-        out_ptrs_arr = [signal_ops.load_ptr_from_array(out_ptrs_i64, arith.constant(i, type=T.i32)) for i in range(8)]
+        sgs = [load_device_ptr(sg_ptrs_i64, arith.constant(i, type=T.i32)) for i in range(8)]
+        tmp_ptrs_arr = [load_device_ptr(tmp_ptrs_i64, arith.constant(i, type=T.i32)) for i in range(8)]
+        out_ptrs_arr = [load_device_ptr(out_ptrs_i64, arith.constant(i, type=T.i32)) for i in range(8)]
 
         stmatrix_c_m_vec_idx = w_tid // WMMA_N * WMMA_FRAG_VALUES
         stmatrix_c_n_idx = w_tid % WMMA_N
@@ -478,8 +478,8 @@ def compile_hgemm_ar_kernel(
         
         gpu.barrier()
 
-        self_tmp_ptr = signal_ops.select_by_lane(_unwrap_value(fx.Int32(0)), tmp_ptrs_arr)
-        self_out_ptr = signal_ops.select_by_lane(rank_i32, out_ptrs_arr)
+        self_tmp_ptr = select_by_lane(_unwrap_value(fx.Int32(0)), tmp_ptrs_arr)
+        self_out_ptr = select_by_lane(rank_i32, out_ptrs_arr)
 
         for i in range_constexpr(LDG_REG_C_COUNT):
             global_tid = BLOCK_THREADS * i + tid
@@ -513,9 +513,9 @@ def compile_hgemm_ar_kernel(
 
                 peer_vecs = []
                 for wi in range_constexpr(1):
-                    peer_ptr = signal_ops.select_by_lane(_unwrap_value(fx.Int32(wi)), tmp_ptrs_arr)
+                    peer_ptr = select_by_lane(_unwrap_value(fx.Int32(wi)), tmp_ptrs_arr)
                     addr_i64 = llvm.AddOp(peer_ptr, byte_offset_i64, llvm.IntegerOverflowFlags(0)).result
-                    raw = signal_ops.ld_global_16b(addr_i64)
+                    raw = load_v4i32(addr_i64)
                     peer_vec = vector.bitcast(T.vec(LDG_VEC_SIZE, dtype_), raw)
                     peer_f32 = arith.extf(T.vec(LDG_VEC_SIZE, T.f32), peer_vec)
                     peer_vecs.append(peer_f32)
@@ -686,7 +686,11 @@ def worker(device_id, num_devices, parts, nsamples, inputs, outputs):
     group = init_world(device_id, num_devices, parts)
     rank = dist.get_rank(group=group)
     world_size = dist.get_world_size(group=group)
-    fa = init_custom_ar(torch.device(device_id), world_size=world_size, rank=rank, backend=GEMMARBackend)
+    meta = torch.empty((0,), device=device_id, dtype=torch.int8)
+    rank_data = inputs[device_id * nsamples]
+    handles = [torch.empty((1,), device="cpu", dtype=torch.uint8) for _ in range(world_size)]
+    offsets = [0 for _ in range(world_size)]
+    fa = init_custom_ar(meta, rank_data, handles, offsets, rank=rank, backend=GEMMARBackend)
     for i in range(nsamples):
         input = inputs[device_id * nsamples + i]
         output = outputs[device_id * nsamples + i]

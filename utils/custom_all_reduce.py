@@ -33,7 +33,7 @@ def _is_weak_contiguous(t) -> bool:
 _FLYDSL_AITER_GLOO_GROUP = None
 
 
-def init_custom_ar(meta, rank_data, handles, offsets, rank: int, full_nvlink: bool=True, out=None, max_size: int = _DEFAULT_MAX_SIZE):
+def init_custom_ar(meta, rank_data, handles, offsets, rank: int, full_nvlink: bool=True, out=None, max_size: int = _DEFAULT_MAX_SIZE, backend=None):
     """Initialize allreduce backend.
 
     Backend controlled by env var FLYDSL_AITER_IMPL:
@@ -69,6 +69,16 @@ def init_custom_ar(meta, rank_data, handles, offsets, rank: int, full_nvlink: bo
             _FLYDSL_AITER_GLOO_GROUP = dist.group.WORLD
 
     dev = getattr(rank_data, "device", None) or torch.device(f"cuda:{rank}")
+
+    if backend is not None:
+        return backend(
+            group=_FLYDSL_AITER_GLOO_GROUP,
+            device=dev,
+            max_size=max_size,
+            world_size=world_size,
+            rank=rank,
+            full_nvlink=bool(full_nvlink),
+        )
 
     if impl == "flydsl":
         return FlyDSLAllreduce(
