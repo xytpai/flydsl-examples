@@ -18,7 +18,7 @@ from flydsl._mlir import ir
 from flydsl.runtime.device import get_rocm_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl._mlir.dialects import llvm, fly, memref
+from flydsl._mlir.dialects import llvm, fly, memref, scf
 from flydsl.compiler.protocol import fly_values
 from flydsl.expr.buffer_ops import _unwrap_value
 
@@ -478,7 +478,6 @@ def compile_hgemm_ar_kernel(
         
         gpu.barrier()
 
-        self_tmp_ptr = select_by_index(_unwrap_value(fx.Int32(0)), tmp_ptrs_arr)
         self_out_ptr = select_by_index(rank_i32, out_ptrs_arr)
 
         for i in range_constexpr(LDG_REG_C_COUNT):
@@ -487,22 +486,18 @@ def compile_hgemm_ar_kernel(
             n_local_idx = fx.Index(global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE)
             m_global_idx = m_offset + m_local_idx
 
-            if arith.cmpi(arith.CmpIPredicate.ult, m_global_idx, fx.Index(m)):
+            cond = arith.cmpi(arith.CmpIPredicate.ult, m_global_idx, fx.Index(m))
+            cond_if = scf.IfOp(cond, results_=[], has_else=False)
+            with ir.InsertionPoint(cond_if.then_block):
                 vec = cs_.vec_load((m_local_idx, n_local_idx), LDG_VEC_SIZE)
                 # C_.vec_store((m_global_idx, n_offset + n_local_idx), vec, LDG_VEC_SIZE)
                 linear_byte_offset = (m_global_idx * fx.Index(n) + n_offset + n_local_idx) * fx.Index(DTYPE_BYTES)
                 byte_offset_i64 = arith.index_cast(T.i64, linear_byte_offset)
-                dst_addr = llvm.AddOp(self_tmp_ptr, byte_offset_i64, llvm.IntegerOverflowFlags(0)).result
                 vec_i32x4 = vector.bitcast(T.i32x4, vec)
-                store_v4i32_nt(dst_addr, vec_i32x4)
-        
-        rocdl.sched_barrier(0)
-        gpu.barrier()
+                store_v4i32_nt(tmp_ptrs_arr[0] + byte_offset_i64, vec_i32x4)
+                scf.YieldOp([])
 
         _signal_start_sync(lane_i32=lane_i32, rank_i32=rank_i32, bid_i32=bid_i32, self_sg_i64=self_sg_i64, sgs_i64=sgs, ngpus=world_size)
-        
-        rocdl.sched_barrier(0)
-        gpu.barrier()
 
         for i in range_constexpr(LDG_REG_C_COUNT):
             global_tid = BLOCK_THREADS * i + tid
@@ -510,15 +505,15 @@ def compile_hgemm_ar_kernel(
             n_local_idx = fx.Index(global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE)
             m_global_idx = m_offset + m_local_idx
         
-            if arith.cmpi(arith.CmpIPredicate.ult, m_global_idx, fx.Index(m)):
+            cond = arith.cmpi(arith.CmpIPredicate.ult, m_global_idx, fx.Index(m))
+            cond_if = scf.IfOp(cond, results_=[], has_else=False)
+            with ir.InsertionPoint(cond_if.then_block):
                 linear_byte_offset = (m_global_idx * fx.Index(n) + n_offset + n_local_idx) * fx.Index(DTYPE_BYTES)
                 byte_offset_i64 = arith.index_cast(T.i64, linear_byte_offset)
 
                 peer_vecs = []
                 for wi in range_constexpr(world_size):
-                    peer_ptr = select_by_index(_unwrap_value(fx.Int32(wi)), tmp_ptrs_arr)
-                    addr_i64 = llvm.AddOp(peer_ptr, byte_offset_i64, llvm.IntegerOverflowFlags(0)).result
-                    raw = load_v4i32(addr_i64)
+                    raw = load_v4i32(tmp_ptrs_arr[wi] + byte_offset_i64)
                     peer_vec = vector.bitcast(T.vec(LDG_VEC_SIZE, dtype_), raw)
                     peer_f32 = arith.extf(T.vec(LDG_VEC_SIZE, T.f32), peer_vec)
                     peer_vecs.append(peer_f32)
@@ -530,10 +525,8 @@ def compile_hgemm_ar_kernel(
                 final_vec = acc_f32.truncf(T.vec(LDG_VEC_SIZE, dtype_))
                 dst_addr = llvm.AddOp(self_out_ptr, byte_offset_i64, llvm.IntegerOverflowFlags(0)).result
                 vec_i32x4 = vector.bitcast(T.i32x4, final_vec)
-                store_v4i32(dst_addr, vec_i32x4)
-                
-        rocdl.sched_barrier(0)
-        gpu.barrier()
+                store_v4i32_nt(dst_addr, vec_i32x4)
+                scf.YieldOp([])
         
         _signal_end_sync(lane_i32=lane_i32, rank_i32=rank_i32, bid_i32=bid_i32, self_sg_i64=self_sg_i64, sgs_i64=sgs, ngpus=world_size)
 
@@ -726,7 +719,6 @@ def benchmark(args, func, ref_func):
         is_allclose = torch.allclose(output, ref_output)
         # assert is_allclose == True
         maxdiff_out = (output - ref_output).abs().max().item()
-        print(maxdiff_out)
         max_diff_global = max(max_diff_global, maxdiff_out)
     print(f"max_diff_global:{max_diff_global}")
 
@@ -761,7 +753,7 @@ if __name__ == '__main__':
     args = Args(**vars(args))
     benchmark(args, func, ref_func)
     # rm -rf ~/.flydsl/ ; python3 hgemm_ar.py --nsamples=10 --num_devices=4 --m=32 --n=7168 --k=2048 --dtype=bf16
-    # rm -rf ~/.flydsl/ ; python3 hgemm_ar.py --nsamples=1 --num_devices=4 --m=128 --n=128 --k=128 --dtype=bf16
+    # rm -rf ~/.flydsl/ ; python3 hgemm_ar.py --nsamples=10 --num_devices=4 --m=512 --n=512 --k=512 --dtype=bf16
 
 
 CMD_FOR_KILL = '''

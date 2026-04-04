@@ -79,6 +79,7 @@ def load_i32_uncached(addr_i64):
         has_side_effects=True,
     ).result
     rocdl.s_waitcnt(0)
+    rocdl.sched_barrier(0)
     return v
 
 
@@ -97,6 +98,7 @@ def store_i32_uncached_flush(addr_i64, val_i32):
         has_side_effects=True,
     )
     rocdl.s_waitcnt(0)
+    rocdl.sched_barrier(0)
 
 
 @traced_op
@@ -113,6 +115,7 @@ def store_i32_uncached(addr_i64, val_i32):
         has_side_effects=True,
     )
     rocdl.s_waitcnt(0)
+    rocdl.sched_barrier(0)
 
 
 @traced_op
@@ -128,6 +131,7 @@ def store_i32(addr_i64, val_i32):
         has_side_effects=True,
     )
     rocdl.s_waitcnt(0)
+    rocdl.sched_barrier(0)
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +150,7 @@ def load_v4i32(addr_i64):
         has_side_effects=True,
     ).result
     rocdl.s_waitcnt(0)
+    rocdl.sched_barrier(0)
     return v
 
 
@@ -161,6 +166,7 @@ def store_v4i32(addr_i64, v4i32_val):
         has_side_effects=True,
     )
     rocdl.s_waitcnt(0)
+    rocdl.sched_barrier(0)
 
 
 @traced_op
@@ -177,6 +183,7 @@ def store_v4i32_nt(addr_i64, v4i32_val):
         has_side_effects=True,
     )
     rocdl.s_waitcnt(0)
+    rocdl.sched_barrier(0)
 
 
 # ---------------------------------------------------------------------------

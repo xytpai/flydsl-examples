@@ -10,6 +10,7 @@ This repository will provide the following examples from scratch:
 - [x] RMS Norm
 - [x] HGEMM (wmma)
 - [x] Allreduce
+- [x] HGEMM Allreduce Fusion
 - [ ] Flash Attention
 - [ ] Linear Attention (NEED REBASE)
 - [ ] GEMM-FP8
