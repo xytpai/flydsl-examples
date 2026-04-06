@@ -322,8 +322,7 @@ def compile_hgemm_ar_kernel(
             # origin: n // WARP_ATOM_N, WARP_ATOM_N, k // WARP_ATOM_K, WARP_ATOM_K // LDG_VEC_SIZE, LDG_VEC_SIZE
             SHUFFLED_B_ = GTensor(B, dtype=dtype_, shape=(
                 n // WARP_ATOM_N, k // WARP_ATOM_K, WARP_ATOM_K // LDG_VEC_SIZE, WARP_ATOM_N, LDG_VEC_SIZE))
-        if IS_SPLIT_K:
-            COUNTER_ = GTensor(COUNTER, dtype=T.i32, shape=(-1,))
+        COUNTER_ = GTensor(COUNTER, dtype=T.i32, shape=(-1,))
         
         tid = fx.Int32(fx.thread_idx.x)
         wid = tid // WARP_SIZE
@@ -380,7 +379,7 @@ def compile_hgemm_ar_kernel(
                     with ir.InsertionPoint(cond_boundary_if.then_block):
                         linear_byte_offset = C_.linear_offset((row_idx, n_offset + n_local_idx)) * DTYPE_BYTES
                         byte_offset_i64 = arith.index_cast(T.i64, linear_byte_offset)
-                        store_v4i32_nt(tmp_ptrs_arr[0] + byte_offset_i64, vec_i32x4)
+                        store_v4i32_nt(self_out_ptr + byte_offset_i64, vec_i32x4)
                         # C_.vec_store((row_idx, n_offset + n_local_idx), zero_vec, LDG_VEC_SIZE)
                         scf.YieldOp([])
                 scf.YieldOp([])
@@ -650,8 +649,7 @@ def compile_hgemm_ar_kernel(
                         else:
                             raise NotImplementedError(f"MFMA_PER_WARP_K={MFMA_PER_WARP_K} not supported")
         
-        if IS_SPLIT_K:
-            zero_c()
+        zero_c()
         
         if B_TO_LDS:
 
@@ -782,27 +780,23 @@ def compile_hgemm_ar_kernel(
                     cs_[lds_m_idx, lds_n_idx] = val.truncf(dtype_)
         
         # write back to global
-        if IS_SPLIT_K:
-            split_k_barrier()
-            out_raw = fly_values(tmp_ptrs_arr[0])[0]
-            out_base_ptr = fly.extract_aligned_pointer_as_index(_ptr_type, out_raw)
-            out_base_int = llvm.PtrToIntOp(_i64_type, out_base_ptr).result
-            for i in range_constexpr(LDG_REG_C_COUNT):
-                global_tid = BLOCK_THREADS * i + tid
-                m_local_idx = fx.Index(global_tid // LDG_C_X_THREADS)
-                n_local_idx = fx.Index(global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE)
-                m_global_idx = m_offset + m_local_idx
-                n_global_idx = n_offset + n_local_idx
-                cond_boundary = arith.cmpi(arith.CmpIPredicate.ult, m_global_idx, fx.Index(m))
-                cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
-                with ir.InsertionPoint(cond_boundary_if.then_block):
+
+        split_k_barrier()
+
+        _signal_start_sync(lane_i32=lane_i32, rank_i32=rank_i32, bid_i32=bid_i32, self_sg_i64=self_sg_i64, sgs_i64=sgs, ngpus=world_size)
+
+        for i in range_constexpr(LDG_REG_C_COUNT):
+            global_tid = BLOCK_THREADS * i + tid
+            m_local_idx = fx.Index(global_tid // LDG_C_X_THREADS)
+            n_local_idx = fx.Index(global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE)
+            m_global_idx = m_offset + m_local_idx
+            cond_boundary = arith.cmpi(arith.CmpIPredicate.ult, m_global_idx, fx.Index(m))
+            cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
+            with ir.InsertionPoint(cond_boundary_if.then_block):
+                for wi in range_constexpr(world_size):
+                    out_memref = select_by_index(arith.constant(wi, type=T.i32), out_ptrs_arr)
+                    linear_bytes_offset = C_.linear_offset((m_global_idx, n_offset + n_local_idx)) * DTYPE_BYTES
                     pk_val = cs_.vec_load((m_local_idx, n_local_idx), LDG_VEC_SIZE)
-                    linear_bytes_offset = C_.linear_offset((m_global_idx, n_global_idx)) * DTYPE_BYTES
-                    byte_offset_i64 = arith.index_cast(T.i64, linear_bytes_offset)
-                    addr_i64 = llvm.AddOp(out_base_int, byte_offset_i64, llvm.IntegerOverflowFlags(0)).result
-                    out_ptr = llvm.IntToPtrOp(_ptr_type, addr_i64).result
-                    out_ptr_v = out_ptr._value if hasattr(out_ptr, "_value") else out_ptr
-                    pk_val_v = pk_val._value if hasattr(pk_val, "_value") else pk_val
                     # split to vec2s
                     vec2_ty = T.vec(2, dtype_)
                     for vec_idx in range_constexpr(LDG_VEC_SIZE // 2):
@@ -810,7 +804,7 @@ def compile_hgemm_ar_kernel(
                         e1 = vector.extract(pk_val, static_position=[vec_idx * 2 + 1], dynamic_position=[])
                         pair = vector.from_elements(vec2_ty, [e0, e1])
                         pair_byte_offset = arith.index_cast(T.i64, linear_bytes_offset + fx.Index(vec_idx * 2 * DTYPE_BYTES))
-                        pair_addr_i64 = llvm.AddOp(out_base_int, pair_byte_offset, llvm.IntegerOverflowFlags(0)).result
+                        pair_addr_i64 = llvm.AddOp(out_memref, pair_byte_offset, llvm.IntegerOverflowFlags(0)).result
                         pair_ptr = llvm.IntToPtrOp(_ptr_type, pair_addr_i64).result
                         pair_ptr_v = pair_ptr._value if hasattr(pair_ptr, "_value") else pair_ptr
                         pair_v = pair._value if hasattr(pair, "_value") else pair
@@ -822,54 +816,7 @@ def compile_hgemm_ar_kernel(
                             syncscope="agent",
                             alignment=4,
                         )
-                    scf.YieldOp([])
-        else:
-            gpu.barrier()
-            for i in range_constexpr(LDG_REG_C_COUNT):
-                global_tid = BLOCK_THREADS * i + tid
-                m_local_idx = fx.Index(global_tid // LDG_C_X_THREADS)
-                n_local_idx = fx.Index(global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE)
-                m_global_idx = m_offset + m_local_idx
-                cond_boundary = arith.cmpi(arith.CmpIPredicate.ult, m_global_idx, fx.Index(m))
-                cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
-                with ir.InsertionPoint(cond_boundary_if.then_block):
-                    vec = cs_.vec_load((m_local_idx, n_local_idx), LDG_VEC_SIZE)
-                    vec_i32x4 = vector.bitcast(T.i32x4, vec)
-                    linear_byte_offset = C_.linear_offset((m_global_idx, n_offset + n_local_idx)) * DTYPE_BYTES
-                    byte_offset_i64 = arith.index_cast(T.i64, linear_byte_offset)
-                    store_v4i32_nt(tmp_ptrs_arr[0] + byte_offset_i64, vec_i32x4)
-                    # C_.vec_store((m_global_idx, n_offset + n_local_idx), vec, LDG_VEC_SIZE)
-                    scf.YieldOp([])
-        
-        _signal_start_sync(lane_i32=lane_i32, rank_i32=rank_i32, bid_i32=bid_i32, self_sg_i64=self_sg_i64, sgs_i64=sgs, ngpus=world_size)
-
-        for i in range_constexpr(LDG_REG_C_COUNT):
-            global_tid = BLOCK_THREADS * i + tid
-            m_local_idx = fx.Index(global_tid // LDG_C_X_THREADS)
-            n_local_idx = fx.Index(global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE)
-            m_global_idx = m_offset + m_local_idx
-        
-            cond = arith.cmpi(arith.CmpIPredicate.ult, m_global_idx, fx.Index(m))
-            cond_if = scf.IfOp(cond, results_=[], has_else=False)
-            with ir.InsertionPoint(cond_if.then_block):
-                linear_byte_offset = (m_global_idx * fx.Index(n) + n_offset + n_local_idx) * fx.Index(DTYPE_BYTES)
-                byte_offset_i64 = arith.index_cast(T.i64, linear_byte_offset)
-
-                peer_vecs = []
-                for wi in range_constexpr(world_size):
-                    raw = load_v4i32(tmp_ptrs_arr[wi] + byte_offset_i64)
-                    peer_vec = vector.bitcast(T.vec(LDG_VEC_SIZE, dtype_), raw)
-                    peer_f32 = arith.extf(T.vec(LDG_VEC_SIZE, T.f32), peer_vec)
-                    peer_vecs.append(peer_f32)
-
-                acc_f32 = arith.constant_vector(0.0, T.vec(LDG_VEC_SIZE, T.f32))
-                for wi in range_constexpr(world_size):
-                    acc_f32 = arith.addf(acc_f32, peer_vecs[wi], fastmath=fm_fast)
-                
-                final_vec = acc_f32.truncf(T.vec(LDG_VEC_SIZE, dtype_))
-                dst_addr = llvm.AddOp(self_out_ptr, byte_offset_i64, llvm.IntegerOverflowFlags(0)).result
-                vec_i32x4 = vector.bitcast(T.i32x4, final_vec)
-                store_v4i32_nt(dst_addr, vec_i32x4)
+                # C_.vec_store((m_global_idx, n_offset + n_local_idx), vec, LDG_VEC_SIZE)
                 scf.YieldOp([])
         
         _signal_end_sync(lane_i32=lane_i32, rank_i32=rank_i32, bid_i32=bid_i32, self_sg_i64=self_sg_i64, sgs_i64=sgs, ngpus=world_size)
@@ -1005,8 +952,7 @@ def hgemm_ar_(
     bn = n // kwargs['TILE_N']
     assert bm * bn <= min(80, SPLIT_K_COUNTER_MAX_LEN)
     exe(rank, self_sg, sg_ptrs, tmp_ptrs, out_ptrs, c, a, b, m, semaphore, signal_state, stream)
-    if kwargs['SPLIT_K'] > 1:
-        HGEMMAR_SPLIT_K_GLOBAL_SEMAPHORE_STATE[stream] = (signal_state + 1) % 3
+    HGEMMAR_SPLIT_K_GLOBAL_SEMAPHORE_STATE[stream] = (signal_state + 1) % 3
 
 
 class GEMMARBackend(FlyDSLAllreduce):
