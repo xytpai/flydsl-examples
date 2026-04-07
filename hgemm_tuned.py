@@ -186,6 +186,7 @@ if __name__ == '__main__':
         benchmark(args, hgemm_tuned, ref_func)
     elif args.tune_all:
         tune_all(args.dtype, args.out)
+    # rm -rf ~/.flydsl/ ; python3 hgemm_tuned.py --single --dtype bf16 --m 2048 --n 2048 --k 2048
     # rm -rf ~/.flydsl/ ; python3 hgemm_tuned.py --single --dtype bf16 --m 4096 --n 4096 --k 4096
     # rm -rf ~/.flydsl/ ; python3 hgemm_tuned.py --single --dtype bf16 --m 8192 --n 8192 --k 8192
     # rm -rf ~/.flydsl/ ; python3 hgemm_tuned.py --single --dtype bf16 --m 32 --n 384 --k 7168
