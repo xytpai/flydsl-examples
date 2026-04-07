@@ -597,9 +597,12 @@ def compile_hgemm_kernel(
                     rocdl.sched_dsrd(1) # lds_matrix_b current
                 for i in range_constexpr(LDG_REG_A_COUNT_):
                     rocdl.sched_vmem(1) # ldg_sts_a_async next
+                    rocdl.sched_mfma(2)
                 for i in range_constexpr(LDG_REG_B_COUNT_):
                     rocdl.sched_vmem(1) # ldg_sts_b_async next
-                for i in range_constexpr(WARP_K_STEPS * WARP_M_STEPS * WARP_N_STEPS * MFMA_PER_WARP_K):
+                    rocdl.sched_mfma(2)
+                REMAINING = max(MFMA_TOTAL - (LDG_REG_A_COUNT_ + LDG_REG_B_COUNT_) * 2, 0)
+                for i in range_constexpr(REMAINING):
                     rocdl.sched_mfma(1)
                 # ================ Reordered ================
                 rocdl.sched_barrier(0)
