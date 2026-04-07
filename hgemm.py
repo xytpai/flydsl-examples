@@ -818,17 +818,22 @@ def get_default_kwargs(m, n, k):
         'B_PRE_SHUFFLE': False,
         'B_TO_LDS': True,
     }
-    if m <= 32 and n == 7168 and k == 2048:
-        kwargs['TILE_M'] = 32
+    if m == 2048 and n == 2048 and k == 2048:
+        kwargs['TILE_M'] = 128
         kwargs['TILE_N'] = 64
-        kwargs['TILE_K'] = 128
+        kwargs['TILE_K'] = 64
         kwargs['SPLIT_K'] = 1
-    if m <= 32 and n == 384 and k == 7168:
+    elif m <= 32 and n == 384 and k == 7168:
         kwargs['TILE_M'] = 32
         kwargs['TILE_N'] = 64
         kwargs['TILE_K'] = 64
         kwargs['SPLIT_K'] = 16
-    if m <= 32 and n == 384 and k == 16384:
+    elif m <= 32 and n == 7168 and k == 2048:
+        kwargs['TILE_M'] = 32
+        kwargs['TILE_N'] = 64
+        kwargs['TILE_K'] = 128
+        kwargs['SPLIT_K'] = 1
+    elif m <= 32 and n == 384 and k == 16384:
         kwargs['TILE_M'] = 32
         kwargs['TILE_N'] = 64
         kwargs['TILE_K'] = 128
@@ -943,6 +948,7 @@ if __name__ == '__main__':
     args.dtype = dtype_convert[args.dtype]
     args = Args(**vars(args))
     benchmark(args, func, ref_func)
+    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=2048 --n=2048 --k=2048 --dtype=bf16
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=4096 --n=4096 --k=4096 --dtype=bf16
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8192 --n=8192 --k=8192 --dtype=bf16
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=32 --n=384 --k=7168 --dtype=bf16
