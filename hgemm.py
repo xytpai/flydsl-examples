@@ -544,6 +544,7 @@ def compile_hgemm_kernel(
         
         def block_mma_sync(a_frags, b_frags, c_frags):
             # wmma
+            c_frags_new = [cx for cx in c_frags]
             for kk in range_constexpr(WARP_K_STEPS):
                 for ii in range_constexpr(WARP_M_STEPS):
                     a_frag = a_frags[kk * WARP_M_STEPS + ii]
@@ -564,14 +565,15 @@ def compile_hgemm_kernel(
                             b_v1 = vector.bitcast(T.f16x4, vector.from_elements(T.vec(1, T.i64), [b1_i64]))
                             # wmma
                             c_idx = ii * WARP_N_STEPS + jj
-                            acc_in = c_frags[c_idx]
+                            acc_in = c_frags_new[c_idx]
                             acc_mid = WMMA_IMPL(a_v0, b_v0, acc_in)
-                            c_frags[c_idx] = WMMA_IMPL(a_v1, b_v1, acc_mid)
+                            c_frags_new[c_idx] = WMMA_IMPL(a_v1, b_v1, acc_mid)
                         elif MFMA_PER_WARP_K == 1:
                             c_idx = ii * WARP_N_STEPS + jj
-                            c_frags[c_idx] = WMMA_IMPL(a_frag, b_frag, c_frags[c_idx])
+                            c_frags_new[c_idx] = WMMA_IMPL(a_frag, b_frag, c_frags_new[c_idx])
                         else:
                             raise NotImplementedError(f"MFMA_PER_WARP_K={MFMA_PER_WARP_K} not supported")
+            return c_frags_new
         
         if IS_SPLIT_K:
             zero_c()
@@ -601,26 +603,38 @@ def compile_hgemm_kernel(
                     rocdl.sched_mfma(1)
                 # ================ Reordered ================
                 rocdl.sched_barrier(0)
+            UNROLL = 8
             init_state = [ks_begin, arith.constant(0, index=True)] + c_frags
-            for bki, state in range(1, BLOCK_K_LOOPS, init=init_state):
+            for bki, state in range(0, BLOCK_K_LOOPS - 1, UNROLL, init=init_state):
                 k_offset = state[0]
                 current_stage = fx.Index(state[1])
-                next_stage = 1 - current_stage
                 c_frags = state[2 : 2 + C_FRAGS_LEN]
-                a_frags = lds_matrix_a(current_stage)
-                b_frags = lds_matrix_b(current_stage)
-                ldg_sts_a_async(k_offset + BLOCK_K, next_stage)
-                ldg_sts_b_async(k_offset + BLOCK_K, next_stage)
-                block_mma_sync(a_frags, b_frags, c_frags)
-                hot_loop_scheduler()
-                gpu.barrier()
-                k_offset = k_offset + fx.Int32(BLOCK_K)
-                results = yield [k_offset, next_stage] + c_frags
+                for unroll_i in range_constexpr(UNROLL):
+                    cond = arith.cmpi(arith.CmpIPredicate.ult, fx.Index(bki + unroll_i), fx.Index(BLOCK_K_LOOPS - 1))
+                    cond_if = scf.IfOp(cond, results_=[T.vec(WMMA_C_FRAG_VALUES, T.f32)] * C_FRAGS_LEN + [T.index, T.i32], has_else=True)
+                    with ir.InsertionPoint(cond_if.then_block):
+                        next_stage = 1 - current_stage
+                        a_frags = lds_matrix_a(current_stage)
+                        b_frags = lds_matrix_b(current_stage)
+                        ldg_sts_a_async(k_offset + BLOCK_K, next_stage)
+                        ldg_sts_b_async(k_offset + BLOCK_K, next_stage)
+                        c_frags_new = block_mma_sync(a_frags, b_frags, c_frags)
+                        hot_loop_scheduler()
+                        gpu.barrier()
+                        k_offset_next = k_offset + fx.Int32(BLOCK_K)
+                        current_stage_next = 1 - current_stage
+                        scf.YieldOp(c_frags_new + [_to_raw(current_stage_next), k_offset_next])
+                    with ir.InsertionPoint(cond_if.else_block):
+                        scf.YieldOp(c_frags + [_to_raw(current_stage), k_offset])
+                    c_frags = [cond_if.results[i] for i in range(C_FRAGS_LEN)]
+                    current_stage = cond_if.results[C_FRAGS_LEN]
+                    k_offset = cond_if.results[C_FRAGS_LEN + 1]
+                results = yield [k_offset, current_stage] + c_frags
             current_stage = results[1]
             c_frags = results[2 : 2 + C_FRAGS_LEN]
             a_frags = lds_matrix_a(current_stage)
             b_frags = lds_matrix_b(current_stage)
-            block_mma_sync(a_frags, b_frags, c_frags)
+            c_frags = block_mma_sync(a_frags, b_frags, c_frags)
 
         else:
 
@@ -671,7 +685,7 @@ def compile_hgemm_kernel(
                 else:
                     a_regs_next = ldg_a(k_offset + BLOCK_K)
                 b_frags_next = ldg_matrix_b(k_offset + BLOCK_K)
-                block_mma_sync(a_frags, b_frags, c_frags)
+                c_frags = block_mma_sync(a_frags, b_frags, c_frags)
                 if not ASYNC_COPY:
                     sts_a(a_regs_next, next_stage)
                 hot_loop_scheduler()
@@ -683,7 +697,7 @@ def compile_hgemm_kernel(
             c_frags = results[2 : 2 + C_FRAGS_LEN]
             a_frags = results[2 + C_FRAGS_LEN : 2 + C_FRAGS_LEN + A_FRAGS_LEN]
             b_frags = results[2 + C_FRAGS_LEN + A_FRAGS_LEN : 2 + C_FRAGS_LEN + A_FRAGS_LEN + B_FRAGS_LEN]
-            block_mma_sync(a_frags, b_frags, c_frags)
+            c_frags = block_mma_sync(a_frags, b_frags, c_frags)
 
         # write to lds
         stmatrix_c_m_vec_idx = w_tid // WMMA_N * WMMA_C_FRAG_VALUES
@@ -806,14 +820,14 @@ def get_default_kwargs(m, n, k):
     }
     if m <= 32 and n == 7168 and k == 2048:
         kwargs['TILE_M'] = 32
-        kwargs['TILE_N'] = 128
-        kwargs['TILE_K'] = 64
-        kwargs['SPLIT_K'] = 4
-    if m <= 32 and n == 384 and k == 7168:
-        kwargs['TILE_M'] = 16
-        kwargs['TILE_N'] = 128
+        kwargs['TILE_N'] = 64
         kwargs['TILE_K'] = 128
-        kwargs['SPLIT_K'] = 8
+        kwargs['SPLIT_K'] = 1
+    if m <= 32 and n == 384 and k == 7168:
+        kwargs['TILE_M'] = 32
+        kwargs['TILE_N'] = 64
+        kwargs['TILE_K'] = 64
+        kwargs['SPLIT_K'] = 16
     if m <= 32 and n == 384 and k == 16384:
         kwargs['TILE_M'] = 32
         kwargs['TILE_N'] = 64
@@ -932,4 +946,5 @@ if __name__ == '__main__':
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=4096 --n=4096 --k=4096 --dtype=bf16
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8192 --n=8192 --k=8192 --dtype=bf16
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=32 --n=384 --k=7168 --dtype=bf16
+    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=32 --n=7168 --k=2048 --dtype=bf16
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=32 --n=384 --k=16384 --dtype=bf16
