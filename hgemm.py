@@ -589,25 +589,17 @@ def compile_hgemm_kernel(
                 LDS_TOTAL = WARP_K_STEPS * (WARP_M_STEPS + WARP_N_STEPS)
                 LD_TOTAL = LDG_TOTAL + LDS_TOTAL
                 # ================ Ordered ================
-                # for i in range_constexpr(LDG_REG_A_COUNT_AS or LDG_REG_A_COUNT):
-                #     rocdl.sched_vmem(1) # ldg_sts_a_async next
-                # for i in range_constexpr(LDG_REG_B_COUNT_AS or LDG_REG_B_COUNT):
-                #     rocdl.sched_vmem(1) # ldg_sts_b_async next
-                # for i in range_constexpr(WARP_K_STEPS * WARP_M_STEPS * WARP_N_STEPS * MFMA_PER_WARP_K):
-                #     rocdl.sched_mfma(1)
+                for i in range_constexpr(WARP_K_STEPS * WARP_M_STEPS):
+                    rocdl.sched_dsrd(1) # lds_matrix_a current
+                for i in range_constexpr(WARP_K_STEPS * WARP_N_STEPS):
+                    rocdl.sched_dsrd(1) # lds_matrix_b current
+                for i in range_constexpr(LDG_REG_A_COUNT_):
+                    rocdl.sched_vmem(1) # ldg_sts_a_async next
+                for i in range_constexpr(LDG_REG_B_COUNT_):
+                    rocdl.sched_vmem(1) # ldg_sts_b_async next
+                for i in range_constexpr(WARP_K_STEPS * WARP_M_STEPS * WARP_N_STEPS * MFMA_PER_WARP_K):
+                    rocdl.sched_mfma(1)
                 # ================ Reordered ================
-                mfma_ = OnlineScheduler(MFMA_TOTAL, MFMA_TOTAL)
-                ldg_ = OnlineScheduler(LDG_TOTAL, LDG_TOTAL)
-                lds_ = OnlineScheduler(LDS_TOTAL, LDS_TOTAL)
-                AVG_MFMA_COUNT = (MFMA_TOTAL + LD_TOTAL - 1)  // LD_TOTAL
-                for i in range_constexpr(LDG_TOTAL):
-                    rocdl.sched_vmem(ldg_.consume(1))
-                    rocdl.sched_mfma(mfma_.consume(AVG_MFMA_COUNT))
-                    rocdl.sched_dsrd(lds_.consume(1))
-                    rocdl.sched_mfma(mfma_.consume(AVG_MFMA_COUNT))
-                # for i in range_constexpr(LDS_TOTAL):
-                #     rocdl.sched_dsrd(lds_.consume(1))
-                #     rocdl.sched_mfma(mfma_.consume(1))
                 rocdl.sched_barrier(0)
             init_state = [ks_begin, arith.constant(0, index=True)] + c_frags
             for bki, state in range(1, BLOCK_K_LOOPS, init=init_state):
