@@ -353,7 +353,7 @@ def compile_hgemm_ar_kernel(
         c_frags = [acc_init] * C_FRAGS_LEN
 
         # communication vars
-        bid_linear = fx.block_idx.x * (n // BLOCK_N) + fx.block_idx.y
+        bid_linear = (fx.block_idx.x * (n // BLOCK_N) + fx.block_idx.y) * SPLIT_K + fx.block_idx.z
         rank_i32 = _unwrap_value(rank)
         self_sg_i64 = _unwrap_value(self_sg)
         sg_ptrs_i64 = _unwrap_value(sg_ptrs)
@@ -800,18 +800,10 @@ def compile_hgemm_ar_kernel(
 
         if IS_SPLIT_K:
             split_k_barrier()
-            cond_ks0 = arith.cmpi(arith.CmpIPredicate.eq, ks_idx, fx.Index(0))
         else:
             gpu.barrier()
 
-        
-        if IS_SPLIT_K:
-            cond_ks0_if = scf.IfOp(cond_ks0, results_=[], has_else=False)
-            with ir.InsertionPoint(cond_ks0_if.then_block):
-                _signal_start_sync(lane_i32=lane_i32, rank_i32=rank_i32, bid_i32=bid_i32, self_sg_i64=self_sg_i64, sgs_i64=sgs, ngpus=world_size)
-                scf.YieldOp([])
-        else:
-            _signal_start_sync(lane_i32=lane_i32, rank_i32=rank_i32, bid_i32=bid_i32, self_sg_i64=self_sg_i64, sgs_i64=sgs, ngpus=world_size)
+        _signal_start_sync(lane_i32=lane_i32, rank_i32=rank_i32, bid_i32=bid_i32, self_sg_i64=self_sg_i64, sgs_i64=sgs, ngpus=world_size)
 
         for i in range_constexpr(LDG_REG_C_COUNT):
             global_tid = BLOCK_THREADS * i + tid
@@ -847,13 +839,7 @@ def compile_hgemm_ar_kernel(
                 # C_.vec_store((m_global_idx, n_offset + n_local_idx), vec, LDG_VEC_SIZE)
                 scf.YieldOp([])
         
-        if IS_SPLIT_K:
-            cond_ks0_if = scf.IfOp(cond_ks0, results_=[], has_else=False)
-            with ir.InsertionPoint(cond_ks0_if.then_block):
-                _signal_end_sync(lane_i32=lane_i32, rank_i32=rank_i32, bid_i32=bid_i32, self_sg_i64=self_sg_i64, sgs_i64=sgs, ngpus=world_size)
-                scf.YieldOp([])
-        else:
-            _signal_end_sync(lane_i32=lane_i32, rank_i32=rank_i32, bid_i32=bid_i32, self_sg_i64=self_sg_i64, sgs_i64=sgs, ngpus=world_size)
+        # _signal_end_sync(lane_i32=lane_i32, rank_i32=rank_i32, bid_i32=bid_i32, self_sg_i64=self_sg_i64, sgs_i64=sgs, ngpus=world_size)
         
         return
     
@@ -921,7 +907,7 @@ def get_default_kwargs(m, n, k):
         kwargs['TILE_M'] = 32
         kwargs['TILE_N'] = 64
         kwargs['TILE_K'] = 64
-        kwargs['SPLIT_K'] = 16
+        kwargs['SPLIT_K'] = 8
     elif m <= 32 and n == 7168 and k == 2048:
         kwargs['TILE_M'] = 32
         kwargs['TILE_N'] = 64
@@ -987,7 +973,7 @@ def hgemm_ar_(
     semaphore = SPLIT_K_GLOBAL_SEMAPHORE[stream]
     bm = (m + kwargs['TILE_M'] - 1) // kwargs['TILE_M']
     bn = n // kwargs['TILE_N']
-    assert bm * bn <= min(80, SPLIT_K_COUNTER_MAX_LEN)
+    assert bm * bn * kwargs['SPLIT_K'] <= min(80, SPLIT_K_COUNTER_MAX_LEN)
     exe(rank, self_sg, sg_ptrs, tmp_ptrs, out_ptrs, c, a, b, m, semaphore, signal_state, stream)
     if kwargs['SPLIT_K'] > 1:
         SPLIT_K_GLOBAL_SEMAPHORE_STATE[stream] = (signal_state + 1) % 3
