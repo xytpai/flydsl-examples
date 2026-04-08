@@ -29,6 +29,7 @@ from utils.tensor_shim import get_dtype_in_kernel, GTensor, STensor, _to_raw
 fm_fast = arith.FastMathFlags.fast
 
 
+WARMUP_ITERS = 4
 SPLIT_K_COUNTER_MAX_LEN = 128
 
 
@@ -89,12 +90,30 @@ def create_outputs(args):
 
 def ref_worker(device_id, num_devices, parts, nsamples, inputs, outputs):
     group = init_world(device_id, num_devices, parts)
-    for i in range(nsamples):
+    for i in range(WARMUP_ITERS):
         input = inputs[device_id * nsamples + i]
         output = outputs[device_id * nsamples + i]
         F.linear(input[0], input[1], out=output)
         dist.all_reduce(output, group=group)
     torch.cuda.synchronize()
+    dist.barrier(group=group)
+    # with profile(
+    #     activities=[ProfilerActivity.CUDA],
+    #     profile_memory=False,
+    #     with_stack=True,
+    #     with_modules=True
+    # ) as prof:
+    if True:
+        start = time.perf_counter()
+        for i in range(WARMUP_ITERS, nsamples):
+            input = inputs[device_id * nsamples + i]
+            output = outputs[device_id * nsamples + i]
+            F.linear(input[0], input[1], out=output)
+            dist.all_reduce(output, group=group)
+        torch.cuda.synchronize()
+        print(f"ref_worker:{time.perf_counter() - start}", flush=True)
+    # table = prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1)
+    # print(table, flush=True)
     dist.barrier(group=group)
     dist.destroy_process_group()
 
@@ -195,6 +214,7 @@ def compile_hgemm_ar_kernel(
     BLOCK_N_WARPS: int = 4,
     B_PRE_SHUFFLE: bool = False,
     B_TO_LDS: bool = False,
+    USE_CROSS_DEVICE_ATOMIC: bool = False,
 ):
     IS_SPLIT_K = SPLIT_K > 1
     BLOCK_K = TILE_K
@@ -287,8 +307,11 @@ def compile_hgemm_ar_kernel(
         KERNEL_NAME += "_BP"
     if IS_SPLIT_K:
         KERNEL_NAME += f"_SPK{SPLIT_K}"
+        USE_CROSS_DEVICE_ATOMIC = True
     if B_TO_LDS:
         KERNEL_NAME += f"_BS"
+    if USE_CROSS_DEVICE_ATOMIC:
+        KERNEL_NAME += f"_CATOM"
     
     @flyc.kernel
     def hgemm_ar_kernel(
@@ -364,6 +387,7 @@ def compile_hgemm_ar_kernel(
         sgs = [load_device_ptr(sg_ptrs_i64, arith.constant(i, type=T.i32)) for i in range(8)]
         tmp_ptrs_arr = [load_device_ptr(tmp_ptrs_i64, arith.constant(i, type=T.i32)) for i in range(8)]
         out_ptrs_arr = [load_device_ptr(out_ptrs_i64, arith.constant(i, type=T.i32)) for i in range(8)]
+        self_tmp_ptr = select_by_index(arith.constant(0, type=T.i32), tmp_ptrs_arr)
         self_out_ptr = select_by_index(rank_i32, out_ptrs_arr)
 
         def zero_c():
@@ -383,7 +407,10 @@ def compile_hgemm_ar_kernel(
                     with ir.InsertionPoint(cond_boundary_if.then_block):
                         linear_byte_offset = C_.linear_offset((row_idx, n_offset + n_local_idx)) * DTYPE_BYTES
                         byte_offset_i64 = arith.index_cast(T.i64, linear_byte_offset)
-                        store_v4i32_nt(self_out_ptr + byte_offset_i64, vec_i32x4)
+                        if USE_CROSS_DEVICE_ATOMIC:
+                            store_v4i32_nt(self_out_ptr + byte_offset_i64, vec_i32x4)
+                        else:
+                            store_v4i32_nt(self_tmp_ptr + byte_offset_i64, vec_i32x4)
                         # C_.vec_store((row_idx, n_offset + n_local_idx), zero_vec, LDG_VEC_SIZE)
                         scf.YieldOp([])
                 scf.YieldOp([])
@@ -803,42 +830,85 @@ def compile_hgemm_ar_kernel(
         else:
             gpu.barrier()
 
-        _signal_start_sync(lane_i32=lane_i32, rank_i32=rank_i32, bid_i32=bid_i32, self_sg_i64=self_sg_i64, sgs_i64=sgs, ngpus=world_size)
+        if USE_CROSS_DEVICE_ATOMIC:
 
-        for i in range_constexpr(LDG_REG_C_COUNT):
-            global_tid = BLOCK_THREADS * i + tid
-            m_local_idx = fx.Index(global_tid // LDG_C_X_THREADS)
-            n_local_idx = fx.Index(global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE)
-            m_global_idx = m_offset + m_local_idx
-            cond_boundary = arith.cmpi(arith.CmpIPredicate.ult, m_global_idx, fx.Index(m))
-            cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
-            with ir.InsertionPoint(cond_boundary_if.then_block):
-                for wi in range_constexpr(world_size):
-                    out_memref = select_by_index(arith.constant(wi, type=T.i32), out_ptrs_arr)
-                    linear_bytes_offset = C_.linear_offset((m_global_idx, n_offset + n_local_idx)) * DTYPE_BYTES
-                    pk_val = cs_.vec_load((m_local_idx, n_local_idx), LDG_VEC_SIZE)
-                    # split to vec2s
-                    vec2_ty = T.vec(2, dtype_)
-                    for vec_idx in range_constexpr(LDG_VEC_SIZE // 2):
-                        e0 = vector.extract(pk_val, static_position=[vec_idx * 2], dynamic_position=[])
-                        e1 = vector.extract(pk_val, static_position=[vec_idx * 2 + 1], dynamic_position=[])
-                        pair = vector.from_elements(vec2_ty, [e0, e1])
-                        pair_byte_offset = arith.index_cast(T.i64, linear_bytes_offset + fx.Index(vec_idx * 2 * DTYPE_BYTES))
-                        pair_addr_i64 = llvm.AddOp(out_memref, pair_byte_offset, llvm.IntegerOverflowFlags(0)).result
-                        pair_ptr = llvm.IntToPtrOp(_ptr_type, pair_addr_i64).result
-                        pair_ptr_v = pair_ptr._value if hasattr(pair_ptr, "_value") else pair_ptr
-                        pair_v = pair._value if hasattr(pair, "_value") else pair
-                        llvm.AtomicRMWOp(
-                            llvm.AtomicBinOp.fadd,
-                            pair_ptr_v,
-                            pair_v,
-                            llvm.AtomicOrdering.monotonic,
-                            syncscope="agent",
-                            alignment=4,
-                        )
-                # C_.vec_store((m_global_idx, n_offset + n_local_idx), vec, LDG_VEC_SIZE)
-                scf.YieldOp([])
+            # NOTE: Low performance for atomic impl
+            
+            _signal_start_sync(lane_i32=lane_i32, rank_i32=rank_i32, bid_i32=bid_i32, self_sg_i64=self_sg_i64, sgs_i64=sgs, ngpus=world_size)
+
+            for i in range_constexpr(LDG_REG_C_COUNT):
+                global_tid = BLOCK_THREADS * i + tid
+                m_local_idx = fx.Index(global_tid // LDG_C_X_THREADS)
+                n_local_idx = fx.Index(global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE)
+                m_global_idx = m_offset + m_local_idx
+                cond_boundary = arith.cmpi(arith.CmpIPredicate.ult, m_global_idx, fx.Index(m))
+                cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
+                with ir.InsertionPoint(cond_boundary_if.then_block):
+                    for wi in range_constexpr(world_size):
+                        out_memref = select_by_index(arith.constant(wi, type=T.i32), out_ptrs_arr)
+                        linear_bytes_offset = C_.linear_offset((m_global_idx, n_offset + n_local_idx)) * DTYPE_BYTES
+                        pk_val = cs_.vec_load((m_local_idx, n_local_idx), LDG_VEC_SIZE)
+                        # split to vec2s
+                        vec2_ty = T.vec(2, dtype_)
+                        for vec_idx in range_constexpr(LDG_VEC_SIZE // 2):
+                            e0 = vector.extract(pk_val, static_position=[vec_idx * 2], dynamic_position=[])
+                            e1 = vector.extract(pk_val, static_position=[vec_idx * 2 + 1], dynamic_position=[])
+                            pair = vector.from_elements(vec2_ty, [e0, e1])
+                            pair_byte_offset = arith.index_cast(T.i64, linear_bytes_offset + fx.Index(vec_idx * 2 * DTYPE_BYTES))
+                            pair_addr_i64 = llvm.AddOp(out_memref, pair_byte_offset, llvm.IntegerOverflowFlags(0)).result
+                            pair_ptr = llvm.IntToPtrOp(_ptr_type, pair_addr_i64).result
+                            pair_ptr_v = pair_ptr._value if hasattr(pair_ptr, "_value") else pair_ptr
+                            pair_v = pair._value if hasattr(pair, "_value") else pair
+                            llvm.AtomicRMWOp(
+                                llvm.AtomicBinOp.fadd,
+                                pair_ptr_v,
+                                pair_v,
+                                llvm.AtomicOrdering.monotonic,
+                                syncscope="agent",
+                                alignment=4,
+                            )
+                    # C_.vec_store((m_global_idx, n_offset + n_local_idx), vec, LDG_VEC_SIZE)
+                    scf.YieldOp([])
         
+        else:
+
+            # FIXME: For some reasons splitk doesn't work
+
+            for i in range_constexpr(LDG_REG_C_COUNT):
+                global_tid = BLOCK_THREADS * i + tid
+                m_local_idx = fx.Index(global_tid // LDG_C_X_THREADS)
+                n_local_idx = fx.Index(global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE)
+                m_global_idx = m_offset + m_local_idx
+                n_global_idx = n_offset + n_local_idx
+                cond_boundary = arith.cmpi(arith.CmpIPredicate.ult, m_global_idx, fx.Index(m))
+                cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
+                with ir.InsertionPoint(cond_boundary_if.then_block):
+                    vec = cs_.vec_load((m_local_idx, n_local_idx), LDG_VEC_SIZE)
+                    vec_i32x4 = vector.bitcast(T.i32x4, vec)
+                    linear_bytes_offset = C_.linear_offset((m_global_idx, n_global_idx)) * DTYPE_BYTES
+                    store_v4i32_nt(self_tmp_ptr + arith.index_cast(T.i64, linear_bytes_offset), vec_i32x4)
+                    scf.YieldOp([])
+            
+            _signal_start_sync(lane_i32=lane_i32, rank_i32=rank_i32, bid_i32=bid_i32, self_sg_i64=self_sg_i64, sgs_i64=sgs, ngpus=world_size)
+            
+            for i in range_constexpr(LDG_REG_C_COUNT):
+                global_tid = BLOCK_THREADS * i + tid
+                m_local_idx = fx.Index(global_tid // LDG_C_X_THREADS)
+                n_local_idx = fx.Index(global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE)
+                m_global_idx = m_offset + m_local_idx
+                cond_boundary = arith.cmpi(arith.CmpIPredicate.ult, m_global_idx, fx.Index(m))
+                cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
+                with ir.InsertionPoint(cond_boundary_if.then_block):
+                    linear_bytes_offset = C_.linear_offset((m_global_idx, n_offset + n_local_idx)) * DTYPE_BYTES
+                    final_vec = arith.constant_vector(0.0, T.vec(LDG_VEC_SIZE, T.f32))
+                    for wi in range_constexpr(world_size):
+                        vec_v4i32 = load_v4i32(select_by_index(arith.constant(wi, type=T.i32), tmp_ptrs_arr) + arith.index_cast(T.i64, linear_bytes_offset))
+                        vec = vector.bitcast(T.vec(LDG_VEC_SIZE, dtype_), vec_v4i32)
+                        final_vec = final_vec + vec.extf(T.vec(LDG_VEC_SIZE, T.f32))
+                    final_vec_i32x4 = vector.bitcast(T.i32x4, final_vec.truncf(T.vec(LDG_VEC_SIZE, dtype_)))
+                    store_v4i32(self_out_ptr + arith.index_cast(T.i64, linear_bytes_offset), final_vec_i32x4)
+                    scf.YieldOp([])
+
         # _signal_end_sync(lane_i32=lane_i32, rank_i32=rank_i32, bid_i32=bid_i32, self_sg_i64=self_sg_i64, sgs_i64=sgs, ngpus=world_size)
         
         return
@@ -897,6 +967,7 @@ def get_default_kwargs(m, n, k):
         'BLOCK_N_WARPS': 2,
         'B_PRE_SHUFFLE': False,
         'B_TO_LDS': True,
+        'USE_CROSS_DEVICE_ATOMIC': False,
     }
     if m == 2048 and n == 2048 and k == 2048:
         kwargs['TILE_M'] = 128
@@ -980,7 +1051,7 @@ def hgemm_ar_(
 
 
 class GEMMARBackend(FlyDSLAllreduce):
-    def hgemm_ar_fusion(self, a, b, c):
+    def hgemm_ar_fusion(self, a, b, c, kwargs: dict={}, bench_mode: bool=False):
         world_size = self.world_size
         m, k = a.shape
         n = b.shape[0]
@@ -997,21 +1068,22 @@ class GEMMARBackend(FlyDSLAllreduce):
                 self._graph_out = c.view(-1)
                 self._graph_bytes_n = bytes_mn
                 out_ptrs = Int64(int(self._gpu_graph_out_ptrs_array.data_ptr()))
-                hgemm_ar_(world_size, rank, self_sg, sg_ptrs, tmp_ptrs, out_ptrs, c, a, b, shuffle_b=True)
+                hgemm_ar_(world_size, rank, self_sg, sg_ptrs, tmp_ptrs, out_ptrs, c, a, b, hgemm_kwargs=kwargs)
                 return c
             else:
                 out_ptrs = Int64(int(self._gpu_output_buffer_ptrs_array.data_ptr()))
-                hgemm_ar_(world_size, rank, self_sg, sg_ptrs, tmp_ptrs, out_ptrs, c, a, b, shuffle_b=True)
+                hgemm_ar_(world_size, rank, self_sg, sg_ptrs, tmp_ptrs, out_ptrs, c, a, b, hgemm_kwargs=kwargs)
                 c.view(-1).view(torch.uint8)[:bytes_mn].copy_(self.output_buffer[:bytes_mn])
                 return c
         else:
             out_ptrs = Int64(int(self._gpu_output_buffer_ptrs_array.data_ptr()))
-            hgemm_ar_(world_size, rank, self_sg, sg_ptrs, tmp_ptrs, out_ptrs, c, a, b, shuffle_b=True)
-            c.view(-1).view(torch.uint8)[:bytes_mn].copy_(self.output_buffer[:bytes_mn])
+            hgemm_ar_(world_size, rank, self_sg, sg_ptrs, tmp_ptrs, out_ptrs, c, a, b, hgemm_kwargs=kwargs)
+            if not bench_mode:
+                c.view(-1).view(torch.uint8)[:bytes_mn].copy_(self.output_buffer[:bytes_mn])
             return c
 
 
-def worker(device_id, num_devices, parts, nsamples, inputs, outputs):
+def worker(device_id, num_devices, parts, nsamples, inputs, outputs, bench_mode):
     group = init_world(device_id, num_devices, parts)
     rank = dist.get_rank(group=group)
     world_size = dist.get_world_size(group=group)
@@ -1020,20 +1092,36 @@ def worker(device_id, num_devices, parts, nsamples, inputs, outputs):
     handles = [torch.empty((1,), device="cpu", dtype=torch.uint8) for _ in range(world_size)]
     offsets = [0 for _ in range(world_size)]
     fa = init_custom_ar(meta, rank_data, handles, offsets, rank=rank, backend=GEMMARBackend)
-    for i in range(nsamples):
+    for i in range(WARMUP_ITERS):
         input = inputs[device_id * nsamples + i]
         output = outputs[device_id * nsamples + i]
         fa.hgemm_ar_fusion(input[0], input[1], output)
-        # fa.custom_all_reduce(output.view(-1), open_fp8_quant=False, out=output.view(-1))
     torch.cuda.synchronize()
+    dist.barrier(group=group)
+    # with profile(
+    #     activities=[ProfilerActivity.CUDA],
+    #     profile_memory=False,
+    #     with_stack=True,
+    #     with_modules=True
+    # ) as prof:
+    if True:
+        start = time.perf_counter()
+        for i in range(WARMUP_ITERS, nsamples):
+            input = inputs[device_id * nsamples + i]
+            output = outputs[device_id * nsamples + i]
+            fa.hgemm_ar_fusion(input[0], input[1], output, bench_mode=bench_mode)
+        torch.cuda.synchronize()
+        print(f"worker:{time.perf_counter() - start}", flush=True)
+    # table = prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1)
+    # print(table, flush=True)
     dist.barrier(group=group)
     dist.destroy_process_group()
 
 
-def func(args, inputs, outputs):
+def func(args, inputs, outputs, bench_mode=False):
     mp.spawn(
         worker,
-        args=(args.num_devices, args.parts, args.nsamples, inputs, outputs),
+        args=(args.num_devices, args.parts, args.nsamples, inputs, outputs, bench_mode),
         nprocs=args.num_devices,
         join=True
     )
@@ -1043,8 +1131,8 @@ def benchmark(args, func, ref_func):
     inputs = create_inputs(args)
     outputs = create_outputs(args)
     ref_outputs = create_outputs(args)
-    func(args, inputs, outputs)
     ref_func(args, inputs, ref_outputs)
+    func(args, inputs, outputs)
     max_diff_global = float(-1)
     for output, ref_output in zip(outputs, ref_outputs):
         is_allclose = torch.allclose(output, ref_output)
@@ -1055,17 +1143,11 @@ def benchmark(args, func, ref_func):
 
     # get ref_func perf
     print("===================== [REF] =====================")
-    with profile(activities=[ProfilerActivity.CUDA], ) as prof:
-        ref_func(args, inputs, ref_outputs)
-    table = prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1)
-    print(table)
+    ref_func(args, inputs, ref_outputs)
 
     # get func perf
     print("===================== [FLYDSL] =====================")
-    with profile(activities=[ProfilerActivity.CUDA], ) as prof:
-        func(args, inputs, outputs)
-    table = prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1)
-    print(table)
+    func(args, inputs, outputs, bench_mode=True)
 
 
 if __name__ == '__main__':
@@ -1083,9 +1165,9 @@ if __name__ == '__main__':
     args.dtype = dtype_convert[args.dtype]
     args = Args(**vars(args))
     benchmark(args, func, ref_func)
-    # rm -rf ~/.flydsl/ ; python3 hgemm_ar.py --nsamples=10 --num_devices=4 --m=32 --n=384 --k=7168 --dtype=bf16
-    # rm -rf ~/.flydsl/ ; python3 hgemm_ar.py --nsamples=10 --num_devices=4 --m=512 --n=512 --k=512 --dtype=bf16
-    # rm -rf ~/.flydsl/ ; python3 hgemm_ar.py --nsamples=10 --num_devices=4 --m=128 --n=128 --k=512 --dtype=bf16
+    # rm -rf ~/.flydsl/ ; python3 hgemm_ar.py --nsamples=24 --num_devices=4 --m=32 --n=384 --k=7168 --dtype=bf16
+    # rm -rf ~/.flydsl/ ; python3 hgemm_ar.py --nsamples=24 --num_devices=4 --m=512 --n=512 --k=512 --dtype=bf16
+    # rm -rf ~/.flydsl/ ; python3 hgemm_ar.py --nsamples=24 --num_devices=4 --m=128 --n=128 --k=512 --dtype=bf16
 
 
 CMD_FOR_KILL = '''
