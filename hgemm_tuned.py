@@ -54,18 +54,21 @@ def create_outputs(args):
 
 
 def tuning_benchmark(args, hgemm_kwargs={}, warmup=5, niters=50):
+    # correctness test
     a, b = create_inputs(args)
     c = create_outputs(args)[0]
     c_ref = create_outputs(args)[0]
     F.linear(a, b, out=c_ref)
-    for i in range(warmup):
-        hgemm_splitk_(c, a, b, hgemm_kwargs=hgemm_kwargs, shuffle_b=True)
+    hgemm_splitk_(c, a, b, hgemm_kwargs=hgemm_kwargs, shuffle_b=False)
     tol = float(args.k) / 2048 * 6e-1
     is_allclose = torch.allclose(c, c_ref, atol=tol, rtol=tol)
     assert is_allclose == True
+    # performance bench
+    inputs = [create_inputs(args) for i in range(niters)]
+    outputs = [create_outputs(args) for i in range(niters)]
     with profile(activities=[ProfilerActivity.CUDA], ) as prof:
         for i in range(niters):
-            hgemm_splitk_(c, a, b, hgemm_kwargs=hgemm_kwargs, shuffle_b=True)
+            hgemm_splitk_(outputs[i][0], inputs[i][0], inputs[i][1], hgemm_kwargs=hgemm_kwargs, shuffle_b=False)
     table = prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1)
     hgemm_durations = []
     for event in prof.events():
@@ -189,8 +192,10 @@ if __name__ == '__main__':
     # rm -rf ~/.flydsl/ ; python3 hgemm_tuned.py --single --dtype bf16 --m 2048 --n 2048 --k 2048
     # rm -rf ~/.flydsl/ ; python3 hgemm_tuned.py --single --dtype bf16 --m 4096 --n 4096 --k 4096
     # rm -rf ~/.flydsl/ ; python3 hgemm_tuned.py --single --dtype bf16 --m 8192 --n 8192 --k 8192
+
     # rm -rf ~/.flydsl/ ; python3 hgemm_tuned.py --single --dtype bf16 --m 32 --n 384 --k 7168
     # rm -rf ~/.flydsl/ ; python3 hgemm_tuned.py --single --dtype bf16 --m 32 --n 7168 --k 2048
     # rm -rf ~/.flydsl/ ; python3 hgemm_tuned.py --single --dtype bf16 --m 32 --n 384 --k 16384
+    
     # rm -rf ~/.flydsl/ ; python3 hgemm_tuned.py --eval --dtype bf16 --m 32 --n 384 --k 7168
     # rm -rf ~/.flydsl/ ; python3 hgemm_tuned.py --tune_all

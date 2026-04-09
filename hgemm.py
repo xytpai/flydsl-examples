@@ -850,7 +850,7 @@ def get_default_kwargs(m, n, k):
         kwargs['TILE_M'] = 32
         kwargs['TILE_N'] = 64
         kwargs['TILE_K'] = 128
-        kwargs['SPLIT_K'] = 1
+        kwargs['SPLIT_K'] = 2
     elif m <= 32 and n == 384 and k == 16384:
         kwargs['TILE_M'] = 32
         kwargs['TILE_N'] = 64
@@ -935,26 +935,29 @@ def benchmark(args, func, ref_func, warmup=20, niters=100):
             maxdiff_out = (output - ref_output).abs().max()
             print(f"maxdiff_out:{maxdiff_out}")
             # assert is_allclose == True
+    
+    inputs = [create_inputs(args) for i in range(niters)]
+    ref_inputs = [create_inputs(args) for i in range(niters)]
+    outputs = [create_outputs(args) for i in range(niters)]
+    ref_outputs = [create_outputs(args) for i in range(niters)]
 
     # get ref_func perf
     print("===================== [REF] =====================")
     for i in range(warmup):
-        ref_func(*ref_inouts)
+        ref_func(*(ref_inputs[i] + ref_outputs[i]))
     with profile(activities=[ProfilerActivity.CUDA], ) as prof:
-        for i in range(niters):
-            ref_func(*ref_inouts)
-    table = prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1)
-    print(table)
+        for i in range(warmup, niters):
+            ref_func(*(ref_inputs[i] + ref_outputs[i]))
+    print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))
 
     # get func perf
     print("===================== [FLYDSL] =====================")
     for i in range(warmup):
-        func(*inouts)
+        func(*(inputs[i] + outputs[i]))
     with profile(activities=[ProfilerActivity.CUDA], ) as prof:
-        for i in range(niters):
-            func(*inouts)
-    table = prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1)
-    print(table)
+        for i in range(warmup, niters):
+            func(*(inputs[i] + outputs[i]))
+    print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))
 
 
 if __name__ == '__main__':
