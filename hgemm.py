@@ -799,11 +799,13 @@ def compile_hgemm_kernel(
         with CompilationContext.compile_hints(_compile_hints):
             return launch_hgemm_kernel(*args, **kwargs)
 
-    @functools.lru_cache(maxsize=1024)
-    def _compile(*args, **kwargs):
+    _compile_cache = {}
+    def _compile(C, A, B, m, COUNTER, signal_state, stream):
         with CompilationContext.compile_hints(_compile_hints):
-            return flyc.compile(launch_hgemm_kernel, *args, **kwargs)
-    
+            if _compile_cache.get(m, None) is None:
+                _compile_cache[m] = flyc.compile(launch_hgemm_kernel, C, A, B, m, COUNTER, signal_state, stream)
+            return _compile_cache[m]
+
     _launch.compile = _compile
     
     return _launch

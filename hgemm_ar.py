@@ -938,10 +938,15 @@ def compile_hgemm_ar_kernel(
         with CompilationContext.compile_hints(_compile_hints):
             return launch_hgemm_ar_kernel(*args, **kwargs)
 
-    @functools.lru_cache(maxsize=1024)
-    def _compile(*args, **kwargs):
+    _compile_cache = {}
+    def _compile(rank, self_sg, sg_ptrs, tmp_ptrs, out_ptrs, C, A, B, m, COUNTER, signal_state, stream):
         with CompilationContext.compile_hints(_compile_hints):
-            return flyc.compile(launch_hgemm_ar_kernel, *args, **kwargs)
+            lookup_key = (rank, m)
+            if _compile_cache.get(lookup_key, None) is None:
+                _compile_cache[lookup_key] = flyc.compile(launch_hgemm_ar_kernel, 
+                    rank, self_sg, sg_ptrs, tmp_ptrs, out_ptrs, 
+                    C, A, B, m, COUNTER, signal_state, stream)
+            return _compile_cache[lookup_key]
     
     _launch.compile = _compile
     
@@ -1052,7 +1057,8 @@ def hgemm_ar_(
     bm = (m + kwargs['TILE_M'] - 1) // kwargs['TILE_M']
     bn = n // kwargs['TILE_N']
     assert bm * bn * kwargs['SPLIT_K'] <= min(80, SPLIT_K_COUNTER_MAX_LEN)
-    exe(rank, self_sg, sg_ptrs, tmp_ptrs, out_ptrs, c, a, b, m, semaphore, signal_state, stream)
+    compiled_exe = exe.compile(rank, self_sg, sg_ptrs, tmp_ptrs, out_ptrs, c, a, b, m, semaphore, signal_state, stream)
+    compiled_exe(rank, self_sg, sg_ptrs, tmp_ptrs, out_ptrs, c, a, b, m, semaphore, signal_state, stream)
     if kwargs['SPLIT_K'] > 1:
         SPLIT_K_GLOBAL_SEMAPHORE_STATE[lookup_key] = (signal_state + 1) % 3
 
