@@ -932,7 +932,20 @@ def compile_hgemm_ar_kernel(
             rank, self_sg, sg_ptrs, tmp_ptrs, out_ptrs, 
             C, A, B, m, COUNTER, signal_state).launch(grid=(bm, bn, SPLIT_K), block=(BLOCK_THREADS, 1, 1), stream=stream)
     
-    return launch_hgemm_ar_kernel
+    _compile_hints = {}
+
+    def _launch(*args, **kwargs):
+        with CompilationContext.compile_hints(_compile_hints):
+            return launch_hgemm_ar_kernel(*args, **kwargs)
+
+    @functools.lru_cache(maxsize=1024)
+    def _compile(*args, **kwargs):
+        with CompilationContext.compile_hints(_compile_hints):
+            return flyc.compile(launch_hgemm_ar_kernel, *args, **kwargs)
+    
+    _launch.compile = _compile
+    
+    return _launch
 
 
 def hgemm_shuffle_b(x, layout=(16, 16), k_steps=2):

@@ -788,7 +788,25 @@ def compile_hgemm_kernel(
         hgemm_kernel._func.__name__ = KERNEL_NAME
         hgemm_kernel(C, A, B, m, COUNTER, signal_state).launch(grid=(bm, bn, SPLIT_K), block=(BLOCK_THREADS, 1, 1), stream=stream)
     
-    return launch_hgemm_kernel
+    _compile_hints = {
+        "llvm_options": {
+            "enable-post-misched": False,
+            "lsr-drop-solution": True,
+        },
+    }
+
+    def _launch(*args, **kwargs):
+        with CompilationContext.compile_hints(_compile_hints):
+            return launch_hgemm_kernel(*args, **kwargs)
+
+    @functools.lru_cache(maxsize=1024)
+    def _compile(*args, **kwargs):
+        with CompilationContext.compile_hints(_compile_hints):
+            return flyc.compile(launch_hgemm_kernel, *args, **kwargs)
+    
+    _launch.compile = _compile
+    
+    return _launch
 
 
 def hgemm_shuffle_b(x, layout=(16, 16), k_steps=2):
@@ -889,7 +907,8 @@ def hgemm_splitk_(
         bm = (m + kwargs['TILE_M'] - 1) // kwargs['TILE_M']
         bn = n // kwargs['TILE_N']
         assert bm * bn <= SPLIT_K_COUNTER_MAX_LEN
-    exe(c, a, b, m, semaphore, signal_state, stream)
+    exe_compiled = exe.compile(c, a, b, m, semaphore, signal_state, stream)
+    exe_compiled(c, a, b, m, semaphore, signal_state, stream)
     if kwargs['SPLIT_K'] > 1:
         SPLIT_K_GLOBAL_SEMAPHORE_STATE[lookup_key] = (signal_state + 1) % 3
 
