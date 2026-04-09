@@ -32,6 +32,15 @@ def get_dtype_in_kernel(dtype: str):
         return T.bf16
 
 
+def get_dtype_vec_size(dtype: str):
+    if dtype == 'f32':
+        return 4
+    elif dtype == 'f16':
+        return 8
+    elif dtype == 'bf16':
+        return 8
+
+
 class TensorView:
     def __init__(self, dtype, shape, stride, base_offset, load_impl, store_impl):
         self.dtype = dtype
