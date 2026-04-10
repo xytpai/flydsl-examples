@@ -4,7 +4,7 @@ This script supports two workflows:
 1. Benchmark a single GEMM shape against the `tgemm.mm` reference path.
 2. Tune a CSV of GEMM shapes and emit only the shapes where FlyDSL wins.
 
-The CSV tuning path currently assumes `bias=False`, `scaleAB=False`, and the
+The CSV tuning path currently assumes `scaleAB=False` and the
 non-preshuffled-B wrapper path (`bpreshuffle=False`).
 """
 
@@ -16,7 +16,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.profiler import ProfilerActivity, profile
 from tqdm import tqdm
 
@@ -33,6 +32,7 @@ class Args:
     m: int
     n: int
     k: int
+    bias: bool = False
 
 
 CLI_DTYPE_MAP = {
@@ -173,18 +173,22 @@ def create_inputs(args):
     a.uniform_(-1, 1)
     b = torch.empty((args.n, args.k), dtype=args.dtype, device="cuda")
     b.uniform_(-1, 1)
-    return a, b
+    bias = None
+    if args.bias:
+        bias = torch.empty((args.n,), dtype=args.dtype, device="cuda")
+        bias.uniform_(-1, 1)
+    return a, b, bias
 
 
 def create_outputs(args):
     return torch.empty((args.m, args.n), dtype=args.dtype, device="cuda")
 
 
-def ref_func(a, b):
-    return tgemm.mm(a, b, None, otype=a.dtype)
+def ref_func(a, b, bias=None):
+    return tgemm.mm(a, b, bias, otype=a.dtype)
 
 
-def func(a, b, c, config=None):
+def func(a, b, c=None, *, bias=None, config=None):
     config = _normalize_config(
         config,
         default_b_preshuffle=getattr(b, "is_shuffled", False),
@@ -193,6 +197,7 @@ def func(a, b, c, config=None):
         a,
         b,
         c,
+        bias=bias,
         tile_m=config["tile_m"],
         tile_n=config["tile_n"],
         tile_k=config["tile_k"],
@@ -212,10 +217,10 @@ def _get_tol(k: int) -> float:
     return float(k) / 2048 * 6e-1
 
 
-def _measure_flydsl_duration(a, b, c, c_ref, config=None, warmup=5, niters=50):
+def _measure_flydsl_duration(a, b, bias, c, c_ref, config=None, warmup=5, niters=50):
     config = {} if config is None else dict(config)
     for _ in range(warmup):
-        func(a, b, c, config=config)
+        func(a, b, c, bias=bias, config=config)
     torch.cuda.synchronize()
     tol = _get_tol(a.shape[-1])
     if not torch.allclose(c, c_ref, atol=tol, rtol=tol):
@@ -225,7 +230,7 @@ def _measure_flydsl_duration(a, b, c, c_ref, config=None, warmup=5, niters=50):
         )
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
         for _ in range(niters):
-            func(a, b, c, config=config)
+            func(a, b, c, bias=bias, config=config)
     hgemm_durations = [
         event.device_time
         for event in prof.events()
@@ -237,10 +242,10 @@ def _measure_flydsl_duration(a, b, c, c_ref, config=None, warmup=5, niters=50):
 
 
 def _create_tuning_context(args):
-    a, b = create_inputs(args)
+    a, b, bias = create_inputs(args)
     c = create_outputs(args)
-    c_ref = F.linear(a, b)
-    return a, b, c, c_ref
+    c_ref = ref_func(a, b, bias)
+    return a, b, bias, c, c_ref
 
 
 def _config_to_kernel_name(config, dtype: str = "bf16", out_dtype: str = "bf16"):
@@ -309,23 +314,27 @@ def _calculate_perf(m, n, k, us, dtype, out_dtype):
     return tflops, bw
 
 
-def _measure_ref_duration(a, b, warmup=20, niters=100):
+def _measure_ref_duration(a, b, bias=None, warmup=20, niters=100):
     _, ref_us = run_perftest(
         ref_func,
         a,
         b,
+        bias,
         num_warmup=warmup,
         num_iters=niters,
     )
     return float(ref_us)
 
 
-def _measure_end_to_end_flydsl_duration(a, b, config=None, warmup=20, niters=100):
+def _measure_end_to_end_flydsl_duration(
+    a, b, bias=None, config=None, warmup=20, niters=100
+):
     _, flydsl_us = run_perftest(
         func,
         a,
         b,
         None,
+        bias=bias,
         config=config,
         num_warmup=warmup,
         num_iters=niters,
@@ -334,9 +343,9 @@ def _measure_end_to_end_flydsl_duration(a, b, config=None, warmup=20, niters=100
 
 
 def _benchmark_shape(args, config, warmup=20, niters=100):
-    a, b = create_inputs(args)
-    ref_output = F.linear(a, b)
-    output = func(a, b, None, config=config)
+    a, b, bias = create_inputs(args)
+    ref_output = ref_func(a, b, bias)
+    output = func(a, b, None, bias=bias, config=config)
     tol = _get_tol(args.k)
     err_ratio = checkAllclose(
         ref_output,
@@ -349,11 +358,12 @@ def _benchmark_shape(args, config, warmup=20, niters=100):
     flydsl_us = _measure_end_to_end_flydsl_duration(
         a,
         b,
+        bias=bias,
         config=config,
         warmup=warmup,
         niters=niters,
     )
-    ref_us = _measure_ref_duration(a, b, warmup=warmup, niters=niters)
+    ref_us = _measure_ref_duration(a, b, bias, warmup=warmup, niters=niters)
     return flydsl_us, ref_us, float(err_ratio)
 
 
@@ -366,7 +376,7 @@ def _make_output_row(args, config, flydsl_us, err_ratio):
         "M": args.m,
         "N": args.n,
         "K": args.k,
-        "bias": False,
+        "bias": args.bias,
         "dtype": _dtype_to_csv_string(args.dtype),
         "outdtype": _dtype_to_csv_string(args.dtype),
         "scaleAB": False,
@@ -420,9 +430,10 @@ def tune_shapes_from_csv(
                 m=int(row["M"]),
                 n=int(row["N"]),
                 k=int(row["K"]),
+                bias=_parse_bool(row.get("bias", False)),
             )
             shape_pbar.set_postfix_str(f"M={args.m},N={args.n},K={args.k}")
-            if _parse_bool(row.get("bias", False)) or _parse_bool(row.get("scaleAB", False)):
+            if _parse_bool(row.get("scaleAB", False)):
                 continue
             try:
                 best_config, _ = get_best_config(
@@ -454,7 +465,7 @@ def tune_shapes_from_csv(
 def get_best_config(args, warmup=5, niters=50, leave=True):
     best_config = None
     best_time = float("inf")
-    a, b, c, c_ref = _create_tuning_context(args)
+    a, b, bias, c, c_ref = _create_tuning_context(args)
     total_configs = len(CANDIDATE_CONFIGS)
     pbar = tqdm(total=total_configs, desc=f"{args}", leave=leave)
     try:
@@ -463,6 +474,7 @@ def get_best_config(args, warmup=5, niters=50, leave=True):
                 duration = _measure_flydsl_duration(
                     a,
                     b,
+                    bias,
                     c,
                     c_ref,
                     config=config,
@@ -484,9 +496,9 @@ def get_best_config(args, warmup=5, niters=50, leave=True):
 
 
 def benchmark(args, func, ref_func, config=None, warmup=20, niters=100):
-    a, b = create_inputs(args)
-    output = func(a, b, None, config=config)
-    ref_output = F.linear(a, b)
+    a, b, bias = create_inputs(args)
+    output = func(a, b, None, bias=bias, config=config)
+    ref_output = ref_func(a, b, bias)
     maxdiff_out = (output - ref_output).abs().max().item()
     tol = _get_tol(args.k)
     print(f"config: {config or {}}")
@@ -499,6 +511,7 @@ def benchmark(args, func, ref_func, config=None, warmup=20, niters=100):
         a,
         b,
         None,
+        bias=bias,
         config=config,
         num_warmup=warmup,
         num_iters=niters,
@@ -510,6 +523,7 @@ def benchmark(args, func, ref_func, config=None, warmup=20, niters=100):
         ref_func,
         a,
         b,
+        bias,
         num_warmup=warmup,
         num_iters=niters,
     )
@@ -543,6 +557,11 @@ if __name__ == "__main__":
         default="bf16",
         choices=sorted(CLI_DTYPE_MAP),
         help="Input/output dtype for single-shape mode.",
+    )
+    parser.add_argument(
+        "--bias",
+        action="store_true",
+        help="Enable bias input for single-shape mode.",
     )
     parser.add_argument(
         "--search-best",
@@ -612,6 +631,7 @@ if __name__ == "__main__":
             m=args.m,
             n=args.n,
             k=args.k,
+            bias=args.bias,
         )
 
         best_config = None

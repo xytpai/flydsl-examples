@@ -33,6 +33,7 @@ class Args:
     m: int
     n: int
     k: int
+    bias: bool = False
 
 
 def create_inputs(args):
@@ -40,7 +41,11 @@ def create_inputs(args):
     a.uniform_(-1, 1)
     b = torch.empty((args.n, args.k), dtype=args.dtype, device='cuda')
     b.uniform_(-1, 1)
-    return (a, b)
+    bias = None
+    if args.bias:
+        bias = torch.empty((args.n,), dtype=args.dtype, device='cuda')
+        bias.uniform_(-1, 1)
+    return (a, b, bias)
 
 
 def create_outputs(args):
@@ -48,8 +53,8 @@ def create_outputs(args):
     return (c,)
 
 
-def ref_func(a, b, c):
-    F.linear(a, b, out=c)
+def ref_func(a, b, bias, c):
+    F.linear(a, b, bias=bias, out=c)
 
 
 def swizzle_xor16(row, col_in_bytes, k_blocks16):
@@ -138,6 +143,7 @@ def compile_hgemm_kernel(
     BLOCK_N_WARPS: int = 4,
     B_PRE_SHUFFLE: bool = False,
     B_TO_LDS: bool = False,
+    HAS_BIAS: bool = False,
 ):
     IS_SPLIT_K = SPLIT_K > 1
     BLOCK_K = TILE_K
@@ -232,12 +238,15 @@ def compile_hgemm_kernel(
         KERNEL_NAME += f"_SPK{SPLIT_K}"
     if B_TO_LDS:
         KERNEL_NAME += f"_BS"
+    if HAS_BIAS:
+        KERNEL_NAME += "_BIAS"
     
     @flyc.kernel
     def hgemm_kernel(
         C: fx.Tensor,
         A: fx.Tensor,
         B: fx.Tensor,
+        BIAS: fx.Tensor,
         m: fx.Int32,
         COUNTER: fx.Tensor,
         signal_state: fx.Int32,
@@ -251,6 +260,8 @@ def compile_hgemm_kernel(
         A_ = GTensor(A, dtype=dtype_, shape=(-1, k))
         B_ = GTensor(B, dtype=dtype_, shape=(n, k))
         C_ = GTensor(C, dtype=dtype_, shape=(-1, n))
+        if HAS_BIAS:
+            BIAS_ = GTensor(BIAS, dtype=dtype_, shape=(n,))
         base_ptr = allocator.get_base()
         smem_a_ptr = SmemPtr(base_ptr, smem_a_offset, dtype_, shape=(STAGES * BLOCK_M * BLOCK_K,))
         as_ = STensor(smem_a_ptr, dtype_, shape=(STAGES, BLOCK_M, BLOCK_K))
@@ -301,10 +312,13 @@ def compile_hgemm_kernel(
                     m_local_idx = global_tid // LDG_C_X_THREADS
                     n_local_idx = global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE
                     row_idx = m_offset + fx.Index(m_local_idx)
+                    init_vec = zero_vec
+                    if HAS_BIAS:
+                        init_vec = BIAS_.vec_load((n_offset + n_local_idx,), LDG_VEC_SIZE)
                     cond_boundary = arith.cmpi(arith.CmpIPredicate.ult, row_idx, fx.Index(m))
                     cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
                     with ir.InsertionPoint(cond_boundary_if.then_block):
-                        C_.vec_store((row_idx, n_offset + n_local_idx), zero_vec, LDG_VEC_SIZE)
+                        C_.vec_store((row_idx, n_offset + n_local_idx), init_vec, LDG_VEC_SIZE)
                         scf.YieldOp([])
                 scf.YieldOp([])
             rocdl.sched_barrier(0)
@@ -764,6 +778,9 @@ def compile_hgemm_kernel(
                 cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
                 with ir.InsertionPoint(cond_boundary_if.then_block):
                     vec = cs_.vec_load((m_local_idx, n_local_idx), LDG_VEC_SIZE)
+                    if HAS_BIAS:
+                        bias_vec = BIAS_.vec_load((n_offset + n_local_idx,), LDG_VEC_SIZE)
+                        vec = vec + bias_vec
                     C_.vec_store((m_global_idx, n_offset + n_local_idx), vec, LDG_VEC_SIZE)
                     scf.YieldOp([])
         return
@@ -773,6 +790,7 @@ def compile_hgemm_kernel(
         C: fx.Tensor,
         A: fx.Tensor,
         B: fx.Tensor,
+        BIAS: fx.Tensor,
         m: fx.Int32,
         COUNTER: fx.Tensor,
         signal_state: fx.Int32,
@@ -786,7 +804,7 @@ def compile_hgemm_kernel(
         bm = (m + BLOCK_M - 1) // BLOCK_M
         bn = n // BLOCK_N
         hgemm_kernel._func.__name__ = KERNEL_NAME
-        hgemm_kernel(C, A, B, m, COUNTER, signal_state).launch(grid=(bm, bn, SPLIT_K), block=(BLOCK_THREADS, 1, 1), stream=stream)
+        hgemm_kernel(C, A, B, BIAS, m, COUNTER, signal_state).launch(grid=(bm, bn, SPLIT_K), block=(BLOCK_THREADS, 1, 1), stream=stream)
     
     _compile_hints = {
         "llvm_options": {
@@ -795,15 +813,29 @@ def compile_hgemm_kernel(
         },
     }
 
-    def _launch(*args, **kwargs):
+    def _resolve_bias_arg(BIAS, ref_tensor: torch.Tensor):
+        if BIAS is not None:
+            return BIAS
+        if HAS_BIAS:
+            raise ValueError("Kernel compiled with bias support requires a bias tensor")
+        # Keep the launch signature stable without allocating a dummy zero tensor.
+        # `BIAS` is never dereferenced when `HAS_BIAS` is False, so any live tensor
+        # on the right device can be used as a placeholder.
+        return ref_tensor
+
+    def _launch(C, A, B, BIAS, m, COUNTER, signal_state, stream=None):
+        BIAS = _resolve_bias_arg(BIAS, B)
         with CompilationContext.compile_hints(_compile_hints):
-            return launch_hgemm_kernel(*args, **kwargs)
+            return launch_hgemm_kernel(C, A, B, BIAS, m, COUNTER, signal_state, stream=stream)
 
     _compile_cache = {}
-    def _compile(C, A, B, m, COUNTER, signal_state, stream):
+    def _compile(C, A, B, BIAS, m, COUNTER, signal_state, stream):
+        BIAS = _resolve_bias_arg(BIAS, B)
         with CompilationContext.compile_hints(_compile_hints):
             if _compile_cache.get(m, None) is None:
-                _compile_cache[m] = flyc.compile(launch_hgemm_kernel, C, A, B, m, COUNTER, signal_state, stream)
+                _compile_cache[m] = flyc.compile(
+                    launch_hgemm_kernel, C, A, B, BIAS, m, COUNTER, signal_state, stream
+                )
             return _compile_cache[m]
 
     _launch.compile = _compile
@@ -873,6 +905,7 @@ def hgemm_splitk_(
     c: torch.Tensor,
     a: torch.Tensor,
     b: torch.Tensor,
+    bias: torch.Tensor = None,
     shuffle_b: bool = False,
     hgemm_kwargs: dict = {},
     stream: torch.cuda.Stream = torch.cuda.current_stream(),
@@ -892,14 +925,20 @@ def hgemm_splitk_(
     m = a.shape[0]
     n = b.shape[0]
     assert b.shape[1] == k
+    if bias is not None:
+        assert bias.shape == (n,)
+        assert bias.dtype == a.dtype
+        assert bias.device == device
+        if not bias.is_contiguous():
+            bias = bias.contiguous()
     c = c.view(-1, n)
     assert c.shape[0] == m
     kwargs = get_default_kwargs(m, n, k)
     kwargs.update(hgemm_kwargs)
     if a.dtype == torch.half:
-        exe = compile_hgemm_kernel('f16', n, k, **kwargs)
+        exe = compile_hgemm_kernel('f16', n, k, HAS_BIAS=bias is not None, **kwargs)
     elif a.dtype == torch.bfloat16:
-        exe = compile_hgemm_kernel('bf16', n, k, **kwargs)
+        exe = compile_hgemm_kernel('bf16', n, k, HAS_BIAS=bias is not None, **kwargs)
     else:
         raise NotImplementedError()
     if kwargs['B_PRE_SHUFFLE'] and shuffle_b:
@@ -909,14 +948,17 @@ def hgemm_splitk_(
         bm = (m + kwargs['TILE_M'] - 1) // kwargs['TILE_M']
         bn = n // kwargs['TILE_N']
         assert bm * bn <= SPLIT_K_COUNTER_MAX_LEN
-    exe_compiled = exe.compile(c, a, b, m, semaphore, signal_state, stream)
-    exe_compiled(c, a, b, m, semaphore, signal_state, stream)
+    # `compile_hgemm_kernel()` always takes a BIAS argument; when bias is disabled,
+    # reuse `b` as a live placeholder instead of allocating a zero tensor.
+    bias_arg = bias if bias is not None else b
+    exe_compiled = exe.compile(c, a, b, bias_arg, m, semaphore, signal_state, stream)
+    exe_compiled(c, a, b, bias_arg, m, semaphore, signal_state, stream)
     if kwargs['SPLIT_K'] > 1:
         SPLIT_K_GLOBAL_SEMAPHORE_STATE[lookup_key] = (signal_state + 1) % 3
 
 
-def func(a, b, c):
-    hgemm_splitk_(c, a, b, shuffle_b=True)
+def func(a, b, bias, c):
+    hgemm_splitk_(c, a, b, bias=bias, shuffle_b=True)
 
 
 def benchmark(args, func, ref_func, warmup=20, niters=100):
@@ -963,6 +1005,7 @@ if __name__ == '__main__':
     parser.add_argument("--n", type=int, required=True)
     parser.add_argument("--k", type=int, required=True)
     parser.add_argument("--dtype", type=str, required=True)
+    parser.add_argument("--bias", action="store_true")
     args = parser.parse_args()
     print(f"run: {__file__}, args: {args}")
     dtype_convert = {'f16': torch.half, 'bf16': torch.bfloat16}
