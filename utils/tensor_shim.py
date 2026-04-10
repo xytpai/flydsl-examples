@@ -1,5 +1,4 @@
-# flydsl: pre_v0.1
-
+import torch
 import numpy as np
 from itertools import product
 from abc import ABC, abstractmethod
@@ -21,6 +20,15 @@ def _to_raw(v):
     if hasattr(v, "ir_value"):
         return _to_raw(v.ir_value())
     return ir.Value._CAPICreate(v._CAPIPtr)
+
+
+def get_dtype_str(dtype):
+    if dtype == torch.float:
+        return 'f32'
+    elif dtype == torch.half:
+        return 'f16'
+    elif dtype == torch.bfloat16:
+        return 'bf16'
 
 
 def get_dtype_in_kernel(dtype: str):
