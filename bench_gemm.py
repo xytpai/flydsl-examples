@@ -14,16 +14,14 @@ import itertools
 from dataclasses import dataclass
 from pathlib import Path
 
-import numpy as np
 import torch
-from torch.profiler import ProfilerActivity, profile
 from tqdm import tqdm
 
 from aiter.ops.flydsl.gemm_kernels import flydsl_kernel_name
 from aiter.test_common import checkAllclose, run_perftest
 from aiter.tuned_gemm import tgemm
 from flydsl.runtime.device import get_rocm_arch
-from gemm_kernal import flydsl_hgemm
+from gemm_kernal import _validate_hgemm_tiling, flydsl_hgemm
 
 
 @dataclass
@@ -49,15 +47,16 @@ DEFAULT_BLOCK_N_WARPS = 4
 DEFAULT_B_PRESHUFFLE = False
 GPU_ARCH = get_rocm_arch()
 KERNEL_ASYNC_COPY = GPU_ARCH != "gfx942"
+SMALL_M_VALUES = {1, 2, 4, 8}
 
-CONFIG_SELECTIONS = {
+DEFAULT_CONFIG_SELECTIONS = {
     "tile_k": [64, 128],
     "tile_m": [16, 32, 48, 64, 96, 128],
     "tile_n": [64, 128, 256],
     "split_k": [1, 2, 4, 8, 16],
 }
 
-TUNING_CONFIG_VARIANTS = (
+DEFAULT_TUNING_CONFIG_VARIANTS = (
     {
         "block_m_warps": DEFAULT_BLOCK_M_WARPS,
         "block_n_warps": DEFAULT_BLOCK_N_WARPS,
@@ -69,6 +68,10 @@ TUNING_CONFIG_VARIANTS = (
         "b_to_lds": True,
     },
 )
+
+SMALL_M_TILE_K_OPTIONS = [32, 64, 96, 128]
+SMALL_M_TILE_N_OPTIONS = [16, 32, 64, 96, 128, 160, 192, 256]
+SMALL_M_SPLIT_K_OPTIONS = [1, 2, 3, 4, 5, 6, 8, 9, 10, 12, 15, 16]
 
 
 def _kernel_uses_async_copy() -> bool:
@@ -105,6 +108,89 @@ def _normalize_config(config=None, *, default_b_preshuffle=DEFAULT_B_PRESHUFFLE)
     }
     return normalized
 
+
+def _kernel_dtype(dtype: torch.dtype) -> str:
+    if dtype == torch.bfloat16:
+        return "bf16"
+    if dtype == torch.float16:
+        return "f16"
+    raise ValueError(f"unsupported dtype: {dtype!r}")
+
+
+def _small_m_tile_m_options(m: int) -> list[int]:
+    return [16] if m <= 4 else [16, 32]
+
+
+def _small_m_tuning_variants(m: int):
+    variants = [
+        {"block_m_warps": 1, "block_n_warps": 1, "b_to_lds": False},
+        {"block_m_warps": 1, "block_n_warps": 2, "b_to_lds": False},
+        {"block_m_warps": 1, "block_n_warps": 4, "b_to_lds": False},
+        {"block_m_warps": 1, "block_n_warps": 2, "b_to_lds": True},
+        {"block_m_warps": 1, "block_n_warps": 4, "b_to_lds": True},
+    ]
+    if m >= 8:
+        variants.extend(
+            [
+                {"block_m_warps": 2, "block_n_warps": 1, "b_to_lds": False},
+                {"block_m_warps": 2, "block_n_warps": 2, "b_to_lds": False},
+                {"block_m_warps": 2, "block_n_warps": 2, "b_to_lds": True},
+            ]
+        )
+    return tuple(variants)
+
+
+def _iter_candidate_spaces(args: Args | None = None):
+    yield DEFAULT_CONFIG_SELECTIONS, DEFAULT_TUNING_CONFIG_VARIANTS
+
+    if args is None:
+        yield (
+            {
+                "tile_k": SMALL_M_TILE_K_OPTIONS,
+                "tile_m": _small_m_tile_m_options(8),
+                "tile_n": SMALL_M_TILE_N_OPTIONS,
+                "split_k": SMALL_M_SPLIT_K_OPTIONS,
+            },
+            _small_m_tuning_variants(8),
+        )
+        return
+
+    if args.m not in SMALL_M_VALUES:
+        return
+
+    yield (
+        {
+            "tile_k": [tk for tk in SMALL_M_TILE_K_OPTIONS if args.k % tk == 0],
+            "tile_m": _small_m_tile_m_options(args.m),
+            "tile_n": [tn for tn in SMALL_M_TILE_N_OPTIONS if args.n % tn == 0],
+            "split_k": [sk for sk in SMALL_M_SPLIT_K_OPTIONS if args.k % sk == 0],
+        },
+        _small_m_tuning_variants(args.m),
+    )
+
+
+def _is_valid_config_for_shape(args: Args, config) -> bool:
+    config = _normalize_config(config)
+    try:
+        _validate_hgemm_tiling(
+            args.m,
+            args.n,
+            args.k,
+            dtype=_kernel_dtype(args.dtype),
+            tile_m=config["tile_m"],
+            tile_n=config["tile_n"],
+            tile_k=config["tile_k"],
+            pack_n=1,
+            split_k=config["split_k"],
+            stages=config["stages"],
+            block_m_warps=config["block_m_warps"],
+            block_n_warps=config["block_n_warps"],
+            b_to_lds=config["b_to_lds"],
+        )
+    except Exception:
+        return False
+    return True
+
 CSV_COLUMNS = [
     "cu_num",
     "M",
@@ -126,20 +212,25 @@ CSV_COLUMNS = [
 ]
 
 
-def _candidate_configs():
-    keys = list(CONFIG_SELECTIONS.keys())
-    values = [CONFIG_SELECTIONS[key] for key in keys]
+def _candidate_configs(args: Args | None = None):
     candidate_configs = []
     seen_configs = set()
-    for combo in itertools.product(*values):
-        base_config = dict(zip(keys, combo))
-        for variant in TUNING_CONFIG_VARIANTS:
-            config = _normalize_config({**base_config, **variant})
-            config_key = tuple(sorted(config.items()))
-            if config_key in seen_configs:
-                continue
-            seen_configs.add(config_key)
-            candidate_configs.append(config)
+    for selections, variants in _iter_candidate_spaces(args):
+        keys = list(selections.keys())
+        values = [selections[key] for key in keys]
+        if any(len(value) == 0 for value in values):
+            continue
+        for combo in itertools.product(*values):
+            base_config = dict(zip(keys, combo))
+            for variant in variants:
+                config = _normalize_config({**base_config, **variant, "b_preshuffle": False})
+                if args is not None and not _is_valid_config_for_shape(args, config):
+                    continue
+                config_key = tuple(sorted(config.items()))
+                if config_key in seen_configs:
+                    continue
+                seen_configs.add(config_key)
+                candidate_configs.append(config)
     return candidate_configs
 
 
@@ -180,10 +271,6 @@ def create_inputs(args):
     return a, b, bias
 
 
-def create_outputs(args):
-    return torch.empty((args.m, args.n), dtype=args.dtype, device="cuda")
-
-
 def ref_func(a, b, bias=None):
     return tgemm.mm(a, b, bias, otype=a.dtype)
 
@@ -217,35 +304,10 @@ def _get_tol(k: int) -> float:
     return float(k) / 2048 * 6e-1
 
 
-def _measure_flydsl_duration(a, b, bias, c, c_ref, config=None, warmup=5, niters=50):
-    config = {} if config is None else dict(config)
-    for _ in range(warmup):
-        func(a, b, c, bias=bias, config=config)
-    torch.cuda.synchronize()
-    tol = _get_tol(a.shape[-1])
-    if not torch.allclose(c, c_ref, atol=tol, rtol=tol):
-        maxdiff = (c - c_ref).abs().max().item()
-        raise AssertionError(
-            f"config {config} failed correctness check: maxdiff={maxdiff}, tol={tol}"
-        )
-    with profile(activities=[ProfilerActivity.CUDA]) as prof:
-        for _ in range(niters):
-            func(a, b, c, bias=bias, config=config)
-    hgemm_durations = [
-        event.device_time
-        for event in prof.events()
-        if event.name.startswith("hgemm_")
-    ]
-    if not hgemm_durations:
-        raise RuntimeError(f"no hgemm profiler events captured for config {config}")
-    return float(np.median(hgemm_durations))
-
-
 def _create_tuning_context(args):
     a, b, bias = create_inputs(args)
-    c = create_outputs(args)
-    c_ref = ref_func(a, b, bias)
-    return a, b, bias, c, c_ref
+    ref_output = ref_func(a, b, bias)
+    return a, b, bias, ref_output
 
 
 def _config_to_kernel_name(config, dtype: str = "bf16", out_dtype: str = "bf16"):
@@ -273,7 +335,10 @@ KERNEL_SOLIDX_MAP = {
 
 
 def _config_to_solidx(config):
-    return KERNEL_SOLIDX_MAP[_config_to_kernel_name(config)]
+    kernel_name = _config_to_kernel_name(config)
+    if kernel_name not in KERNEL_SOLIDX_MAP:
+        KERNEL_SOLIDX_MAP[kernel_name] = len(KERNEL_SOLIDX_MAP)
+    return KERNEL_SOLIDX_MAP[kernel_name]
 
 
 def _dtype_to_csv_string(dtype: torch.dtype) -> str:
@@ -340,6 +405,26 @@ def _measure_end_to_end_flydsl_duration(
         num_iters=niters,
     )
     return float(flydsl_us)
+
+
+def _measure_validated_flydsl_duration(
+    a, b, bias, ref_output, config=None, warmup=5, niters=50
+):
+    output = func(a, b, None, bias=bias, config=config)
+    tol = _get_tol(a.shape[-1])
+    if not torch.allclose(output, ref_output, atol=tol, rtol=tol):
+        maxdiff = (output - ref_output).abs().max().item()
+        raise AssertionError(
+            f"config {config} failed correctness check: maxdiff={maxdiff}, tol={tol}"
+        )
+    return _measure_end_to_end_flydsl_duration(
+        a,
+        b,
+        bias=bias,
+        config=config,
+        warmup=warmup,
+        niters=niters,
+    )
 
 
 def _benchmark_shape(args, config, warmup=20, niters=100):
@@ -465,18 +550,18 @@ def tune_shapes_from_csv(
 def get_best_config(args, warmup=5, niters=50, leave=True):
     best_config = None
     best_time = float("inf")
-    a, b, bias, c, c_ref = _create_tuning_context(args)
-    total_configs = len(CANDIDATE_CONFIGS)
+    a, b, bias, ref_output = _create_tuning_context(args)
+    candidate_configs = _candidate_configs(args)
+    total_configs = len(candidate_configs)
     pbar = tqdm(total=total_configs, desc=f"{args}", leave=leave)
     try:
-        for config in CANDIDATE_CONFIGS:
+        for config in candidate_configs:
             try:
-                duration = _measure_flydsl_duration(
+                duration = _measure_validated_flydsl_duration(
                     a,
                     b,
                     bias,
-                    c,
-                    c_ref,
+                    ref_output,
                     config=config,
                     warmup=warmup,
                     niters=niters,
