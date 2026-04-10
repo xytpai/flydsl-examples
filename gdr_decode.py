@@ -16,7 +16,7 @@ import flydsl
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr.typing import T
-from flydsl._mlir.dialects import gpu as mlir_gpu, vector as mlir_vector
+from flydsl._mlir.dialects import gpu as mlir_gpu, vector as mlir_vector, math as mlir_math
 from flydsl.expr import range_constexpr, arith, vector, gpu, rocdl
 from flydsl._mlir import ir
 from flydsl.runtime.device import get_rocm_arch
@@ -40,17 +40,6 @@ class Args:
     head_v_dim: int
     use_qk_l2norm: bool = False
 
-    def __hash__(self):
-        return hash((
-            self.dtype,
-            self.b,
-            self.sq,
-            self.num_k_heads,
-            self.num_v_heads,
-            self.head_k_dim,
-            self.head_v_dim,
-            self.use_qk_l2norm))
-
 
 def create_inputs(args):
     query = torch.randn((args.b, args.sq, args.num_k_heads, args.head_k_dim), dtype=args.dtype, device='cuda')
@@ -72,7 +61,7 @@ def create_outputs(args):
     return (out,)
 
 
-def ref_func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out):
+def ref_func_(args, query, key, value, a, b, dt_bias, A_log, indices, state, out):
     beta = b.sigmoid()
     g = -A_log.float().exp() * F.softplus(a.float() + dt_bias, beta=1.0, threshold=20.0)
     if args.num_v_heads // args.num_k_heads > 1:
@@ -198,10 +187,10 @@ def create_shuffle_gdr_decode_kernel(
         dtype_ = get_dtype_in_kernel(dtype)
         i32_0 = arith.constant(0, type=T.i32)
         f32_0 = arith.constant(0.0, type=T.f32)
+        f32_1 = arith.constant(1.0, type=T.f32)
         width_i32 = arith.constant(WARP_SIZE, type=T.i32)
         acc_vec_t = T.vec(VALUES_PER_THREAD_K, T.f32)
         vec_t = T.vec(VALUES_PER_THREAD_K, dtype_)
-        prefetch_acc_vec_t = T.vec(PREFETCH_VEC_SIZE, T.f32)
 
         tidx = fx.thread_idx.x
         bidx = fx.block_idx.x
@@ -236,10 +225,15 @@ def create_shuffle_gdr_decode_kernel(
         smem_sr_ptr = SmemPtr(base_ptr, smem_sr_offset, T.f32, shape=(2 * NUM_WARPS,))
         sr_tensor = STensor(smem_sr_ptr, dtype=T.f32, shape=(-1,))
 
-        def fast_exp(x):
-            log2e = 1.4426950408889634
-            out = rocdl.exp2(T.f32, x * log2e)
-            return out
+        def fast_exp(x, use_exp2=False):
+            if use_exp2:
+                log2e = 1.4426950408889634
+                out = rocdl.exp2(T.f32, x * log2e)
+                return out
+            return mlir_math.exp(x, fastmath=fm_fast)
+        
+        def fast_log1p(x):
+            return mlir_math.log1p(x, fastmath=fm_fast)
 
         cond_valid = arith.cmpi(arith.CmpIPredicate.sge, pool_idx, fx.Int32(0))
         cond_valid_if = scf.IfOp(cond_valid, results_=[], has_else=False)
@@ -265,17 +259,15 @@ def create_shuffle_gdr_decode_kernel(
                 cond_sp = arith.cmpf(arith.CmpFPredicate.OLE, beta_x, fx.Float32(softplus_threshold))
                 cond_sp_if = scf.IfOp(cond_sp, results_=[T.f32], has_else=True)
                 with ir.InsertionPoint(cond_sp_if.then_block):
-                    beta_x_exp = fast_exp(beta_x)
-                    beta_x_exp_log1p = rocdl.log(T.f32, 1.0 + beta_x_exp)
-                    softplus_x_ = (1.0 / softplus_beta) * beta_x_exp_log1p
+                    softplus_x_ = (1.0 / softplus_beta) * fast_log1p(fast_exp(beta_x))
                     scf.YieldOp([softplus_x_])
                 with ir.InsertionPoint(cond_sp_if.else_block):
                     softplus_x_ = x
                     scf.YieldOp([softplus_x_])
                 softplus_x = cond_sp_if.results[0]
 
-                r_g_value = 0.0 - fast_exp(r_A_log) * softplus_x
-                r_beta = 1.0 / (1.0 + fast_exp(0.0 - r_b))
+                r_g_value = f32_0 - fast_exp(r_A_log) * softplus_x
+                r_beta = f32_1 / (f32_1 + fast_exp(f32_0 - r_b))
                 r_g = fast_exp(r_g_value)
                 r_g_vec = vector.BroadcastOp(acc_vec_t, r_g).vector
 
@@ -311,9 +303,8 @@ def create_shuffle_gdr_decode_kernel(
                     #         sq_vecs[ki] = sq_vecs[ki] * scale_vec * inv_norm_q_vec
                     #         sk_vecs[ki] = sk_vecs[ki] * inv_norm_k_vec
                     # else:
-                # if True:
-                #     for ki in range_constexpr(WARP_TILE_K_ITERS):
-                #         sq_vecs[ki] = sq_vecs[ki] * scale_vec
+                    #     for ki in range_constexpr(WARP_TILE_K_ITERS):
+                    #         sq_vecs[ki] = sq_vecs[ki] * scale_vec
                     
                 dot_kq_vec = vector.from_elements(acc_vec_t, [f32_0 for i in range_constexpr(VALUES_PER_THREAD_K)])
                 for ki in range_constexpr(WARP_TILE_K_ITERS):

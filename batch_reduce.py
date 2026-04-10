@@ -70,8 +70,8 @@ def compile_batch_reduce_kernel(dtype: str, batch_size: int, reduce_size: int):
         dtype_ = get_dtype_in_kernel(dtype)
         acc_vec_t = T.vec(VEC_SIZE, T.f32)
 
-        bidx = fx.block_idx.x
-        tidx = fx.thread_idx.x
+        bidx = fx.Index(fx.block_idx.x)
+        tidx = fx.Index(fx.thread_idx.x)
         wid = fx.Index(tidx // WARP_SIZE)
 
         X_ = GTensor(X, dtype=dtype_, shape=(batch_size, reduce_size))
@@ -95,7 +95,7 @@ def compile_batch_reduce_kernel(dtype: str, batch_size: int, reduce_size: int):
         smem_[wid] = results
         gpu.barrier()
 
-        if arith.cmpi(arith.CmpIPredicate.eq, tidx, fx.Int32(0)):
+        if arith.cmpi(arith.CmpIPredicate.eq, tidx, fx.Index(0)):
             sum_x = c_zero_f
             for i in range_constexpr(NUM_WARPS):
                 sum_x = sum_x + smem_[i]
