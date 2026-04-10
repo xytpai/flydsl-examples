@@ -38,7 +38,7 @@ class Args:
     num_v_heads: int
     head_k_dim: int
     head_v_dim: int
-    use_qk_l2norm: bool = False
+    use_qk_l2norm: bool = True
 
 
 def create_inputs(args):
@@ -266,8 +266,8 @@ def create_shuffle_gdr_decode_kernel(
                     scf.YieldOp([softplus_x_])
                 softplus_x = cond_sp_if.results[0]
 
-                r_g_value = f32_0 - fast_exp(r_A_log) * softplus_x
-                r_beta = f32_1 / (f32_1 + fast_exp(f32_0 - r_b))
+                r_g_value = - fast_exp(r_A_log) * softplus_x
+                r_beta = f32_1 / (f32_1 + fast_exp(-r_b))
                 r_g = fast_exp(r_g_value)
                 r_g_vec = vector.BroadcastOp(acc_vec_t, r_g).vector
 
@@ -275,36 +275,37 @@ def create_shuffle_gdr_decode_kernel(
                 sk_vecs = [0] * WARP_TILE_K_ITERS
                 
                 scale_vec = vector.BroadcastOp(acc_vec_t, scale).vector
+                
                 for ki in range_constexpr(WARP_TILE_K_ITERS):
                     warp_k_vec_i = warp_k_vec_start + ki * WARP_TILE_K
                     q_vec = q_tensor.vec_load((b_i, sq_i, hk_i, warp_k_vec_i), VALUES_PER_THREAD_K)
                     k_vec = k_tensor.vec_load((b_i, sq_i, hk_i, warp_k_vec_i), VALUES_PER_THREAD_K)
-                    sq_vecs[ki] = q_vec.extf(acc_vec_t) * scale_vec
+                    sq_vecs[ki] = q_vec.extf(acc_vec_t)
                     sk_vecs[ki] = k_vec.extf(acc_vec_t)
 
-                    # if use_qk_l2norm:
-                    #     sum_q_partial_vec = vector.from_elements(acc_vec_t, [f32_0 for i in range_constexpr(VALUES_PER_THREAD_K)])
-                    #     sum_k_partial_vec = vector.from_elements(acc_vec_t, [f32_0 for i in range_constexpr(VALUES_PER_THREAD_K)])
-                    #     for ki in range_constexpr(WARP_TILE_K_ITERS):
-                    #         sum_q_partial_vec = sum_q_partial_vec + sq_vecs[ki] * sq_vecs[ki]
-                    #         sum_k_partial_vec = sum_k_partial_vec + sk_vecs[ki] * sk_vecs[ki]
-                    #         sum_q_partial = vector.ReductionOp(T.f32(), vector.CombiningKind.ADD, _asv(sum_q_partial_vec)).dest
-                    #         sum_k_partial = vector.ReductionOp(T.f32(), vector.CombiningKind.ADD, _asv(sum_k_partial_vec)).dest
-                    #     for offset in WARP_THREADS_K_SHFL_OFFSETS:
-                    #         sum_q_partial = sum_q_partial + gpu.ShuffleOp(_asv(sum_q_partial), _asv(arith.constant(offset, type=T.i32())), width_i32, mode="xor").shuffleResult
-                    #         sum_k_partial = sum_k_partial + gpu.ShuffleOp(_asv(sum_k_partial), _asv(arith.constant(offset, type=T.i32())), width_i32, mode="xor").shuffleResult
-                    #     local_sum_q = gpu.ShuffleOp(_asv(sum_q_partial), _asv(arith.index_cast(T.i32(), w_tid // WARP_THREADS_K * WARP_THREADS_K)), width_i32, mode="idx").shuffleResult
-                    #     local_sum_k = gpu.ShuffleOp(_asv(sum_k_partial), _asv(arith.index_cast(T.i32(), w_tid // WARP_THREADS_K * WARP_THREADS_K)), width_i32, mode="idx").shuffleResult
-                    #     inv_norm_q = _extf32(_asv(flir.math.rsqrt(_extf32(_asv(local_sum_q + 1e-6)).value)))
-                    #     inv_norm_k = _extf32(_asv(flir.math.rsqrt(_extf32(_asv(local_sum_k + 1e-6)).value)))
-                    #     inv_norm_q_vec = vector.BroadcastOp(acc_vec_t, _asv(inv_norm_q))
-                    #     inv_norm_k_vec = vector.BroadcastOp(acc_vec_t, _asv(inv_norm_k))
-                    #     for ki in range_constexpr(WARP_TILE_K_ITERS):
-                    #         sq_vecs[ki] = sq_vecs[ki] * scale_vec * inv_norm_q_vec
-                    #         sk_vecs[ki] = sk_vecs[ki] * inv_norm_k_vec
-                    # else:
-                    #     for ki in range_constexpr(WARP_TILE_K_ITERS):
-                    #         sq_vecs[ki] = sq_vecs[ki] * scale_vec
+                    if use_qk_l2norm:
+                        sum_q_partial_vec = vector.from_elements(acc_vec_t, [f32_0 for i in range_constexpr(VALUES_PER_THREAD_K)])
+                        sum_k_partial_vec = vector.from_elements(acc_vec_t, [f32_0 for i in range_constexpr(VALUES_PER_THREAD_K)])
+                        for ki in range_constexpr(WARP_TILE_K_ITERS):
+                            sum_q_partial_vec = sum_q_partial_vec + sq_vecs[ki] * sq_vecs[ki]
+                            sum_k_partial_vec = sum_k_partial_vec + sk_vecs[ki] * sk_vecs[ki]
+                            sum_q_partial = vector.ReductionOp(T.f32, vector.CombiningKind.ADD, sum_q_partial_vec).dest
+                            sum_k_partial = vector.ReductionOp(T.f32, vector.CombiningKind.ADD, sum_k_partial_vec).dest
+                        for offset in WARP_THREADS_K_SHFL_OFFSETS:
+                            sum_q_partial = sum_q_partial + mlir_gpu.ShuffleOp(sum_q_partial, _to_raw(arith.constant(offset, type=T.i32)), width_i32, mode="xor").shuffleResult
+                            sum_k_partial = sum_k_partial + mlir_gpu.ShuffleOp(sum_k_partial, _to_raw(arith.constant(offset, type=T.i32)), width_i32, mode="xor").shuffleResult
+                        local_sum_q = mlir_gpu.ShuffleOp(sum_q_partial, _to_raw(fx.Int32(w_tid // WARP_THREADS_K * WARP_THREADS_K)), width_i32, mode="idx").shuffleResult
+                        local_sum_k = mlir_gpu.ShuffleOp(sum_k_partial, _to_raw(fx.Int32(w_tid // WARP_THREADS_K * WARP_THREADS_K)), width_i32, mode="idx").shuffleResult
+                        inv_norm_q = mlir_math.rsqrt(local_sum_q + 1e-6)
+                        inv_norm_k = mlir_math.rsqrt(local_sum_k + 1e-6)
+                        inv_norm_q_vec = vector.BroadcastOp(acc_vec_t, inv_norm_q).vector
+                        inv_norm_k_vec = vector.BroadcastOp(acc_vec_t, inv_norm_k).vector
+                        for ki in range_constexpr(WARP_TILE_K_ITERS):
+                            sq_vecs[ki] = sq_vecs[ki] * scale_vec * inv_norm_q_vec
+                            sk_vecs[ki] = sk_vecs[ki] * inv_norm_k_vec
+                    else:
+                        for ki in range_constexpr(WARP_TILE_K_ITERS):
+                            sq_vecs[ki] = sq_vecs[ki] * scale_vec
                     
                 dot_kq_vec = vector.from_elements(acc_vec_t, [f32_0 for i in range_constexpr(VALUES_PER_THREAD_K)])
                 for ki in range_constexpr(WARP_TILE_K_ITERS):
