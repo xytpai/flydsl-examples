@@ -11,8 +11,8 @@ This repository will provide the following examples from scratch:
 - [x] HGEMM (wmma)
 - [x] Allreduce
 - [x] HGEMM Allreduce Fusion
+- [x] Linear Attention (decode)
 - [ ] Flash Attention
-- [ ] Linear Attention (NEED REBASE)
 - [ ] GEMM-FP8
 
 For IR study: https://mlir.llvm.org/docs/

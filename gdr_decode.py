@@ -38,7 +38,7 @@ class Args:
     num_v_heads: int
     head_k_dim: int
     head_v_dim: int
-    use_qk_l2norm: bool = False
+    use_qk_l2norm: bool = True
 
 
 def create_inputs(args):
@@ -164,6 +164,7 @@ def create_shuffle_gdr_decode_kernel(
 
     KERNEL_NAME = f"gdr_decode_{dtype}_kh{num_k_heads}x{head_k_dim}_vh{num_v_heads}x{head_v_dim}_q{seq_length}"
     KERNEL_NAME += f"_{NUM_WARPS}w{WARP_THREADS_V}x{WARP_THREADS_K}"
+    KERNEL_NAME += f"_vs{NUM_BLOCKS_PER_V_DIM}"
 
     @flyc.kernel
     def gdr_decode_kernel(
@@ -403,10 +404,21 @@ def create_shuffle_gdr_decode_kernel(
 
 def get_default_kwargs(batch_size, seq_length):
     d = {}
-    # if args.b == 1 or (args.b >= 16 and args.b <= 64):
-    #     d['NUM_BLOCKS_PER_V_DIM'] = 2
-    # else:
-    #     d['NUM_BLOCKS_PER_V_DIM'] = 1
+    b_to_vs = {
+        1: 4,
+        2: 4,
+        3: 4,
+        4: 2,
+        5: 2,
+        6: 2,
+        7: 2,
+        8: 2,
+        9: 2,
+        10: 2,
+        11: 1,
+    }
+    if b_to_vs.get(batch_size, None) is not None:
+        d['NUM_BLOCKS_PER_V_DIM'] = b_to_vs[batch_size]
     return d
 
 
@@ -769,3 +781,5 @@ if __name__ == '__main__':
     args = Args(**vars(args))
     benchmark(args, func, ref_func)
     # rm -rf ~/.flydsl ; python3 gdr_decode.py --b=2 --sq=2 --num_k_heads=16 --num_v_heads=32 --head_k_dim=128 --head_v_dim=128 --dtype=bf16
+    # rm -rf ~/.flydsl ; python3 gdr_decode.py --b=1 --sq=1 --num_k_heads=2 --num_v_heads=8 --head_k_dim=128 --head_v_dim=128 --dtype=bf16
+    # rm -rf ~/.flydsl ; python3 gdr_decode.py --b=128 --sq=1 --num_k_heads=2 --num_v_heads=8 --head_k_dim=128 --head_v_dim=128 --dtype=bf16
