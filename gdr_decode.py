@@ -222,7 +222,7 @@ def create_shuffle_gdr_decode_kernel(
         smem_sr_ptr = SmemPtr(base_ptr, smem_sr_offset, T.f32, shape=(2 * NUM_WARPS,))
         sr_tensor = STensor(smem_sr_ptr, dtype=T.f32, shape=(-1,))
 
-        def fast_exp(x, use_exp2=False):
+        def fast_exp(x, use_exp2=True):
             if use_exp2:
                 log2e = 1.4426950408889634
                 out = rocdl.exp2(T.f32, x * log2e)
@@ -390,10 +390,11 @@ def create_shuffle_gdr_decode_kernel(
     _compile_cache = {}
     def _compile(query, key, value, a, b, dt_bias, A_log, indices, state, out, batch_size, stream):
         with CompilationContext.compile_hints(_compile_hints):
-            if _compile_cache.get(batch_size, None) is None:
-                _compile_cache[batch_size] = flyc.compile(launch_gdr_decode_kernel, 
-                    query, key, value, a, b, dt_bias, A_log, indices, state, out, batch_size, stream)
-            return _compile_cache[batch_size]
+            lookup_key = (query.dtype, batch_size)
+            if _compile_cache.get(lookup_key, None) is None:
+                _compile_cache[lookup_key] = flyc.compile(launch_gdr_decode_kernel, 
+                    query, key, value, a, b, dt_bias, A_log, indices, state.clone(), out, batch_size, stream)
+            return _compile_cache[lookup_key]
 
     _launch.compile = _compile
     
@@ -726,7 +727,7 @@ def benchmark(args, func, ref_func, warmup=20, niters=100):
         # print(ref_output)
         # print("output")
         # print(output)
-        print(output - ref_output)
+        # print(output - ref_output)
         print(f"maxdiff_out:{maxdiff_out}\nmaxdiff_state:{maxdiff_state}")
         # assert is_allclose == True
     print("validation passed!\n", flush=True)
