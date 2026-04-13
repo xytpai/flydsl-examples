@@ -138,8 +138,10 @@ def compile_hgemm_kernel(
     BLOCK_N_WARPS: int = 4,
     B_PRE_SHUFFLE: bool = False,
     B_TO_LDS: bool = False,
-    RASTER_FACTOR: int = 1,
 ):
+    N_BLOCKS = n // TILE_N
+    assert (N_BLOCKS >= 1) and (n % TILE_N == 0)
+    NUM_BLOCKS_PER_XCD = 8
     IS_SPLIT_K = SPLIT_K > 1
     BLOCK_K = TILE_K
     assert (k % SPLIT_K == 0) and (k // SPLIT_K >= 1)
@@ -155,11 +157,13 @@ def compile_hgemm_kernel(
         DMA_BYTES = 4
         MFMA_PER_WARP_K = 2
         ASYNC_COPY = False
+        NUM_XCDS = 8
     else:
         WMMA_IMPL = WmmaHalf_m16n16k32(dtype)
         DMA_BYTES = 16
         MFMA_PER_WARP_K = 1
         ASYNC_COPY = True
+        NUM_XCDS = 8
     
     # Fixed parameters:
     WARP_SIZE = 64
@@ -270,8 +274,50 @@ def compile_hgemm_kernel(
         tid = fx.Int32(fx.thread_idx.x)
         wid = tid // WARP_SIZE
         w_tid = tid % WARP_SIZE
-        block_m_idx = fx.block_idx.x // RASTER_FACTOR
-        block_n_idx = fx.block_idx.x % RASTER_FACTOR + fx.block_idx.y * RASTER_FACTOR
+        
+        def swizzle_for_cache_reuse(xy):
+            # L2_WINDOW_M = 2
+            # L2_WINDOW_N = NUM_BLOCKS_PER_XCD // L2_WINDOW_M
+            # LLC_WINDOW_M = 2
+            # LLC_WINDOW_N = NUM_XCDS // LLC_WINDOW_M
+            # M_BLOCKS = (m + BLOCK_M - 1) // BLOCK_M
+            # L2_TILE_M = L2_WINDOW_M # 2
+            # L2_TILE_N = L2_WINDOW_N # 4
+            # LLC_TILE_M = L2_TILE_M * LLC_WINDOW_M # 4
+            # LLC_TILE_N = L2_TILE_N * LLC_WINDOW_N # 16
+            # llc_tile_idx = xy // (LLC_TILE_M * LLC_TILE_N)
+            # llc_tile_m = llc_tile_idx // (N_BLOCKS // LLC_TILE_N)
+            # llc_tile_n = llc_tile_idx % (N_BLOCKS // LLC_TILE_N)
+            # l2_tile_idx = xy % (LLC_TILE_M * LLC_TILE_N) // (L2_TILE_M * L2_TILE_N)
+            # l2_tile_m = l2_tile_idx // LLC_WINDOW_N
+            # l2_tile_n = l2_tile_idx % LLC_WINDOW_N
+            # local_idx = xy % (LLC_TILE_M * LLC_TILE_N) % (L2_TILE_M * L2_TILE_N)
+            # local_m = local_idx // L2_WINDOW_N
+            # local_n = local_idx % L2_WINDOW_N
+            # m_idx = llc_tile_m * LLC_TILE_M + l2_tile_m * L2_TILE_M + local_m
+            # n_idx = llc_tile_n * LLC_TILE_N + l2_tile_n * L2_TILE_N + local_n
+            # #
+            # xcd = xy % NUM_XCDS
+            # local = xy // NUM_XCDS
+            # chunk_idx = local // CHUNK_SIZE
+            # pos = local % CHUNK_SIZE
+            # xy = chunk_idx * CHUNK_SIZE * NUM_XCDS + xcd * CHUNK_SIZE + pos
+            # num_rows = (m + BLOCK_M - 1) // BLOCK_M
+            # num_cols = N_BLOCKS
+            # tid_per_group = WINDOW_HEIGHT * num_cols
+            # group_id = xy // tid_per_group
+            # first_row = group_id * WINDOW_HEIGHT
+            # # win_h = min(num_rows - first_row, WINDOW_HEIGHT)
+            # win_h = WINDOW_HEIGHT
+            # l = xy % tid_per_group
+            # row = first_row + l % win_h
+            # col = l // win_h
+            # return row, col
+            m_idx = xy // N_BLOCKS
+            n_idx = xy % N_BLOCKS
+            return m_idx, n_idx
+        
+        block_m_idx, block_n_idx = swizzle_for_cache_reuse(fx.block_idx.x)
         ks_idx = fx.Index(fx.block_idx.z)
         ks_begin = arith.index_cast(T.i32, ks_idx * ks)
         counter_idx = fx.Int32(signal_state * SPLIT_K_COUNTER_MAX_LEN) + fx.block_idx.x * fx.Int32(n // BLOCK_N) + fx.block_idx.y
@@ -785,11 +831,8 @@ def compile_hgemm_kernel(
             allocator.finalize()
         
         bm = (m + BLOCK_M - 1) // BLOCK_M
-        bn = n // BLOCK_N
-        bm = bm * RASTER_FACTOR
-        bn = bn // RASTER_FACTOR
         hgemm_kernel._func.__name__ = KERNEL_NAME
-        hgemm_kernel(C, A, B, m, COUNTER, signal_state).launch(grid=(bm, bn, SPLIT_K), block=(BLOCK_THREADS, 1, 1), stream=stream)
+        hgemm_kernel(C, A, B, m, COUNTER, signal_state).launch(grid=(bm * N_BLOCKS, 1, SPLIT_K), block=(BLOCK_THREADS, 1, 1), stream=stream)
     
     _compile_hints = {
         "llvm_options": {
