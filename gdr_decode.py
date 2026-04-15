@@ -109,11 +109,13 @@ def ref_func_(args, query, key, value, a, b, dt_bias, A_log, indices, state, out
 @functools.lru_cache(maxsize=1024)
 def create_shuffle_gdr_decode_kernel(
     dtype: str,
+    A_log_dtype: str,
     seq_length: int,
     num_k_heads: int,
     num_v_heads: int,
     head_k_dim: int,
     head_v_dim: int,
+    state_strides: tuple,
     use_qk_l2norm: bool,
     softplus_beta: float = 1.0,
     softplus_threshold: float = 20.0,
@@ -185,6 +187,7 @@ def create_shuffle_gdr_decode_kernel(
         softplus_threshold_ = arith.constant(softplus_threshold, type=T.f32)
 
         dtype_ = get_dtype_in_kernel(dtype)
+        A_log_dtype_ = get_dtype_in_kernel(A_log_dtype)
         i32_0 = arith.constant(0, type=T.i32)
         f32_0 = arith.constant(0.0, type=T.f32)
         f32_1 = arith.constant(1.0, type=T.f32)
@@ -215,8 +218,12 @@ def create_shuffle_gdr_decode_kernel(
         a_tensor = GTensor(a, dtype=dtype_, shape=(-1, seq_length, num_v_heads))
         b_tensor = GTensor(b, dtype=dtype_, shape=(-1, seq_length, num_v_heads))
         dt_bias_tensor = GTensor(dt_bias, dtype=dtype_, shape=(num_v_heads,))
-        A_log_tensor = GTensor(A_log, dtype=T.f32, shape=(num_v_heads,))
-        state_tensor = GTensor(state, dtype=T.f32, shape=(-1, num_v_heads, head_v_dim, head_k_dim))
+        A_log_tensor = GTensor(A_log, dtype=A_log_dtype_, shape=(num_v_heads,))
+        state_tensor = GTensor(
+            state,
+            dtype=T.f32,
+            shape=(-1, num_v_heads, head_v_dim, head_k_dim),
+            stride=(state_strides[0], state_strides[1], state_strides[2], state_strides[3]))
         out_tensor = GTensor(out, dtype=dtype_, shape=(-1, seq_length, num_v_heads, head_v_dim))
 
         base_ptr = allocator.get_base()
@@ -237,7 +244,10 @@ def create_shuffle_gdr_decode_kernel(
         cond_valid_if = scf.IfOp(cond_valid, results_=[], has_else=False)
         with ir.InsertionPoint(cond_valid_if.then_block):
 
-            r_A_log = A_log_tensor[hv_i]
+            if 'f32' in A_log_dtype:
+                r_A_log = A_log_tensor[hv_i]
+            else:
+                r_A_log = A_log_tensor[hv_i].extf(T.f32)
             r_dt_bias = dt_bias_tensor[hv_i].extf(T.f32)
 
             state_vecs = [0] * (WARP_TILE_V_ITERS * WARP_TILE_K_ITERS)
@@ -447,11 +457,13 @@ def gdr_decode_(
     kwargs = get_default_kwargs(batch_size, seq_length)
     exe = create_shuffle_gdr_decode_kernel(
         get_dtype_str(query.dtype),
+        get_dtype_str(A_log.dtype),
         seq_length,
         num_k_heads,
         num_v_heads,
         head_k_dim,
         head_v_dim,
+        state.stride(),
         use_qk_l2norm,
         **kwargs)
     exe_compiled = exe.compile(query, key, value, a, b, dt_bias, A_log, indices, state_, out, batch_size, stream)
