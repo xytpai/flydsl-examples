@@ -276,20 +276,21 @@ def compile_hgemm_kernel(
         w_tid = tid % WARP_SIZE
         
         def swizzle_for_cache_reuse(pid):
-            group_m = 2 # 8
-            grid_m = (m + BLOCK_M - 1) // BLOCK_M
-            grid_n = N_BLOCKS
-            effective_group_m = group_m # min(group_m, grid_m)
-            c_grid_n = fx.Index(grid_n)
-            c_group_m = fx.Index(effective_group_m)
-            num_pid_in_group = c_group_m * c_grid_n
-            group_id = pid // num_pid_in_group
-            first_pid_m = group_id * c_group_m
-            group_size_m = c_group_m
-            pid_in_group = pid % num_pid_in_group
-            bid_m = first_pid_m + (pid_in_group % group_size_m)
-            bid_n = pid_in_group // group_size_m
-            return bid_m, bid_n
+            # group_m = 2 # 8
+            # grid_m = (m + BLOCK_M - 1) // BLOCK_M
+            # grid_n = N_BLOCKS
+            # effective_group_m = group_m # min(group_m, grid_m)
+            # c_grid_n = fx.Index(grid_n)
+            # c_group_m = fx.Index(effective_group_m)
+            # num_pid_in_group = c_group_m * c_grid_n
+            # group_id = pid // num_pid_in_group
+            # first_pid_m = group_id * c_group_m
+            # group_size_m = c_group_m
+            # pid_in_group = pid % num_pid_in_group
+            # bid_m = first_pid_m + (pid_in_group % group_size_m)
+            # bid_n = pid_in_group // group_size_m
+            # return bid_m, bid_n
+            return pid // N_BLOCKS, pid % N_BLOCKS
         
         block_m_idx, block_n_idx = swizzle_for_cache_reuse(fx.block_idx.x)
         ks_idx = fx.Index(fx.block_idx.z)
@@ -604,6 +605,9 @@ def compile_hgemm_kernel(
             ldg_sts_a_async(ks_begin, 0)
             ldg_sts_b_async(ks_begin, 0)
             gpu.barrier()
+            a_frags_next = lds_matrix_a(0)
+            b_frags_next = lds_matrix_b(0)
+            rocdl.sched_barrier(0)
             def hot_loop_scheduler():
                 MFMA_TOTAL = WARP_K_STEPS * WARP_M_STEPS * WARP_N_STEPS * MFMA_PER_WARP_K
                 LDG_REG_A_COUNT_ = LDG_REG_A_COUNT_AS if ASYNC_COPY else LDG_REG_A_COUNT
@@ -611,53 +615,39 @@ def compile_hgemm_kernel(
                 LDG_TOTAL = LDG_REG_A_COUNT_ + LDG_REG_B_COUNT_
                 LDS_TOTAL = WARP_K_STEPS * (WARP_M_STEPS + WARP_N_STEPS)
                 LD_TOTAL = LDG_TOTAL + LDS_TOTAL
+                mfma_ = OnlineScheduler(MFMA_TOTAL, MFMA_TOTAL)
                 # ================ Ordered ================
-                for i in range_constexpr(WARP_K_STEPS * WARP_M_STEPS):
-                    rocdl.sched_dsrd(1) # lds_matrix_a current
-                for i in range_constexpr(WARP_K_STEPS * WARP_N_STEPS):
-                    rocdl.sched_dsrd(1) # lds_matrix_b current
                 for i in range_constexpr(LDG_REG_A_COUNT_):
                     rocdl.sched_vmem(1) # ldg_sts_a_async next
-                    rocdl.sched_mfma(2)
+                    rocdl.sched_mfma(mfma_.consume(2))
                 for i in range_constexpr(LDG_REG_B_COUNT_):
                     rocdl.sched_vmem(1) # ldg_sts_b_async next
-                    rocdl.sched_mfma(2)
-                REMAINING = max(MFMA_TOTAL - (LDG_REG_A_COUNT_ + LDG_REG_B_COUNT_) * 2, 0)
-                for i in range_constexpr(REMAINING):
+                    rocdl.sched_mfma(mfma_.consume(2))
+                for i in range_constexpr(mfma_.remaining):
                     rocdl.sched_mfma(1)
                 # ================ Reordered ================
                 rocdl.sched_barrier(0)
-            UNROLL = 8
-            init_state = [ks_begin, arith.constant(0, index=True)] + c_frags
-            for bki, state in range(0, BLOCK_K_LOOPS - 1, UNROLL, init=init_state):
+            init_state = [ks_begin, arith.constant(0, index=True)] + c_frags + a_frags_next + b_frags_next
+            for bki, state in range(0, BLOCK_K_LOOPS - 1, 1, init=init_state):
                 k_offset = state[0]
                 current_stage = fx.Index(state[1])
+                next_stage = 1 - current_stage
                 c_frags = state[2 : 2 + C_FRAGS_LEN]
-                for unroll_i in range_constexpr(UNROLL):
-                    cond = arith.cmpi(arith.CmpIPredicate.ult, fx.Index(bki + unroll_i), fx.Index(BLOCK_K_LOOPS - 1))
-                    cond_if = scf.IfOp(cond, results_=[T.vec(WMMA_C_FRAG_VALUES, T.f32)] * C_FRAGS_LEN + [T.index, T.i32], has_else=True)
-                    with ir.InsertionPoint(cond_if.then_block):
-                        next_stage = 1 - current_stage
-                        a_frags = lds_matrix_a(current_stage)
-                        b_frags = lds_matrix_b(current_stage)
-                        ldg_sts_a_async(k_offset + BLOCK_K, next_stage)
-                        ldg_sts_b_async(k_offset + BLOCK_K, next_stage)
-                        c_frags_new = block_mma_sync(a_frags, b_frags, c_frags)
-                        hot_loop_scheduler()
-                        gpu.barrier()
-                        k_offset_next = k_offset + fx.Int32(BLOCK_K)
-                        current_stage_next = 1 - current_stage
-                        scf.YieldOp(c_frags_new + [_to_raw(current_stage_next), k_offset_next])
-                    with ir.InsertionPoint(cond_if.else_block):
-                        scf.YieldOp(c_frags + [_to_raw(current_stage), k_offset])
-                    c_frags = [cond_if.results[i] for i in range(C_FRAGS_LEN)]
-                    current_stage = cond_if.results[C_FRAGS_LEN]
-                    k_offset = cond_if.results[C_FRAGS_LEN + 1]
-                results = yield [k_offset, current_stage] + c_frags
-            current_stage = results[1]
+                a_frags = state[2 + C_FRAGS_LEN : 2 + C_FRAGS_LEN + A_FRAGS_LEN]
+                b_frags = state[2 + C_FRAGS_LEN + A_FRAGS_LEN : 2 + C_FRAGS_LEN + A_FRAGS_LEN + B_FRAGS_LEN]
+                ldg_sts_a_async(k_offset + BLOCK_K, next_stage)
+                ldg_sts_b_async(k_offset + BLOCK_K, next_stage)
+                c_frags_new = block_mma_sync(a_frags, b_frags, c_frags)
+                hot_loop_scheduler()
+                gpu.barrier()
+                a_frags_next = lds_matrix_a(next_stage)
+                b_frags_next = lds_matrix_b(next_stage)
+                k_offset_next = k_offset + fx.Int32(BLOCK_K)
+                rocdl.sched_barrier(0)
+                results = yield [k_offset_next, next_stage] + c_frags_new + a_frags_next + b_frags_next
             c_frags = results[2 : 2 + C_FRAGS_LEN]
-            a_frags = lds_matrix_a(current_stage)
-            b_frags = lds_matrix_b(current_stage)
+            a_frags = results[2 + C_FRAGS_LEN : 2 + C_FRAGS_LEN + A_FRAGS_LEN]
+            b_frags = results[2 + C_FRAGS_LEN + A_FRAGS_LEN : 2 + C_FRAGS_LEN + A_FRAGS_LEN + B_FRAGS_LEN]
             c_frags = block_mma_sync(a_frags, b_frags, c_frags)
 
         else:
