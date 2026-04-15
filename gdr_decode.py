@@ -473,9 +473,9 @@ def gdr_decode_(
         state.copy_(state_)
 
 
-def func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out):
+def func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out, stream=torch.cuda.current_stream()):
     gdr_decode_(query, key, value, a, b, dt_bias, A_log, indices, state, out, 
-        use_qk_l2norm=args.use_qk_l2norm, need_shuffle_state=True)
+        use_qk_l2norm=args.use_qk_l2norm, need_shuffle_state=True, stream=stream)
 
 
 @triton.jit(do_not_specialize=["T"])
@@ -777,6 +777,46 @@ def benchmark(args, func, ref_func, warmup=20, niters=100):
     print(table)
 
 
+def benchmark_cudagraph(args, func, ref_func):
+    print('===================== CUDA GRAPH TEST =====================')
+    torch.manual_seed(2025)
+
+    inputs = create_inputs(args)
+    ref_inputs = create_inputs(args)
+    
+    outputs = create_outputs(args)
+    ref_outputs = create_outputs(args)
+
+    def copy_from_ref():
+        for input, ref_input in zip(inputs, ref_inputs):
+            if isinstance(input, torch.Tensor):
+                input.copy_(ref_input)
+        for output, ref_output in zip(outputs, ref_outputs):
+            if isinstance(output, torch.Tensor):
+                output.copy_(ref_output)
+    
+    graph = torch.cuda.CUDAGraph()
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(capture_stream):
+        with torch.cuda.graph(graph, stream=capture_stream):
+            func(*(inputs + outputs), stream=capture_stream)
+    torch.cuda.synchronize()
+    
+    copy_from_ref()
+    ref_func(*(ref_inputs + ref_outputs))
+    torch.cuda.synchronize()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    for output, ref_output in zip(outputs, ref_outputs):
+        is_allclose = torch.allclose(output, ref_output, atol=1e-2, rtol=1e-2)
+        maxdiff_out = (output - ref_output).abs().max()
+        is_allclose = is_allclose and torch.allclose(inputs[-1], ref_inputs[-1], atol=1e-2, rtol=1e-2)
+        maxdiff_state = (inputs[-1] - ref_inputs[-1]).abs().max()
+        print(f"maxdiff_out:{maxdiff_out}\nmaxdiff_state:{maxdiff_state}")
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Examples")
     parser.add_argument("--b", type=int, required=True)
@@ -792,6 +832,7 @@ if __name__ == '__main__':
     args.dtype = dtype_convert[args.dtype]
     args = Args(**vars(args))
     benchmark(args, func, ref_func)
+    benchmark_cudagraph(args, func, ref_func)
     # rm -rf ~/.flydsl ; python3 gdr_decode.py --b=2 --sq=2 --num_k_heads=16 --num_v_heads=32 --head_k_dim=128 --head_v_dim=128 --dtype=bf16
     # rm -rf ~/.flydsl ; python3 gdr_decode.py --b=1 --sq=1 --num_k_heads=2 --num_v_heads=8 --head_k_dim=128 --head_v_dim=128 --dtype=bf16
     # rm -rf ~/.flydsl ; python3 gdr_decode.py --b=128 --sq=1 --num_k_heads=2 --num_v_heads=8 --head_k_dim=128 --head_v_dim=128 --dtype=bf16
