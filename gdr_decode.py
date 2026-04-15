@@ -109,11 +109,13 @@ def ref_func_(args, query, key, value, a, b, dt_bias, A_log, indices, state, out
 @functools.lru_cache(maxsize=1024)
 def create_shuffle_gdr_decode_kernel(
     dtype: str,
+    A_log_dtype: str,
     seq_length: int,
     num_k_heads: int,
     num_v_heads: int,
     head_k_dim: int,
     head_v_dim: int,
+    state_strides: tuple,
     use_qk_l2norm: bool,
     softplus_beta: float = 1.0,
     softplus_threshold: float = 20.0,
@@ -185,6 +187,7 @@ def create_shuffle_gdr_decode_kernel(
         softplus_threshold_ = arith.constant(softplus_threshold, type=T.f32)
 
         dtype_ = get_dtype_in_kernel(dtype)
+        A_log_dtype_ = get_dtype_in_kernel(A_log_dtype)
         i32_0 = arith.constant(0, type=T.i32)
         f32_0 = arith.constant(0.0, type=T.f32)
         f32_1 = arith.constant(1.0, type=T.f32)
@@ -215,8 +218,12 @@ def create_shuffle_gdr_decode_kernel(
         a_tensor = GTensor(a, dtype=dtype_, shape=(-1, seq_length, num_v_heads))
         b_tensor = GTensor(b, dtype=dtype_, shape=(-1, seq_length, num_v_heads))
         dt_bias_tensor = GTensor(dt_bias, dtype=dtype_, shape=(num_v_heads,))
-        A_log_tensor = GTensor(A_log, dtype=T.f32, shape=(num_v_heads,))
-        state_tensor = GTensor(state, dtype=T.f32, shape=(-1, num_v_heads, head_v_dim, head_k_dim))
+        A_log_tensor = GTensor(A_log, dtype=A_log_dtype_, shape=(num_v_heads,))
+        state_tensor = GTensor(
+            state,
+            dtype=T.f32,
+            shape=(-1, num_v_heads, head_v_dim, head_k_dim),
+            stride=(state_strides[0], state_strides[1], state_strides[2], state_strides[3]))
         out_tensor = GTensor(out, dtype=dtype_, shape=(-1, seq_length, num_v_heads, head_v_dim))
 
         base_ptr = allocator.get_base()
@@ -237,7 +244,10 @@ def create_shuffle_gdr_decode_kernel(
         cond_valid_if = scf.IfOp(cond_valid, results_=[], has_else=False)
         with ir.InsertionPoint(cond_valid_if.then_block):
 
-            r_A_log = A_log_tensor[hv_i]
+            if 'f32' in A_log_dtype:
+                r_A_log = A_log_tensor[hv_i]
+            else:
+                r_A_log = A_log_tensor[hv_i].extf(T.f32)
             r_dt_bias = dt_bias_tensor[hv_i].extf(T.f32)
 
             state_vecs = [0] * (WARP_TILE_V_ITERS * WARP_TILE_K_ITERS)
@@ -288,8 +298,8 @@ def create_shuffle_gdr_decode_kernel(
                     for ki in range_constexpr(WARP_TILE_K_ITERS):
                         sum_q_partial_vec = sum_q_partial_vec + sq_vecs[ki] * sq_vecs[ki]
                         sum_k_partial_vec = sum_k_partial_vec + sk_vecs[ki] * sk_vecs[ki]
-                        sum_q_partial = vector.ReductionOp(T.f32, vector.CombiningKind.ADD, sum_q_partial_vec).dest
-                        sum_k_partial = vector.ReductionOp(T.f32, vector.CombiningKind.ADD, sum_k_partial_vec).dest
+                        sum_q_partial = mlir_vector.ReductionOp(T.f32, vector.CombiningKind.ADD, sum_q_partial_vec).dest
+                        sum_k_partial = mlir_vector.ReductionOp(T.f32, vector.CombiningKind.ADD, sum_k_partial_vec).dest
                     for offset in WARP_THREADS_K_SHFL_OFFSETS:
                         sum_q_partial = sum_q_partial + mlir_gpu.ShuffleOp(sum_q_partial, _to_raw(arith.constant(offset, type=T.i32)), width_i32, mode="xor").shuffleResult
                         sum_k_partial = sum_k_partial + mlir_gpu.ShuffleOp(sum_k_partial, _to_raw(arith.constant(offset, type=T.i32)), width_i32, mode="xor").shuffleResult
@@ -317,7 +327,7 @@ def create_shuffle_gdr_decode_kernel(
                         state_vecs[vi * WARP_TILE_K_ITERS + ki] *= r_g_vec
                         sum_hk = vector.FMAOp(state_vecs[vi * WARP_TILE_K_ITERS + ki], sk_vecs[ki], sum_hk).result
                     
-                    sum_hk = vector.ReductionOp(T.f32, vector.CombiningKind.ADD, sum_hk).dest
+                    sum_hk = mlir_vector.ReductionOp(T.f32, vector.CombiningKind.ADD, sum_hk).dest
                     
                     for offset in WARP_THREADS_K_SHFL_OFFSETS:
                         sum_hk = sum_hk + mlir_gpu.ShuffleOp(sum_hk, _to_raw(fx.Int32(offset)), width_i32, mode="xor").shuffleResult
@@ -336,7 +346,7 @@ def create_shuffle_gdr_decode_kernel(
                         state_vecs[vi * WARP_TILE_K_ITERS + ki] = h_new
                         sum_hq = vector.FMAOp(h_new, r_q_val, sum_hq).result
                     
-                    sum_hq = vector.ReductionOp(T.f32, vector.CombiningKind.ADD, sum_hq).dest
+                    sum_hq = mlir_vector.ReductionOp(T.f32, vector.CombiningKind.ADD, sum_hq).dest
 
                     for offset in WARP_THREADS_K_SHFL_OFFSETS:
                         sum_hq = sum_hq + mlir_gpu.ShuffleOp(sum_hq, _to_raw(arith.constant(offset, type=T.i32)), width_i32, mode="xor").shuffleResult
@@ -447,11 +457,13 @@ def gdr_decode_(
     kwargs = get_default_kwargs(batch_size, seq_length)
     exe = create_shuffle_gdr_decode_kernel(
         get_dtype_str(query.dtype),
+        get_dtype_str(A_log.dtype),
         seq_length,
         num_k_heads,
         num_v_heads,
         head_k_dim,
         head_v_dim,
+        state.stride(),
         use_qk_l2norm,
         **kwargs)
     exe_compiled = exe.compile(query, key, value, a, b, dt_bias, A_log, indices, state_, out, batch_size, stream)
@@ -461,9 +473,9 @@ def gdr_decode_(
         state.copy_(state_)
 
 
-def func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out):
+def func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out, stream=torch.cuda.current_stream()):
     gdr_decode_(query, key, value, a, b, dt_bias, A_log, indices, state, out, 
-        use_qk_l2norm=args.use_qk_l2norm, need_shuffle_state=True)
+        use_qk_l2norm=args.use_qk_l2norm, need_shuffle_state=True, stream=stream)
 
 
 @triton.jit(do_not_specialize=["T"])
@@ -765,6 +777,46 @@ def benchmark(args, func, ref_func, warmup=20, niters=100):
     print(table)
 
 
+def benchmark_cudagraph(args, func, ref_func):
+    print('===================== CUDA GRAPH TEST =====================')
+    torch.manual_seed(2025)
+
+    inputs = create_inputs(args)
+    ref_inputs = create_inputs(args)
+    
+    outputs = create_outputs(args)
+    ref_outputs = create_outputs(args)
+
+    def copy_from_ref():
+        for input, ref_input in zip(inputs, ref_inputs):
+            if isinstance(input, torch.Tensor):
+                input.copy_(ref_input)
+        for output, ref_output in zip(outputs, ref_outputs):
+            if isinstance(output, torch.Tensor):
+                output.copy_(ref_output)
+    
+    graph = torch.cuda.CUDAGraph()
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(capture_stream):
+        with torch.cuda.graph(graph, stream=capture_stream):
+            func(*(inputs + outputs), stream=capture_stream)
+    torch.cuda.synchronize()
+    
+    copy_from_ref()
+    ref_func(*(ref_inputs + ref_outputs))
+    torch.cuda.synchronize()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    for output, ref_output in zip(outputs, ref_outputs):
+        is_allclose = torch.allclose(output, ref_output, atol=1e-2, rtol=1e-2)
+        maxdiff_out = (output - ref_output).abs().max()
+        is_allclose = is_allclose and torch.allclose(inputs[-1], ref_inputs[-1], atol=1e-2, rtol=1e-2)
+        maxdiff_state = (inputs[-1] - ref_inputs[-1]).abs().max()
+        print(f"maxdiff_out:{maxdiff_out}\nmaxdiff_state:{maxdiff_state}")
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Examples")
     parser.add_argument("--b", type=int, required=True)
@@ -780,6 +832,7 @@ if __name__ == '__main__':
     args.dtype = dtype_convert[args.dtype]
     args = Args(**vars(args))
     benchmark(args, func, ref_func)
+    benchmark_cudagraph(args, func, ref_func)
     # rm -rf ~/.flydsl ; python3 gdr_decode.py --b=2 --sq=2 --num_k_heads=16 --num_v_heads=32 --head_k_dim=128 --head_v_dim=128 --dtype=bf16
     # rm -rf ~/.flydsl ; python3 gdr_decode.py --b=1 --sq=1 --num_k_heads=2 --num_v_heads=8 --head_k_dim=128 --head_v_dim=128 --dtype=bf16
     # rm -rf ~/.flydsl ; python3 gdr_decode.py --b=128 --sq=1 --num_k_heads=2 --num_v_heads=8 --head_k_dim=128 --head_v_dim=128 --dtype=bf16
