@@ -238,7 +238,7 @@ def compile_hgemm_kernel(
     if B_TO_LDS:
         KERNEL_NAME += f"_BS"
     
-    @flyc.kernel
+    @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
     def hgemm_kernel(
         C: fx.Tensor,
         A: fx.Tensor,
@@ -275,47 +275,21 @@ def compile_hgemm_kernel(
         wid = tid // WARP_SIZE
         w_tid = tid % WARP_SIZE
         
-        def swizzle_for_cache_reuse(xy):
-            # L2_WINDOW_M = 2
-            # L2_WINDOW_N = NUM_BLOCKS_PER_XCD // L2_WINDOW_M
-            # LLC_WINDOW_M = 2
-            # LLC_WINDOW_N = NUM_XCDS // LLC_WINDOW_M
-            # M_BLOCKS = (m + BLOCK_M - 1) // BLOCK_M
-            # L2_TILE_M = L2_WINDOW_M # 2
-            # L2_TILE_N = L2_WINDOW_N # 4
-            # LLC_TILE_M = L2_TILE_M * LLC_WINDOW_M # 4
-            # LLC_TILE_N = L2_TILE_N * LLC_WINDOW_N # 16
-            # llc_tile_idx = xy // (LLC_TILE_M * LLC_TILE_N)
-            # llc_tile_m = llc_tile_idx // (N_BLOCKS // LLC_TILE_N)
-            # llc_tile_n = llc_tile_idx % (N_BLOCKS // LLC_TILE_N)
-            # l2_tile_idx = xy % (LLC_TILE_M * LLC_TILE_N) // (L2_TILE_M * L2_TILE_N)
-            # l2_tile_m = l2_tile_idx // LLC_WINDOW_N
-            # l2_tile_n = l2_tile_idx % LLC_WINDOW_N
-            # local_idx = xy % (LLC_TILE_M * LLC_TILE_N) % (L2_TILE_M * L2_TILE_N)
-            # local_m = local_idx // L2_WINDOW_N
-            # local_n = local_idx % L2_WINDOW_N
-            # m_idx = llc_tile_m * LLC_TILE_M + l2_tile_m * L2_TILE_M + local_m
-            # n_idx = llc_tile_n * LLC_TILE_N + l2_tile_n * L2_TILE_N + local_n
-            # #
-            # xcd = xy % NUM_XCDS
-            # local = xy // NUM_XCDS
-            # chunk_idx = local // CHUNK_SIZE
-            # pos = local % CHUNK_SIZE
-            # xy = chunk_idx * CHUNK_SIZE * NUM_XCDS + xcd * CHUNK_SIZE + pos
-            # num_rows = (m + BLOCK_M - 1) // BLOCK_M
-            # num_cols = N_BLOCKS
-            # tid_per_group = WINDOW_HEIGHT * num_cols
-            # group_id = xy // tid_per_group
-            # first_row = group_id * WINDOW_HEIGHT
-            # # win_h = min(num_rows - first_row, WINDOW_HEIGHT)
-            # win_h = WINDOW_HEIGHT
-            # l = xy % tid_per_group
-            # row = first_row + l % win_h
-            # col = l // win_h
-            # return row, col
-            m_idx = xy // N_BLOCKS
-            n_idx = xy % N_BLOCKS
-            return m_idx, n_idx
+        def swizzle_for_cache_reuse(pid):
+            group_m = 2 # 8
+            grid_m = (m + BLOCK_M - 1) // BLOCK_M
+            grid_n = N_BLOCKS
+            effective_group_m = group_m # min(group_m, grid_m)
+            c_grid_n = fx.Index(grid_n)
+            c_group_m = fx.Index(effective_group_m)
+            num_pid_in_group = c_group_m * c_grid_n
+            group_id = pid // num_pid_in_group
+            first_pid_m = group_id * c_group_m
+            group_size_m = c_group_m
+            pid_in_group = pid % num_pid_in_group
+            bid_m = first_pid_m + (pid_in_group % group_size_m)
+            bid_n = pid_in_group // group_size_m
+            return bid_m, bid_n
         
         block_m_idx, block_n_idx = swizzle_for_cache_reuse(fx.block_idx.x)
         ks_idx = fx.Index(fx.block_idx.z)
