@@ -778,14 +778,14 @@ def compile_hgemm_ar_kernel(
         with CompilationContext.compile_hints(_compile_hints):
             return launch_hgemm_ar_kernel(*args, **kwargs)
 
-    _compile_cache = {}
+    _launch._compile_cache = {}
     def _compile(rank, self_sg, sg_ptrs, tmp_ptrs, C, A, B, m, stream):
         with CompilationContext.compile_hints(_compile_hints):
             lookup_key = (rank, m)
-            if _compile_cache.get(lookup_key, None) is None:
-                _compile_cache[lookup_key] = flyc.compile(launch_hgemm_ar_kernel, 
+            if _launch._compile_cache.get(lookup_key, None) is None:
+                _launch._compile_cache[lookup_key] = flyc.compile(launch_hgemm_ar_kernel,
                     rank, self_sg, sg_ptrs, tmp_ptrs, C, A, B, m, stream)
-            return _compile_cache[lookup_key]
+            return _launch._compile_cache[lookup_key]
     
     _launch.compile = _compile
     
