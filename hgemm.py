@@ -826,12 +826,13 @@ def compile_hgemm_kernel(
         with CompilationContext.compile_hints(_compile_hints):
             return launch_hgemm_kernel(*args, **kwargs)
 
-    _compile_cache = {}
+    _launch._compile_cache = {}
     def _compile(C, A, B, m, COUNTER, signal_state, stream):
         with CompilationContext.compile_hints(_compile_hints):
-            if _compile_cache.get(m, None) is None:
-                _compile_cache[m] = flyc.compile(launch_hgemm_kernel, C, A, B, m, COUNTER, signal_state, stream)
-            return _compile_cache[m]
+            lookup_key = (A.dtype, m)
+            if _launch._compile_cache.get(lookup_key, None) is None:
+                _launch._compile_cache[lookup_key] = flyc.compile(launch_hgemm_kernel, C, A, B, m, COUNTER, signal_state, stream)
+            return _launch._compile_cache[lookup_key]
 
     _launch.compile = _compile
     
