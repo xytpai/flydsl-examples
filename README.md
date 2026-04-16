@@ -24,7 +24,7 @@ Check the ROCm version using `amd-smi`. My version is `7.0.1`.
 ```bash
 git clone https://github.com/ROCm/FlyDSL
 cd FlyDSL
-git checkout 88728c95754a6f6c1fdcf447558b20414e50ae6d
+git checkout fd9ca4fed12095099920eca19efa5f9940b93577
 bash scripts/build_llvm.sh -j64
 
 # After this you will see the installed path.
