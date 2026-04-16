@@ -20,7 +20,7 @@ from flydsl.compiler.kernel_function import CompilationContext
 from flydsl._mlir.dialects import llvm, fly, memref, scf
 from flydsl.compiler.protocol import fly_values
 
-from utils.tensor_shim import get_dtype_in_kernel, GTensor, STensor, _to_raw
+from utils.tensor_shim import get_dtype_in_kernel, GTensor, STensor, _to_raw, _run_compiled
 fm_fast = arith.FastMathFlags.fast
 
 
@@ -815,28 +815,7 @@ def compile_hgemm_kernel(
         hgemm_kernel._func.__name__ = KERNEL_NAME
         hgemm_kernel(C, A, B, m, COUNTER, signal_state).launch(grid=(bm * N_BLOCKS, 1, SPLIT_K), block=(BLOCK_THREADS, 1, 1), stream=stream)
     
-    _compile_hints = {
-        "llvm_options": {
-            "enable-post-misched": False,
-            "lsr-drop-solution": True,
-        },
-    }
-
-    def _launch(*args, **kwargs):
-        with CompilationContext.compile_hints(_compile_hints):
-            return launch_hgemm_kernel(*args, **kwargs)
-
-    _launch._compile_cache = {}
-    def _compile(C, A, B, m, COUNTER, signal_state, stream):
-        with CompilationContext.compile_hints(_compile_hints):
-            lookup_key = (A.dtype, m)
-            if _launch._compile_cache.get(lookup_key, None) is None:
-                _launch._compile_cache[lookup_key] = flyc.compile(launch_hgemm_kernel, C, A, B, m, COUNTER, signal_state, stream)
-            return _launch._compile_cache[lookup_key]
-
-    _launch.compile = _compile
-    
-    return _launch
+    return launch_hgemm_kernel
 
 
 def hgemm_shuffle_b(x, layout=(16, 16), k_steps=2):
@@ -937,8 +916,7 @@ def hgemm_splitk_(
         bm = (m + kwargs['TILE_M'] - 1) // kwargs['TILE_M']
         bn = n // kwargs['TILE_N']
         assert bm * bn <= SPLIT_K_COUNTER_MAX_LEN
-    exe_compiled = exe.compile(c, a, b, m, semaphore, signal_state, stream)
-    exe_compiled(c, a, b, m, semaphore, signal_state, stream)
+    _run_compiled(exe, c, a, b, m, semaphore, signal_state, stream)
     if kwargs['SPLIT_K'] > 1:
         SPLIT_K_GLOBAL_SEMAPHORE_STATE[lookup_key] = (signal_state + 1) % 3
 

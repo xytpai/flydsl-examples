@@ -25,7 +25,7 @@ from flydsl.expr.buffer_ops import _unwrap_value
 
 from utils.custom_all_reduce import init_custom_ar, FlyDSLAllreduce
 from utils.custom_all_reduce_kernel import _signal_start_sync, _signal_end_sync, load_device_ptr, select_by_index, load_v4i32, store_v4i32, store_v4i32_nt
-from utils.tensor_shim import get_dtype_in_kernel, GTensor, STensor, _to_raw
+from utils.tensor_shim import get_dtype_in_kernel, GTensor, STensor, _to_raw, _run_compiled
 fm_fast = arith.FastMathFlags.fast
 
 
@@ -772,24 +772,7 @@ def compile_hgemm_ar_kernel(
         hgemm_ar_kernel(
             rank, self_sg, sg_ptrs, tmp_ptrs, C, A, B, m).launch(grid=(bm, bn, 1), block=(BLOCK_THREADS, 1, 1), stream=stream)
     
-    _compile_hints = {}
-
-    def _launch(*args, **kwargs):
-        with CompilationContext.compile_hints(_compile_hints):
-            return launch_hgemm_ar_kernel(*args, **kwargs)
-
-    _launch._compile_cache = {}
-    def _compile(rank, self_sg, sg_ptrs, tmp_ptrs, C, A, B, m, stream):
-        with CompilationContext.compile_hints(_compile_hints):
-            lookup_key = (rank, m)
-            if _launch._compile_cache.get(lookup_key, None) is None:
-                _launch._compile_cache[lookup_key] = flyc.compile(launch_hgemm_ar_kernel,
-                    rank, self_sg, sg_ptrs, tmp_ptrs, C, A, B, m, stream)
-            return _launch._compile_cache[lookup_key]
-    
-    _launch.compile = _compile
-    
-    return _launch
+    return launch_hgemm_ar_kernel
 
 
 def hgemm_shuffle_b(x, layout=(16, 16), k_steps=2):
@@ -867,8 +850,7 @@ def hgemm_ar_(
     bm = (m + kwargs['TILE_M'] - 1) // kwargs['TILE_M']
     bn = n // kwargs['TILE_N']
     assert bm * bn <= 80
-    compiled_exe = exe.compile(rank, self_sg, sg_ptrs, tmp_ptrs, c, a, b, m, stream)
-    compiled_exe(rank, self_sg, sg_ptrs, tmp_ptrs, c, a, b, m, stream)
+    _run_compiled(exe, rank, self_sg, sg_ptrs, tmp_ptrs, c, a, b, m, stream)
 
 
 class GEMMARBackend(FlyDSLAllreduce):    
