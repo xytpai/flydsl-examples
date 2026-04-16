@@ -946,7 +946,7 @@ def func(a, b, c):
     hgemm_splitk_(c, a, b, shuffle_b=True)
 
 
-def benchmark(args, func, ref_func, warmup=20, niters=100, sole_inputs=True):
+def benchmark(args, func, ref_func, warmup=20, niters=100, sole_inputs=False):
     inputs = create_inputs(args)
     outputs = create_outputs(args)
     ref_outputs = create_outputs(args)
