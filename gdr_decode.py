@@ -25,7 +25,7 @@ from flydsl.compiler.kernel_function import CompilationContext
 from flydsl._mlir.dialects import llvm, fly, memref, scf
 from flydsl.compiler.protocol import fly_values
 
-from utils.tensor_shim import get_dtype_in_kernel, get_dtype_vec_size, get_dtype_str, GTensor, STensor, _to_raw
+from utils.tensor_shim import get_dtype_in_kernel, get_dtype_vec_size, get_dtype_str, GTensor, STensor, _to_raw, _run_compiled
 fm_fast = arith.FastMathFlags.fast
 
 
@@ -391,25 +391,8 @@ def create_shuffle_gdr_decode_kernel(
         gdr_decode_kernel(
             query, key, value, a, b, dt_bias, A_log, indices, state, out, batch_size,
         ).launch(grid=(gx, 1, 1), block=(BLOCK_THREADS, 1, 1), stream=stream)
-
-    _compile_hints = {}
-
-    def _launch(*args, **kwargs):
-        with CompilationContext.compile_hints(_compile_hints):
-            return launch_gdr_decode_kernel(*args, **kwargs)
-
-    _compile_cache = {}
-    def _compile(query, key, value, a, b, dt_bias, A_log, indices, state, out, batch_size, stream):
-        with CompilationContext.compile_hints(_compile_hints):
-            lookup_key = (query.dtype, batch_size)
-            if _compile_cache.get(lookup_key, None) is None:
-                _compile_cache[lookup_key] = flyc.compile(launch_gdr_decode_kernel, 
-                    query, key, value, a, b, dt_bias, A_log, indices, state.clone(), out, batch_size, stream)
-            return _compile_cache[lookup_key]
-
-    _launch.compile = _compile
     
-    return _launch
+    return launch_gdr_decode_kernel
 
 
 def get_default_kwargs(batch_size, seq_length):
@@ -466,8 +449,7 @@ def gdr_decode_(
         state.stride(),
         use_qk_l2norm,
         **kwargs)
-    exe_compiled = exe.compile(query, key, value, a, b, dt_bias, A_log, indices, state_, out, batch_size, stream)
-    exe_compiled(query, key, value, a, b, dt_bias, A_log, indices, state_, out, batch_size, stream)
+    _run_compiled(exe, query, key, value, a, b, dt_bias, A_log, indices, state_, out, batch_size, stream)
     if need_shuffle_state:
         state_ = state_.permute(0, 1, 3, 2).contiguous()
         state.copy_(state_)
