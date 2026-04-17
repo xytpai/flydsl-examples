@@ -953,10 +953,14 @@ def benchmark(args, func, ref_func, warmup=20, niters=100, sole_inputs=False):
     for i in range(warmup):
         idx = i % niters_
         ref_func(*(ref_inputs[idx] + ref_outputs[idx]))
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
     with profile(activities=[ProfilerActivity.CUDA], ) as prof:
         for i in range(warmup, niters):
             idx = i % niters_
             ref_func(*(ref_inputs[idx] + ref_outputs[idx]))
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
     print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))
 
     # get func perf
@@ -964,10 +968,14 @@ def benchmark(args, func, ref_func, warmup=20, niters=100, sole_inputs=False):
     for i in range(warmup):
         idx = i % niters_
         func(*(inputs[idx] + outputs[idx]))
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
     with profile(activities=[ProfilerActivity.CUDA], ) as prof:
         for i in range(warmup, niters):
             idx = i % niters_
             func(*(inputs[idx] + outputs[idx]))
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
     print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))
 
 

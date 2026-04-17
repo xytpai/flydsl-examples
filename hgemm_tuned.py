@@ -69,6 +69,8 @@ def tuning_benchmark(args, hgemm_kwargs={}, warmup=5, niters=50):
     with profile(activities=[ProfilerActivity.CUDA], ) as prof:
         for i in range(niters):
             hgemm_splitk_(outputs[i][0], inputs[i][0], inputs[i][1], hgemm_kwargs=hgemm_kwargs, shuffle_b=False)
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
     table = prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1)
     hgemm_durations = []
     for event in prof.events():
