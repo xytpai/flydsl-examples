@@ -275,22 +275,26 @@ def compile_hgemm_kernel(
         wid = tid // WARP_SIZE
         w_tid = tid % WARP_SIZE
         
-        def swizzle_for_cache_reuse(pid):
-            # group_m = 2 # 8
-            # grid_m = (m + BLOCK_M - 1) // BLOCK_M
-            # grid_n = N_BLOCKS
-            # effective_group_m = group_m # min(group_m, grid_m)
-            # c_grid_n = fx.Index(grid_n)
-            # c_group_m = fx.Index(effective_group_m)
-            # num_pid_in_group = c_group_m * c_grid_n
-            # group_id = pid // num_pid_in_group
-            # first_pid_m = group_id * c_group_m
-            # group_size_m = c_group_m
-            # pid_in_group = pid % num_pid_in_group
-            # bid_m = first_pid_m + (pid_in_group % group_size_m)
-            # bid_n = pid_in_group // group_size_m
-            # return bid_m, bid_n
-            return pid // N_BLOCKS, pid % N_BLOCKS
+        def swizzle_for_cache_reuse(pid, enable=True):
+            if enable:
+                group_m = 4
+                group_n = NUM_BLOCKS_PER_XCD // group_m
+                grid_m = (m + BLOCK_M - 1) // BLOCK_M
+                grid_n = N_BLOCKS
+                num_pid_in_group = group_m * group_n
+                group_id = pid // num_pid_in_group
+                pid_in_group = pid % num_pid_in_group
+                num_group_in_grid_n = grid_n // group_n
+                assert num_group_in_grid_n >= 1 and grid_n % group_n == 0
+                group_id_m = group_id // num_group_in_grid_n
+                group_id_n = group_id % num_group_in_grid_n
+                first_pid_m = group_id_m * group_m
+                first_pid_n = group_id_n * group_n
+                bid_m = first_pid_m + (pid_in_group % group_m)
+                bid_n = first_pid_n + (pid_in_group // group_m)
+                return bid_m, bid_n
+            else:
+                return pid // N_BLOCKS, pid % N_BLOCKS
         
         block_m_idx, block_n_idx = swizzle_for_cache_reuse(fx.block_idx.x)
         ks_idx = fx.Index(fx.block_idx.z)
