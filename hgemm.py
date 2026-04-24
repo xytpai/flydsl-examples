@@ -41,7 +41,9 @@ def create_inputs(args):
     a.uniform_(-1, 1)
     b = torch.empty((args.n, args.k), dtype=args.dtype, device='cuda')
     b.uniform_(-1, 1)
-    return (a, b)
+    bias = torch.empty((args.n,), dtype=args.dtype, device='cuda')
+    bias.uniform_(10, 20)
+    return (a, b, bias)
 
 
 def create_outputs(args):
@@ -49,8 +51,8 @@ def create_outputs(args):
     return (c,)
 
 
-def ref_func(a, b, c):
-    F.linear(a, b, out=c)
+def ref_func(a, b, bias, c):
+    F.linear(a, b, out=c, bias=bias)
 
 
 def swizzle_xor16(row, col_in_bytes, k_blocks16):
@@ -905,8 +907,8 @@ def hgemm_splitk_(
     _run_compiled(exe, c, a, b, bias_tensor, m, semaphore, signal_state, stream)
 
 
-def func(a, b, c):
-    hgemm_splitk_(c, a, b)
+def func(a, b, bias, c):
+    hgemm_splitk_(c, a, b, bias=bias)
 
 
 def benchmark(args, func, ref_func, warmup=20, niters=100, sole_inputs=False):
