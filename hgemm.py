@@ -16,7 +16,7 @@ from flydsl.expr.typing import T
 from flydsl.expr import range_constexpr, const_expr, arith, vector, gpu, rocdl, buffer_ops
 from flydsl._mlir import ir
 from flydsl.runtime.device import get_rocm_arch
-from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
+from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr, SMEM_CAPACITY_MAP
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl._mlir.dialects import llvm, fly, memref, scf
 from flydsl.compiler.protocol import fly_values
@@ -224,7 +224,7 @@ def compile_hgemm_kernel(
         allocator.ptr = smem_b_offset + STAGES * BLOCK_N * BLOCK_K * DTYPE_BYTES
         SMEM_USE += STAGES * BLOCK_N * BLOCK_K * DTYPE_BYTES
     SMEM_USE = max(SMEM_USE, BLOCK_M * BLOCK_N * DTYPE_BYTES)
-    assert SMEM_USE <= 163840
+    assert SMEM_USE <= SMEM_CAPACITY_MAP[GPU_ARCH]
     LDG_ASYNC_VEC_SIZE = DMA_BYTES // DTYPE_BYTES
     LDG_A_X_THREADS_AS = BLOCK_K // LDG_ASYNC_VEC_SIZE
     LDG_REG_A_COUNT_AS = BLOCK_MK_SIZE // LDG_ASYNC_VEC_SIZE // BLOCK_THREADS
