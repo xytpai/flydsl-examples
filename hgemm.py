@@ -144,9 +144,11 @@ def compile_hgemm_kernel(
 ):
     assert BLOCK_M_WARPS * BLOCK_N_WARPS <= 4
     assert TILE_M * TILE_N * TILE_K <= 256 * 256 * 64
+    if (TILE_M >= 256) or (TILE_N >= 256):
+        assert TILE_M == 256 and TILE_N == 256 and TILE_K == 64
+        assert SPLIT_K == 1
     N_BLOCKS = n // TILE_N
     assert (N_BLOCKS >= 1) and (n % TILE_N == 0)
-    NUM_BLOCKS_PER_XCD = 8
     IS_SPLIT_K = SPLIT_K > 1
     BLOCK_K = TILE_K
     assert (k % SPLIT_K == 0) and (k // SPLIT_K >= 1)
@@ -849,7 +851,7 @@ def get_default_kwargs(m, n, k):
         kwargs['SPLIT_K'] = 16
     elif m <= 16 and n == 5120 and k == 2880:
         kwargs['TILE_M'] = 32
-        kwargs['TILE_N'] = 64
+        kwargs['TILE_N'] = 128
         kwargs['TILE_K'] = 64
         kwargs['SPLIT_K'] = 9
     return kwargs

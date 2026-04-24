@@ -45,7 +45,9 @@ def create_inputs(args):
     a.uniform_(-1, 1)
     b = torch.empty((args.n, args.k), dtype=args.dtype, device='cuda')
     b.uniform_(-1, 1)
-    return (a, b)
+    bias = torch.empty((args.n,), dtype=args.dtype, device='cuda')
+    bias.uniform_(10, 20)
+    return (a, b, bias)
 
 
 def create_outputs(args):
@@ -55,11 +57,11 @@ def create_outputs(args):
 
 def tuning_benchmark(args, hgemm_kwargs={}, warmup=5, niters=50):
     # correctness test
-    a, b = create_inputs(args)
+    a, b, bias = create_inputs(args)
     c = create_outputs(args)[0]
     c_ref = create_outputs(args)[0]
-    F.linear(a, b, out=c_ref)
-    hgemm_splitk_(c, a, b, hgemm_kwargs=hgemm_kwargs)
+    F.linear(a, b, out=c_ref, bias=bias)
+    hgemm_splitk_(c, a, b, bias=bias, hgemm_kwargs=hgemm_kwargs)
     tol = float(args.k) / 2048 * 6e-1
     is_allclose = torch.allclose(c, c_ref, atol=tol, rtol=tol)
     assert is_allclose == True
@@ -68,7 +70,7 @@ def tuning_benchmark(args, hgemm_kwargs={}, warmup=5, niters=50):
     outputs = [create_outputs(args) for i in range(niters)]
     with profile(activities=[ProfilerActivity.CUDA], ) as prof:
         for i in range(niters):
-            hgemm_splitk_(outputs[i][0], inputs[i][0], inputs[i][1], hgemm_kwargs=hgemm_kwargs)
+            hgemm_splitk_(outputs[i][0], inputs[i][0], inputs[i][1], bias=inputs[i][2], hgemm_kwargs=hgemm_kwargs)
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
     table = prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1)
