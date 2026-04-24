@@ -25,7 +25,7 @@ from utils.tensor_shim import get_dtype_in_kernel, GTensor, STensor, _to_raw, _r
 fm_fast = arith.FastMathFlags.fast
 
 
-SPLIT_K_SEMAPHORE_MAX_LEN = 128
+SPLIT_K_SEMAPHORE_MAX_LEN = 256
 
 
 @dataclass
