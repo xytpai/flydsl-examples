@@ -459,7 +459,6 @@ def compile_hgemm_kernel(
             return warp_offset
         
         def ldg_sts_a_async(k_offset, lds_stage):
-            warp_offset = get_dma_copy_warp_offset()
             for i in range_constexpr(LDG_REG_A_COUNT_AS):
                 global_tid = BLOCK_THREADS * i + tid
                 m_local_idx = global_tid // LDG_A_X_THREADS_AS
@@ -499,7 +498,6 @@ def compile_hgemm_kernel(
                 )
         
         def ldg_sts_b_async(k_offset, lds_stage):
-            warp_offset = get_dma_copy_warp_offset()
             for i in range_constexpr(LDG_REG_B_COUNT_AS):
                 global_tid = BLOCK_THREADS * i + tid
                 n_local_idx = global_tid // LDG_B_X_THREADS_AS
@@ -616,6 +614,8 @@ def compile_hgemm_kernel(
                         else:
                             raise NotImplementedError(f"MFMA_PER_WARP_K={MFMA_PER_WARP_K} not supported")
             return c_frags_new
+        
+        warp_offset = get_dma_copy_warp_offset()
         
         if IS_SPLIT_K:
             zero_c()
@@ -821,8 +821,8 @@ def compile_hgemm_kernel(
 
 def get_default_kwargs(m, n, k):
     kwargs = {
-        'TILE_M': 128,
-        'TILE_N': 128,
+        'TILE_M': 256,
+        'TILE_N': 256,
         'TILE_K': 64,
         'SPLIT_K': 1,
         'BLOCK_M_WARPS': 2,
