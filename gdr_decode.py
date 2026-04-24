@@ -455,7 +455,9 @@ def gdr_decode_(
         state.copy_(state_)
 
 
-def func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out, stream=torch.cuda.current_stream()):
+def func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out, stream=None):
+    if stream is None:
+        stream = torch.cuda.current_stream()
     gdr_decode_(query, key, value, a, b, dt_bias, A_log, indices, state, out, 
         use_qk_l2norm=args.use_qk_l2norm, need_shuffle_state=True, stream=stream)
 
@@ -713,7 +715,7 @@ def ref_func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out)
         float(1.0 / (args.head_k_dim ** 0.5)), args.use_qk_l2norm)
 
 
-def benchmark(args, func, ref_func, warmup=20, niters=100):
+def benchmark(args, func, ref_func, warmup=20, niters=100, sole_inputs=False):
     torch.manual_seed(2025)
     inputs = create_inputs(args)
     outputs = create_outputs(args)
@@ -738,23 +740,43 @@ def benchmark(args, func, ref_func, warmup=20, niters=100):
         # assert is_allclose == True
     print("validation passed!\n", flush=True)
 
+    niters_ = niters if not sole_inputs else 1
+    inputs = [create_inputs(args) for i in range(niters_)]
+    ref_inputs = [create_inputs(args) for i in range(niters_)]
+    outputs = [create_outputs(args) for i in range(niters_)]
+    ref_outputs = [create_outputs(args) for i in range(niters_)]
+    for i in range(niters_):
+        inputs[i][-1].copy_(ref_inputs[i][-1])
+
     # get ref_func perf
     print("===================== [REF] =====================")
     for i in range(warmup):
-        ref_func(*ref_inouts)
+        idx = i % niters_
+        ref_func(*(ref_inputs[idx] + ref_outputs[idx]))
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
     with profile(activities=[ProfilerActivity.CUDA], ) as prof:
-        for i in range(niters):
-            ref_func(*ref_inouts)
+        for i in range(warmup, niters):
+            idx = i % niters_
+            ref_func(*(ref_inputs[idx] + ref_outputs[idx]))
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
     table = prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1)
     print(table)
 
     # get func perf
     print("===================== [FLYDSL] =====================")
     for i in range(warmup):
-        func(*inouts)
+        idx = i % niters_
+        func(*(inputs[idx] + outputs[idx]))
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
     with profile(activities=[ProfilerActivity.CUDA], ) as prof:
-        for i in range(niters):
-            func(*inouts)
+        for i in range(warmup, niters):
+            idx = i % niters_
+            func(*(inputs[idx] + outputs[idx]))
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
     table = prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1)
     print(table)
 
@@ -782,7 +804,7 @@ def benchmark_cudagraph(args, func, ref_func):
     capture_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(capture_stream):
         with torch.cuda.graph(graph, stream=capture_stream):
-            func(*(inputs + outputs), stream=capture_stream)
+            func(*(inputs + outputs), stream=torch.cuda.current_stream())
     torch.cuda.synchronize()
     
     copy_from_ref()
