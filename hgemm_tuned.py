@@ -59,7 +59,7 @@ def tuning_benchmark(args, hgemm_kwargs={}, warmup=5, niters=50):
     c = create_outputs(args)[0]
     c_ref = create_outputs(args)[0]
     F.linear(a, b, out=c_ref)
-    hgemm_splitk_(c, a, b, hgemm_kwargs=hgemm_kwargs, shuffle_b=False)
+    hgemm_splitk_(c, a, b, hgemm_kwargs=hgemm_kwargs)
     tol = float(args.k) / 2048 * 6e-1
     is_allclose = torch.allclose(c, c_ref, atol=tol, rtol=tol)
     assert is_allclose == True
@@ -68,7 +68,7 @@ def tuning_benchmark(args, hgemm_kwargs={}, warmup=5, niters=50):
     outputs = [create_outputs(args) for i in range(niters)]
     with profile(activities=[ProfilerActivity.CUDA], ) as prof:
         for i in range(niters):
-            hgemm_splitk_(outputs[i][0], inputs[i][0], inputs[i][1], hgemm_kwargs=hgemm_kwargs, shuffle_b=False)
+            hgemm_splitk_(outputs[i][0], inputs[i][0], inputs[i][1], hgemm_kwargs=hgemm_kwargs)
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
     table = prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1)
@@ -167,7 +167,7 @@ def hgemm_tuned(a, b, c):
             config = MAP_CONFIGS[search_key]
             if SHOW_TUNED_LOG:
                 print(f"Found tuned config for m={m_lb}, n={n}, k={k}: {config}")
-    hgemm_splitk_(c, a, b, hgemm_kwargs=config, shuffle_b=True)
+    hgemm_splitk_(c, a, b, hgemm_kwargs=config)
 
 
 if __name__ == '__main__':

@@ -24,7 +24,7 @@ from utils.tensor_shim import get_dtype_in_kernel, GTensor, STensor, _to_raw, _r
 fm_fast = arith.FastMathFlags.fast
 
 
-SPLIT_K_COUNTER_MAX_LEN = 128
+SPLIT_K_SEMAPHORE_MAX_LEN = 128
 
 
 @dataclass
@@ -136,7 +136,6 @@ def compile_hgemm_kernel(
     SPLIT_K: int = 1,
     BLOCK_M_WARPS: int = 1,
     BLOCK_N_WARPS: int = 4,
-    B_PRE_SHUFFLE: bool = False,
     B_TO_LDS: bool = False,
 ):
     N_BLOCKS = n // TILE_N
@@ -148,9 +147,6 @@ def compile_hgemm_kernel(
     ks = k // SPLIT_K
     assert (ks % BLOCK_K == 0) and (ks // BLOCK_K >= 1)
     assert BLOCK_K >= 32
-    if B_PRE_SHUFFLE == True:
-        B_TO_LDS = False
-        assert B_TO_LDS == False
     GPU_ARCH = get_rocm_arch()
     if GPU_ARCH == 'gfx942':
         WMMA_IMPL = WmmaHalf_m16n16k16(dtype)
@@ -215,13 +211,13 @@ def compile_hgemm_kernel(
     allocator = SmemAllocator(None, arch=GPU_ARCH, global_sym_name="smem")
     smem_a_offset = allocator._align(allocator.ptr, 16)
     AS_BYTES = STAGES * BLOCK_M * BLOCK_K * DTYPE_BYTES
-    AS_BYTES = max(AS_BYTES, BLOCK_M * BLOCK_N * DTYPE_BYTES)
     allocator.ptr = smem_a_offset + AS_BYTES
     SMEM_USE = AS_BYTES
     if B_TO_LDS:
         smem_b_offset = allocator._align(allocator.ptr, 16)
         allocator.ptr = smem_b_offset + STAGES * BLOCK_N * BLOCK_K * DTYPE_BYTES
         SMEM_USE += STAGES * BLOCK_N * BLOCK_K * DTYPE_BYTES
+    SMEM_USE = max(SMEM_USE, BLOCK_M * BLOCK_N * DTYPE_BYTES)
     assert SMEM_USE <= 163840
     LDG_ASYNC_VEC_SIZE = DMA_BYTES // DTYPE_BYTES
     LDG_A_X_THREADS_AS = BLOCK_K // LDG_ASYNC_VEC_SIZE
@@ -229,14 +225,9 @@ def compile_hgemm_kernel(
     LDG_B_X_THREADS_AS = BLOCK_K // LDG_ASYNC_VEC_SIZE
     LDG_REG_B_COUNT_AS = BLOCK_NK_SIZE // LDG_ASYNC_VEC_SIZE // BLOCK_THREADS
 
-    KERNEL_NAME = f"hgemm_{dtype}_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_S{STAGES}TN"
-    KERNEL_NAME += "_NA" if not ASYNC_COPY else "_AS"
-    if B_PRE_SHUFFLE:
-        KERNEL_NAME += "_BP"
-    if IS_SPLIT_K:
-        KERNEL_NAME += f"_SPK{SPLIT_K}"
-    if B_TO_LDS:
-        KERNEL_NAME += f"_BS"
+    KERNEL_NAME = f"hgemm_{dtype}_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_W{BLOCK_M_WARPS}x{BLOCK_N_WARPS}_S{STAGES}_BT_BLDS{int(B_TO_LDS)}"
+    KERNEL_NAME += "_AS0" if not ASYNC_COPY else "_AS1"
+    KERNEL_NAME += f"_SPK{SPLIT_K}"
     
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
     def hgemm_kernel(
@@ -244,8 +235,8 @@ def compile_hgemm_kernel(
         A: fx.Tensor,
         B: fx.Tensor,
         m: fx.Int32,
-        COUNTER: fx.Tensor,
-        signal_state: fx.Int32,
+        semaphore: fx.Tensor,
+        signal_state: fx.Tensor,
     ):
         dtype_ = get_dtype_in_kernel(dtype)
         _ptr_type = ir.Type.parse("!llvm.ptr<1>")
@@ -264,18 +255,20 @@ def compile_hgemm_kernel(
             bs_ = STensor(smem_b_ptr, dtype_, shape=(STAGES, BLOCK_N, BLOCK_K))
         smem_c_ptr = SmemPtr(base_ptr, smem_a_offset, dtype_, shape=(BLOCK_M * BLOCK_N,))
         cs_ = STensor(smem_c_ptr, dtype_, shape=(BLOCK_M, BLOCK_N))
-        if B_PRE_SHUFFLE:
-            # origin: n // WARP_ATOM_N, WARP_ATOM_N, k // WARP_ATOM_K, WARP_ATOM_K // LDG_VEC_SIZE, LDG_VEC_SIZE
-            SHUFFLED_B_ = GTensor(B, dtype=dtype_, shape=(
-                n // WARP_ATOM_N, k // WARP_ATOM_K, WARP_ATOM_K // LDG_VEC_SIZE, WARP_ATOM_N, LDG_VEC_SIZE))
         if IS_SPLIT_K:
-            COUNTER_ = GTensor(COUNTER, dtype=T.i32, shape=(-1,))
+            semaphore_ = GTensor(semaphore, dtype=T.i32, shape=(-1,))
+            signal_state_ = GTensor(signal_state, dtype=T.i32, shape=(-1,))
+            signal_idx = fx.Int32(fx.block_idx.y * fx.grid_dim.x + fx.block_idx.x)
+            write_state = fx.Int32(signal_state_[signal_idx])
+            clean_state = (write_state + 2) % 3
+            w_semaphore_idx = signal_idx * 3 + write_state
+            c_semaphore_idx = signal_idx * 3 + clean_state
         
         tid = fx.Int32(fx.thread_idx.x)
         wid = tid // WARP_SIZE
         w_tid = tid % WARP_SIZE
         
-        def swizzle_for_cache_reuse(pid, enable=True):
+        def swizzle_for_cache_reuse(pid, enable=False):
             if enable:
                 group_m = 4
                 group_n = NUM_BLOCKS_PER_XCD // group_m
@@ -299,7 +292,6 @@ def compile_hgemm_kernel(
         block_m_idx, block_n_idx = swizzle_for_cache_reuse(fx.block_idx.x)
         ks_idx = fx.Index(fx.block_idx.z)
         ks_begin = arith.index_cast(T.i32, ks_idx * ks)
-        counter_idx = fx.Int32(signal_state * SPLIT_K_COUNTER_MAX_LEN) + fx.block_idx.x * fx.Int32(n // BLOCK_N) + fx.block_idx.y
 
         m_offset = fx.Index(block_m_idx * BLOCK_M)
         n_offset = fx.Index(block_n_idx * BLOCK_N)
@@ -341,15 +333,15 @@ def compile_hgemm_kernel(
                 is_t0_cond = arith.cmpi(arith.CmpIPredicate.eq, fx.Index(tid), fx.Index(0))
                 is_t0_cond_if = scf.IfOp(is_t0_cond, results_=[], has_else=False)
                 with ir.InsertionPoint(is_t0_cond_if.then_block):
-                    counter_base_ptr = fly.extract_aligned_pointer_as_index(_ptr_type, fly_values(COUNTER)[0])
-                    counter_base_ptr = llvm.PtrToIntOp(_i64_type, counter_base_ptr).result
-                    counter_byte_offset = arith.index_cast(T.i64, fx.Index(counter_idx) * fx.Index(4))
-                    counter_ptr = llvm.AddOp(counter_base_ptr, counter_byte_offset, llvm.IntegerOverflowFlags(0)).result
-                    counter_ptr = llvm.IntToPtrOp(_ptr_type, counter_ptr).result
-                    counter_ptr_v = counter_ptr._value if hasattr(counter_ptr, "_value") else counter_ptr
+                    semaphore_base_ptr = fly.extract_aligned_pointer_as_index(_ptr_type, fly_values(semaphore)[0])
+                    semaphore_base_ptr = llvm.PtrToIntOp(_i64_type, semaphore_base_ptr).result
+                    semaphore_byte_offset = arith.index_cast(T.i64, fx.Index(w_semaphore_idx) * fx.Index(4))
+                    semaphore_ptr = llvm.AddOp(semaphore_base_ptr, semaphore_byte_offset, llvm.IntegerOverflowFlags(0)).result
+                    semaphore_ptr = llvm.IntToPtrOp(_ptr_type, semaphore_ptr).result
+                    semaphore_ptr_v = semaphore_ptr._value if hasattr(semaphore_ptr, "_value") else semaphore_ptr
                     llvm.InlineAsmOp(None, [], "buffer_wbl2 sc0 sc1", "", has_side_effects=True)
                     llvm.InlineAsmOp(
-                        None, [counter_ptr_v, arith.constant(1, type=T.i32)],
+                        None, [semaphore_ptr_v, arith.constant(1, type=T.i32)],
                         "global_store_dword $0, $1, off sc0 sc1", "v,v",
                         has_side_effects=True,
                     )
@@ -361,11 +353,12 @@ def compile_hgemm_kernel(
             # zero signal
             cond_ks0_if = scf.IfOp(cond_ks0, results_=[], has_else=False)
             with ir.InsertionPoint(cond_ks0_if.then_block):
-                clean_cond = arith.cmpi(arith.CmpIPredicate.ult, fx.Index(tid), fx.Index(SPLIT_K_COUNTER_MAX_LEN))
+                clean_cond = arith.cmpi(arith.CmpIPredicate.eq, fx.Index(tid), fx.Index(0))
                 clean_cond_if = scf.IfOp(clean_cond, results_=[], has_else=False)
                 with ir.InsertionPoint(clean_cond_if.then_block):
-                    clean_counter_idx = fx.Int32(((signal_state + 2) % 3) * SPLIT_K_COUNTER_MAX_LEN) + fx.Index(tid)
-                    COUNTER_[fx.Index(clean_counter_idx)] = arith.constant(0, type=T.i32)
+                    signal_state_[signal_idx] = (write_state + 1) % 3
+                    semaphore_[fx.Index(c_semaphore_idx)] = arith.constant(0, type=T.i32)
+                    rocdl.s_waitcnt(0)
                     scf.YieldOp([])
                 scf.YieldOp([])
             rocdl.sched_barrier(0)
@@ -373,6 +366,7 @@ def compile_hgemm_kernel(
 
         def split_k_barrier():
             if True:
+                rocdl.sched_barrier(0)
                 init_cur = arith.constant(0, type=T.i32)
                 w = scf.WhileOp([T.i32], [init_cur])
                 before = ir.Block.create_at_start(w.before, [T.i32])
@@ -382,19 +376,20 @@ def compile_hgemm_kernel(
                     need_wait = arith.CmpIOp(arith.CmpIPredicate.eq, cur, arith.constant(0, type=T.i32)).result
                     scf.ConditionOp(need_wait, [cur])
                 with ir.InsertionPoint(after):
-                    counter_base_ptr = fly.extract_aligned_pointer_as_index(_ptr_type, fly_values(COUNTER)[0])
-                    counter_base_ptr = llvm.PtrToIntOp(_i64_type, counter_base_ptr).result
-                    counter_byte_offset = arith.index_cast(T.i64, fx.Index(counter_idx) * fx.Index(4))
-                    counter_ptr = llvm.AddOp(counter_base_ptr, counter_byte_offset, llvm.IntegerOverflowFlags(0)).result
-                    counter_ptr = llvm.IntToPtrOp(_ptr_type, counter_ptr).result
-                    counter_ptr_v = counter_ptr._value if hasattr(counter_ptr, "_value") else counter_ptr
+                    semaphore_base_ptr = fly.extract_aligned_pointer_as_index(_ptr_type, fly_values(semaphore)[0])
+                    semaphore_base_ptr = llvm.PtrToIntOp(_i64_type, semaphore_base_ptr).result
+                    semaphore_byte_offset = arith.index_cast(T.i64, fx.Index(w_semaphore_idx) * fx.Index(4))
+                    semaphore_ptr = llvm.AddOp(semaphore_base_ptr, semaphore_byte_offset, llvm.IntegerOverflowFlags(0)).result
+                    semaphore_ptr = llvm.IntToPtrOp(_ptr_type, semaphore_ptr).result
+                    semaphore_ptr_v = semaphore_ptr._value if hasattr(semaphore_ptr, "_value") else semaphore_ptr
                     data = llvm.InlineAsmOp(
-                        T.i32, [counter_ptr_v],
+                        T.i32, [semaphore_ptr_v],
                         "global_load_dword $0, $1, off sc1", "=v,v",
                         has_side_effects=True,
                     ).result
                     rocdl.s_waitcnt(0)
                     scf.YieldOp([data])
+                rocdl.sched_barrier(0)
             gpu.barrier()
         
         def ldg_a(k_offset):
@@ -574,17 +569,12 @@ def compile_hgemm_kernel(
                 b_k0 = b_k0_base + kk
                 for ii in range_constexpr(WARP_N_STEPS):
                     b_n0 = b_n0_base + ii
-                    if not B_PRE_SHUFFLE:
-                        warp_atom_n_idx = warp_n_idx + ii * WARP_ATOM_N
-                        warp_atom_k_idx = kk * WARP_ATOM_K
-                        n_idx = n_offset + warp_atom_n_idx + ldmatrix_b_n_idx
-                        k_idx = k_offset + warp_atom_k_idx + ldmatrix_b_k_vec_idx
-                        vec = B_.vec_load((n_idx, k_idx), WMMA_B_FRAG_VALUES * MFMA_PER_WARP_K)
-                        vecs.append(vec)
-                    else:
-                        b_n_intra = b_n_intra_base  # idx_1
-                        vec = SHUFFLED_B_.vec_load((b_n0, b_k0, b_k_intra_vec, b_n_intra, 0), LDG_VEC_SIZE)
-                        vecs.append(vec)
+                    warp_atom_n_idx = warp_n_idx + ii * WARP_ATOM_N
+                    warp_atom_k_idx = kk * WARP_ATOM_K
+                    n_idx = n_offset + warp_atom_n_idx + ldmatrix_b_n_idx
+                    k_idx = k_offset + warp_atom_k_idx + ldmatrix_b_k_vec_idx
+                    vec = B_.vec_load((n_idx, k_idx), WMMA_B_FRAG_VALUES * MFMA_PER_WARP_K)
+                    vecs.append(vec)
             return vecs
         
         def block_mma_sync(a_frags, b_frags, c_frags):
@@ -806,7 +796,7 @@ def compile_hgemm_kernel(
         A: fx.Tensor,
         B: fx.Tensor,
         m: fx.Int32,
-        COUNTER: fx.Tensor,
+        semaphore: fx.Tensor,
         signal_state: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
@@ -817,23 +807,9 @@ def compile_hgemm_kernel(
         
         bm = (m + BLOCK_M - 1) // BLOCK_M
         hgemm_kernel._func.__name__ = KERNEL_NAME
-        hgemm_kernel(C, A, B, m, COUNTER, signal_state).launch(grid=(bm * N_BLOCKS, 1, SPLIT_K), block=(BLOCK_THREADS, 1, 1), stream=stream)
+        hgemm_kernel(C, A, B, m, semaphore, signal_state).launch(grid=(bm * N_BLOCKS, 1, SPLIT_K), block=(BLOCK_THREADS, 1, 1), stream=stream)
     
     return launch_hgemm_kernel
-
-
-def hgemm_shuffle_b(x, layout=(16, 16), k_steps=2):
-    x_shape = x.shape
-    VEC_SIZE = 16 // x.element_size()
-    BN = layout[0]
-    BK = layout[1] * k_steps
-    assert x.shape[-2] % BN == 0, f"{x.shape[-2]} % {BN} == {x.shape[-2] % BN }"
-    assert x.shape[-1] % BK == 0, f"{x.shape[-1]} % {BK} == {x.shape[-1] % BK }"
-    x = x.view(-1, x.shape[-2] // BN, BN, x.shape[-1] // BK, BK // VEC_SIZE, VEC_SIZE)
-    x = x.permute(0, 1, 3, 4, 2, 5).contiguous()
-    x = x.view(*x_shape)
-    x.is_shuffled = True
-    return x
 
 
 def get_default_kwargs(m, n, k):
@@ -844,7 +820,6 @@ def get_default_kwargs(m, n, k):
         'SPLIT_K': 1,
         'BLOCK_M_WARPS': 2,
         'BLOCK_N_WARPS': 2,
-        'B_PRE_SHUFFLE': False,
         'B_TO_LDS': True,
     }
     if m == 2048 and n == 2048 and k == 2048:
@@ -874,30 +849,29 @@ selections = {
     'TILE_M': [16, 32, 48, 64, 96, 128],
     'TILE_N': [64, 128, 256],
     'TILE_K': [64, 128],
-    'SPLIT_K': [1, 2, 4, 8, 16],
+    'SPLIT_K': [1, 9],
+    'BLOCK_M_WARPS': [1, 2],
+    'BLOCK_N_WARPS': [1, 2],
 }
 
 
-SPLIT_K_GLOBAL_SEMAPHORE = {}
-SPLIT_K_GLOBAL_SEMAPHORE_STATE = {}
+@functools.lru_cache(maxsize=128)
+def get_semaphore(device):
+    semaphore = torch.zeros((128*3,), dtype=torch.int32, device=device)
+    signal_state = torch.zeros((128,), dtype=torch.int32, device=device)
+    return semaphore, signal_state
+
+
 def hgemm_splitk_(
     c: torch.Tensor,
     a: torch.Tensor,
     b: torch.Tensor,
-    shuffle_b: bool = False,
     hgemm_kwargs: dict = {},
     stream: torch.cuda.Stream = torch.cuda.current_stream(),
 ):
-    global SPLIT_K_COUNTER_MAX_LEN
-    global SPLIT_K_GLOBAL_SEMAPHORE
-    global SPLIT_K_GLOBAL_SEMAPHORE_STATE
+    global SPLIT_K_SEMAPHORE_MAX_LEN
     device = a.device
-    lookup_key = (stream, device)
-    if SPLIT_K_GLOBAL_SEMAPHORE.get(lookup_key, None) is None:
-        SPLIT_K_GLOBAL_SEMAPHORE[lookup_key] = torch.zeros(
-            (3 * SPLIT_K_COUNTER_MAX_LEN,), dtype=torch.int32, device=device)
-        SPLIT_K_GLOBAL_SEMAPHORE_STATE[lookup_key] = int(0)
-    signal_state = SPLIT_K_GLOBAL_SEMAPHORE_STATE[lookup_key]
+    semaphore, signal_state = get_semaphore(device)
     k = a.shape[-1]
     a = a.view(-1, k)
     m = a.shape[0]
@@ -913,20 +887,15 @@ def hgemm_splitk_(
         exe = compile_hgemm_kernel('bf16', n, k, **kwargs)
     else:
         raise NotImplementedError()
-    if kwargs['B_PRE_SHUFFLE'] and shuffle_b:
-        b = hgemm_shuffle_b(b)
-    semaphore = SPLIT_K_GLOBAL_SEMAPHORE[lookup_key]
     if kwargs['SPLIT_K'] > 1:
         bm = (m + kwargs['TILE_M'] - 1) // kwargs['TILE_M']
         bn = n // kwargs['TILE_N']
-        assert bm * bn <= SPLIT_K_COUNTER_MAX_LEN
+        assert bm * bn <= SPLIT_K_SEMAPHORE_MAX_LEN
     _run_compiled(exe, c, a, b, m, semaphore, signal_state, stream)
-    if kwargs['SPLIT_K'] > 1:
-        SPLIT_K_GLOBAL_SEMAPHORE_STATE[lookup_key] = (signal_state + 1) % 3
 
 
 def func(a, b, c):
-    hgemm_splitk_(c, a, b, shuffle_b=True)
+    hgemm_splitk_(c, a, b)
 
 
 def benchmark(args, func, ref_func, warmup=20, niters=100, sole_inputs=False):
