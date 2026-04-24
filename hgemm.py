@@ -356,7 +356,6 @@ def compile_hgemm_kernel(
                 clean_cond = arith.cmpi(arith.CmpIPredicate.eq, fx.Index(tid), fx.Index(0))
                 clean_cond_if = scf.IfOp(clean_cond, results_=[], has_else=False)
                 with ir.InsertionPoint(clean_cond_if.then_block):
-                    signal_state_[signal_idx] = (write_state + 1) % 3
                     semaphore_[fx.Index(c_semaphore_idx)] = arith.constant(0, type=T.i32)
                     rocdl.s_waitcnt(0)
                     scf.YieldOp([])
@@ -366,7 +365,6 @@ def compile_hgemm_kernel(
 
         def split_k_barrier():
             if True:
-                rocdl.sched_barrier(0)
                 init_cur = arith.constant(0, type=T.i32)
                 w = scf.WhileOp([T.i32], [init_cur])
                 before = ir.Block.create_at_start(w.before, [T.i32])
@@ -390,6 +388,15 @@ def compile_hgemm_kernel(
                     rocdl.s_waitcnt(0)
                     scf.YieldOp([data])
                 rocdl.sched_barrier(0)
+            cond_ksl = arith.cmpi(arith.CmpIPredicate.eq, ks_idx, fx.Index(SPLIT_K - 1))
+            cond_ksl_if = scf.IfOp(cond_ksl, results_=[], has_else=False)
+            with ir.InsertionPoint(cond_ksl_if.then_block):
+                clean_cond = arith.cmpi(arith.CmpIPredicate.eq, fx.Index(tid), fx.Index(0))
+                clean_cond_if = scf.IfOp(clean_cond, results_=[], has_else=False)
+                with ir.InsertionPoint(clean_cond_if.then_block):
+                    signal_state_[signal_idx] = (write_state + 1) % 3
+                    scf.YieldOp([])
+                scf.YieldOp([])
             gpu.barrier()
         
         def ldg_a(k_offset):
@@ -849,14 +856,14 @@ selections = {
     'TILE_M': [16, 32, 48, 64, 96, 128],
     'TILE_N': [64, 128, 256],
     'TILE_K': [64, 128],
-    'SPLIT_K': [1, 9],
+    'SPLIT_K': [i for i in range(1, 16)],
     'BLOCK_M_WARPS': [1, 2],
     'BLOCK_N_WARPS': [1, 2],
 }
 
 
 @functools.lru_cache(maxsize=128)
-def get_semaphore(device):
+def get_semaphore(stream, device):
     semaphore = torch.zeros((128*3,), dtype=torch.int32, device=device)
     signal_state = torch.zeros((128,), dtype=torch.int32, device=device)
     return semaphore, signal_state
@@ -871,7 +878,7 @@ def hgemm_splitk_(
 ):
     global SPLIT_K_SEMAPHORE_MAX_LEN
     device = a.device
-    semaphore, signal_state = get_semaphore(device)
+    semaphore, signal_state = get_semaphore(stream, device)
     k = a.shape[-1]
     a = a.view(-1, k)
     m = a.shape[0]
