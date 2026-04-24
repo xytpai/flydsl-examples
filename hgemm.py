@@ -7,12 +7,13 @@ import torch.nn.functional as F
 from torch.profiler import profile, ProfilerActivity
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
+from typing import Optional
 
 import flydsl
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr.typing import T
-from flydsl.expr import range_constexpr, arith, vector, gpu, rocdl, buffer_ops
+from flydsl.expr import range_constexpr, const_expr, arith, vector, gpu, rocdl, buffer_ops
 from flydsl._mlir import ir
 from flydsl.runtime.device import get_rocm_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
@@ -40,7 +41,9 @@ def create_inputs(args):
     a.uniform_(-1, 1)
     b = torch.empty((args.n, args.k), dtype=args.dtype, device='cuda')
     b.uniform_(-1, 1)
-    return (a, b)
+    bias = torch.empty((args.n,), dtype=args.dtype, device='cuda')
+    bias.uniform_(10, 20)
+    return (a, b, bias)
 
 
 def create_outputs(args):
@@ -48,8 +51,8 @@ def create_outputs(args):
     return (c,)
 
 
-def ref_func(a, b, c):
-    F.linear(a, b, out=c)
+def ref_func(a, b, bias, c):
+    F.linear(a, b, out=c, bias=bias)
 
 
 def swizzle_xor16(row, col_in_bytes, k_blocks16):
@@ -137,10 +140,15 @@ def compile_hgemm_kernel(
     BLOCK_M_WARPS: int = 1,
     BLOCK_N_WARPS: int = 4,
     B_TO_LDS: bool = False,
+    HAS_BIAS: bool = False,
 ):
+    assert BLOCK_M_WARPS * BLOCK_N_WARPS <= 4
+    assert TILE_M * TILE_N * TILE_K <= 256 * 256 * 64
+    if (TILE_M >= 256) or (TILE_N >= 256):
+        assert TILE_M == 256 and TILE_N == 256 and TILE_K == 64
+        assert SPLIT_K == 1
     N_BLOCKS = n // TILE_N
     assert (N_BLOCKS >= 1) and (n % TILE_N == 0)
-    NUM_BLOCKS_PER_XCD = 8
     IS_SPLIT_K = SPLIT_K > 1
     BLOCK_K = TILE_K
     assert (k % SPLIT_K == 0) and (k // SPLIT_K >= 1)
@@ -153,13 +161,11 @@ def compile_hgemm_kernel(
         DMA_BYTES = 4
         MFMA_PER_WARP_K = 2
         ASYNC_COPY = False
-        NUM_XCDS = 8
     else:
         WMMA_IMPL = WmmaHalf_m16n16k32(dtype)
         DMA_BYTES = 16
         MFMA_PER_WARP_K = 1
         ASYNC_COPY = True
-        NUM_XCDS = 8
     
     # Fixed parameters:
     WARP_SIZE = 64
@@ -228,12 +234,15 @@ def compile_hgemm_kernel(
     KERNEL_NAME = f"hgemm_{dtype}_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_W{BLOCK_M_WARPS}x{BLOCK_N_WARPS}_S{STAGES}_BT_BLDS{int(B_TO_LDS)}"
     KERNEL_NAME += "_AS0" if not ASYNC_COPY else "_AS1"
     KERNEL_NAME += f"_SPK{SPLIT_K}"
+    if HAS_BIAS:
+        KERNEL_NAME += "_BIAS"
     
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
     def hgemm_kernel(
         C: fx.Tensor,
         A: fx.Tensor,
         B: fx.Tensor,
+        BIAS: fx.Tensor,
         m: fx.Int32,
         semaphore: fx.Tensor,
         signal_state: fx.Tensor,
@@ -247,15 +256,17 @@ def compile_hgemm_kernel(
         A_ = GTensor(A, dtype=dtype_, shape=(-1, k))
         B_ = GTensor(B, dtype=dtype_, shape=(n, k))
         C_ = GTensor(C, dtype=dtype_, shape=(-1, n))
+        if const_expr(HAS_BIAS):
+            BIAS_ = GTensor(BIAS, dtype=dtype_, shape=(n,))
         base_ptr = allocator.get_base()
         smem_a_ptr = SmemPtr(base_ptr, smem_a_offset, dtype_, shape=(STAGES * BLOCK_M * BLOCK_K,))
         as_ = STensor(smem_a_ptr, dtype_, shape=(STAGES, BLOCK_M, BLOCK_K))
-        if B_TO_LDS:
+        if const_expr(B_TO_LDS):
             smem_b_ptr = SmemPtr(base_ptr, smem_b_offset, dtype_, shape=(STAGES * BLOCK_N * BLOCK_K,))
             bs_ = STensor(smem_b_ptr, dtype_, shape=(STAGES, BLOCK_N, BLOCK_K))
         smem_c_ptr = SmemPtr(base_ptr, smem_a_offset, dtype_, shape=(BLOCK_M * BLOCK_N,))
         cs_ = STensor(smem_c_ptr, dtype_, shape=(BLOCK_M, BLOCK_N))
-        if IS_SPLIT_K:
+        if const_expr(IS_SPLIT_K):
             semaphore_ = GTensor(semaphore, dtype=T.i32, shape=(-1,))
             signal_state_ = GTensor(signal_state, dtype=T.i32, shape=(-1,))
             signal_idx = fx.Int32(fx.block_idx.y * fx.grid_dim.x + fx.block_idx.x)
@@ -268,26 +279,8 @@ def compile_hgemm_kernel(
         wid = tid // WARP_SIZE
         w_tid = tid % WARP_SIZE
         
-        def swizzle_for_cache_reuse(pid, enable=False):
-            if enable:
-                group_m = 4
-                group_n = NUM_BLOCKS_PER_XCD // group_m
-                grid_m = (m + BLOCK_M - 1) // BLOCK_M
-                grid_n = N_BLOCKS
-                num_pid_in_group = group_m * group_n
-                group_id = pid // num_pid_in_group
-                pid_in_group = pid % num_pid_in_group
-                num_group_in_grid_n = grid_n // group_n
-                assert num_group_in_grid_n >= 1 and grid_n % group_n == 0
-                group_id_m = group_id // num_group_in_grid_n
-                group_id_n = group_id % num_group_in_grid_n
-                first_pid_m = group_id_m * group_m
-                first_pid_n = group_id_n * group_n
-                bid_m = first_pid_m + (pid_in_group % group_m)
-                bid_n = first_pid_n + (pid_in_group // group_m)
-                return bid_m, bid_n
-            else:
-                return pid // N_BLOCKS, pid % N_BLOCKS
+        def swizzle_for_cache_reuse(pid):
+            return pid // N_BLOCKS, pid % N_BLOCKS
         
         block_m_idx, block_n_idx = swizzle_for_cache_reuse(fx.block_idx.x)
         ks_idx = fx.Index(fx.block_idx.z)
@@ -319,10 +312,13 @@ def compile_hgemm_kernel(
                     m_local_idx = global_tid // LDG_C_X_THREADS
                     n_local_idx = global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE
                     row_idx = m_offset + fx.Index(m_local_idx)
+                    init_vec = zero_vec
+                    if const_expr(HAS_BIAS):
+                        init_vec = BIAS_.vec_load((n_offset + n_local_idx,), LDG_VEC_SIZE)
                     cond_boundary = arith.cmpi(arith.CmpIPredicate.ult, row_idx, fx.Index(m))
                     cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
                     with ir.InsertionPoint(cond_boundary_if.then_block):
-                        C_.vec_store((row_idx, n_offset + n_local_idx), zero_vec, LDG_VEC_SIZE)
+                        C_.vec_store((row_idx, n_offset + n_local_idx), init_vec, LDG_VEC_SIZE)
                         scf.YieldOp([])
                 scf.YieldOp([])
             rocdl.sched_barrier(0)
@@ -338,7 +334,7 @@ def compile_hgemm_kernel(
                     semaphore_byte_offset = arith.index_cast(T.i64, fx.Index(w_semaphore_idx) * fx.Index(4))
                     semaphore_ptr = llvm.AddOp(semaphore_base_ptr, semaphore_byte_offset, llvm.IntegerOverflowFlags(0)).result
                     semaphore_ptr = llvm.IntToPtrOp(_ptr_type, semaphore_ptr).result
-                    semaphore_ptr_v = semaphore_ptr._value if hasattr(semaphore_ptr, "_value") else semaphore_ptr
+                    semaphore_ptr_v = semaphore_ptr._value if const_expr(hasattr(semaphore_ptr, "_value")) else semaphore_ptr
                     llvm.InlineAsmOp(None, [], "buffer_wbl2 sc0 sc1", "", has_side_effects=True)
                     llvm.InlineAsmOp(
                         None, [semaphore_ptr_v, arith.constant(1, type=T.i32)],
@@ -364,7 +360,7 @@ def compile_hgemm_kernel(
             gpu.barrier()
 
         def split_k_barrier():
-            if True:
+            if const_expr(True):
                 init_cur = arith.constant(0, type=T.i32)
                 w = scf.WhileOp([T.i32], [init_cur])
                 before = ir.Block.create_at_start(w.before, [T.i32])
@@ -379,7 +375,7 @@ def compile_hgemm_kernel(
                     semaphore_byte_offset = arith.index_cast(T.i64, fx.Index(w_semaphore_idx) * fx.Index(4))
                     semaphore_ptr = llvm.AddOp(semaphore_base_ptr, semaphore_byte_offset, llvm.IntegerOverflowFlags(0)).result
                     semaphore_ptr = llvm.IntToPtrOp(_ptr_type, semaphore_ptr).result
-                    semaphore_ptr_v = semaphore_ptr._value if hasattr(semaphore_ptr, "_value") else semaphore_ptr
+                    semaphore_ptr_v = semaphore_ptr._value if const_expr(hasattr(semaphore_ptr, "_value")) else semaphore_ptr
                     data = llvm.InlineAsmOp(
                         T.i32, [semaphore_ptr_v],
                         "global_load_dword $0, $1, off sc1", "=v,v",
@@ -476,7 +472,7 @@ def compile_hgemm_kernel(
                 global_offset = A_.linear_offset((safe_row_idx, col_idx)) * DTYPE_BYTES
                 global_offset = arith.index_cast(T.i32, global_offset)
                 # get lds ptr
-                if i == 0:
+                if const_expr(i == 0):
                     lds_offset = as_.linear_offset((fx.Index(lds_stage), 0, 0)) * DTYPE_BYTES
                     lds_base = memref.extract_aligned_pointer_as_index(as_.memptr) + lds_offset
                     lds_ptr_base = buffer_ops.create_llvm_ptr(arith.index_cast(T.i64, lds_base), address_space=3)
@@ -515,7 +511,7 @@ def compile_hgemm_kernel(
                 global_offset = B_.linear_offset((safe_row_idx, col_idx)) * DTYPE_BYTES
                 global_offset = arith.index_cast(T.i32, global_offset)
                 # get lds ptr
-                if i == 0:
+                if const_expr(i == 0):
                     lds_offset = bs_.linear_offset((fx.Index(lds_stage), 0, 0)) * DTYPE_BYTES
                     lds_base = memref.extract_aligned_pointer_as_index(bs_.memptr) + lds_offset
                     lds_ptr_base = buffer_ops.create_llvm_ptr(arith.index_cast(T.i64, lds_base), address_space=3)
@@ -590,7 +586,7 @@ def compile_hgemm_kernel(
                     a_frag = a_frags[kk * WARP_M_STEPS + ii]
                     for jj in range_constexpr(WARP_N_STEPS):
                         b_frag = b_frags[kk * WARP_N_STEPS + jj]
-                        if MFMA_PER_WARP_K == 2:
+                        if const_expr(MFMA_PER_WARP_K == 2):
                             # split a
                             a_i64x2 = vector.bitcast(T.i64x2, a_frag)
                             a0_i64 = vector.extract(a_i64x2, static_position=[0], dynamic_position=[])
@@ -608,7 +604,7 @@ def compile_hgemm_kernel(
                             acc_in = c_frags_new[c_idx]
                             acc_mid = WMMA_IMPL(a_v0, b_v0, acc_in)
                             c_frags_new[c_idx] = WMMA_IMPL(a_v1, b_v1, acc_mid)
-                        elif MFMA_PER_WARP_K == 1:
+                        elif const_expr(MFMA_PER_WARP_K == 1):
                             c_idx = ii * WARP_N_STEPS + jj
                             c_frags_new[c_idx] = WMMA_IMPL(a_frag, b_frag, c_frags_new[c_idx])
                         else:
@@ -617,10 +613,10 @@ def compile_hgemm_kernel(
         
         warp_offset = get_dma_copy_warp_offset()
         
-        if IS_SPLIT_K:
+        if const_expr(IS_SPLIT_K):
             zero_c()
         
-        if B_TO_LDS:
+        if const_expr(B_TO_LDS):
 
             ldg_sts_a_async(ks_begin, 0)
             ldg_sts_b_async(ks_begin, 0)
@@ -629,8 +625,8 @@ def compile_hgemm_kernel(
             rocdl.sched_barrier(0)
             def hot_loop_scheduler():
                 MFMA_TOTAL = WARP_K_STEPS * WARP_M_STEPS * WARP_N_STEPS * MFMA_PER_WARP_K
-                LDG_REG_A_COUNT_ = LDG_REG_A_COUNT_AS if ASYNC_COPY else LDG_REG_A_COUNT
-                LDG_REG_B_COUNT_ = LDG_REG_B_COUNT_AS if ASYNC_COPY else LDG_REG_B_COUNT
+                LDG_REG_A_COUNT_ = LDG_REG_A_COUNT_AS if const_expr(ASYNC_COPY) else LDG_REG_A_COUNT
+                LDG_REG_B_COUNT_ = LDG_REG_B_COUNT_AS if const_expr(ASYNC_COPY) else LDG_REG_B_COUNT
                 mfma_ = OnlineScheduler(MFMA_TOTAL, MFMA_TOTAL)
                 # ================ Ordered ================
                 for i in range_constexpr(WARP_K_STEPS * WARP_M_STEPS):
@@ -677,7 +673,7 @@ def compile_hgemm_kernel(
             rocdl.sched_barrier(0)
             def hot_loop_scheduler():
                 MFMA_TOTAL = WARP_K_STEPS * WARP_M_STEPS * WARP_N_STEPS * MFMA_PER_WARP_K
-                LDG_REG_A_COUNT_ = LDG_REG_A_COUNT_AS if ASYNC_COPY else LDG_REG_A_COUNT
+                LDG_REG_A_COUNT_ = LDG_REG_A_COUNT_AS if const_expr(ASYNC_COPY) else LDG_REG_A_COUNT
                 LDG_TOTAL = LDG_REG_A_COUNT_ + WARP_K_STEPS * WARP_N_STEPS
                 mfma_ = OnlineScheduler(MFMA_TOTAL, MFMA_TOTAL)
                 ldg_ = OnlineScheduler(LDG_TOTAL, LDG_TOTAL)
@@ -689,7 +685,7 @@ def compile_hgemm_kernel(
                 # for i in range_constexpr(WARP_K_STEPS * WARP_M_STEPS * WARP_N_STEPS * MFMA_PER_WARP_K):
                 #     rocdl.sched_mfma(1)
                 # ================ Reordered ================
-                if ASYNC_COPY:
+                if const_expr(ASYNC_COPY):
                     AVG_MFMA_COUNT = (MFMA_TOTAL + LDG_TOTAL - 1)  // LDG_TOTAL
                     for i in range_constexpr(LDG_TOTAL):
                         rocdl.sched_vmem(ldg_.consume(1))
@@ -712,13 +708,13 @@ def compile_hgemm_kernel(
                 c_frags = state[2 : 2 + C_FRAGS_LEN]
                 a_frags = state[2 + C_FRAGS_LEN : 2 + C_FRAGS_LEN + A_FRAGS_LEN]
                 b_frags = state[2 + C_FRAGS_LEN + A_FRAGS_LEN : 2 + C_FRAGS_LEN + A_FRAGS_LEN + B_FRAGS_LEN]
-                if ASYNC_COPY:
+                if const_expr(ASYNC_COPY):
                     ldg_sts_a_async(k_offset + BLOCK_K, next_stage)
                 else:
                     a_regs_next = ldg_a(k_offset + BLOCK_K)
                 b_frags_next = ldg_matrix_b(k_offset + BLOCK_K)
                 c_frags = block_mma_sync(a_frags, b_frags, c_frags)
-                if not ASYNC_COPY:
+                if const_expr(not ASYNC_COPY):
                     sts_a(a_regs_next, next_stage)
                 hot_loop_scheduler()
                 gpu.barrier()
@@ -746,7 +742,7 @@ def compile_hgemm_kernel(
                     cs_[lds_m_idx, lds_n_idx] = val.truncf(dtype_)
         
         # write back to global
-        if IS_SPLIT_K:
+        if const_expr(IS_SPLIT_K):
             split_k_barrier()
             out_raw = fly_values(C)[0]
             out_base_ptr = fly.extract_aligned_pointer_as_index(_ptr_type, out_raw)
@@ -771,8 +767,8 @@ def compile_hgemm_kernel(
                         pair_byte_offset = arith.index_cast(T.i64, linear_bytes_offset + fx.Index(vec_idx * 2 * DTYPE_BYTES))
                         pair_addr_i64 = llvm.AddOp(out_base_int, pair_byte_offset, llvm.IntegerOverflowFlags(0)).result
                         pair_ptr = llvm.IntToPtrOp(_ptr_type, pair_addr_i64).result
-                        pair_ptr_v = pair_ptr._value if hasattr(pair_ptr, "_value") else pair_ptr
-                        pair_v = pair._value if hasattr(pair, "_value") else pair
+                        pair_ptr_v = pair_ptr._value if const_expr(hasattr(pair_ptr, "_value")) else pair_ptr
+                        pair_v = pair._value if const_expr(hasattr(pair, "_value")) else pair
                         llvm.AtomicRMWOp(
                             llvm.AtomicBinOp.fadd,
                             pair_ptr_v,
@@ -793,6 +789,9 @@ def compile_hgemm_kernel(
                 cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
                 with ir.InsertionPoint(cond_boundary_if.then_block):
                     vec = cs_.vec_load((m_local_idx, n_local_idx), LDG_VEC_SIZE)
+                    if const_expr(HAS_BIAS):
+                        bias_vec = BIAS_.vec_load((n_offset + n_local_idx,), LDG_VEC_SIZE)
+                        vec = vec + bias_vec
                     C_.vec_store((m_global_idx, n_offset + n_local_idx), vec, LDG_VEC_SIZE)
                     scf.YieldOp([])
         return
@@ -802,6 +801,7 @@ def compile_hgemm_kernel(
         C: fx.Tensor,
         A: fx.Tensor,
         B: fx.Tensor,
+        BIAS: fx.Tensor,
         m: fx.Int32,
         semaphore: fx.Tensor,
         signal_state: fx.Int32,
@@ -814,7 +814,7 @@ def compile_hgemm_kernel(
         
         bm = (m + BLOCK_M - 1) // BLOCK_M
         hgemm_kernel._func.__name__ = KERNEL_NAME
-        hgemm_kernel(C, A, B, m, semaphore, signal_state).launch(grid=(bm * N_BLOCKS, 1, SPLIT_K), block=(BLOCK_THREADS, 1, 1), stream=stream)
+        hgemm_kernel(C, A, B, BIAS, m, semaphore, signal_state).launch(grid=(bm * N_BLOCKS, 1, SPLIT_K), block=(BLOCK_THREADS, 1, 1), stream=stream)
     
     return launch_hgemm_kernel
 
@@ -851,19 +851,19 @@ def get_default_kwargs(m, n, k):
         kwargs['SPLIT_K'] = 16
     elif m <= 16 and n == 5120 and k == 2880:
         kwargs['TILE_M'] = 32
-        kwargs['TILE_N'] = 64
+        kwargs['TILE_N'] = 128
         kwargs['TILE_K'] = 64
         kwargs['SPLIT_K'] = 9
     return kwargs
 
 
 selections = {
-    'TILE_M': [16, 32, 48, 64, 96, 128],
+    'TILE_M': [16, 32, 48, 64, 96, 128, 256],
     'TILE_N': [64, 128, 256],
     'TILE_K': [64, 128],
     'SPLIT_K': [i for i in range(1, 16)],
-    'BLOCK_M_WARPS': [1, 2],
-    'BLOCK_N_WARPS': [1, 2],
+    'BLOCK_M_WARPS': [1, 2, 4],
+    'BLOCK_N_WARPS': [1, 2, 4],
 }
 
 
@@ -878,6 +878,7 @@ def hgemm_splitk_(
     c: torch.Tensor,
     a: torch.Tensor,
     b: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
     hgemm_kwargs: dict = {},
     stream: torch.cuda.Stream = torch.cuda.current_stream(),
 ):
@@ -893,6 +894,7 @@ def hgemm_splitk_(
     assert c.shape[0] == m
     kwargs = get_default_kwargs(m, n, k)
     kwargs.update(hgemm_kwargs)
+    kwargs['HAS_BIAS'] = False if bias is None else True
     if a.dtype == torch.half:
         exe = compile_hgemm_kernel('f16', n, k, **kwargs)
     elif a.dtype == torch.bfloat16:
@@ -903,11 +905,12 @@ def hgemm_splitk_(
         bm = (m + kwargs['TILE_M'] - 1) // kwargs['TILE_M']
         bn = n // kwargs['TILE_N']
         assert bm * bn <= SPLIT_K_SEMAPHORE_MAX_LEN
-    _run_compiled(exe, c, a, b, m, semaphore, signal_state, stream)
+    bias_tensor = a if bias is None else bias
+    _run_compiled(exe, c, a, b, bias_tensor, m, semaphore, signal_state, stream)
 
 
-def func(a, b, c):
-    hgemm_splitk_(c, a, b)
+def func(a, b, bias, c):
+    hgemm_splitk_(c, a, b, bias=bias)
 
 
 def benchmark(args, func, ref_func, warmup=20, niters=100, sole_inputs=False):
