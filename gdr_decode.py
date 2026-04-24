@@ -2,8 +2,10 @@ import time
 import torch
 import argparse
 import functools
+import itertools
 import numpy as np
 import torch.nn.functional as F
+from tqdm import tqdm
 from torch.profiler import profile, ProfilerActivity
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
@@ -428,6 +430,7 @@ def gdr_decode_(
     out: torch.Tensor,
     use_qk_l2norm: bool,
     need_shuffle_state: bool,
+    kwargs: dict = {},
     stream: torch.cuda.Stream = torch.cuda.current_stream(),
 ):
     if need_shuffle_state:
@@ -437,7 +440,8 @@ def gdr_decode_(
     batch_size, seq_length, num_k_heads, head_k_dim = query.shape
     num_v_heads = value.shape[-2]
     head_v_dim = value.shape[-1]
-    kwargs = get_default_kwargs(batch_size, seq_length)
+    kwargs_ = get_default_kwargs(batch_size, seq_length)
+    kwargs_.update(kwargs)
     exe = create_shuffle_gdr_decode_kernel(
         get_dtype_str(query.dtype),
         get_dtype_str(A_log.dtype),
@@ -448,7 +452,7 @@ def gdr_decode_(
         head_v_dim,
         state.stride(),
         use_qk_l2norm,
-        **kwargs)
+        **kwargs_)
     _run_compiled(exe, query, key, value, a, b, dt_bias, A_log, indices, state_, out, batch_size, stream)
     if need_shuffle_state:
         state_ = state_.permute(0, 1, 3, 2).contiguous()
@@ -821,6 +825,82 @@ def benchmark_cudagraph(args, func, ref_func):
         print(f"maxdiff_out:{maxdiff_out}\nmaxdiff_state:{maxdiff_state}")
 
 
+class GDRDecodeTuner:
+    def __init__(self, args):
+        self.args = args
+        self.selections = {
+            'NUM_BLOCKS_PER_V_DIM': [1, 2, 4, 8],
+            'NUM_WARPS': [1, 2, 4],
+            'WARP_THREADS_K': [4, 8, 16],
+        }
+
+    def tune_single(self):
+        args = self.args
+        keys = self.selections.keys()
+        values = self.selections.values()
+        configs = [dict(zip(keys, combo)) for combo in itertools.product(*values)]
+        best_duration = float(1e10)
+        best_idx = 0
+        pbar = tqdm(total=len(configs), desc=f"{args}")
+        for i, config in enumerate(configs):
+            try:
+                dur = self.benchmark(args, kwargs=config)
+            except:
+                dur = float(1e10)
+            if dur < best_duration:
+                best_duration = dur
+                best_idx = i
+            pbar.update(1)
+        pbar.close()
+        print(f"best_config:{configs[best_idx]}, duration:{best_duration}")
+    
+    def func(self, args, query, key, value, a, b, dt_bias, A_log, indices, state, out, kwargs={}, stream=None):
+        if stream is None:
+            stream = torch.cuda.current_stream()
+        gdr_decode_(query, key, value, a, b, dt_bias, A_log, indices, state, out, 
+            use_qk_l2norm=args.use_qk_l2norm, need_shuffle_state=True, stream=stream, kwargs=kwargs)
+
+    def ref_func(self, args, query, key, value, a, b, dt_bias, A_log, indices, state, out):
+        run_triton_kernel(out, A_log, dt_bias, query, key, value, a, b, state, indices,
+            float(1.0 / (args.head_k_dim ** 0.5)), args.use_qk_l2norm)
+
+    def benchmark(self, args, kwargs={}, warmup=5, niters=50):
+        # correctness test
+        inputs = create_inputs(args)
+        ref_inputs = create_inputs(args)
+        outputs = create_outputs(args)
+        ref_outputs = create_outputs(args)
+        def copy_from_ref():
+            for input, ref_input in zip(inputs, ref_inputs):
+                if isinstance(input, torch.Tensor):
+                    input.copy_(ref_input)
+            for output, ref_output in zip(outputs, ref_outputs):
+                if isinstance(output, torch.Tensor):
+                    output.copy_(ref_output)
+        copy_from_ref()
+        self.ref_func(*(ref_inputs + ref_outputs))
+        self.func(*(inputs + outputs + (kwargs,)))
+        tol = 1e-3
+        is_allclose = torch.allclose(ref_outputs[0], outputs[0], atol=tol, rtol=tol)
+        is_allclose = is_allclose and torch.allclose(ref_inputs[-1], inputs[-1], atol=tol, rtol=tol)
+        assert is_allclose == True
+        # performance bench
+        inputs = [create_inputs(args) for i in range(niters)]
+        outputs = [create_outputs(args) for i in range(niters)]
+        with profile(activities=[ProfilerActivity.CUDA], ) as prof:
+            for i in range(niters):
+                self.func(*(inputs[i] + outputs[i] + (kwargs,)))
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+        table = prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1)
+        durations = []
+        for event in prof.events():
+            if event.name.startswith("gdr_decode_"):
+                durations.append(event.device_time)
+        duration = np.median(durations)
+        return duration
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Examples")
     parser.add_argument("--b", type=int, required=True)
@@ -837,6 +917,11 @@ if __name__ == '__main__':
     args = Args(**vars(args))
     benchmark(args, func, ref_func)
     benchmark_cudagraph(args, func, ref_func)
+
+    print(f"===================== Tune best config  =====================")
+    tuner = GDRDecodeTuner(args)
+    tuner.tune_single()
+    
     # rm -rf ~/.flydsl ; python3 gdr_decode.py --b=2 --sq=2 --num_k_heads=16 --num_v_heads=32 --head_k_dim=128 --head_v_dim=128 --dtype=bf16
     # rm -rf ~/.flydsl ; python3 gdr_decode.py --b=1 --sq=1 --num_k_heads=2 --num_v_heads=8 --head_k_dim=128 --head_v_dim=128 --dtype=bf16
     # rm -rf ~/.flydsl ; python3 gdr_decode.py --b=128 --sq=1 --num_k_heads=2 --num_v_heads=8 --head_k_dim=128 --head_v_dim=128 --dtype=bf16
