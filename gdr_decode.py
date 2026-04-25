@@ -7,6 +7,7 @@ import itertools
 import numpy as np
 import torch.nn.functional as F
 from tqdm import tqdm
+from pathlib import Path
 from torch.profiler import profile, ProfilerActivity
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
@@ -30,6 +31,10 @@ from flydsl.compiler.protocol import fly_values
 
 from utils.tensor_shim import get_dtype_in_kernel, get_dtype_vec_size, get_dtype_str, GTensor, STensor, _to_raw, _run_compiled
 fm_fast = arith.FastMathFlags.fast
+
+base_dir = Path(__file__).resolve().parent
+temp_dir = base_dir / 'temp'
+temp_dir.mkdir(parents=True, exist_ok=True)
 
 
 @dataclass
