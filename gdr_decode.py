@@ -403,23 +403,28 @@ def create_shuffle_gdr_decode_kernel(
     return launch_gdr_decode_kernel
 
 
-def get_default_kwargs(batch_size, seq_length):
+GDR_GLOBAL_CONFIG_MAP = None
+GDR_GPU_ARCH = get_rocm_arch()
+def get_default_kwargs(batch_size, seq_length, num_k_heads, num_v_heads, head_k_dim, head_v_dim):
     d = {}
-    b_to_vs = {
-        1: 4,
-        2: 4,
-        3: 4,
-        4: 2,
-        5: 2,
-        6: 2,
-        7: 2,
-        8: 2,
-        9: 2,
-        10: 2,
-        11: 1,
-    }
-    if b_to_vs.get(batch_size, None) is not None:
-        d['NUM_BLOCKS_PER_V_DIM'] = b_to_vs[batch_size]
+    d['NUM_BLOCKS_PER_V_DIM'] = 1
+    d['NUM_WARPS'] = 4
+    d['WARP_THREADS_K'] = 8
+    global GDR_GLOBAL_CONFIG_MAP
+    global GDR_GPU_ARCH
+    if GDR_GLOBAL_CONFIG_MAP is None:
+        _dict = {}
+        with open('gdr_decode_tuned.jsonl', 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if len(line) > 10:
+                    obj = json.loads(line)
+                    arch, b, sq, nkh, nvh, khd, vhd = obj['arch'], obj['b'], obj['sq'], obj['num_k_heads'], obj['num_v_heads'], obj['head_k_dim'], obj['head_v_dim']
+                    _dict[(arch, b, sq, nkh, nvh, khd, vhd)] = obj['config']
+        GDR_GLOBAL_CONFIG_MAP = _dict
+    config = GDR_GLOBAL_CONFIG_MAP.get((GDR_GPU_ARCH, batch_size, seq_length, num_k_heads, num_v_heads, head_k_dim, head_v_dim), None)
+    if config:
+        d.update(config)
     return d
 
 
@@ -446,7 +451,7 @@ def gdr_decode_(
     batch_size, seq_length, num_k_heads, head_k_dim = query.shape
     num_v_heads = value.shape[-2]
     head_v_dim = value.shape[-1]
-    kwargs_ = get_default_kwargs(batch_size, seq_length)
+    kwargs_ = get_default_kwargs(batch_size, seq_length, num_k_heads, num_v_heads, head_k_dim, head_v_dim)
     kwargs_.update(kwargs)
     exe = create_shuffle_gdr_decode_kernel(
         get_dtype_str(query.dtype),
@@ -994,5 +999,6 @@ if __name__ == '__main__':
     # rm -rf ~/.flydsl ; python3 gdr_decode.py --b=2 --sq=2 --num_k_heads=16 --num_v_heads=32 --head_k_dim=128 --head_v_dim=128 --dtype=bf16
     # rm -rf ~/.flydsl ; python3 gdr_decode.py --b=1 --sq=1 --num_k_heads=2 --num_v_heads=8 --head_k_dim=128 --head_v_dim=128 --dtype=bf16
     # rm -rf ~/.flydsl ; python3 gdr_decode.py --b=128 --sq=1 --num_k_heads=2 --num_v_heads=8 --head_k_dim=128 --head_v_dim=128 --dtype=bf16
+    # rm -rf ~/.flydsl ; python3 gdr_decode.py --b=2 --sq=1 --num_k_heads=16 --num_v_heads=32 --head_k_dim=128 --head_v_dim=128 --dtype=bf16
 
     # rm -rf ~/.flydsl ; python3 gdr_decode.py --dtype=bf16 --tune_all
