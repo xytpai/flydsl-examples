@@ -1,4 +1,5 @@
 import time
+import json
 import torch
 import argparse
 import functools
@@ -825,17 +826,63 @@ def benchmark_cudagraph(args, func, ref_func):
         print(f"maxdiff_out:{maxdiff_out}\nmaxdiff_state:{maxdiff_state}")
 
 
+@dataclass
+class TunedArgs:
+    arch: str
+    dtype: str
+    b: int
+    sq: int
+    num_k_heads: int
+    num_v_heads: int
+    head_k_dim: int
+    head_v_dim: int
+    config: dict
+    duration: float
+
+
 class GDRDecodeTuner:
-    def __init__(self, args):
-        self.args = args
+    def __init__(self):
         self.selections = {
             'NUM_BLOCKS_PER_V_DIM': [1, 2, 4, 8],
             'NUM_WARPS': [1, 2, 4],
-            'WARP_THREADS_K': [4, 8, 16],
+            'WARP_THREADS_K': [4, 8, 16, 32],
         }
+        self.gpu_arch = get_rocm_arch()
+    
+    def tune_all(
+        self,
+        out_prefix,
+        dtype,
+        num_kv_heads = [[2, 8], [16, 32]],
+        head_kv_dims = [[128, 128],],
+        bs = [i for i in range(1, 257)],
+        seq_length = 1,
+    ):
+        args = Args(
+            dtype=dtype,
+            b=0,
+            sq=seq_length,
+            num_k_heads=0,
+            num_v_heads=0,
+            head_k_dim=0,
+            head_v_dim=0,
+            use_qk_l2norm=True
+        )
+        with open(f"{out_prefix}.jsonl", "w", encoding="utf-8") as f:
+            for num_kv_head in num_kv_heads:
+                for head_kv_dim in head_kv_dims:
+                    for b in bs:
+                        args.b = b
+                        args.num_k_heads = num_kv_head[0]
+                        args.num_v_heads = num_kv_head[1]
+                        args.head_k_dim = head_kv_dim[0]
+                        args.head_v_dim = head_kv_dim[1]
+                        result = self.tune_single(args)
+                        result = vars(result)
+                        f.write(json.dumps(result, ensure_ascii=False) + "\n")
+                        f.flush()
 
-    def tune_single(self):
-        args = self.args
+    def tune_single(self, args):
         keys = self.selections.keys()
         values = self.selections.values()
         configs = [dict(zip(keys, combo)) for combo in itertools.product(*values)]
@@ -853,6 +900,19 @@ class GDRDecodeTuner:
             pbar.update(1)
         pbar.close()
         print(f"best_config:{configs[best_idx]}, duration:{best_duration}")
+        result = TunedArgs(
+            arch = self.gpu_arch,
+            dtype = str(args.dtype),
+            b = args.b,
+            sq = args.sq,
+            num_k_heads = args.num_k_heads,
+            num_v_heads = args.num_v_heads,
+            head_k_dim = args.head_k_dim,
+            head_v_dim = args.head_v_dim,
+            config = configs[best_idx],
+            duration = best_duration,
+        )
+        return result
     
     def func(self, args, query, key, value, a, b, dt_bias, A_log, indices, state, out, kwargs={}, stream=None):
         if stream is None:
@@ -903,25 +963,31 @@ class GDRDecodeTuner:
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Examples")
-    parser.add_argument("--b", type=int, required=True)
-    parser.add_argument("--sq", type=int, required=True)
-    parser.add_argument("--num_k_heads", type=int, required=True)
-    parser.add_argument("--num_v_heads", type=int, required=True)
-    parser.add_argument("--head_k_dim", type=int, required=True)
-    parser.add_argument("--head_v_dim", type=int, required=True)
-    parser.add_argument("--dtype", type=str, required=True)
+    parser.add_argument("--b", type=int, default=2)
+    parser.add_argument("--sq", type=int, default=2)
+    parser.add_argument("--num_k_heads", type=int, default=16)
+    parser.add_argument("--num_v_heads", type=int, default=32)
+    parser.add_argument("--head_k_dim", type=int, default=128)
+    parser.add_argument("--head_v_dim", type=int, default=128)
+    parser.add_argument("--dtype", type=str, default='bf16')
+    parser.add_argument("--tune_all", action='store_true')
     args = parser.parse_args()
-    print(f"run: {__file__}, args: {args}")
     dtype_convert = {'f32': torch.float, 'f16': torch.half, 'bf16': torch.bfloat16}
     args.dtype = dtype_convert[args.dtype]
-    args = Args(**vars(args))
-    benchmark(args, func, ref_func)
-    benchmark_cudagraph(args, func, ref_func)
 
-    print(f"===================== Tune best config  =====================")
-    tuner = GDRDecodeTuner(args)
-    tuner.tune_single()
+    if not args.tune_all:
+        delattr(args, 'tune_all')
+        args = Args(**vars(args))
+        print(f"run: {__file__}, args: {args}")
+        benchmark(args, func, ref_func)
+        benchmark_cudagraph(args, func, ref_func)
+    else:
+        print(f"===================== Tune best configs  =====================")
+        tuner = GDRDecodeTuner()
+        tuner.tune_all(dtype=args.dtype, out_prefix='temp/gdr_decode_tuned')
     
     # rm -rf ~/.flydsl ; python3 gdr_decode.py --b=2 --sq=2 --num_k_heads=16 --num_v_heads=32 --head_k_dim=128 --head_v_dim=128 --dtype=bf16
     # rm -rf ~/.flydsl ; python3 gdr_decode.py --b=1 --sq=1 --num_k_heads=2 --num_v_heads=8 --head_k_dim=128 --head_v_dim=128 --dtype=bf16
     # rm -rf ~/.flydsl ; python3 gdr_decode.py --b=128 --sq=1 --num_k_heads=2 --num_v_heads=8 --head_k_dim=128 --head_v_dim=128 --dtype=bf16
+
+    # rm -rf ~/.flydsl ; python3 gdr_decode.py --dtype=bf16 --tune_all
