@@ -863,7 +863,7 @@ class GDRDecodeTuner:
         self,
         out_prefix,
         dtype,
-        num_kv_heads = [[2, 8], [16, 32]],
+        num_kv_heads = [[2, 8], [16, 32], [16, 64]],
         head_kv_dims = [[128, 128],],
         bs = [i for i in range(1, 257)],
         seq_length = 1,
