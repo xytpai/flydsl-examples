@@ -439,8 +439,8 @@ def get_default_kwargs(dtype_str, state_dtype_str, batch_size, seq_length, num_k
                 if len(line) > 10:
                     obj = json.loads(line)
                     arch, b, sq, nkh, nvh, khd, vhd = obj['arch'], obj['b'], obj['sq'], obj['num_k_heads'], obj['num_v_heads'], obj['head_k_dim'], obj['head_v_dim']
-                    dtype_str, state_dtype_str = obj['dtype'], obj['state_dtype']
-                    _dict[(dtype_str, state_dtype_str, arch, b, sq, nkh, nvh, khd, vhd)] = obj['config']
+                    d_str, sd_str = obj['dtype'], obj['state_dtype']
+                    _dict[(d_str, sd_str, arch, b, sq, nkh, nvh, khd, vhd)] = obj['config']
         GDR_GLOBAL_CONFIG_MAP = _dict
     config = GDR_GLOBAL_CONFIG_MAP.get((dtype_str, state_dtype_str, GDR_GPU_ARCH, batch_size, seq_length, num_k_heads, num_v_heads, head_k_dim, head_v_dim), None)
     if config:
