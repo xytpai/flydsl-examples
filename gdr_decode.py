@@ -424,7 +424,7 @@ def create_shuffle_gdr_decode_kernel(
 
 GDR_GLOBAL_CONFIG_MAP = None
 GDR_GPU_ARCH = get_rocm_arch()
-def get_default_kwargs(batch_size, seq_length, num_k_heads, num_v_heads, head_k_dim, head_v_dim):
+def get_default_kwargs(dtype_str, state_dtype_str, batch_size, seq_length, num_k_heads, num_v_heads, head_k_dim, head_v_dim):
     d = {}
     d['NUM_BLOCKS_PER_V_DIM'] = 1
     d['NUM_WARPS'] = 4
@@ -439,9 +439,10 @@ def get_default_kwargs(batch_size, seq_length, num_k_heads, num_v_heads, head_k_
                 if len(line) > 10:
                     obj = json.loads(line)
                     arch, b, sq, nkh, nvh, khd, vhd = obj['arch'], obj['b'], obj['sq'], obj['num_k_heads'], obj['num_v_heads'], obj['head_k_dim'], obj['head_v_dim']
-                    _dict[(arch, b, sq, nkh, nvh, khd, vhd)] = obj['config']
+                    d_str, sd_str = obj['dtype'], obj['state_dtype']
+                    _dict[(d_str, sd_str, arch, b, sq, nkh, nvh, khd, vhd)] = obj['config']
         GDR_GLOBAL_CONFIG_MAP = _dict
-    config = GDR_GLOBAL_CONFIG_MAP.get((GDR_GPU_ARCH, batch_size, seq_length, num_k_heads, num_v_heads, head_k_dim, head_v_dim), None)
+    config = GDR_GLOBAL_CONFIG_MAP.get((dtype_str, state_dtype_str, GDR_GPU_ARCH, batch_size, seq_length, num_k_heads, num_v_heads, head_k_dim, head_v_dim), None)
     if config:
         d.update(config)
     return d
@@ -483,7 +484,7 @@ def gdr_decode_(
     batch_size, seq_length, num_k_heads, head_k_dim = query.shape
     num_v_heads = value.shape[-2]
     head_v_dim = value.shape[-1]
-    kwargs_ = get_default_kwargs(batch_size, seq_length, num_k_heads, num_v_heads, head_k_dim, head_v_dim)
+    kwargs_ = get_default_kwargs(str(dtype), str(state.dtype), batch_size, seq_length, num_k_heads, num_v_heads, head_k_dim, head_v_dim)
     kwargs_.update(kwargs)
     exe = create_shuffle_gdr_decode_kernel(
         get_dtype_str(query.dtype),
@@ -874,6 +875,7 @@ def benchmark_cudagraph(args, func, ref_func):
 class TunedArgs:
     arch: str
     dtype: str
+    state_dtype: str
     b: int
     sq: int
     num_k_heads: int
@@ -897,6 +899,7 @@ class GDRDecodeTuner:
         self,
         out_prefix,
         dtype,
+        state_dtype,
         num_kv_heads = [[2, 8], [4, 8], [16, 32], [16, 64]],
         head_kv_dims = [[128, 128],],
         bs = [i for i in range(1, 257)],
@@ -904,12 +907,14 @@ class GDRDecodeTuner:
     ):
         args = Args(
             dtype=dtype,
+            ssm_state_dtype=state_dtype,
             b=0,
             sq=seq_length,
             num_k_heads=0,
             num_v_heads=0,
             head_k_dim=0,
             head_v_dim=0,
+            ssm_state_size_n=256,
             use_qk_l2norm=True
         )
         with open(f"{out_prefix}.jsonl", "w", encoding="utf-8") as f:
@@ -947,6 +952,7 @@ class GDRDecodeTuner:
         result = TunedArgs(
             arch = self.gpu_arch,
             dtype = str(args.dtype),
+            state_dtype = str(args.ssm_state_dtype),
             b = args.b,
             sq = args.sq,
             num_k_heads = args.num_k_heads,
@@ -1031,11 +1037,12 @@ if __name__ == '__main__':
     else:
         print(f"===================== Tune best configs  =====================")
         tuner = GDRDecodeTuner()
-        tuner.tune_all(dtype=args.dtype, out_prefix='temp/gdr_decode_tuned')
+        tuner.tune_all(dtype=args.dtype, state_dtype=args.ssm_state_dtype, out_prefix='temp/gdr_decode_tuned')
     
     # rm -rf ~/.flydsl ; python3 gdr_decode.py --b=2 --sq=2 --num_k_heads=16 --num_v_heads=32 --head_k_dim=128 --head_v_dim=128 --dtype=bf16
     # rm -rf ~/.flydsl ; python3 gdr_decode.py --b=1 --sq=1 --num_k_heads=2 --num_v_heads=8 --head_k_dim=128 --head_v_dim=128 --dtype=bf16
     # rm -rf ~/.flydsl ; python3 gdr_decode.py --b=128 --sq=1 --num_k_heads=2 --num_v_heads=8 --head_k_dim=128 --head_v_dim=128 --dtype=bf16
     # rm -rf ~/.flydsl ; python3 gdr_decode.py --b=2 --sq=1 --num_k_heads=16 --num_v_heads=32 --head_k_dim=128 --head_v_dim=128 --dtype=bf16
+    # rm -rf ~/.flydsl ; python3 gdr_decode.py --b=16 --sq=1 --num_k_heads=4 --num_v_heads=8 --head_k_dim=128 --head_v_dim=128 --dtype=bf16
 
     # rm -rf ~/.flydsl ; python3 gdr_decode.py --dtype=bf16 --tune_all
