@@ -341,11 +341,17 @@ def compile_hgemm_kernel(
                     cond_boundary = arith.cmpi(arith.CmpIPredicate.ult, row_idx, fx.Index(m))
                     cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
                     with ir.InsertionPoint(cond_boundary_if.then_block):
-                        C_.vec_store((row_idx, n_offset + n_local_idx), init_vec, LDG_VEC_SIZE)
+                        bytes_offset = C_.linear_offset((row_idx, n_offset + n_local_idx))
+                        bytes_offset_i32 = arith.index_cast(T.i32, bytes_offset)
+                        c_ptr = get_llvm_ptr(C, bytes_offset_i32, DTYPE_BYTES)
+                        llvm.InlineAsmOp(
+                            None, [c_ptr, init_vec],
+                            "global_store_dwordx4 $0, $1, off sc0 sc1", "v,v",
+                            has_side_effects=True,
+                        )
                         scf.YieldOp([])
                 gpu.barrier()
                 # trigger signal when zeroc is done by the first arrived block
-                # NOTE: in fact, the sinal only indicates that the data has been written to L2 cache
                 is_t0_cond_if = scf.IfOp(is_t0_cond, results_=[], has_else=False)
                 with ir.InsertionPoint(is_t0_cond_if.then_block):
                     signal_ptr = get_llvm_ptr(signal, signal_idx, 4)
@@ -403,7 +409,6 @@ def compile_hgemm_kernel(
                     scf.YieldOp([])
                 scf.YieldOp([])
             gpu.barrier()
-            llvm.InlineAsmOp(None, [], "buffer_wbl2 sc0", "", has_side_effects=True)
         
         def ldg_a(k_offset):
             vecs = []
