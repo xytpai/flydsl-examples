@@ -1037,7 +1037,8 @@ if __name__ == '__main__':
     else:
         print(f"===================== Tune best configs  =====================")
         tuner = GDRDecodeTuner()
-        tuner.tune_all(dtype=args.dtype, state_dtype=args.ssm_state_dtype, out_prefix='temp/gdr_decode_tuned')
+        tuner.tune_all(dtype=args.dtype, state_dtype=torch.bfloat16, out_prefix='temp/gdr_decode_tuned_sbf16')
+        tuner.tune_all(dtype=args.dtype, state_dtype=torch.float, out_prefix='temp/gdr_decode_tuned_sf32')
     
     # rm -rf ~/.flydsl ; python3 gdr_decode.py --b=2 --sq=2 --num_k_heads=16 --num_v_heads=32 --head_k_dim=128 --head_v_dim=128 --dtype=bf16
     # rm -rf ~/.flydsl ; python3 gdr_decode.py --b=1 --sq=1 --num_k_heads=2 --num_v_heads=8 --head_k_dim=128 --head_v_dim=128 --dtype=bf16
