@@ -201,6 +201,7 @@ if __name__ == '__main__':
     # rm -rf ~/.flydsl/ ; python3 hgemm_tuned.py --single --dtype bf16 --m 32 --n 7168 --k 2048
     # rm -rf ~/.flydsl/ ; python3 hgemm_tuned.py --single --dtype bf16 --m 32 --n 384 --k 16384
     # rm -rf ~/.flydsl/ ; python3 hgemm_tuned.py --single --dtype bf16 --m 8 --n 5120 --k 2880
+    # rm -rf ~/.flydsl/ ; python3 hgemm_tuned.py --single --dtype bf16 --m 32 --n 2880 --k 2048
     
     # rm -rf ~/.flydsl/ ; python3 hgemm_tuned.py --eval --dtype bf16 --m 32 --n 384 --k 7168
     # rm -rf ~/.flydsl/ ; python3 hgemm_tuned.py --tune_all
