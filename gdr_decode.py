@@ -1,9 +1,13 @@
 import time
+import json
 import torch
 import argparse
 import functools
+import itertools
 import numpy as np
 import torch.nn.functional as F
+from tqdm import tqdm
+from pathlib import Path
 from torch.profiler import profile, ProfilerActivity
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
@@ -27,6 +31,10 @@ from flydsl.compiler.protocol import fly_values
 
 from utils.tensor_shim import get_dtype_in_kernel, get_dtype_vec_size, get_dtype_str, GTensor, STensor, _to_raw, _run_compiled
 fm_fast = arith.FastMathFlags.fast
+
+base_dir = Path(__file__).resolve().parent
+temp_dir = base_dir / 'temp'
+temp_dir.mkdir(parents=True, exist_ok=True)
 
 
 @dataclass
@@ -316,40 +324,42 @@ def create_shuffle_gdr_decode_kernel(
                     for ki in range_constexpr(WARP_TILE_K_ITERS):
                         sq_vecs[ki] = sq_vecs[ki] * scale_vec
 
+                dot_kq_vec = vector.from_elements(acc_vec_t, [f32_0 for i in range_constexpr(VALUES_PER_THREAD_K)])
+                for ki in range_constexpr(WARP_TILE_K_ITERS):
+                    dot_kq_vec = vector.FMAOp(sk_vecs[ki], sq_vecs[ki], dot_kq_vec).result
+                dot_kq = mlir_vector.ReductionOp(T.f32, vector.CombiningKind.ADD, dot_kq_vec).dest
+                for offset in WARP_THREADS_K_SHFL_OFFSETS:
+                    dot_kq = dot_kq + mlir_gpu.ShuffleOp(dot_kq, _to_raw(fx.Int32(offset)), width_i32, mode="xor").shuffleResult
+
                 for vi in range_constexpr(WARP_TILE_V_ITERS):
 
                     global_v_i = global_v_start + vi * WARP_GROUP_TILE_V
                     r_v = v_tensor[b_i, sq_i, hv_i, global_v_i].extf(T.f32)
 
                     sum_hk = vector.from_elements(acc_vec_t, [f32_0 for i in range_constexpr(VALUES_PER_THREAD_K)])
-
+                    sum_hq_old = vector.from_elements(acc_vec_t, [f32_0 for i in range_constexpr(VALUES_PER_THREAD_K)])
+                    
                     for ki in range_constexpr(WARP_TILE_K_ITERS):
                         state_vecs[vi * WARP_TILE_K_ITERS + ki] *= r_g_vec
-                        sum_hk = vector.FMAOp(state_vecs[vi * WARP_TILE_K_ITERS + ki], sk_vecs[ki], sum_hk).result
+                        h_cur = state_vecs[vi * WARP_TILE_K_ITERS + ki]
+                        sum_hk = vector.FMAOp(h_cur, sk_vecs[ki], sum_hk).result
+                        sum_hq_old = vector.FMAOp(h_cur, sq_vecs[ki], sum_hq_old).result
                     
                     sum_hk = mlir_vector.ReductionOp(T.f32, vector.CombiningKind.ADD, sum_hk).dest
+                    sum_hq_old = mlir_vector.ReductionOp(T.f32, vector.CombiningKind.ADD, sum_hq_old).dest
                     
                     for offset in WARP_THREADS_K_SHFL_OFFSETS:
                         sum_hk = sum_hk + mlir_gpu.ShuffleOp(sum_hk, _to_raw(fx.Int32(offset)), width_i32, mode="xor").shuffleResult
+                        sum_hq_old = sum_hq_old + mlir_gpu.ShuffleOp(sum_hq_old, _to_raw(fx.Int32(offset)), width_i32, mode="xor").shuffleResult
                         
                     v_new = (r_v - sum_hk) * r_beta
                     v_new = mlir_gpu.ShuffleOp(v_new, _to_raw(fx.Int32(w_tid // WARP_THREADS_K * WARP_THREADS_K)), width_i32, mode="idx").shuffleResult
-                    v_new = vector.BroadcastOp(acc_vec_t, v_new)
-
-                    sum_hq = vector.from_elements(acc_vec_t, [f32_0 for i in range_constexpr(VALUES_PER_THREAD_K)])
+                    sum_hq = sum_hq_old + v_new * dot_kq
+                    v_new_bcast = vector.BroadcastOp(acc_vec_t, v_new)
 
                     for ki in range_constexpr(WARP_TILE_K_ITERS):
-                        h_old = state_vecs[vi * WARP_TILE_K_ITERS + ki]
-                        r_q_val = sq_vecs[ki]
-                        r_k_val = sk_vecs[ki]
-                        h_new = vector.FMAOp(r_k_val, v_new, h_old).result
+                        h_new = vector.FMAOp(sk_vecs[ki], v_new_bcast, state_vecs[vi * WARP_TILE_K_ITERS + ki]).result
                         state_vecs[vi * WARP_TILE_K_ITERS + ki] = h_new
-                        sum_hq = vector.FMAOp(h_new, r_q_val, sum_hq).result
-                    
-                    sum_hq = mlir_vector.ReductionOp(T.f32, vector.CombiningKind.ADD, sum_hq).dest
-
-                    for offset in WARP_THREADS_K_SHFL_OFFSETS:
-                        sum_hq = sum_hq + mlir_gpu.ShuffleOp(sum_hq, _to_raw(arith.constant(offset, type=T.i32)), width_i32, mode="xor").shuffleResult
                     
                     sum_hq = sum_hq.truncf(dtype_)
                     write_cond = arith.cmpi(arith.CmpIPredicate.eq, fx.Index(warp_k_vec_start), fx.Index(0))
@@ -395,23 +405,28 @@ def create_shuffle_gdr_decode_kernel(
     return launch_gdr_decode_kernel
 
 
-def get_default_kwargs(batch_size, seq_length):
+GDR_GLOBAL_CONFIG_MAP = None
+GDR_GPU_ARCH = get_rocm_arch()
+def get_default_kwargs(batch_size, seq_length, num_k_heads, num_v_heads, head_k_dim, head_v_dim):
     d = {}
-    b_to_vs = {
-        1: 4,
-        2: 4,
-        3: 4,
-        4: 2,
-        5: 2,
-        6: 2,
-        7: 2,
-        8: 2,
-        9: 2,
-        10: 2,
-        11: 1,
-    }
-    if b_to_vs.get(batch_size, None) is not None:
-        d['NUM_BLOCKS_PER_V_DIM'] = b_to_vs[batch_size]
+    d['NUM_BLOCKS_PER_V_DIM'] = 1
+    d['NUM_WARPS'] = 4
+    d['WARP_THREADS_K'] = 8
+    global GDR_GLOBAL_CONFIG_MAP
+    global GDR_GPU_ARCH
+    if GDR_GLOBAL_CONFIG_MAP is None:
+        _dict = {}
+        with open('gdr_decode_tuned.jsonl', 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if len(line) > 10:
+                    obj = json.loads(line)
+                    arch, b, sq, nkh, nvh, khd, vhd = obj['arch'], obj['b'], obj['sq'], obj['num_k_heads'], obj['num_v_heads'], obj['head_k_dim'], obj['head_v_dim']
+                    _dict[(arch, b, sq, nkh, nvh, khd, vhd)] = obj['config']
+        GDR_GLOBAL_CONFIG_MAP = _dict
+    config = GDR_GLOBAL_CONFIG_MAP.get((GDR_GPU_ARCH, batch_size, seq_length, num_k_heads, num_v_heads, head_k_dim, head_v_dim), None)
+    if config:
+        d.update(config)
     return d
 
 
@@ -428,6 +443,7 @@ def gdr_decode_(
     out: torch.Tensor,
     use_qk_l2norm: bool,
     need_shuffle_state: bool,
+    kwargs: dict = {},
     stream: torch.cuda.Stream = torch.cuda.current_stream(),
 ):
     if need_shuffle_state:
@@ -437,7 +453,8 @@ def gdr_decode_(
     batch_size, seq_length, num_k_heads, head_k_dim = query.shape
     num_v_heads = value.shape[-2]
     head_v_dim = value.shape[-1]
-    kwargs = get_default_kwargs(batch_size, seq_length)
+    kwargs_ = get_default_kwargs(batch_size, seq_length, num_k_heads, num_v_heads, head_k_dim, head_v_dim)
+    kwargs_.update(kwargs)
     exe = create_shuffle_gdr_decode_kernel(
         get_dtype_str(query.dtype),
         get_dtype_str(A_log.dtype),
@@ -448,14 +465,16 @@ def gdr_decode_(
         head_v_dim,
         state.stride(),
         use_qk_l2norm,
-        **kwargs)
+        **kwargs_)
     _run_compiled(exe, query, key, value, a, b, dt_bias, A_log, indices, state_, out, batch_size, stream)
     if need_shuffle_state:
         state_ = state_.permute(0, 1, 3, 2).contiguous()
         state.copy_(state_)
 
 
-def func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out, stream=torch.cuda.current_stream()):
+def func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out, stream=None):
+    if stream is None:
+        stream = torch.cuda.current_stream()
     gdr_decode_(query, key, value, a, b, dt_bias, A_log, indices, state, out, 
         use_qk_l2norm=args.use_qk_l2norm, need_shuffle_state=True, stream=stream)
 
@@ -713,7 +732,7 @@ def ref_func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out)
         float(1.0 / (args.head_k_dim ** 0.5)), args.use_qk_l2norm)
 
 
-def benchmark(args, func, ref_func, warmup=20, niters=100):
+def benchmark(args, func, ref_func, warmup=20, niters=100, sole_inputs=False):
     torch.manual_seed(2025)
     inputs = create_inputs(args)
     outputs = create_outputs(args)
@@ -738,23 +757,43 @@ def benchmark(args, func, ref_func, warmup=20, niters=100):
         # assert is_allclose == True
     print("validation passed!\n", flush=True)
 
+    niters_ = niters if not sole_inputs else 1
+    inputs = [create_inputs(args) for i in range(niters_)]
+    ref_inputs = [create_inputs(args) for i in range(niters_)]
+    outputs = [create_outputs(args) for i in range(niters_)]
+    ref_outputs = [create_outputs(args) for i in range(niters_)]
+    for i in range(niters_):
+        inputs[i][-1].copy_(ref_inputs[i][-1])
+
     # get ref_func perf
     print("===================== [REF] =====================")
     for i in range(warmup):
-        ref_func(*ref_inouts)
+        idx = i % niters_
+        ref_func(*(ref_inputs[idx] + ref_outputs[idx]))
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
     with profile(activities=[ProfilerActivity.CUDA], ) as prof:
-        for i in range(niters):
-            ref_func(*ref_inouts)
+        for i in range(warmup, niters):
+            idx = i % niters_
+            ref_func(*(ref_inputs[idx] + ref_outputs[idx]))
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
     table = prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1)
     print(table)
 
     # get func perf
     print("===================== [FLYDSL] =====================")
     for i in range(warmup):
-        func(*inouts)
+        idx = i % niters_
+        func(*(inputs[idx] + outputs[idx]))
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
     with profile(activities=[ProfilerActivity.CUDA], ) as prof:
-        for i in range(niters):
-            func(*inouts)
+        for i in range(warmup, niters):
+            idx = i % niters_
+            func(*(inputs[idx] + outputs[idx]))
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
     table = prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1)
     print(table)
 
@@ -782,7 +821,7 @@ def benchmark_cudagraph(args, func, ref_func):
     capture_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(capture_stream):
         with torch.cuda.graph(graph, stream=capture_stream):
-            func(*(inputs + outputs), stream=capture_stream)
+            func(*(inputs + outputs), stream=torch.cuda.current_stream())
     torch.cuda.synchronize()
     
     copy_from_ref()
@@ -799,22 +838,169 @@ def benchmark_cudagraph(args, func, ref_func):
         print(f"maxdiff_out:{maxdiff_out}\nmaxdiff_state:{maxdiff_state}")
 
 
+@dataclass
+class TunedArgs:
+    arch: str
+    dtype: str
+    b: int
+    sq: int
+    num_k_heads: int
+    num_v_heads: int
+    head_k_dim: int
+    head_v_dim: int
+    config: dict
+    duration: float
+
+
+class GDRDecodeTuner:
+    def __init__(self):
+        self.selections = {
+            'NUM_BLOCKS_PER_V_DIM': [1, 2, 4, 8],
+            'NUM_WARPS': [1, 2, 4],
+            'WARP_THREADS_K': [4, 8, 16, 32],
+        }
+        self.gpu_arch = get_rocm_arch()
+    
+    def tune_all(
+        self,
+        out_prefix,
+        dtype,
+        num_kv_heads = [[2, 8], [16, 32], [16, 64]],
+        head_kv_dims = [[128, 128],],
+        bs = [i for i in range(1, 257)],
+        seq_length = 1,
+    ):
+        args = Args(
+            dtype=dtype,
+            b=0,
+            sq=seq_length,
+            num_k_heads=0,
+            num_v_heads=0,
+            head_k_dim=0,
+            head_v_dim=0,
+            use_qk_l2norm=True
+        )
+        with open(f"{out_prefix}.jsonl", "w", encoding="utf-8") as f:
+            for num_kv_head in num_kv_heads:
+                for head_kv_dim in head_kv_dims:
+                    for b in bs:
+                        args.b = b
+                        args.num_k_heads = num_kv_head[0]
+                        args.num_v_heads = num_kv_head[1]
+                        args.head_k_dim = head_kv_dim[0]
+                        args.head_v_dim = head_kv_dim[1]
+                        result = self.tune_single(args)
+                        result = vars(result)
+                        f.write(json.dumps(result, ensure_ascii=False) + "\n")
+                        f.flush()
+
+    def tune_single(self, args):
+        keys = self.selections.keys()
+        values = self.selections.values()
+        configs = [dict(zip(keys, combo)) for combo in itertools.product(*values)]
+        best_duration = float(1e10)
+        best_idx = 0
+        pbar = tqdm(total=len(configs), desc=f"{args}")
+        for i, config in enumerate(configs):
+            try:
+                dur = self.benchmark(args, kwargs=config)
+            except:
+                dur = float(1e10)
+            if dur < best_duration:
+                best_duration = dur
+                best_idx = i
+            pbar.update(1)
+        pbar.close()
+        print(f"best_config:{configs[best_idx]}, duration:{best_duration}")
+        result = TunedArgs(
+            arch = self.gpu_arch,
+            dtype = str(args.dtype),
+            b = args.b,
+            sq = args.sq,
+            num_k_heads = args.num_k_heads,
+            num_v_heads = args.num_v_heads,
+            head_k_dim = args.head_k_dim,
+            head_v_dim = args.head_v_dim,
+            config = configs[best_idx],
+            duration = best_duration,
+        )
+        return result
+    
+    def func(self, args, query, key, value, a, b, dt_bias, A_log, indices, state, out, kwargs={}, stream=None):
+        if stream is None:
+            stream = torch.cuda.current_stream()
+        gdr_decode_(query, key, value, a, b, dt_bias, A_log, indices, state, out, 
+            use_qk_l2norm=args.use_qk_l2norm, need_shuffle_state=True, stream=stream, kwargs=kwargs)
+
+    def ref_func(self, args, query, key, value, a, b, dt_bias, A_log, indices, state, out):
+        run_triton_kernel(out, A_log, dt_bias, query, key, value, a, b, state, indices,
+            float(1.0 / (args.head_k_dim ** 0.5)), args.use_qk_l2norm)
+
+    def benchmark(self, args, kwargs={}, warmup=5, niters=50):
+        # correctness test
+        inputs = create_inputs(args)
+        ref_inputs = create_inputs(args)
+        outputs = create_outputs(args)
+        ref_outputs = create_outputs(args)
+        def copy_from_ref():
+            for input, ref_input in zip(inputs, ref_inputs):
+                if isinstance(input, torch.Tensor):
+                    input.copy_(ref_input)
+            for output, ref_output in zip(outputs, ref_outputs):
+                if isinstance(output, torch.Tensor):
+                    output.copy_(ref_output)
+        copy_from_ref()
+        self.ref_func(*(ref_inputs + ref_outputs))
+        self.func(*(inputs + outputs + (kwargs,)))
+        tol = 1e-3
+        is_allclose = torch.allclose(ref_outputs[0], outputs[0], atol=tol, rtol=tol)
+        is_allclose = is_allclose and torch.allclose(ref_inputs[-1], inputs[-1], atol=tol, rtol=tol)
+        assert is_allclose == True
+        # performance bench
+        inputs = [create_inputs(args) for i in range(niters)]
+        outputs = [create_outputs(args) for i in range(niters)]
+        with profile(activities=[ProfilerActivity.CUDA], ) as prof:
+            for i in range(niters):
+                self.func(*(inputs[i] + outputs[i] + (kwargs,)))
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+        table = prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1)
+        durations = []
+        for event in prof.events():
+            if event.name.startswith("gdr_decode_"):
+                durations.append(event.device_time)
+        duration = np.median(durations)
+        return duration
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Examples")
-    parser.add_argument("--b", type=int, required=True)
-    parser.add_argument("--sq", type=int, required=True)
-    parser.add_argument("--num_k_heads", type=int, required=True)
-    parser.add_argument("--num_v_heads", type=int, required=True)
-    parser.add_argument("--head_k_dim", type=int, required=True)
-    parser.add_argument("--head_v_dim", type=int, required=True)
-    parser.add_argument("--dtype", type=str, required=True)
+    parser.add_argument("--b", type=int, default=2)
+    parser.add_argument("--sq", type=int, default=2)
+    parser.add_argument("--num_k_heads", type=int, default=16)
+    parser.add_argument("--num_v_heads", type=int, default=32)
+    parser.add_argument("--head_k_dim", type=int, default=128)
+    parser.add_argument("--head_v_dim", type=int, default=128)
+    parser.add_argument("--dtype", type=str, default='bf16')
+    parser.add_argument("--tune_all", action='store_true')
     args = parser.parse_args()
-    print(f"run: {__file__}, args: {args}")
     dtype_convert = {'f32': torch.float, 'f16': torch.half, 'bf16': torch.bfloat16}
     args.dtype = dtype_convert[args.dtype]
-    args = Args(**vars(args))
-    benchmark(args, func, ref_func)
-    benchmark_cudagraph(args, func, ref_func)
+
+    if not args.tune_all:
+        delattr(args, 'tune_all')
+        args = Args(**vars(args))
+        print(f"run: {__file__}, args: {args}")
+        benchmark(args, func, ref_func)
+        benchmark_cudagraph(args, func, ref_func)
+    else:
+        print(f"===================== Tune best configs  =====================")
+        tuner = GDRDecodeTuner()
+        tuner.tune_all(dtype=args.dtype, out_prefix='temp/gdr_decode_tuned')
+    
     # rm -rf ~/.flydsl ; python3 gdr_decode.py --b=2 --sq=2 --num_k_heads=16 --num_v_heads=32 --head_k_dim=128 --head_v_dim=128 --dtype=bf16
     # rm -rf ~/.flydsl ; python3 gdr_decode.py --b=1 --sq=1 --num_k_heads=2 --num_v_heads=8 --head_k_dim=128 --head_v_dim=128 --dtype=bf16
     # rm -rf ~/.flydsl ; python3 gdr_decode.py --b=128 --sq=1 --num_k_heads=2 --num_v_heads=8 --head_k_dim=128 --head_v_dim=128 --dtype=bf16
+    # rm -rf ~/.flydsl ; python3 gdr_decode.py --b=2 --sq=1 --num_k_heads=16 --num_v_heads=32 --head_k_dim=128 --head_v_dim=128 --dtype=bf16
+
+    # rm -rf ~/.flydsl ; python3 gdr_decode.py --dtype=bf16 --tune_all
