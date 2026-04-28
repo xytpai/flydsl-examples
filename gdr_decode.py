@@ -46,6 +46,8 @@ class Args:
     num_v_heads: int
     head_k_dim: int
     head_v_dim: int
+    ssm_state_dtype: torch.dtype
+    ssm_state_size_n: int
     use_qk_l2norm: bool = True
 
 
@@ -60,7 +62,7 @@ def create_inputs(args):
     A_log = torch.randn((args.num_v_heads), dtype=torch.float32, device="cuda")
     A_log.uniform_(0, 16)
     indices = torch.arange(args.b - 1, -1, -1, dtype=torch.int32, device="cuda")
-    state = torch.randn((args.b, args.num_v_heads, args.head_k_dim, args.head_v_dim), dtype=torch.float32, device="cuda")
+    state = torch.randn((args.ssm_state_size_n, args.num_v_heads, args.head_k_dim, args.head_v_dim), dtype=args.ssm_state_dtype, device="cuda")
     return (args, query, key, value, a, b, dt_bias, A_log, indices, state)
 
 
@@ -118,6 +120,7 @@ def ref_func_(args, query, key, value, a, b, dt_bias, A_log, indices, state, out
 def create_shuffle_gdr_decode_kernel(
     dtype: str,
     A_log_dtype: str,
+    state_dtype: str,
     seq_length: int,
     num_k_heads: int,
     num_v_heads: int,
@@ -135,7 +138,11 @@ def create_shuffle_gdr_decode_kernel(
     WARP_THREADS_V = 64 // WARP_THREADS_K
     VEC_SIZE = get_dtype_vec_size(dtype)
     DTYPE_BYTES = 16 // VEC_SIZE
-    VALUES_PER_THREAD_K = 4 # 16B
+
+    if 'f32' in state_dtype:
+        VALUES_PER_THREAD_K = 4 # 16B
+    else:
+        VALUES_PER_THREAD_K = 8
 
     WARP_SIZE = WARP_THREADS_V * WARP_THREADS_K
     BLOCK_THREADS = NUM_WARPS * WARP_SIZE
@@ -196,10 +203,12 @@ def create_shuffle_gdr_decode_kernel(
 
         dtype_ = get_dtype_in_kernel(dtype)
         A_log_dtype_ = get_dtype_in_kernel(A_log_dtype)
+        state_dtype_ = get_dtype_in_kernel(state_dtype)
         i32_0 = arith.constant(0, type=T.i32)
         f32_0 = arith.constant(0.0, type=T.f32)
         f32_1 = arith.constant(1.0, type=T.f32)
         width_i32 = arith.constant(WARP_SIZE, type=T.i32)
+        vec_t = T.vec(VALUES_PER_THREAD_K, dtype_)
         acc_vec_t = T.vec(VALUES_PER_THREAD_K, T.f32)
 
         tidx = fx.thread_idx.x
@@ -229,14 +238,14 @@ def create_shuffle_gdr_decode_kernel(
         A_log_tensor = GTensor(A_log, dtype=A_log_dtype_, shape=(num_v_heads,))
         state_tensor = GTensor(
             state,
-            dtype=T.f32,
+            dtype=state_dtype_,
             shape=(-1, num_v_heads, head_v_dim, head_k_dim),
             stride=(state_strides[0], state_strides[1], state_strides[2], state_strides[3]))
         out_tensor = GTensor(out, dtype=dtype_, shape=(-1, seq_length, num_v_heads, head_v_dim))
 
-        base_ptr = allocator.get_base()
-        smem_sr_ptr = SmemPtr(base_ptr, smem_sr_offset, T.f32, shape=(2 * NUM_WARPS,))
-        sr_tensor = STensor(smem_sr_ptr, dtype=T.f32, shape=(-1,))
+        # base_ptr = allocator.get_base()
+        # smem_sr_ptr = SmemPtr(base_ptr, smem_sr_offset, T.f32, shape=(2 * NUM_WARPS,))
+        # sr_tensor = STensor(smem_sr_ptr, dtype=T.f32, shape=(-1,))
 
         def fast_exp(x, use_exp2=True):
             if const_expr(use_exp2):
@@ -264,7 +273,11 @@ def create_shuffle_gdr_decode_kernel(
                 for ki in range_constexpr(WARP_TILE_K_ITERS):
                     warp_k_vec_i = warp_k_vec_start + ki * WARP_TILE_K
                     state_vecs[vi * WARP_TILE_K_ITERS + ki] = state_tensor.vec_load((pool_idx, hv_i, global_v_i, warp_k_vec_i), VALUES_PER_THREAD_K)
-          
+                    if const_expr('f32' in state_dtype):
+                        pass
+                    else:
+                        state_vecs[vi * WARP_TILE_K_ITERS + ki] = state_vecs[vi * WARP_TILE_K_ITERS + ki].extf(acc_vec_t)
+            
             for sq_i in range_constexpr(seq_length):
 
                 r_a = a_tensor[b_i, sq_i, hv_i].extf(T.f32)
@@ -372,7 +385,11 @@ def create_shuffle_gdr_decode_kernel(
                 global_v_i = global_v_start + vi * WARP_GROUP_TILE_V
                 for ki in range_constexpr(WARP_TILE_K_ITERS):
                     warp_k_vec_i = warp_k_vec_start + ki * WARP_TILE_K
-                    state_tensor.vec_store((pool_idx, hv_i, global_v_i, warp_k_vec_i), state_vecs[vi * WARP_TILE_K_ITERS + ki], VALUES_PER_THREAD_K)
+                    if const_expr('f32' in state_dtype):
+                        out_vec = state_vecs[vi * WARP_TILE_K_ITERS + ki]
+                    else:
+                        out_vec = state_vecs[vi * WARP_TILE_K_ITERS + ki].truncf(vec_t)
+                    state_tensor.vec_store((pool_idx, hv_i, global_v_i, warp_k_vec_i), out_vec, VALUES_PER_THREAD_K)
             scf.YieldOp([])
         return
 
@@ -446,6 +463,19 @@ def gdr_decode_(
     kwargs: dict = {},
     stream: torch.cuda.Stream = torch.cuda.current_stream(),
 ):
+    device = query.device
+    dtype = query.dtype
+    for input in [query, key, value, a, b, dt_bias, A_log, indices, out]:
+        assert input.is_contiguous()
+        assert input.data_ptr() % 16 == 0
+        assert input.device == device
+    assert state.data_ptr() % 16 == 0
+    for input in [key, value, a, b, dt_bias, out]:
+        assert input.dtype == dtype
+    assert state.dtype in [torch.float, torch.bfloat16]
+    assert A_log.dtype in [torch.float, torch.bfloat16]
+    assert indices.dtype == torch.int32
+    
     if need_shuffle_state:
         state_ = state.permute(0, 1, 3, 2).contiguous()
     else:
@@ -458,6 +488,7 @@ def gdr_decode_(
     exe = create_shuffle_gdr_decode_kernel(
         get_dtype_str(query.dtype),
         get_dtype_str(A_log.dtype),
+        get_dtype_str(state.dtype),
         seq_length,
         num_k_heads,
         num_v_heads,
@@ -866,7 +897,7 @@ class GDRDecodeTuner:
         self,
         out_prefix,
         dtype,
-        num_kv_heads = [[2, 8], [16, 32], [16, 64]],
+        num_kv_heads = [[2, 8], [4, 8], [16, 32], [16, 64]],
         head_kv_dims = [[128, 128],],
         bs = [i for i in range(1, 257)],
         seq_length = 1,
@@ -983,10 +1014,13 @@ if __name__ == '__main__':
     parser.add_argument("--head_k_dim", type=int, default=128)
     parser.add_argument("--head_v_dim", type=int, default=128)
     parser.add_argument("--dtype", type=str, default='bf16')
+    parser.add_argument("--ssm_state_size_n", type=int, default=1024)
+    parser.add_argument("--ssm_state_dtype", type=str, default='bf16')
     parser.add_argument("--tune_all", action='store_true')
     args = parser.parse_args()
     dtype_convert = {'f32': torch.float, 'f16': torch.half, 'bf16': torch.bfloat16}
     args.dtype = dtype_convert[args.dtype]
+    args.ssm_state_dtype = dtype_convert[args.ssm_state_dtype]
 
     if not args.tune_all:
         delattr(args, 'tune_all')
