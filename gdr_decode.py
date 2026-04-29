@@ -428,7 +428,7 @@ def get_default_kwargs(dtype_str, state_dtype_str, batch_size, seq_length, num_k
     d = {}
     d['NUM_BLOCKS_PER_V_DIM'] = 1
     d['NUM_WARPS'] = 4
-    d['WARP_THREADS_K'] = 8
+    d['WARP_THREADS_K'] = 16
     global GDR_GLOBAL_CONFIG_MAP
     global GDR_GPU_ARCH
     if GDR_GLOBAL_CONFIG_MAP is None:
@@ -974,7 +974,7 @@ class GDRDecodeTuner:
         run_triton_kernel(out, A_log, dt_bias, query, key, value, a, b, state, indices,
             float(1.0 / (args.head_k_dim ** 0.5)), args.use_qk_l2norm)
 
-    def benchmark(self, args, kwargs={}, warmup=5, niters=50):
+    def benchmark(self, args, kwargs={}, warmup=5, niters=20):
         # correctness test
         inputs = create_inputs(args)
         ref_inputs = create_inputs(args)
@@ -1020,7 +1020,7 @@ if __name__ == '__main__':
     parser.add_argument("--head_k_dim", type=int, default=128)
     parser.add_argument("--head_v_dim", type=int, default=128)
     parser.add_argument("--dtype", type=str, default='bf16')
-    parser.add_argument("--ssm_state_size_n", type=int, default=1024)
+    parser.add_argument("--ssm_state_size_n", type=int, default=256)
     parser.add_argument("--ssm_state_dtype", type=str, default='bf16')
     parser.add_argument("--tune_all", action='store_true')
     args = parser.parse_args()
@@ -1045,5 +1045,6 @@ if __name__ == '__main__':
     # rm -rf ~/.flydsl ; python3 gdr_decode.py --b=128 --sq=1 --num_k_heads=2 --num_v_heads=8 --head_k_dim=128 --head_v_dim=128 --dtype=bf16
     # rm -rf ~/.flydsl ; python3 gdr_decode.py --b=2 --sq=1 --num_k_heads=16 --num_v_heads=32 --head_k_dim=128 --head_v_dim=128 --dtype=bf16
     # rm -rf ~/.flydsl ; python3 gdr_decode.py --b=16 --sq=1 --num_k_heads=4 --num_v_heads=8 --head_k_dim=128 --head_v_dim=128 --dtype=bf16
+    # rm -rf ~/.flydsl ; python3 gdr_decode.py --b=159 --sq=1 --num_k_heads=16 --num_v_heads=32 --head_k_dim=128 --head_v_dim=128 --dtype=bf16
 
     # rm -rf ~/.flydsl ; python3 gdr_decode.py --dtype=bf16 --tune_all
