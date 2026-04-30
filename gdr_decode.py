@@ -142,7 +142,6 @@ def create_shuffle_gdr_decode_kernel(
     num_v_heads: int,
     head_k_dim: int,
     head_v_dim: int,
-    state_strides: tuple,
     use_qk_l2norm: bool,
     softplus_beta: float = 1.0,
     softplus_threshold: float = 20.0,
@@ -209,6 +208,10 @@ def create_shuffle_gdr_decode_kernel(
         state: fx.Tensor,
         out: fx.Tensor,
         batch_size: fx.Int32,
+        state_stride_0: fx.Int32,
+        state_stride_1: fx.Int32,
+        state_stride_2: fx.Int32,
+        state_stride_3: fx.Int32,
     ):
         scale = arith.constant(SCALE_VALUE, type=T.f32)
         softplus_beta_ = arith.constant(softplus_beta, type=T.f32)
@@ -253,7 +256,7 @@ def create_shuffle_gdr_decode_kernel(
             state,
             dtype=state_dtype_,
             shape=(-1, num_v_heads, head_v_dim, head_k_dim),
-            stride=(state_strides[0], state_strides[1], state_strides[2], state_strides[3]))
+            stride=(state_stride_0, state_stride_1, state_stride_2, state_stride_3))
         out_tensor = GTensor(out, dtype=dtype_, shape=(-1, seq_length, num_v_heads, head_v_dim))
 
         def fast_exp(x, use_exp2=True):
@@ -411,6 +414,10 @@ def create_shuffle_gdr_decode_kernel(
         state: fx.Tensor,
         out: fx.Tensor,
         batch_size: fx.Int32,
+        state_stride_0: fx.Int32,
+        state_stride_1: fx.Int32,
+        state_stride_2: fx.Int32,
+        state_stride_3: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
         allocator.finalized = False
@@ -422,6 +429,7 @@ def create_shuffle_gdr_decode_kernel(
         gdr_decode_kernel._func.__name__ = KERNEL_NAME
         gdr_decode_kernel(
             query, key, value, a, b, dt_bias, A_log, indices, state, out, batch_size,
+            state_stride_0, state_stride_1, state_stride_2, state_stride_3
         ).launch(grid=(gx, 1, 1), block=(BLOCK_THREADS, 1, 1), stream=stream)
     
     return launch_gdr_decode_kernel
@@ -466,8 +474,10 @@ def gdr_decode_(
     out: torch.Tensor,
     use_qk_l2norm: bool,
     kwargs: dict = {},
-    stream: torch.cuda.Stream = torch.cuda.current_stream(),
+    stream: torch.cuda.Stream = None,
 ):
+    if stream is None:
+        stream = torch.cuda.current_stream()
     device = query.device
     dtype = query.dtype
     for input in [query, key, value, a, b, dt_bias, A_log, indices, out]:
@@ -495,11 +505,12 @@ def gdr_decode_(
         num_v_heads,
         head_k_dim,
         head_v_dim,
-        state.stride(),
         use_qk_l2norm,
         **kwargs_)
+    state_strides = state.stride()
     with torch.cuda.device(query.device.index):
-        _run_compiled(exe, query, key, value, a, b, dt_bias, A_log, indices, state, out, batch_size, stream)
+        _run_compiled(exe, query, key, value, a, b, dt_bias, A_log, indices, state, out, batch_size, 
+        state_strides[0], state_strides[1], state_strides[2], state_strides[3], stream)
 
 
 def func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out, stream=None):
