@@ -71,7 +71,11 @@ def create_outputs(args):
     return (out,)
 
 
-def ref_func_(args, query, key, value, a, b, dt_bias, A_log, indices, state, out):
+def ref_func_(query, key, value, a, b, dt_bias, A_log, indices, state, out, use_qk_l2norm=True):
+    num_v_heads = value.shape[-2]
+    num_k_heads = key.shape[-2]
+    head_k_dim = key.shape[-1]
+    sq = key.shape[1]
     # query   # (batch, sq, num_k_heads, head_k_dim)
     # key     # (batch, sq, num_k_heads, head_k_dim)
     # value   # (batch, sq, num_v_heads, head_v_dim)
@@ -86,10 +90,10 @@ def ref_func_(args, query, key, value, a, b, dt_bias, A_log, indices, state, out
     g = -A_log.float().exp() * F.softplus(a.float() + dt_bias, beta=1.0, threshold=20.0)
     # g,     # (batch, sq, num_v_heads)
     # beta,  # (batch, sq, num_v_heads)
-    if args.num_v_heads // args.num_k_heads > 1:
-        query = query.repeat_interleave(args.num_v_heads // args.num_k_heads, dim=2)
-        key = key.repeat_interleave(args.num_v_heads // args.num_k_heads, dim=2)
-    if args.use_qk_l2norm:
+    if num_v_heads // num_k_heads > 1:
+        query = query.repeat_interleave(num_v_heads // num_k_heads, dim=2)
+        key = key.repeat_interleave(num_v_heads // num_k_heads, dim=2)
+    if use_qk_l2norm:
         def l2norm(x: torch.FloatTensor, dim: int = -1, eps: float = 1e-6):
             """This function is intended to align with the l2norm implementation in the FLA library."""
             inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
@@ -104,10 +108,10 @@ def ref_func_(args, query, key, value, a, b, dt_bias, A_log, indices, state, out
     # value, # (batch, num_v_heads, sq, head_v_dim)
     # g,     # (batch, num_v_heads, sq)
     # beta,  # (batch, num_v_heads, sq)
-    scale = 1 / (args.head_k_dim ** 0.5)
+    scale = 1 / (float(head_k_dim) ** 0.5)
     query = query * scale
     last_recurrent_state = state[indices].float()
-    for i in range(args.sq):
+    for i in range(sq):
         q_t = query[:, :, i]
         k_t = key[:, :, i]
         v_t = value[:, :, i]
@@ -765,7 +769,7 @@ def run_triton_kernel(out, A_log, dt_bias, q, k, v, a, b, initial_state, indices
 
 
 def ref_func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out):
-    ref_func_(args, query, key, value, a, b, dt_bias, A_log, indices, state, out)
+    ref_func_(query, key, value, a, b, dt_bias, A_log, indices, state, out, args.use_qk_l2norm)
     # run_triton_kernel(out, A_log, dt_bias, query, key, value, a, b, state, indices,
     #     float(1.0 / (args.head_k_dim ** 0.5)), args.use_qk_l2norm)
 
