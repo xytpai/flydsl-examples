@@ -87,7 +87,7 @@ def ref_func_(query, key, value, a, b, dt_bias, A_log, indices, state, out, use_
     # state   # (ssm_n, num_v_heads, head_v_dim, head_k_dim)
     # out,    # (batch, sq, num_v_heads, head_v_dim)
     beta = b.sigmoid()
-    g = -A_log.float().exp() * F.softplus(a.float() + dt_bias, beta=1.0, threshold=20.0)
+    g = -A_log.float().exp() * torch.nn.functional.softplus(a.float() + dt_bias, beta=1.0, threshold=20.0)
     # g,     # (batch, sq, num_v_heads)
     # beta,  # (batch, sq, num_v_heads)
     if num_v_heads // num_k_heads > 1:
@@ -123,11 +123,11 @@ def ref_func_(query, key, value, a, b, dt_bias, A_log, indices, state, out, use_
         # v_t:     # (batch, num_v_heads, head_v_dim)
         # g_t:     # (batch, num_v_heads, 1, 1)
         # beta_t:  # (batch, num_v_heads, 1)
-        # last_recurrent_state: # (b, num_v_heads, head_v_dim, head_k_dim)
-        kv_mem = (last_recurrent_state * k_t.unsqueeze(-2)).sum(dim=-1) # (b, num_v_heads, head_v_dim)
-        delta = (v_t - kv_mem) * beta_t # (b, num_v_heads, head_v_dim)  
+        # last_recurrent_state: # (batch, num_v_heads, head_v_dim, head_k_dim)
+        kv_mem = (last_recurrent_state * k_t.unsqueeze(-2)).sum(dim=-1) # (batch, num_v_heads, head_v_dim)
+        delta = (v_t - kv_mem) * beta_t # (batch, num_v_heads, head_v_dim)  
         last_recurrent_state = last_recurrent_state + k_t.unsqueeze(-2) * delta.unsqueeze(-1)
-        # core_attn_out: # (b, num_v_heads, sq, head_v_dim)
+        # core_attn_out: # (batch, sq, num_v_heads, head_v_dim)
         out[:, i, :] = (last_recurrent_state * q_t.unsqueeze(-2)).sum(dim=-1)
     state[indices] = last_recurrent_state.to(state.dtype)
 
@@ -152,13 +152,11 @@ def create_shuffle_gdr_decode_kernel(
 ):
     SCALE_VALUE = float(1.0 / (float(head_k_dim) ** 0.5))
     WARP_THREADS_V = 64 // WARP_THREADS_K
-    VEC_SIZE = get_dtype_vec_size(dtype)
-    DTYPE_BYTES = 16 // VEC_SIZE
 
     if 'f32' in state_dtype:
         VALUES_PER_THREAD_K = 4 # 16B
     else:
-        VALUES_PER_THREAD_K = 8
+        VALUES_PER_THREAD_K = 8 # 16B
 
     WARP_SIZE = WARP_THREADS_V * WARP_THREADS_K
     BLOCK_THREADS = NUM_WARPS * WARP_SIZE
@@ -168,7 +166,6 @@ def create_shuffle_gdr_decode_kernel(
     WARP_TILE_K_ITERS = head_k_dim // WARP_TILE_K
     assert WARP_TILE_K_ITERS >= 1
     assert head_k_dim % WARP_TILE_K == 0
-    TILE_K = head_k_dim
 
     WARP_TILE_V = WARP_THREADS_V
     WARP_GROUP_TILE_V = NUM_WARPS * WARP_TILE_V
@@ -259,10 +256,6 @@ def create_shuffle_gdr_decode_kernel(
             stride=(state_strides[0], state_strides[1], state_strides[2], state_strides[3]))
         out_tensor = GTensor(out, dtype=dtype_, shape=(-1, seq_length, num_v_heads, head_v_dim))
 
-        # base_ptr = allocator.get_base()
-        # smem_sr_ptr = SmemPtr(base_ptr, smem_sr_offset, T.f32, shape=(2 * NUM_WARPS,))
-        # sr_tensor = STensor(smem_sr_ptr, dtype=T.f32, shape=(-1,))
-
         def fast_exp(x, use_exp2=True):
             if const_expr(use_exp2):
                 log2e = 1.4426950408889634
@@ -335,8 +328,8 @@ def create_shuffle_gdr_decode_kernel(
                     for ki in range_constexpr(WARP_TILE_K_ITERS):
                         sum_q_partial_vec = sum_q_partial_vec + sq_vecs[ki] * sq_vecs[ki]
                         sum_k_partial_vec = sum_k_partial_vec + sk_vecs[ki] * sk_vecs[ki]
-                        sum_q_partial = mlir_vector.ReductionOp(T.f32, vector.CombiningKind.ADD, sum_q_partial_vec).dest
-                        sum_k_partial = mlir_vector.ReductionOp(T.f32, vector.CombiningKind.ADD, sum_k_partial_vec).dest
+                    sum_q_partial = mlir_vector.ReductionOp(T.f32, vector.CombiningKind.ADD, sum_q_partial_vec).dest
+                    sum_k_partial = mlir_vector.ReductionOp(T.f32, vector.CombiningKind.ADD, sum_k_partial_vec).dest
                     for offset in WARP_THREADS_K_SHFL_OFFSETS:
                         sum_q_partial = sum_q_partial + mlir_gpu.ShuffleOp(sum_q_partial, _to_raw(arith.constant(offset, type=T.i32)), width_i32, mode="xor").shuffleResult
                         sum_k_partial = sum_k_partial + mlir_gpu.ShuffleOp(sum_k_partial, _to_raw(arith.constant(offset, type=T.i32)), width_i32, mode="xor").shuffleResult
