@@ -62,7 +62,7 @@ def create_inputs(args):
     A_log = torch.randn((args.num_v_heads), dtype=torch.float32, device="cuda")
     A_log.uniform_(0, 16)
     indices = torch.arange(args.b - 1, -1, -1, dtype=torch.int32, device="cuda")
-    state = torch.randn((args.ssm_state_size_n, args.num_v_heads, args.head_k_dim, args.head_v_dim), dtype=args.ssm_state_dtype, device="cuda")
+    state = torch.randn((args.ssm_state_size_n, args.num_v_heads, args.head_v_dim, args.head_k_dim), dtype=args.ssm_state_dtype, device="cuda")
     return (args, query, key, value, a, b, dt_bias, A_log, indices, state)
 
 
@@ -72,8 +72,20 @@ def create_outputs(args):
 
 
 def ref_func_(args, query, key, value, a, b, dt_bias, A_log, indices, state, out):
+    # query   # (batch, sq, num_k_heads, head_k_dim)
+    # key     # (batch, sq, num_k_heads, head_k_dim)
+    # value   # (batch, sq, num_v_heads, head_v_dim)
+    # a       # (batch, sq, num_v_heads)
+    # b       # (batch, sq, num_v_heads)
+    # dt_bias # (num_v_heads)
+    # A_log   # (num_v_heads)
+    # indices # (batch)
+    # state   # (ssm_n, num_v_heads, head_v_dim, head_k_dim)
+    # out,    # (batch, sq, num_v_heads, head_v_dim)
     beta = b.sigmoid()
     g = -A_log.float().exp() * F.softplus(a.float() + dt_bias, beta=1.0, threshold=20.0)
+    # g,     # (batch, sq, num_v_heads)
+    # beta,  # (batch, sq, num_v_heads)
     if args.num_v_heads // args.num_k_heads > 1:
         query = query.repeat_interleave(args.num_v_heads // args.num_k_heads, dim=2)
         key = key.repeat_interleave(args.num_v_heads // args.num_k_heads, dim=2)
@@ -87,14 +99,14 @@ def ref_func_(args, query, key, value, a, b, dt_bias, A_log, indices, state, out
     query, key, value, beta, g = [
         x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
     ]
-    # query, # (b, num_v_heads, sq, head_k_dim)
-    # key,   # (b, num_v_heads, sq, head_k_dim)
-    # value, # (b, num_v_heads, sq, head_v_dim)
-    # g,     # (b, num_v_heads, sq)
-    # beta,  # (b, num_v_heads, sq)
+    # query, # (batch, num_v_heads, sq, head_k_dim)
+    # key,   # (batch, num_v_heads, sq, head_k_dim)
+    # value, # (batch, num_v_heads, sq, head_v_dim)
+    # g,     # (batch, num_v_heads, sq)
+    # beta,  # (batch, num_v_heads, sq)
     scale = 1 / (args.head_k_dim ** 0.5)
     query = query * scale
-    last_recurrent_state = state[indices]
+    last_recurrent_state = state[indices].float()
     for i in range(args.sq):
         q_t = query[:, :, i]
         k_t = key[:, :, i]
@@ -102,18 +114,18 @@ def ref_func_(args, query, key, value, a, b, dt_bias, A_log, indices, state, out
         g_t = g[:, :, i].exp().unsqueeze(-1).unsqueeze(-1)
         beta_t = beta[:, :, i].unsqueeze(-1)
         last_recurrent_state = last_recurrent_state * g_t
-        # q_t:     # (b, num_v_heads, head_k_dim)
-        # k_t:     # (b, num_v_heads, head_k_dim)
-        # v_t:     # (b, num_v_heads, head_v_dim)
-        # g_t:     # (b, num_v_heads, 1, 1)
-        # beta_t:  # (b, num_v_heads, 1)
-        # last_recurrent_state: # (b, num_v_heads, head_k_dim, head_v_dim)
-        kv_mem = (last_recurrent_state * k_t.unsqueeze(-1)).sum(dim=-2) # (b, num_v_heads, head_v_dim)
+        # q_t:     # (batch, num_v_heads, head_k_dim)
+        # k_t:     # (batch, num_v_heads, head_k_dim)
+        # v_t:     # (batch, num_v_heads, head_v_dim)
+        # g_t:     # (batch, num_v_heads, 1, 1)
+        # beta_t:  # (batch, num_v_heads, 1)
+        # last_recurrent_state: # (b, num_v_heads, head_v_dim, head_k_dim)
+        kv_mem = (last_recurrent_state * k_t.unsqueeze(-2)).sum(dim=-1) # (b, num_v_heads, head_v_dim)
         delta = (v_t - kv_mem) * beta_t # (b, num_v_heads, head_v_dim)  
-        last_recurrent_state = last_recurrent_state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
+        last_recurrent_state = last_recurrent_state + k_t.unsqueeze(-2) * delta.unsqueeze(-1)
         # core_attn_out: # (b, num_v_heads, sq, head_v_dim)
-        out[:, i, :] = (last_recurrent_state * q_t.unsqueeze(-1)).sum(dim=-2)
-    state[indices] = last_recurrent_state
+        out[:, i, :] = (last_recurrent_state * q_t.unsqueeze(-2)).sum(dim=-1)
+    state[indices] = last_recurrent_state.to(state.dtype)
 
 
 @functools.lru_cache(maxsize=1024)
@@ -460,7 +472,6 @@ def gdr_decode_(
     state: torch.Tensor,
     out: torch.Tensor,
     use_qk_l2norm: bool,
-    need_shuffle_state: bool,
     kwargs: dict = {},
     stream: torch.cuda.Stream = torch.cuda.current_stream(),
 ):
@@ -476,11 +487,7 @@ def gdr_decode_(
     assert state.dtype in [torch.float, torch.bfloat16]
     assert A_log.dtype in [torch.float, torch.bfloat16]
     assert indices.dtype == torch.int32
-    
-    if need_shuffle_state:
-        state_ = state.permute(0, 1, 3, 2).contiguous()
-    else:
-        state_ = state
+
     batch_size, seq_length, num_k_heads, head_k_dim = query.shape
     num_v_heads = value.shape[-2]
     head_v_dim = value.shape[-1]
@@ -499,17 +506,14 @@ def gdr_decode_(
         use_qk_l2norm,
         **kwargs_)
     with torch.cuda.device(query.device.index):
-        _run_compiled(exe, query, key, value, a, b, dt_bias, A_log, indices, state_, out, batch_size, stream)
-    if need_shuffle_state:
-        state_ = state_.permute(0, 1, 3, 2).contiguous()
-        state.copy_(state_)
+        _run_compiled(exe, query, key, value, a, b, dt_bias, A_log, indices, state, out, batch_size, stream)
 
 
 def func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out, stream=None):
     if stream is None:
         stream = torch.cuda.current_stream()
     gdr_decode_(query, key, value, a, b, dt_bias, A_log, indices, state, out, 
-        use_qk_l2norm=args.use_qk_l2norm, need_shuffle_state=True, stream=stream)
+        use_qk_l2norm=args.use_qk_l2norm, stream=stream)
 
 
 @triton.jit(do_not_specialize=["T"])
@@ -761,8 +765,9 @@ def run_triton_kernel(out, A_log, dt_bias, q, k, v, a, b, initial_state, indices
 
 
 def ref_func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out):
-    run_triton_kernel(out, A_log, dt_bias, query, key, value, a, b, state, indices,
-        float(1.0 / (args.head_k_dim ** 0.5)), args.use_qk_l2norm)
+    ref_func_(args, query, key, value, a, b, dt_bias, A_log, indices, state, out)
+    # run_triton_kernel(out, A_log, dt_bias, query, key, value, a, b, state, indices,
+    #     float(1.0 / (args.head_k_dim ** 0.5)), args.use_qk_l2norm)
 
 
 def benchmark(args, func, ref_func, warmup=20, niters=100, sole_inputs=False):
@@ -968,7 +973,7 @@ class GDRDecodeTuner:
         if stream is None:
             stream = torch.cuda.current_stream()
         gdr_decode_(query, key, value, a, b, dt_bias, A_log, indices, state, out, 
-            use_qk_l2norm=args.use_qk_l2norm, need_shuffle_state=True, stream=stream, kwargs=kwargs)
+            use_qk_l2norm=args.use_qk_l2norm, stream=stream, kwargs=kwargs)
 
     def ref_func(self, args, query, key, value, a, b, dt_bias, A_log, indices, state, out):
         run_triton_kernel(out, A_log, dt_bias, query, key, value, a, b, state, indices,
