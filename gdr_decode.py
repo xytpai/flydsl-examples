@@ -217,7 +217,7 @@ def create_shuffle_gdr_decode_kernel(
         dtype_ = get_dtype_in_kernel(dtype)
         A_log_dtype_ = get_dtype_in_kernel(A_log_dtype)
         state_dtype_ = get_dtype_in_kernel(state_dtype)
-        i32_0 = arith.constant(0, type=T.i32)
+        # i32_0 = arith.constant(0, type=T.i32)
         f32_0 = arith.constant(0.0, type=T.f32)
         f32_1 = arith.constant(1.0, type=T.f32)
         width_i32 = arith.constant(WARP_SIZE, type=T.i32)
