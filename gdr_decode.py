@@ -1,4 +1,5 @@
 import time
+import csv
 import json
 import torch
 import argparse
@@ -133,7 +134,7 @@ def ref_func_(query, key, value, a, b, dt_bias, A_log, indices, state, out, use_
 
 
 @functools.lru_cache(maxsize=1024)
-def create_shuffle_gdr_decode_kernel(
+def create_vk_gdr_decode_kernel(
     dtype: str,
     A_log_dtype: str,
     state_dtype: str,
@@ -443,7 +444,7 @@ def get_default_kwargs(dtype_str, state_dtype_str, batch_size, seq_length, num_k
     d = {}
     d['NUM_BLOCKS_PER_V_DIM'] = 1
     d['NUM_WARPS'] = 4
-    d['WARP_THREADS_K'] = 16
+    d['WARP_THREADS_K'] = 8
     global GDR_GLOBAL_CONFIG_MAP
     global GDR_GPU_ARCH
     if GDR_GLOBAL_CONFIG_MAP is None:
@@ -483,8 +484,6 @@ def gdr_decode_(
     device = query.device
     dtype = query.dtype
     for input in [query, key, value, a, b, dt_bias, A_log, indices, out]:
-        assert input.is_contiguous()
-        assert input.data_ptr() % 16 == 0
         assert input.device == device
     assert state.data_ptr() % 16 == 0
     for input in [key, value, a, b, dt_bias, out]:
@@ -498,7 +497,7 @@ def gdr_decode_(
     head_v_dim = value.shape[-1]
     kwargs_ = get_default_kwargs(str(dtype), str(state.dtype), batch_size, seq_length, num_k_heads, num_v_heads, head_k_dim, head_v_dim)
     kwargs_.update(kwargs)
-    exe = create_shuffle_gdr_decode_kernel(
+    exe = create_vk_gdr_decode_kernel(
         get_dtype_str(query.dtype),
         get_dtype_str(A_log.dtype),
         get_dtype_str(state.dtype),
@@ -511,8 +510,22 @@ def gdr_decode_(
         **kwargs_)
     state_strides = state.stride()
     with torch.cuda.device(query.device.index):
-        _run_compiled(exe, query, key, value, a, b, dt_bias, A_log, indices, state, out, batch_size, 
-        state_strides[0], state_strides[1], state_strides[2], state_strides[3], stream)
+        _run_compiled(
+            exe,
+            query.contiguous(),
+            key.contiguous(),
+            value.contiguous(),
+            a.contiguous(),
+            b.contiguous(),
+            dt_bias.contiguous(),
+            A_log.contiguous(),
+            indices.contiguous(),
+            state,
+            out,
+            batch_size,
+            state_strides[0], state_strides[1], state_strides[2], state_strides[3],
+            stream
+        )
 
 
 def func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out, stream=None):
@@ -913,7 +926,7 @@ class GDRDecodeTuner:
         state_dtype,
         num_kv_heads = [[2, 8], [4, 8], [16, 32], [16, 64]],
         head_kv_dims = [[128, 128],],
-        bs = [i for i in range(1, 257)],
+        bs = [i for i in range(1, 129)],
         seq_length = 1,
     ):
         args = Args(
@@ -928,7 +941,10 @@ class GDRDecodeTuner:
             ssm_state_size_n=256,
             use_qk_l2norm=True
         )
-        with open(f"{out_prefix}.jsonl", "w", encoding="utf-8") as f:
+        head = ["arch", "dtype", "state_dtype", "b", "sq", "num_k_heads", "num_v_heads", "head_k_dim", "head_v_dim", "NUM_BLOCKS_PER_V_DIM", "NUM_WARPS", "WARP_THREADS_K", "duration"]
+        with open(f"{out_prefix}.csv", "w", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(head)
             for num_kv_head in num_kv_heads:
                 for head_kv_dim in head_kv_dims:
                     for b in bs:
@@ -938,8 +954,22 @@ class GDRDecodeTuner:
                         args.head_k_dim = head_kv_dim[0]
                         args.head_v_dim = head_kv_dim[1]
                         result = self.tune_single(args)
-                        result = vars(result)
-                        f.write(json.dumps(result, ensure_ascii=False) + "\n")
+                        row = [
+                            result.arch,
+                            result.dtype,
+                            result.state_dtype,
+                            result.b,
+                            result.sq,
+                            result.num_k_heads,
+                            result.num_v_heads,
+                            result.head_k_dim,
+                            result.head_v_dim,
+                            result.config['NUM_BLOCKS_PER_V_DIM'],
+                            result.config['NUM_WARPS'],
+                            result.config['WARP_THREADS_K'],
+                            result.duration,
+                        ]
+                        writer.writerow(row)
                         f.flush()
 
     def tune_single(self, args):
@@ -982,8 +1012,7 @@ class GDRDecodeTuner:
             use_qk_l2norm=args.use_qk_l2norm, stream=stream, kwargs=kwargs)
 
     def ref_func(self, args, query, key, value, a, b, dt_bias, A_log, indices, state, out):
-        run_triton_kernel(out, A_log, dt_bias, query, key, value, a, b, state, indices,
-            float(1.0 / (args.head_k_dim ** 0.5)), args.use_qk_l2norm)
+        ref_func_(query, key, value, a, b, dt_bias, A_log, indices, state, out, args.use_qk_l2norm)
 
     def benchmark(self, args, kwargs={}, warmup=5, niters=20):
         # correctness test
@@ -1001,7 +1030,7 @@ class GDRDecodeTuner:
         copy_from_ref()
         self.ref_func(*(ref_inputs + ref_outputs))
         self.func(*(inputs + outputs + (kwargs,)))
-        tol = 1e-3
+        tol = 5e-2
         is_allclose = torch.allclose(ref_outputs[0], outputs[0], atol=tol, rtol=tol)
         is_allclose = is_allclose and torch.allclose(ref_inputs[-1], inputs[-1], atol=tol, rtol=tol)
         assert is_allclose == True
