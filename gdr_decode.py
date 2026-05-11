@@ -435,14 +435,17 @@ def get_default_kwargs(dtype_str, state_dtype_str, batch_size, seq_length, num_k
     global GDR_GPU_ARCH
     if GDR_GLOBAL_CONFIG_MAP is None:
         _dict = {}
-        with open('gdr_decode_tuned.jsonl', 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if len(line) > 10:
-                    obj = json.loads(line)
-                    arch, b, sq, nkh, nvh, khd, vhd = obj['arch'], obj['b'], obj['sq'], obj['num_k_heads'], obj['num_v_heads'], obj['head_k_dim'], obj['head_v_dim']
-                    d_str, sd_str = obj['dtype'], obj['state_dtype']
-                    _dict[(d_str, sd_str, arch, b, sq, nkh, nvh, khd, vhd)] = obj['config']
+        with open('gdr_decode_tuned.csv', 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                obj = dict(row)
+                arch, b, sq, nkh, nvh, khd, vhd = obj['arch'], int(obj['b']), int(obj['sq']), int(obj['num_k_heads']), int(obj['num_v_heads']), int(obj['head_k_dim']), int(obj['head_v_dim'])
+                d_str, sd_str = obj['dtype'], obj['state_dtype']
+                _dict[(d_str, sd_str, arch, b, sq, nkh, nvh, khd, vhd)] = {
+                    'NUM_BLOCKS_PER_V_DIM': int(obj['NUM_BLOCKS_PER_V_DIM']),
+                    'NUM_WARPS': int(obj['NUM_WARPS']),
+                    'WARP_THREADS_K': int(obj['WARP_THREADS_K']),
+                }
         GDR_GLOBAL_CONFIG_MAP = _dict
     config = GDR_GLOBAL_CONFIG_MAP.get((dtype_str, state_dtype_str, GDR_GPU_ARCH, batch_size, seq_length, num_k_heads, num_v_heads, head_k_dim, head_v_dim), None)
     if config:
