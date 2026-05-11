@@ -152,7 +152,7 @@ old_*
 checkpoints/*.ckpt
 .datacache
 *.ckpt
-*.csv
+# *.csv
 gpucore.*
 log
 *_logs

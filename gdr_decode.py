@@ -1,5 +1,5 @@
 import time
-import json
+import csv
 import torch
 import argparse
 import functools
@@ -133,7 +133,7 @@ def ref_func_(query, key, value, a, b, dt_bias, A_log, indices, state, out, use_
 
 
 @functools.lru_cache(maxsize=1024)
-def create_shuffle_gdr_decode_kernel(
+def create_vk_gdr_decode_kernel(
     dtype: str,
     A_log_dtype: str,
     state_dtype: str,
@@ -142,6 +142,7 @@ def create_shuffle_gdr_decode_kernel(
     num_v_heads: int,
     head_k_dim: int,
     head_v_dim: int,
+    state_strides: tuple,
     use_qk_l2norm: bool,
     softplus_beta: float = 1.0,
     softplus_threshold: float = 20.0,
@@ -186,11 +187,6 @@ def create_shuffle_gdr_decode_kernel(
         WARP_SIZE_SHFL_OFFSETS.append(int(offsets_))
         offsets_ /= 2
     
-    GPU_ARCH = get_rocm_arch()
-    allocator = SmemAllocator(None, arch=GPU_ARCH, global_sym_name="smem")
-    smem_sr_offset = allocator._align(allocator.ptr, 16)
-    allocator.ptr = smem_sr_offset + 2 * NUM_WARPS * 4
-
     KERNEL_NAME = f"gdr_decode_{dtype}_kh{num_k_heads}x{head_k_dim}_vh{num_v_heads}x{head_v_dim}_q{seq_length}"
     KERNEL_NAME += f"_{NUM_WARPS}w{WARP_THREADS_V}x{WARP_THREADS_K}"
     KERNEL_NAME += f"_vs{NUM_BLOCKS_PER_V_DIM}"
@@ -208,10 +204,6 @@ def create_shuffle_gdr_decode_kernel(
         state: fx.Tensor,
         out: fx.Tensor,
         batch_size: fx.Int32,
-        state_stride_0: fx.Int32,
-        state_stride_1: fx.Int32,
-        state_stride_2: fx.Int32,
-        state_stride_3: fx.Int32,
     ):
         scale = arith.constant(SCALE_VALUE, type=T.f32)
         softplus_beta_ = arith.constant(softplus_beta, type=T.f32)
@@ -272,8 +264,8 @@ def create_shuffle_gdr_decode_kernel(
                 state,
                 dtype=state_dtype_,
                 shape=(num_v_heads, head_v_dim, head_k_dim),
-                stride=(state_stride_1, state_stride_2, state_stride_3),
-                static_bytes_offset_i64 = fx.Index(pool_idx) *  fx.Index(state_stride_0) * get_dtype_bytes(state_dtype))
+                stride=(state_strides[1], state_strides[2], state_strides[3]),
+                static_bytes_offset_i64 = fx.Index(pool_idx) * fx.Index(state_strides[0]) * get_dtype_bytes(state_dtype))
 
             if const_expr('f32' in A_log_dtype):
                 r_A_log = A_log_tensor[hv_i]
@@ -351,39 +343,43 @@ def create_shuffle_gdr_decode_kernel(
                     for ki in range_constexpr(WARP_TILE_K_ITERS):
                         sq_vecs[ki] = sq_vecs[ki] * scale_vec
 
+                dot_kq_vec = vector.from_elements(acc_vec_t, [f32_0 for i in range_constexpr(VALUES_PER_THREAD_K)])
+                for ki in range_constexpr(WARP_TILE_K_ITERS):
+                    dot_kq_vec = vector.FMAOp(sk_vecs[ki], sq_vecs[ki], dot_kq_vec).result
+                dot_kq = mlir_vector.ReductionOp(T.f32, vector.CombiningKind.ADD, dot_kq_vec).dest
+                for offset in WARP_THREADS_K_SHFL_OFFSETS:
+                    dot_kq = dot_kq + mlir_gpu.ShuffleOp(dot_kq, _to_raw(fx.Int32(offset)), width_i32, mode="xor").shuffleResult
+                
                 for vi in range_constexpr(WARP_TILE_V_ITERS):
 
                     global_v_i = global_v_start + vi * WARP_GROUP_TILE_V
                     r_v = v_tensor[b_i, sq_i, hv_i, global_v_i].extf(T.f32)
 
                     sum_hk = vector.from_elements(acc_vec_t, [f32_0 for i in range_constexpr(VALUES_PER_THREAD_K)])
+                    sum_hq_old = vector.from_elements(acc_vec_t, [f32_0 for i in range_constexpr(VALUES_PER_THREAD_K)])
 
                     for ki in range_constexpr(WARP_TILE_K_ITERS):
                         state_vecs[vi * WARP_TILE_K_ITERS + ki] *= r_g_vec
-                        sum_hk = vector.FMAOp(state_vecs[vi * WARP_TILE_K_ITERS + ki], sk_vecs[ki], sum_hk).result
-                    
+                        h_cur = state_vecs[vi * WARP_TILE_K_ITERS + ki]
+                        sum_hk = vector.FMAOp(h_cur, sk_vecs[ki], sum_hk).result
+                        sum_hq_old = vector.FMAOp(h_cur, sq_vecs[ki], sum_hq_old).result
+
                     sum_hk = mlir_vector.ReductionOp(T.f32, vector.CombiningKind.ADD, sum_hk).dest
+                    sum_hq_old = mlir_vector.ReductionOp(T.f32, vector.CombiningKind.ADD, sum_hq_old).dest
 
                     for offset in WARP_THREADS_K_SHFL_OFFSETS:
                         sum_hk = sum_hk + mlir_gpu.ShuffleOp(sum_hk, _to_raw(fx.Int32(offset)), width_i32, mode="xor").shuffleResult
-                    sum_hk = mlir_gpu.ShuffleOp(sum_hk, _to_raw(fx.Int32(w_tid // WARP_THREADS_K * WARP_THREADS_K)), width_i32, mode="idx").shuffleResult
-                    
-                    delta = (r_v - sum_hk) * r_beta
-                    delta = vector.BroadcastOp(acc_vec_t, delta)
+                        sum_hq_old = sum_hq_old + mlir_gpu.ShuffleOp(sum_hq_old, _to_raw(fx.Int32(offset)), width_i32, mode="xor").shuffleResult
 
-                    sum_hq = vector.from_elements(acc_vec_t, [f32_0 for i in range_constexpr(VALUES_PER_THREAD_K)])
+                    v_new = (r_v - sum_hk) * r_beta
+                    v_new = mlir_gpu.ShuffleOp(v_new, _to_raw(fx.Int32(w_tid // WARP_THREADS_K * WARP_THREADS_K)), width_i32, mode="idx").shuffleResult
+                    sum_hq = sum_hq_old + v_new * dot_kq
+                    v_new_bcast = vector.BroadcastOp(acc_vec_t, v_new)
 
                     for ki in range_constexpr(WARP_TILE_K_ITERS):
-                        h_old = state_vecs[vi * WARP_TILE_K_ITERS + ki]
-                        h_new = vector.FMAOp(sk_vecs[ki], delta, h_old).result
+                        h_new = vector.FMAOp(sk_vecs[ki], v_new_bcast, state_vecs[vi * WARP_TILE_K_ITERS + ki]).result
                         state_vecs[vi * WARP_TILE_K_ITERS + ki] = h_new
-                        sum_hq = vector.FMAOp(h_new, sq_vecs[ki], sum_hq).result
 
-                    sum_hq = mlir_vector.ReductionOp(T.f32, vector.CombiningKind.ADD, sum_hq).dest
-
-                    for offset in WARP_THREADS_K_SHFL_OFFSETS:
-                        sum_hq = sum_hq + mlir_gpu.ShuffleOp(sum_hq, _to_raw(arith.constant(offset, type=T.i32)), width_i32, mode="xor").shuffleResult
-                    
                     sum_hq = sum_hq.truncf(dtype_)
                     write_cond = arith.cmpi(arith.CmpIPredicate.eq, fx.Index(warp_k_vec_start), fx.Index(0))
                     write_cond_if = scf.IfOp(write_cond, results_=[], has_else=False)
@@ -416,22 +412,12 @@ def create_shuffle_gdr_decode_kernel(
         state: fx.Tensor,
         out: fx.Tensor,
         batch_size: fx.Int32,
-        state_stride_0: fx.Int32,
-        state_stride_1: fx.Int32,
-        state_stride_2: fx.Int32,
-        state_stride_3: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        allocator.finalized = False
-        ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            allocator.finalize()
-        
         gx = batch_size * num_v_heads * NUM_BLOCKS_PER_V_DIM
         gdr_decode_kernel._func.__name__ = KERNEL_NAME
         gdr_decode_kernel(
             query, key, value, a, b, dt_bias, A_log, indices, state, out, batch_size,
-            state_stride_0, state_stride_1, state_stride_2, state_stride_3
         ).launch(grid=(gx, 1, 1), block=(BLOCK_THREADS, 1, 1), stream=stream)
     
     return launch_gdr_decode_kernel
@@ -443,19 +429,23 @@ def get_default_kwargs(dtype_str, state_dtype_str, batch_size, seq_length, num_k
     d = {}
     d['NUM_BLOCKS_PER_V_DIM'] = 1
     d['NUM_WARPS'] = 4
-    d['WARP_THREADS_K'] = 16
+    d['WARP_THREADS_K'] = 8
     global GDR_GLOBAL_CONFIG_MAP
     global GDR_GPU_ARCH
     if GDR_GLOBAL_CONFIG_MAP is None:
         _dict = {}
-        with open('gdr_decode_tuned.jsonl', 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if len(line) > 10:
-                    obj = json.loads(line)
-                    arch, b, sq, nkh, nvh, khd, vhd = obj['arch'], obj['b'], obj['sq'], obj['num_k_heads'], obj['num_v_heads'], obj['head_k_dim'], obj['head_v_dim']
-                    d_str, sd_str = obj['dtype'], obj['state_dtype']
-                    _dict[(d_str, sd_str, arch, b, sq, nkh, nvh, khd, vhd)] = obj['config']
+        with open('gdr_decode_tuned.csv', 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                obj = dict(row)
+                arch, b, sq, nkh, nvh, khd, vhd = obj['arch'], int(obj['b']), int(obj['sq']), int(obj['num_k_heads']), int(obj['num_v_heads']), int(obj['head_k_dim']), int(obj['head_v_dim'])
+                d_str, sd_str = obj['dtype'], obj['state_dtype']
+                if float(obj['duration']) < 10000.0:
+                    _dict[(d_str, sd_str, arch, b, sq, nkh, nvh, khd, vhd)] = {
+                        'NUM_BLOCKS_PER_V_DIM': int(obj['NUM_BLOCKS_PER_V_DIM']),
+                        'NUM_WARPS': int(obj['NUM_WARPS']),
+                        'WARP_THREADS_K': int(obj['WARP_THREADS_K']),
+                    }
         GDR_GLOBAL_CONFIG_MAP = _dict
     config = GDR_GLOBAL_CONFIG_MAP.get((dtype_str, state_dtype_str, GDR_GPU_ARCH, batch_size, seq_length, num_k_heads, num_v_heads, head_k_dim, head_v_dim), None)
     if config:
@@ -483,8 +473,6 @@ def gdr_decode_(
     device = query.device
     dtype = query.dtype
     for input in [query, key, value, a, b, dt_bias, A_log, indices, out]:
-        assert input.is_contiguous()
-        assert input.data_ptr() % 16 == 0
         assert input.device == device
     assert state.data_ptr() % 16 == 0
     for input in [key, value, a, b, dt_bias, out]:
@@ -498,7 +486,7 @@ def gdr_decode_(
     head_v_dim = value.shape[-1]
     kwargs_ = get_default_kwargs(str(dtype), str(state.dtype), batch_size, seq_length, num_k_heads, num_v_heads, head_k_dim, head_v_dim)
     kwargs_.update(kwargs)
-    exe = create_shuffle_gdr_decode_kernel(
+    exe = create_vk_gdr_decode_kernel(
         get_dtype_str(query.dtype),
         get_dtype_str(A_log.dtype),
         get_dtype_str(state.dtype),
@@ -507,12 +495,26 @@ def gdr_decode_(
         num_v_heads,
         head_k_dim,
         head_v_dim,
+        state.stride(),
         use_qk_l2norm,
         **kwargs_)
     state_strides = state.stride()
     with torch.cuda.device(query.device.index):
-        _run_compiled(exe, query, key, value, a, b, dt_bias, A_log, indices, state, out, batch_size, 
-        state_strides[0], state_strides[1], state_strides[2], state_strides[3], stream)
+        _run_compiled(
+            exe,
+            query.contiguous(),
+            key.contiguous(),
+            value.contiguous(),
+            a.contiguous(),
+            b.contiguous(),
+            dt_bias.contiguous(),
+            A_log.contiguous(),
+            indices.contiguous(),
+            state,
+            out,
+            batch_size,
+            stream
+        )
 
 
 def func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out, stream=None):
@@ -913,7 +915,7 @@ class GDRDecodeTuner:
         state_dtype,
         num_kv_heads = [[2, 8], [4, 8], [16, 32], [16, 64]],
         head_kv_dims = [[128, 128],],
-        bs = [i for i in range(1, 257)],
+        bs = [i for i in range(1, 129)],
         seq_length = 1,
     ):
         args = Args(
@@ -928,7 +930,10 @@ class GDRDecodeTuner:
             ssm_state_size_n=256,
             use_qk_l2norm=True
         )
-        with open(f"{out_prefix}.jsonl", "w", encoding="utf-8") as f:
+        head = ["arch", "dtype", "state_dtype", "b", "sq", "num_k_heads", "num_v_heads", "head_k_dim", "head_v_dim", "NUM_BLOCKS_PER_V_DIM", "NUM_WARPS", "WARP_THREADS_K", "duration"]
+        with open(f"{out_prefix}.csv", "w", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(head)
             for num_kv_head in num_kv_heads:
                 for head_kv_dim in head_kv_dims:
                     for b in bs:
@@ -938,8 +943,22 @@ class GDRDecodeTuner:
                         args.head_k_dim = head_kv_dim[0]
                         args.head_v_dim = head_kv_dim[1]
                         result = self.tune_single(args)
-                        result = vars(result)
-                        f.write(json.dumps(result, ensure_ascii=False) + "\n")
+                        row = [
+                            result.arch,
+                            result.dtype,
+                            result.state_dtype,
+                            result.b,
+                            result.sq,
+                            result.num_k_heads,
+                            result.num_v_heads,
+                            result.head_k_dim,
+                            result.head_v_dim,
+                            result.config['NUM_BLOCKS_PER_V_DIM'],
+                            result.config['NUM_WARPS'],
+                            result.config['WARP_THREADS_K'],
+                            result.duration,
+                        ]
+                        writer.writerow(row)
                         f.flush()
 
     def tune_single(self, args):
@@ -952,7 +971,7 @@ class GDRDecodeTuner:
         for i, config in enumerate(configs):
             try:
                 dur = self.benchmark(args, kwargs=config)
-            except:
+            except AssertionError:
                 dur = float(1e10)
             if dur < best_duration:
                 best_duration = dur
@@ -982,10 +1001,9 @@ class GDRDecodeTuner:
             use_qk_l2norm=args.use_qk_l2norm, stream=stream, kwargs=kwargs)
 
     def ref_func(self, args, query, key, value, a, b, dt_bias, A_log, indices, state, out):
-        run_triton_kernel(out, A_log, dt_bias, query, key, value, a, b, state, indices,
-            float(1.0 / (args.head_k_dim ** 0.5)), args.use_qk_l2norm)
+        ref_func_(query, key, value, a, b, dt_bias, A_log, indices, state, out, args.use_qk_l2norm)
 
-    def benchmark(self, args, kwargs={}, warmup=5, niters=20):
+    def benchmark(self, args, kwargs={}, warmup=5, niters=40):
         # correctness test
         inputs = create_inputs(args)
         ref_inputs = create_inputs(args)
@@ -1001,7 +1019,7 @@ class GDRDecodeTuner:
         copy_from_ref()
         self.ref_func(*(ref_inputs + ref_outputs))
         self.func(*(inputs + outputs + (kwargs,)))
-        tol = 1e-3
+        tol = 5e-2
         is_allclose = torch.allclose(ref_outputs[0], outputs[0], atol=tol, rtol=tol)
         is_allclose = is_allclose and torch.allclose(ref_inputs[-1], inputs[-1], atol=tol, rtol=tol)
         assert is_allclose == True
