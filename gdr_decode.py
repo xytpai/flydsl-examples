@@ -188,11 +188,6 @@ def create_vk_gdr_decode_kernel(
         WARP_SIZE_SHFL_OFFSETS.append(int(offsets_))
         offsets_ /= 2
     
-    GPU_ARCH = get_rocm_arch()
-    allocator = SmemAllocator(None, arch=GPU_ARCH, global_sym_name="smem")
-    smem_sr_offset = allocator._align(allocator.ptr, 16)
-    allocator.ptr = smem_sr_offset + 2 * NUM_WARPS * 4
-
     KERNEL_NAME = f"gdr_decode_{dtype}_kh{num_k_heads}x{head_k_dim}_vh{num_v_heads}x{head_v_dim}_q{seq_length}"
     KERNEL_NAME += f"_{NUM_WARPS}w{WARP_THREADS_V}x{WARP_THREADS_K}"
     KERNEL_NAME += f"_vs{NUM_BLOCKS_PER_V_DIM}"
@@ -420,11 +415,6 @@ def create_vk_gdr_decode_kernel(
         batch_size: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        allocator.finalized = False
-        ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            allocator.finalize()
-        
         gx = batch_size * num_v_heads * NUM_BLOCKS_PER_V_DIM
         gdr_decode_kernel._func.__name__ = KERNEL_NAME
         gdr_decode_kernel(
