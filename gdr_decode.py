@@ -352,39 +352,43 @@ def create_vk_gdr_decode_kernel(
                     for ki in range_constexpr(WARP_TILE_K_ITERS):
                         sq_vecs[ki] = sq_vecs[ki] * scale_vec
 
+                dot_kq_vec = vector.from_elements(acc_vec_t, [f32_0 for i in range_constexpr(VALUES_PER_THREAD_K)])
+                for ki in range_constexpr(WARP_TILE_K_ITERS):
+                    dot_kq_vec = vector.FMAOp(sk_vecs[ki], sq_vecs[ki], dot_kq_vec).result
+                dot_kq = mlir_vector.ReductionOp(T.f32, vector.CombiningKind.ADD, dot_kq_vec).dest
+                for offset in WARP_THREADS_K_SHFL_OFFSETS:
+                    dot_kq = dot_kq + mlir_gpu.ShuffleOp(dot_kq, _to_raw(fx.Int32(offset)), width_i32, mode="xor").shuffleResult
+                
                 for vi in range_constexpr(WARP_TILE_V_ITERS):
 
                     global_v_i = global_v_start + vi * WARP_GROUP_TILE_V
                     r_v = v_tensor[b_i, sq_i, hv_i, global_v_i].extf(T.f32)
 
                     sum_hk = vector.from_elements(acc_vec_t, [f32_0 for i in range_constexpr(VALUES_PER_THREAD_K)])
+                    sum_hq_old = vector.from_elements(acc_vec_t, [f32_0 for i in range_constexpr(VALUES_PER_THREAD_K)])
 
                     for ki in range_constexpr(WARP_TILE_K_ITERS):
                         state_vecs[vi * WARP_TILE_K_ITERS + ki] *= r_g_vec
-                        sum_hk = vector.FMAOp(state_vecs[vi * WARP_TILE_K_ITERS + ki], sk_vecs[ki], sum_hk).result
-                    
+                        h_cur = state_vecs[vi * WARP_TILE_K_ITERS + ki]
+                        sum_hk = vector.FMAOp(h_cur, sk_vecs[ki], sum_hk).result
+                        sum_hq_old = vector.FMAOp(h_cur, sq_vecs[ki], sum_hq_old).result
+
                     sum_hk = mlir_vector.ReductionOp(T.f32, vector.CombiningKind.ADD, sum_hk).dest
+                    sum_hq_old = mlir_vector.ReductionOp(T.f32, vector.CombiningKind.ADD, sum_hq_old).dest
 
                     for offset in WARP_THREADS_K_SHFL_OFFSETS:
                         sum_hk = sum_hk + mlir_gpu.ShuffleOp(sum_hk, _to_raw(fx.Int32(offset)), width_i32, mode="xor").shuffleResult
-                    sum_hk = mlir_gpu.ShuffleOp(sum_hk, _to_raw(fx.Int32(w_tid // WARP_THREADS_K * WARP_THREADS_K)), width_i32, mode="idx").shuffleResult
-                    
-                    delta = (r_v - sum_hk) * r_beta
-                    delta = vector.BroadcastOp(acc_vec_t, delta)
+                        sum_hq_old = sum_hq_old + mlir_gpu.ShuffleOp(sum_hq_old, _to_raw(fx.Int32(offset)), width_i32, mode="xor").shuffleResult
 
-                    sum_hq = vector.from_elements(acc_vec_t, [f32_0 for i in range_constexpr(VALUES_PER_THREAD_K)])
+                    v_new = (r_v - sum_hk) * r_beta
+                    v_new = mlir_gpu.ShuffleOp(v_new, _to_raw(fx.Int32(w_tid // WARP_THREADS_K * WARP_THREADS_K)), width_i32, mode="idx").shuffleResult
+                    sum_hq = sum_hq_old + v_new * dot_kq
+                    v_new_bcast = vector.BroadcastOp(acc_vec_t, v_new)
 
                     for ki in range_constexpr(WARP_TILE_K_ITERS):
-                        h_old = state_vecs[vi * WARP_TILE_K_ITERS + ki]
-                        h_new = vector.FMAOp(sk_vecs[ki], delta, h_old).result
+                        h_new = vector.FMAOp(sk_vecs[ki], v_new_bcast, state_vecs[vi * WARP_TILE_K_ITERS + ki]).result
                         state_vecs[vi * WARP_TILE_K_ITERS + ki] = h_new
-                        sum_hq = vector.FMAOp(h_new, sq_vecs[ki], sum_hq).result
 
-                    sum_hq = mlir_vector.ReductionOp(T.f32, vector.CombiningKind.ADD, sum_hq).dest
-
-                    for offset in WARP_THREADS_K_SHFL_OFFSETS:
-                        sum_hq = sum_hq + mlir_gpu.ShuffleOp(sum_hq, _to_raw(arith.constant(offset, type=T.i32)), width_i32, mode="xor").shuffleResult
-                    
                     sum_hq = sum_hq.truncf(dtype_)
                     write_cond = arith.cmpi(arith.CmpIPredicate.eq, fx.Index(warp_k_vec_start), fx.Index(0))
                     write_cond_if = scf.IfOp(write_cond, results_=[], has_else=False)
@@ -982,7 +986,7 @@ class GDRDecodeTuner:
         for i, config in enumerate(configs):
             try:
                 dur = self.benchmark(args, kwargs=config)
-            except:
+            except AssertionError:
                 dur = float(1e10)
             if dur < best_duration:
                 best_duration = dur
