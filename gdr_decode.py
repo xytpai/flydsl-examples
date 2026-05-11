@@ -29,7 +29,7 @@ from flydsl.compiler.kernel_function import CompilationContext
 from flydsl._mlir.dialects import llvm, fly, memref, scf
 from flydsl.compiler.protocol import fly_values
 
-from utils.tensor_shim import get_dtype_in_kernel, get_dtype_vec_size, get_dtype_str, GTensor, STensor, _to_raw, _run_compiled
+from utils.tensor_shim import get_dtype_in_kernel, get_dtype_vec_size, get_dtype_str, get_dtype_bytes, GTensor, STensor, _to_raw, _run_compiled
 fm_fast = arith.FastMathFlags.fast
 
 base_dir = Path(__file__).resolve().parent
@@ -252,11 +252,6 @@ def create_shuffle_gdr_decode_kernel(
         b_tensor = GTensor(b, dtype=dtype_, shape=(-1, seq_length, num_v_heads))
         dt_bias_tensor = GTensor(dt_bias, dtype=dtype_, shape=(num_v_heads,))
         A_log_tensor = GTensor(A_log, dtype=A_log_dtype_, shape=(num_v_heads,))
-        state_tensor = GTensor(
-            state,
-            dtype=state_dtype_,
-            shape=(-1, num_v_heads, head_v_dim, head_k_dim),
-            stride=(state_stride_0, state_stride_1, state_stride_2, state_stride_3))
         out_tensor = GTensor(out, dtype=dtype_, shape=(-1, seq_length, num_v_heads, head_v_dim))
 
         def fast_exp(x, use_exp2=True):
@@ -273,6 +268,13 @@ def create_shuffle_gdr_decode_kernel(
         cond_valid_if = scf.IfOp(cond_valid, results_=[], has_else=False)
         with ir.InsertionPoint(cond_valid_if.then_block):
 
+            state_tensor = GTensor(
+                state,
+                dtype=state_dtype_,
+                shape=(num_v_heads, head_v_dim, head_k_dim),
+                stride=(state_stride_1, state_stride_2, state_stride_3),
+                static_bytes_offset_i64 = fx.Index(pool_idx) *  fx.Index(state_stride_0) * get_dtype_bytes(state_dtype))
+
             if const_expr('f32' in A_log_dtype):
                 r_A_log = A_log_tensor[hv_i]
             else:
@@ -284,7 +286,7 @@ def create_shuffle_gdr_decode_kernel(
                 global_v_i = global_v_start + vi * WARP_GROUP_TILE_V
                 for ki in range_constexpr(WARP_TILE_K_ITERS):
                     warp_k_vec_i = warp_k_vec_start + ki * WARP_TILE_K
-                    state_vecs[vi * WARP_TILE_K_ITERS + ki] = state_tensor.vec_load((pool_idx, hv_i, global_v_i, warp_k_vec_i), VALUES_PER_THREAD_K)
+                    state_vecs[vi * WARP_TILE_K_ITERS + ki] = state_tensor.vec_load((hv_i, global_v_i, warp_k_vec_i), VALUES_PER_THREAD_K)
                     if const_expr('f32' in state_dtype):
                         pass
                     else:
@@ -397,7 +399,7 @@ def create_shuffle_gdr_decode_kernel(
                         out_vec = state_vecs[vi * WARP_TILE_K_ITERS + ki]
                     else:
                         out_vec = state_vecs[vi * WARP_TILE_K_ITERS + ki].truncf(vec_t)
-                    state_tensor.vec_store((pool_idx, hv_i, global_v_i, warp_k_vec_i), out_vec, VALUES_PER_THREAD_K)
+                    state_tensor.vec_store((hv_i, global_v_i, warp_k_vec_i), out_vec, VALUES_PER_THREAD_K)
             scf.YieldOp([])
         return
 

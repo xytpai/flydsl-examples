@@ -11,7 +11,7 @@ from flydsl._mlir.dialects import fly, llvm
 from flydsl.compiler.protocol import fly_values
 from flydsl.expr.typing import T
 
-from flydsl.expr import buffer_ops, range_constexpr, vector, memref_load, memref_store
+from flydsl.expr import buffer_ops, range_constexpr, vector, memref_load, memref_store, arith, const_expr
 
 
 def _run_compiled(exe, *args):
@@ -60,6 +60,15 @@ def get_dtype_vec_size(dtype: str):
         return 8
     elif dtype == 'bf16':
         return 8
+
+
+def get_dtype_bytes(dtype: str):
+    if dtype == 'f32':
+        return 4
+    elif dtype == 'f16':
+        return 2
+    elif dtype == 'bf16':
+        return 2
 
 
 class TensorView:
@@ -237,9 +246,13 @@ class TorchTensor(TensorBase):
 
 
 class GTensor(TensorBase):
-    def __init__(self, memref, dtype, shape, stride=None, base_offset=0, cache_modifier=0):
+    def __init__(self, memref, dtype, shape, stride=None, base_offset=0, cache_modifier=0, static_bytes_offset_i64=None):
         super().__init__(dtype, shape, stride, base_offset)
-        self.rsrc = buffer_ops.create_buffer_resource(memref, max_size=True)
+        if static_bytes_offset_i64 is None:
+            self.rsrc = buffer_ops.create_buffer_resource(memref, max_size=True)
+        else:
+            array_base_i64 = self.get_llvm_ptr(memref, (static_bytes_offset_i64))
+            self.rsrc = buffer_ops.create_buffer_resource_from_addr(array_base_i64)
         self.cache_modifier = cache_modifier
     
     def load(self, offset, vec_size=1):
@@ -247,6 +260,14 @@ class GTensor(TensorBase):
     
     def store(self, offset, value, vec_size=1):
         buffer_ops.buffer_store(value, self.rsrc, offset, cache_modifier=self.cache_modifier)
+    
+    def get_llvm_ptr(self, ptr, bytes_offset_i64, ptr_type="!llvm.ptr<1>"):
+        bytes_offset_i64 = arith.index_cast(T.i64, bytes_offset_i64)
+        _ptr_type = ir.Type.parse(ptr_type)
+        base_ptr = fly.extract_aligned_pointer_as_index(_ptr_type, fly_values(ptr)[0])
+        base_ptr = llvm.PtrToIntOp(T.i64, base_ptr).result
+        llvm_ptr = llvm.AddOp(base_ptr, bytes_offset_i64, llvm.IntegerOverflowFlags(0)).result
+        return llvm_ptr
 
 
 class STensor(TensorBase):
@@ -265,11 +286,11 @@ class STensor(TensorBase):
     
     def store(self, offset, value, vec_size=1):
         if vec_size > 1:
-            vector.store(value, self.memptr, [offset], alignment=16)
+            vector.store(value, self.memptr, [fx.Index(offset)], alignment=16)
         else:
             vec_t = T.vec(1, self.dtype)
             vec = vector.from_elements(vec_t, [value])
-            vector.store(vec, self.memptr, [offset], alignment=16)
+            vector.store(vec, self.memptr, [fx.Index(offset)], alignment=16)
 
 
 if __name__ == '__main__':
