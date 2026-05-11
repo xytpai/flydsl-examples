@@ -286,11 +286,11 @@ class STensor(TensorBase):
     
     def store(self, offset, value, vec_size=1):
         if vec_size > 1:
-            vector.store(value, self.memptr, [fx.Index(offset)], alignment=16)
+            vector.store(value, self.memptr, [offset], alignment=16)
         else:
             vec_t = T.vec(1, self.dtype)
             vec = vector.from_elements(vec_t, [value])
-            vector.store(vec, self.memptr, [fx.Index(offset)], alignment=16)
+            vector.store(vec, self.memptr, [offset], alignment=16)
 
 
 if __name__ == '__main__':
