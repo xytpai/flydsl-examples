@@ -143,6 +143,7 @@ def create_vk_gdr_decode_kernel(
     num_v_heads: int,
     head_k_dim: int,
     head_v_dim: int,
+    state_strides: tuple,
     use_qk_l2norm: bool,
     softplus_beta: float = 1.0,
     softplus_threshold: float = 20.0,
@@ -209,10 +210,6 @@ def create_vk_gdr_decode_kernel(
         state: fx.Tensor,
         out: fx.Tensor,
         batch_size: fx.Int32,
-        state_stride_0: fx.Int32,
-        state_stride_1: fx.Int32,
-        state_stride_2: fx.Int32,
-        state_stride_3: fx.Int32,
     ):
         scale = arith.constant(SCALE_VALUE, type=T.f32)
         softplus_beta_ = arith.constant(softplus_beta, type=T.f32)
@@ -273,8 +270,8 @@ def create_vk_gdr_decode_kernel(
                 state,
                 dtype=state_dtype_,
                 shape=(num_v_heads, head_v_dim, head_k_dim),
-                stride=(state_stride_1, state_stride_2, state_stride_3),
-                static_bytes_offset_i64 = fx.Index(pool_idx) *  fx.Index(state_stride_0) * get_dtype_bytes(state_dtype))
+                stride=(state_strides[1], state_strides[2], state_strides[3]),
+                static_bytes_offset_i64 = fx.Index(pool_idx) * fx.Index(state_strides[0]) * get_dtype_bytes(state_dtype))
 
             if const_expr('f32' in A_log_dtype):
                 r_A_log = A_log_tensor[hv_i]
@@ -421,10 +418,6 @@ def create_vk_gdr_decode_kernel(
         state: fx.Tensor,
         out: fx.Tensor,
         batch_size: fx.Int32,
-        state_stride_0: fx.Int32,
-        state_stride_1: fx.Int32,
-        state_stride_2: fx.Int32,
-        state_stride_3: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
         allocator.finalized = False
@@ -436,7 +429,6 @@ def create_vk_gdr_decode_kernel(
         gdr_decode_kernel._func.__name__ = KERNEL_NAME
         gdr_decode_kernel(
             query, key, value, a, b, dt_bias, A_log, indices, state, out, batch_size,
-            state_stride_0, state_stride_1, state_stride_2, state_stride_3
         ).launch(grid=(gx, 1, 1), block=(BLOCK_THREADS, 1, 1), stream=stream)
     
     return launch_gdr_decode_kernel
@@ -510,6 +502,7 @@ def gdr_decode_(
         num_v_heads,
         head_k_dim,
         head_v_dim,
+        state.stride(),
         use_qk_l2norm,
         **kwargs_)
     state_strides = state.stride()
@@ -527,7 +520,6 @@ def gdr_decode_(
             state,
             out,
             batch_size,
-            state_strides[0], state_strides[1], state_strides[2], state_strides[3],
             stream
         )
 
