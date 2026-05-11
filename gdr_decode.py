@@ -1,6 +1,5 @@
 import time
 import csv
-import json
 import torch
 import argparse
 import functools
@@ -441,11 +440,12 @@ def get_default_kwargs(dtype_str, state_dtype_str, batch_size, seq_length, num_k
                 obj = dict(row)
                 arch, b, sq, nkh, nvh, khd, vhd = obj['arch'], int(obj['b']), int(obj['sq']), int(obj['num_k_heads']), int(obj['num_v_heads']), int(obj['head_k_dim']), int(obj['head_v_dim'])
                 d_str, sd_str = obj['dtype'], obj['state_dtype']
-                _dict[(d_str, sd_str, arch, b, sq, nkh, nvh, khd, vhd)] = {
-                    'NUM_BLOCKS_PER_V_DIM': int(obj['NUM_BLOCKS_PER_V_DIM']),
-                    'NUM_WARPS': int(obj['NUM_WARPS']),
-                    'WARP_THREADS_K': int(obj['WARP_THREADS_K']),
-                }
+                if float(obj['duration']) < 10000.0:
+                    _dict[(d_str, sd_str, arch, b, sq, nkh, nvh, khd, vhd)] = {
+                        'NUM_BLOCKS_PER_V_DIM': int(obj['NUM_BLOCKS_PER_V_DIM']),
+                        'NUM_WARPS': int(obj['NUM_WARPS']),
+                        'WARP_THREADS_K': int(obj['WARP_THREADS_K']),
+                    }
         GDR_GLOBAL_CONFIG_MAP = _dict
     config = GDR_GLOBAL_CONFIG_MAP.get((dtype_str, state_dtype_str, GDR_GPU_ARCH, batch_size, seq_length, num_k_heads, num_v_heads, head_k_dim, head_v_dim), None)
     if config:
