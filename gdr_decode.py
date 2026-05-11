@@ -1010,7 +1010,7 @@ class GDRDecodeTuner:
     def ref_func(self, args, query, key, value, a, b, dt_bias, A_log, indices, state, out):
         ref_func_(query, key, value, a, b, dt_bias, A_log, indices, state, out, args.use_qk_l2norm)
 
-    def benchmark(self, args, kwargs={}, warmup=5, niters=20):
+    def benchmark(self, args, kwargs={}, warmup=5, niters=40):
         # correctness test
         inputs = create_inputs(args)
         ref_inputs = create_inputs(args)
