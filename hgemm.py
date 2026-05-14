@@ -187,6 +187,8 @@ def compile_hgemm_kernel(
     WARP_GROUP_K = BLOCK_K_WARPS * WARP_ATOM_K
     WARP_K_STEPS = BLOCK_K // WARP_GROUP_K
     assert (BLOCK_K % WARP_GROUP_K == 0) and (WARP_K_STEPS >= 1)
+    K_SLICE = BLOCK_K // BLOCK_K_WARPS
+    assert K_SLICE % WARP_ATOM_K == 0
     BLOCK_THREADS = BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS * WARP_SIZE
     BLOCK_MN_WARPS = BLOCK_M_WARPS * BLOCK_N_WARPS
     WARP_M_STEPS = TILE_M // BLOCK_M_WARPS // WARP_ATOM_M
@@ -225,8 +227,9 @@ def compile_hgemm_kernel(
         smem_b_offset = allocator._align(allocator.ptr, 16)
         allocator.ptr = smem_b_offset + STAGES * BLOCK_N * BLOCK_K * DTYPE_BYTES
         SMEM_USE += STAGES * BLOCK_N * BLOCK_K * DTYPE_BYTES
-    SMEM_USE = max(SMEM_USE, BLOCK_M * BLOCK_N * DTYPE_BYTES)
-    assert SMEM_USE <= SMEM_CAPACITY_MAP[GPU_ARCH]
+    SMEM_USE_ = max(SMEM_USE, BLOCK_K_WARPS * BLOCK_M * BLOCK_N * DTYPE_BYTES)
+    allocator.ptr += SMEM_USE_ - SMEM_USE
+    assert SMEM_USE_ <= SMEM_CAPACITY_MAP[GPU_ARCH]
     LDG_ASYNC_VEC_SIZE = DMA_BYTES // DTYPE_BYTES
     LDG_A_X_THREADS_AS = BLOCK_K // LDG_ASYNC_VEC_SIZE
     LDG_REG_A_COUNT_AS = BLOCK_MK_SIZE // LDG_ASYNC_VEC_SIZE // BLOCK_THREADS
@@ -264,8 +267,8 @@ def compile_hgemm_kernel(
         if const_expr(B_TO_LDS):
             smem_b_ptr = SmemPtr(base_ptr, smem_b_offset, dtype_, shape=(STAGES * BLOCK_N * BLOCK_K,))
             bs_ = STensor(smem_b_ptr, dtype_, shape=(STAGES, BLOCK_N, BLOCK_K))
-        smem_c_ptr = SmemPtr(base_ptr, smem_a_offset, dtype_, shape=(BLOCK_M * BLOCK_N,))
-        cs_ = STensor(smem_c_ptr, dtype_, shape=(BLOCK_M, BLOCK_N))
+        smem_c_ptr = SmemPtr(base_ptr, smem_a_offset, dtype_, shape=(BLOCK_K_WARPS * BLOCK_M * BLOCK_N,))
+        cs_ = STensor(smem_c_ptr, dtype_, shape=(BLOCK_K_WARPS, BLOCK_M, BLOCK_N))
         if const_expr(IS_SPLIT_K):
             smem_bc_ptr = SmemPtr(base_ptr, smem_a_offset, T.i32, shape=(1,))
             bc_ = STensor(smem_bc_ptr, T.i32, shape=(1,))
@@ -273,7 +276,7 @@ def compile_hgemm_kernel(
             signal_ = GTensor(signal, dtype=T.i32, shape=(-1,))
             signal_idx = fx.Int32(fx.block_idx.x)
         
-        tid = fx.Int32(fx.thread_idx.x)
+        tid = fx.thread_idx.x
         wid = tid // WARP_SIZE
         wid_mn = wid % BLOCK_MN_WARPS
         wid_k = wid // BLOCK_MN_WARPS
@@ -294,9 +297,10 @@ def compile_hgemm_kernel(
         warp_m_idx = wid_mn // BLOCK_N_WARPS * WARP_M
         warp_n_idx = wid_mn % BLOCK_N_WARPS * WARP_N
         ldmatrix_a_m_idx = w_tid % WMMA_M
-        ldmatrix_a_k_vec_idx = w_tid // WMMA_M * WMMA_A_FRAG_VALUES * MFMA_PER_WARP_K + wid_k * WARP_ATOM_K
+        ldmatrix_a_k_vec_idx = w_tid // WMMA_M * WMMA_A_FRAG_VALUES * MFMA_PER_WARP_K
         ldmatrix_b_n_idx = w_tid % WMMA_N
-        ldmatrix_b_k_vec_idx = w_tid // WMMA_N * WMMA_B_FRAG_VALUES * MFMA_PER_WARP_K + wid_k * WARP_ATOM_K
+        ldmatrix_b_k_vec_idx = w_tid // WMMA_N * WMMA_B_FRAG_VALUES * MFMA_PER_WARP_K
+        warp_k_slice_base = wid_k * K_SLICE
         A_FRAGS_LEN = WARP_K_STEPS * WARP_M_STEPS
         B_FRAGS_LEN = WARP_K_STEPS * WARP_N_STEPS
         C_FRAGS_LEN = WARP_M_STEPS * WARP_N_STEPS
@@ -557,7 +561,7 @@ def compile_hgemm_kernel(
             for ii in range_constexpr(WARP_M_STEPS):
                 warp_atom_m_idx = warp_m_idx + ii * WARP_ATOM_M
                 for kk in range_constexpr(WARP_K_STEPS):
-                    warp_atom_k_idx = kk * WARP_GROUP_K
+                    warp_atom_k_idx = warp_k_slice_base + kk * WARP_ATOM_K
                     row = warp_atom_m_idx + ldmatrix_a_m_idx
                     col_in_bytes = (warp_atom_k_idx + ldmatrix_a_k_vec_idx) * DTYPE_BYTES
                     col_in_bytes = swizzle_xor16(row, col_in_bytes, k_blocks16)
@@ -571,7 +575,7 @@ def compile_hgemm_kernel(
             for ii in range_constexpr(WARP_N_STEPS):
                 warp_atom_n_idx = warp_n_idx + ii * WARP_ATOM_N
                 for kk in range_constexpr(WARP_K_STEPS):
-                    warp_atom_k_idx = kk * WARP_GROUP_K
+                    warp_atom_k_idx = warp_k_slice_base + kk * WARP_ATOM_K
                     row = warp_atom_n_idx + ldmatrix_b_n_idx
                     col_in_bytes = (warp_atom_k_idx + ldmatrix_b_k_vec_idx) * DTYPE_BYTES
                     col_in_bytes = swizzle_xor16(row, col_in_bytes, k_blocks16)
@@ -581,16 +585,10 @@ def compile_hgemm_kernel(
         
         def ldg_matrix_b(k_offset):
             vecs = []
-            b_n_intra_base = ldmatrix_b_n_idx
-            b_k_intra_vec = ldmatrix_b_k_vec_idx // LDG_VEC_SIZE
-            b_n0_base = n_offset // WARP_ATOM_N + warp_n_idx // WARP_ATOM_N
-            b_k0_base = k_offset // WARP_GROUP_K
             for kk in range_constexpr(WARP_K_STEPS):
-                b_k0 = b_k0_base + kk
                 for ii in range_constexpr(WARP_N_STEPS):
-                    b_n0 = b_n0_base + ii
                     warp_atom_n_idx = warp_n_idx + ii * WARP_ATOM_N
-                    warp_atom_k_idx = kk * WARP_GROUP_K
+                    warp_atom_k_idx = warp_k_slice_base + kk * WARP_ATOM_K
                     n_idx = n_offset + warp_atom_n_idx + ldmatrix_b_n_idx
                     k_idx = k_offset + warp_atom_k_idx + ldmatrix_b_k_vec_idx
                     vec = B_.vec_load((n_idx, k_idx), WMMA_B_FRAG_VALUES * MFMA_PER_WARP_K)
@@ -758,7 +756,28 @@ def compile_hgemm_kernel(
                     lds_m_idx = fx.Index(warp_atom_m_idx + stmatrix_c_m_vec_idx + kk)
                     lds_n_idx = fx.Index(warp_atom_n_idx + stmatrix_c_n_idx)
                     val = vector.extract(c_frags[ii * WARP_N_STEPS + jj], static_position=[kk], dynamic_position=[])
-                    cs_[lds_m_idx, lds_n_idx] = val.truncf(dtype_)
+                    val = val.truncf(dtype_)
+                    if const_expr(IS_SLICE_K):
+                        cs_[wid_k, lds_m_idx, lds_n_idx] = val
+                    else:
+                        cs_[0, lds_m_idx, lds_n_idx] = val
+        
+        # slice k reduce
+        if const_expr(IS_SLICE_K):
+            gpu.barrier()
+            write_cond = arith.cmpi(arith.CmpIPredicate.eq, wid_k, fx.Int32(0))
+            write_cond_if = scf.IfOp(write_cond, results_=[], has_else=False)
+            with ir.InsertionPoint(write_cond_if.then_block):
+                for ii in range_constexpr(WARP_M_STEPS):
+                    warp_atom_m_idx = warp_m_idx + ii * WARP_ATOM_M
+                    for jj in range_constexpr(WARP_N_STEPS):
+                        warp_atom_n_idx = warp_n_idx + jj * WARP_ATOM_N
+                        for kk in range_constexpr(WMMA_C_FRAG_VALUES):
+                            lds_m_idx = fx.Index(warp_atom_m_idx + stmatrix_c_m_vec_idx + kk)
+                            lds_n_idx = fx.Index(warp_atom_n_idx + stmatrix_c_n_idx)
+                            for sk in range_constexpr(BLOCK_K_WARPS):
+                                cs_[0, lds_m_idx, lds_n_idx] += cs_[sk, lds_m_idx, lds_n_idx]
+                scf.YieldOp([])
         
         # write back to global
         if const_expr(IS_SPLIT_K):
@@ -772,7 +791,7 @@ def compile_hgemm_kernel(
                 cond_boundary = arith.cmpi(arith.CmpIPredicate.ult, m_global_idx, fx.Index(m))
                 cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
                 with ir.InsertionPoint(cond_boundary_if.then_block):
-                    pk_val = cs_.vec_load((m_local_idx, n_local_idx), LDG_VEC_SIZE)
+                    pk_val = cs_.vec_load((0, m_local_idx, n_local_idx), LDG_VEC_SIZE)
                     linear_offset_c = C_.linear_offset((m_global_idx, n_global_idx))
                     # split to vec2s
                     vec2_ty = T.vec(2, dtype_)
@@ -801,7 +820,7 @@ def compile_hgemm_kernel(
                 cond_boundary = arith.cmpi(arith.CmpIPredicate.ult, m_global_idx, fx.Index(m))
                 cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
                 with ir.InsertionPoint(cond_boundary_if.then_block):
-                    vec = cs_.vec_load((m_local_idx, n_local_idx), LDG_VEC_SIZE)
+                    vec = cs_.vec_load((0, m_local_idx, n_local_idx), LDG_VEC_SIZE)
                     if const_expr(HAS_BIAS):
                         bias_vec = BIAS_.vec_load((n_offset + n_local_idx,), LDG_VEC_SIZE)
                         vec = vec + bias_vec
@@ -840,6 +859,7 @@ def get_default_kwargs(m, n, k):
         'SPLIT_K': 1,
         'BLOCK_M_WARPS': 2,
         'BLOCK_N_WARPS': 2,
+        'BLOCK_K_WARPS': 1,
         'B_TO_LDS': True,
     }
     if m == 2048 and n == 2048 and k == 2048:
