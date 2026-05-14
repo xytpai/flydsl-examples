@@ -138,16 +138,18 @@ def compile_hgemm_kernel(
     SPLIT_K: int = 1,
     BLOCK_M_WARPS: int = 1,
     BLOCK_N_WARPS: int = 4,
+    BLOCK_K_WARPS: int = 1,
     B_TO_LDS: bool = False,
     HAS_BIAS: bool = False,
 ):
-    assert BLOCK_M_WARPS * BLOCK_N_WARPS <= 4
+    assert BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS <= 8
     assert TILE_M * TILE_N * TILE_K <= 256 * 256 * 64
     if (TILE_M == 256) and (TILE_N == 256):
         assert (TILE_K == 64) and (SPLIT_K == 1)
     N_BLOCKS = n // TILE_N
     assert (N_BLOCKS >= 1) and (n % TILE_N == 0)
     IS_SPLIT_K = SPLIT_K > 1
+    IS_SLICE_K = BLOCK_K_WARPS > 1
     BLOCK_K = TILE_K
     assert (k % SPLIT_K == 0) and (k // SPLIT_K >= 1)
     ks = k // SPLIT_K
@@ -182,9 +184,10 @@ def compile_hgemm_kernel(
     WARP_ATOM_N = WMMA_N
     WARP_ATOM_K = WMMA_K * MFMA_PER_WARP_K
     BLOCK_K_LOOPS = ks // BLOCK_K
-    WARP_K_STEPS = BLOCK_K // WARP_ATOM_K
-    assert (BLOCK_K % WARP_ATOM_K == 0) and (WARP_K_STEPS >= 1)
-    BLOCK_THREADS = BLOCK_M_WARPS * BLOCK_N_WARPS * WARP_SIZE
+    WARP_GROUP_K = BLOCK_K_WARPS * WARP_ATOM_K
+    WARP_K_STEPS = BLOCK_K // WARP_GROUP_K
+    assert (BLOCK_K % WARP_GROUP_K == 0) and (WARP_K_STEPS >= 1)
+    BLOCK_THREADS = BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS * WARP_SIZE
     WARP_M_STEPS = TILE_M // BLOCK_M_WARPS // WARP_ATOM_M
     WARP_N_STEPS = TILE_N // BLOCK_N_WARPS // WARP_ATOM_N
     assert (WARP_M_STEPS >= 1) and (WARP_N_STEPS >= 1)
@@ -229,7 +232,7 @@ def compile_hgemm_kernel(
     LDG_B_X_THREADS_AS = BLOCK_K // LDG_ASYNC_VEC_SIZE
     LDG_REG_B_COUNT_AS = BLOCK_NK_SIZE // LDG_ASYNC_VEC_SIZE // BLOCK_THREADS
 
-    KERNEL_NAME = f"hgemm_{dtype}_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_W{BLOCK_M_WARPS}x{BLOCK_N_WARPS}_S{STAGES}_BT_BLDS{int(B_TO_LDS)}"
+    KERNEL_NAME = f"hgemm_{dtype}_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_W{BLOCK_M_WARPS}x{BLOCK_N_WARPS}x{BLOCK_K_WARPS}_S{STAGES}_BT_BLDS{int(B_TO_LDS)}"
     KERNEL_NAME += "_AS0" if not ASYNC_COPY else "_AS1"
     KERNEL_NAME += f"_SPK{SPLIT_K}"
     if HAS_BIAS:
@@ -276,6 +279,7 @@ def compile_hgemm_kernel(
         w_tid = tid % WARP_SIZE
         
         def swizzle_for_cache_reuse(pid):
+            # Do nothing currently
             return pid // N_BLOCKS, pid % N_BLOCKS
         
         block_m_idx, block_n_idx = swizzle_for_cache_reuse(fx.block_idx.x)
