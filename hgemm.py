@@ -270,8 +270,6 @@ def compile_hgemm_kernel(
         smem_c_ptr = SmemPtr(base_ptr, smem_a_offset, dtype_, shape=(BLOCK_K_WARPS * BLOCK_M * BLOCK_N,))
         cs_ = STensor(smem_c_ptr, dtype_, shape=(BLOCK_K_WARPS, BLOCK_M, BLOCK_N))
         if const_expr(IS_SPLIT_K):
-            smem_bc_ptr = SmemPtr(base_ptr, smem_a_offset, T.i32, shape=(1,))
-            bc_ = STensor(smem_bc_ptr, T.i32, shape=(1,))
             semaphore_ = GTensor(semaphore, dtype=T.i32, shape=(-1,))
             signal_ = GTensor(signal, dtype=T.i32, shape=(-1,))
             signal_idx = fx.Int32(fx.block_idx.x)
@@ -316,25 +314,9 @@ def compile_hgemm_kernel(
             return ptr_v
         
         def zero_c():
-            # get arrive index within split-k group
+            # zero c if current block is the first block
             is_t0_cond = arith.cmpi(arith.CmpIPredicate.eq, fx.Index(tid), fx.Index(0))
-            is_t0_cond_if = scf.IfOp(is_t0_cond, results_=[], has_else=False)
-            with ir.InsertionPoint(is_t0_cond_if.then_block):
-                semaphore_ptr = get_llvm_ptr(semaphore, signal_idx, 4)
-                prev = llvm.AtomicRMWOp(
-                    llvm.AtomicBinOp.add,
-                    semaphore_ptr,
-                    arith.constant(1, type=T.i32),
-                    llvm.AtomicOrdering.monotonic,
-                    syncscope="agent",
-                    alignment=4,
-                ).result
-                bc_[0] = prev
-                scf.YieldOp([])
-            gpu.barrier()
-            arrive_idx = fx.Index(bc_[0])
-            # zero c if current block is the first arrived block
-            cond_ks0 = arith.cmpi(arith.CmpIPredicate.eq, arrive_idx, fx.Index(0))
+            cond_ks0 = arith.cmpi(arith.CmpIPredicate.eq, ks_idx, fx.Index(0))
             cond_ks0_if = scf.IfOp(cond_ks0, results_=[], has_else=False)
             with ir.InsertionPoint(cond_ks0_if.then_block):
                 zero_vec = vector.broadcast(T.vec(LDG_VEC_SIZE, dtype_), c_zero_d)
@@ -409,7 +391,7 @@ def compile_hgemm_kernel(
                     syncscope="agent",
                     alignment=4,
                 ).result
-                cond_ksl = arith.cmpi(arith.CmpIPredicate.eq, fx.Index(arrive_idx), fx.Index(2 * SPLIT_K - 1))
+                cond_ksl = arith.cmpi(arith.CmpIPredicate.eq, fx.Index(arrive_idx), fx.Index(SPLIT_K - 1))
                 cond_ksl_if = scf.IfOp(cond_ksl, results_=[], has_else=False)
                 with ir.InsertionPoint(cond_ksl_if.then_block):
                     semaphore_[signal_idx] = arith.constant(0, type=T.i32)
@@ -877,10 +859,11 @@ def get_default_kwargs(m, n, k):
     elif m <= 32 and n == 2880 and k == 2048:
         kwargs['TILE_M'] = 32
         kwargs['TILE_N'] = 64
-        kwargs['TILE_K'] = 128
+        kwargs['TILE_K'] = 256
         kwargs['SPLIT_K'] = 4
         kwargs['BLOCK_M_WARPS'] = 1
         kwargs['BLOCK_N_WARPS'] = 2
+        kwargs['BLOCK_K_WARPS'] = 2
     return kwargs
 
 
