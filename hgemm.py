@@ -891,6 +891,7 @@ selections = {
     'SPLIT_K': [i for i in range(1, 17)],
     'BLOCK_M_WARPS': [1, 2, 4],
     'BLOCK_N_WARPS': [1, 2, 4],
+    'BLOCK_K_WARPS': [1, 2, 4],
 }
 
 
