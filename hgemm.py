@@ -270,8 +270,6 @@ def compile_hgemm_kernel(
         smem_c_ptr = SmemPtr(base_ptr, smem_a_offset, dtype_, shape=(BLOCK_K_WARPS * BLOCK_M * BLOCK_N,))
         cs_ = STensor(smem_c_ptr, dtype_, shape=(BLOCK_K_WARPS, BLOCK_M, BLOCK_N))
         if const_expr(IS_SPLIT_K):
-            smem_bc_ptr = SmemPtr(base_ptr, smem_a_offset, T.i32, shape=(1,))
-            bc_ = STensor(smem_bc_ptr, T.i32, shape=(1,))
             semaphore_ = GTensor(semaphore, dtype=T.i32, shape=(-1,))
             signal_ = GTensor(signal, dtype=T.i32, shape=(-1,))
             signal_idx = fx.Int32(fx.block_idx.x)
@@ -316,25 +314,9 @@ def compile_hgemm_kernel(
             return ptr_v
         
         def zero_c():
-            # get arrive index within split-k group
+            # zero c if current block is the first block
             is_t0_cond = arith.cmpi(arith.CmpIPredicate.eq, fx.Index(tid), fx.Index(0))
-            is_t0_cond_if = scf.IfOp(is_t0_cond, results_=[], has_else=False)
-            with ir.InsertionPoint(is_t0_cond_if.then_block):
-                semaphore_ptr = get_llvm_ptr(semaphore, signal_idx, 4)
-                prev = llvm.AtomicRMWOp(
-                    llvm.AtomicBinOp.add,
-                    semaphore_ptr,
-                    arith.constant(1, type=T.i32),
-                    llvm.AtomicOrdering.monotonic,
-                    syncscope="agent",
-                    alignment=4,
-                ).result
-                bc_[0] = prev
-                scf.YieldOp([])
-            gpu.barrier()
-            arrive_idx = fx.Index(bc_[0])
-            # zero c if current block is the first arrived block
-            cond_ks0 = arith.cmpi(arith.CmpIPredicate.eq, arrive_idx, fx.Index(0))
+            cond_ks0 = arith.cmpi(arith.CmpIPredicate.eq, ks_idx, fx.Index(0))
             cond_ks0_if = scf.IfOp(cond_ks0, results_=[], has_else=False)
             with ir.InsertionPoint(cond_ks0_if.then_block):
                 zero_vec = vector.broadcast(T.vec(LDG_VEC_SIZE, dtype_), c_zero_d)
@@ -409,7 +391,7 @@ def compile_hgemm_kernel(
                     syncscope="agent",
                     alignment=4,
                 ).result
-                cond_ksl = arith.cmpi(arith.CmpIPredicate.eq, fx.Index(arrive_idx), fx.Index(2 * SPLIT_K - 1))
+                cond_ksl = arith.cmpi(arith.CmpIPredicate.eq, fx.Index(arrive_idx), fx.Index(SPLIT_K - 1))
                 cond_ksl_if = scf.IfOp(cond_ksl, results_=[], has_else=False)
                 with ir.InsertionPoint(cond_ksl_if.then_block):
                     semaphore_[signal_idx] = arith.constant(0, type=T.i32)
@@ -762,23 +744,6 @@ def compile_hgemm_kernel(
                     else:
                         cs_[0, lds_m_idx, lds_n_idx] = val
         
-        # slice k reduce
-        if const_expr(IS_SLICE_K):
-            gpu.barrier()
-            write_cond = arith.cmpi(arith.CmpIPredicate.eq, wid_k, fx.Int32(0))
-            write_cond_if = scf.IfOp(write_cond, results_=[], has_else=False)
-            with ir.InsertionPoint(write_cond_if.then_block):
-                for ii in range_constexpr(WARP_M_STEPS):
-                    warp_atom_m_idx = warp_m_idx + ii * WARP_ATOM_M
-                    for jj in range_constexpr(WARP_N_STEPS):
-                        warp_atom_n_idx = warp_n_idx + jj * WARP_ATOM_N
-                        for kk in range_constexpr(WMMA_C_FRAG_VALUES):
-                            lds_m_idx = fx.Index(warp_atom_m_idx + stmatrix_c_m_vec_idx + kk)
-                            lds_n_idx = fx.Index(warp_atom_n_idx + stmatrix_c_n_idx)
-                            for sk in range_constexpr(BLOCK_K_WARPS):
-                                cs_[0, lds_m_idx, lds_n_idx] += cs_[sk, lds_m_idx, lds_n_idx]
-                scf.YieldOp([])
-        
         # write back to global
         if const_expr(IS_SPLIT_K):
             split_k_barrier()
@@ -792,6 +757,8 @@ def compile_hgemm_kernel(
                 cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
                 with ir.InsertionPoint(cond_boundary_if.then_block):
                     pk_val = cs_.vec_load((0, m_local_idx, n_local_idx), LDG_VEC_SIZE)
+                    for ksi in range_constexpr(1, BLOCK_K_WARPS):
+                        pk_val += cs_.vec_load((ksi, m_local_idx, n_local_idx), LDG_VEC_SIZE)
                     linear_offset_c = C_.linear_offset((m_global_idx, n_global_idx))
                     # split to vec2s
                     vec2_ty = T.vec(2, dtype_)
@@ -821,6 +788,8 @@ def compile_hgemm_kernel(
                 cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
                 with ir.InsertionPoint(cond_boundary_if.then_block):
                     vec = cs_.vec_load((0, m_local_idx, n_local_idx), LDG_VEC_SIZE)
+                    for ksi in range_constexpr(1, BLOCK_K_WARPS):
+                        vec += cs_.vec_load((ksi, m_local_idx, n_local_idx), LDG_VEC_SIZE)
                     if const_expr(HAS_BIAS):
                         bias_vec = BIAS_.vec_load((n_offset + n_local_idx,), LDG_VEC_SIZE)
                         vec = vec + bias_vec
@@ -870,30 +839,43 @@ def get_default_kwargs(m, n, k):
     elif m <= 32 and n == 384 and k == 7168:
         kwargs['TILE_M'] = 32
         kwargs['TILE_N'] = 64
-        kwargs['TILE_K'] = 64
-        kwargs['SPLIT_K'] = 16
+        kwargs['TILE_K'] = 256
+        kwargs['SPLIT_K'] = 14
+        kwargs['BLOCK_M_WARPS'] = 1
+        kwargs['BLOCK_N_WARPS'] = 2
+        kwargs['BLOCK_K_WARPS'] = 2
     elif m <= 32 and n == 7168 and k == 2048:
-        kwargs['TILE_M'] = 32
+        kwargs['TILE_M'] = 16
         kwargs['TILE_N'] = 64
-        kwargs['TILE_K'] = 128
+        kwargs['TILE_K'] = 256
         kwargs['SPLIT_K'] = 2
+        kwargs['BLOCK_M_WARPS'] = 1
+        kwargs['BLOCK_N_WARPS'] = 2
+        kwargs['BLOCK_K_WARPS'] = 1
     elif m <= 32 and n == 384 and k == 16384:
         kwargs['TILE_M'] = 32
         kwargs['TILE_N'] = 64
-        kwargs['TILE_K'] = 128
+        kwargs['TILE_K'] = 256
         kwargs['SPLIT_K'] = 16
+        kwargs['BLOCK_M_WARPS'] = 1
+        kwargs['BLOCK_N_WARPS'] = 2
+        kwargs['BLOCK_K_WARPS'] = 2
     elif m <= 16 and n == 5120 and k == 2880:
         kwargs['TILE_M'] = 32
         kwargs['TILE_N'] = 128
         kwargs['TILE_K'] = 64
         kwargs['SPLIT_K'] = 9
+        kwargs['BLOCK_M_WARPS'] = 1
+        kwargs['BLOCK_N_WARPS'] = 4
+        kwargs['BLOCK_K_WARPS'] = 1
     elif m <= 32 and n == 2880 and k == 2048:
         kwargs['TILE_M'] = 32
         kwargs['TILE_N'] = 64
-        kwargs['TILE_K'] = 128
+        kwargs['TILE_K'] = 256
         kwargs['SPLIT_K'] = 4
         kwargs['BLOCK_M_WARPS'] = 1
         kwargs['BLOCK_N_WARPS'] = 2
+        kwargs['BLOCK_K_WARPS'] = 2
     return kwargs
 
 
@@ -904,6 +886,7 @@ selections = {
     'SPLIT_K': [i for i in range(1, 17)],
     'BLOCK_M_WARPS': [1, 2, 4],
     'BLOCK_N_WARPS': [1, 2, 4],
+    'BLOCK_K_WARPS': [1, 2, 4],
 }
 
 
