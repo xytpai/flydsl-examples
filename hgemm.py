@@ -839,18 +839,27 @@ def get_default_kwargs(m, n, k):
     elif m <= 32 and n == 384 and k == 7168:
         kwargs['TILE_M'] = 32
         kwargs['TILE_N'] = 64
-        kwargs['TILE_K'] = 64
-        kwargs['SPLIT_K'] = 16
+        kwargs['TILE_K'] = 256
+        kwargs['SPLIT_K'] = 14
+        kwargs['BLOCK_M_WARPS'] = 1
+        kwargs['BLOCK_N_WARPS'] = 2
+        kwargs['BLOCK_K_WARPS'] = 2
     elif m <= 32 and n == 7168 and k == 2048:
-        kwargs['TILE_M'] = 32
+        kwargs['TILE_M'] = 16
         kwargs['TILE_N'] = 64
-        kwargs['TILE_K'] = 128
+        kwargs['TILE_K'] = 256
         kwargs['SPLIT_K'] = 2
+        kwargs['BLOCK_M_WARPS'] = 1
+        kwargs['BLOCK_N_WARPS'] = 2
+        kwargs['BLOCK_K_WARPS'] = 1
     elif m <= 32 and n == 384 and k == 16384:
         kwargs['TILE_M'] = 32
         kwargs['TILE_N'] = 64
-        kwargs['TILE_K'] = 128
+        kwargs['TILE_K'] = 256
         kwargs['SPLIT_K'] = 16
+        kwargs['BLOCK_M_WARPS'] = 1
+        kwargs['BLOCK_N_WARPS'] = 2
+        kwargs['BLOCK_K_WARPS'] = 2
     elif m <= 16 and n == 5120 and k == 2880:
         kwargs['TILE_M'] = 32
         kwargs['TILE_N'] = 128
