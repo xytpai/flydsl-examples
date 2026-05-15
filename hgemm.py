@@ -762,23 +762,6 @@ def compile_hgemm_kernel(
                     else:
                         cs_[0, lds_m_idx, lds_n_idx] = val
         
-        # slice k reduce
-        if const_expr(IS_SLICE_K):
-            gpu.barrier()
-            write_cond = arith.cmpi(arith.CmpIPredicate.eq, wid_k, fx.Int32(0))
-            write_cond_if = scf.IfOp(write_cond, results_=[], has_else=False)
-            with ir.InsertionPoint(write_cond_if.then_block):
-                for ii in range_constexpr(WARP_M_STEPS):
-                    warp_atom_m_idx = warp_m_idx + ii * WARP_ATOM_M
-                    for jj in range_constexpr(WARP_N_STEPS):
-                        warp_atom_n_idx = warp_n_idx + jj * WARP_ATOM_N
-                        for kk in range_constexpr(WMMA_C_FRAG_VALUES):
-                            lds_m_idx = fx.Index(warp_atom_m_idx + stmatrix_c_m_vec_idx + kk)
-                            lds_n_idx = fx.Index(warp_atom_n_idx + stmatrix_c_n_idx)
-                            for sk in range_constexpr(BLOCK_K_WARPS):
-                                cs_[0, lds_m_idx, lds_n_idx] += cs_[sk, lds_m_idx, lds_n_idx]
-                scf.YieldOp([])
-        
         # write back to global
         if const_expr(IS_SPLIT_K):
             split_k_barrier()
@@ -792,6 +775,8 @@ def compile_hgemm_kernel(
                 cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
                 with ir.InsertionPoint(cond_boundary_if.then_block):
                     pk_val = cs_.vec_load((0, m_local_idx, n_local_idx), LDG_VEC_SIZE)
+                    for ksi in range_constexpr(1, BLOCK_K_WARPS):
+                        pk_val += cs_.vec_load((ksi, m_local_idx, n_local_idx), LDG_VEC_SIZE)
                     linear_offset_c = C_.linear_offset((m_global_idx, n_global_idx))
                     # split to vec2s
                     vec2_ty = T.vec(2, dtype_)
@@ -821,6 +806,8 @@ def compile_hgemm_kernel(
                 cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
                 with ir.InsertionPoint(cond_boundary_if.then_block):
                     vec = cs_.vec_load((0, m_local_idx, n_local_idx), LDG_VEC_SIZE)
+                    for ksi in range_constexpr(1, BLOCK_K_WARPS):
+                        vec += cs_.vec_load((ksi, m_local_idx, n_local_idx), LDG_VEC_SIZE)
                     if const_expr(HAS_BIAS):
                         bias_vec = BIAS_.vec_load((n_offset + n_local_idx,), LDG_VEC_SIZE)
                         vec = vec + bias_vec
