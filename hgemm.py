@@ -298,10 +298,15 @@ def compile_hgemm_kernel(
         ldmatrix_b_n_idx = w_tid % WMMA_N
         ldmatrix_b_k_vec_idx = w_tid // WMMA_N * WMMA_B_FRAG_VALUES * MFMA_PER_WARP_K
         warp_k_slice_base = wid_k * K_SLICE
-        A_FRAGS_LEN = WARP_K_STEPS * WARP_M_STEPS
-        B_FRAGS_LEN = WARP_K_STEPS * WARP_N_STEPS
         C_FRAGS_LEN = WARP_M_STEPS * WARP_N_STEPS
         c_frags = [acc_init] * C_FRAGS_LEN
+
+        def __barrier(vmcnt=0, use_s_barrier=True):
+            if const_expr(use_s_barrier):
+                asm = f"s_waitcnt vmcnt({vmcnt})\n\ts_barrier"
+            else:
+                asm = f"s_waitcnt vmcnt({vmcnt})"
+            llvm.InlineAsmOp(None, [], asm, "", has_side_effects=True)
 
         def get_llvm_ptr(ptr, offset, dtype_bytes, ptr_type=ir.Type.parse("!llvm.ptr<1>")):
             base_ptr = fly.extract_aligned_pointer_as_index(ptr_type, ptr)
@@ -425,32 +430,6 @@ def compile_hgemm_kernel(
                 col_in_bytes = swizzle_xor16(m_local_idx, col_in_bytes, k_blocks16)
                 as_.vec_store((fx.Index(lds_stage), m_local_idx, col_in_bytes // DTYPE_BYTES), vecs[i], LDG_VEC_SIZE)
         
-        def ldg_b(k_offset):
-            vecs = []
-            for i in range_constexpr(LDG_REG_B_COUNT):
-                global_tid = BLOCK_THREADS * i + tid
-                n_local_idx = global_tid // LDG_B_X_THREADS
-                k_local_idx = global_tid % LDG_B_X_THREADS * LDG_VEC_SIZE
-                row_idx = n_offset + fx.Index(n_local_idx)
-                safe_row_idx = arith.select(
-                    arith.cmpi(arith.CmpIPredicate.ult, row_idx, fx.Index(n)),
-                    row_idx,
-                    fx.Index(0),
-                )
-                col_idx = fx.Index(k_offset + k_local_idx)
-                vec = B_.vec_load((safe_row_idx, col_idx), LDG_VEC_SIZE)
-                vecs.append(vec)
-            return vecs
-        
-        def sts_b(vecs, lds_stage):
-            for i in range_constexpr(LDG_REG_B_COUNT):
-                global_tid = BLOCK_THREADS * i + tid
-                n_local_idx = global_tid // LDG_B_X_THREADS
-                k_local_idx = global_tid % LDG_B_X_THREADS * LDG_VEC_SIZE
-                col_in_bytes = k_local_idx * DTYPE_BYTES
-                col_in_bytes = swizzle_xor16(n_local_idx, col_in_bytes, k_blocks16)
-                bs_.vec_store((fx.Index(lds_stage), n_local_idx, col_in_bytes // DTYPE_BYTES), vecs[i], LDG_VEC_SIZE)
-        
         def get_dma_copy_warp_offset():
             warp_offset = rocdl.readfirstlane(
                 T.i64,
@@ -467,13 +446,7 @@ def compile_hgemm_kernel(
                 asm = "s_mov_b32 m0, $0\n\tbuffer_load_dword $1, $2, 0 offen sc0 lds"
             else:
                 raise NotImplementedError(f"DMA_BYTES={DMA_BYTES} not supported")
-            llvm.InlineAsmOp(
-                None,
-                [lds_ptr, global_offset, rsrc],
-                asm,
-                "s,v,s",
-                has_side_effects=True,
-            )
+            llvm.InlineAsmOp(None, [lds_ptr, global_offset, rsrc], asm, "s,v,s", has_side_effects=True)
         
         def ldg_sts_a_async(k_offset, lds_stage):
             for i in range_constexpr(LDG_REG_A_COUNT_AS):
@@ -537,34 +510,6 @@ def compile_hgemm_kernel(
                 # dma copy
                 buffer_load_lds_inline(B_.rsrc, lds_ptr, global_offset)
         
-        def lds_matrix_a(lds_stage):
-            s = fx.Index(lds_stage)
-            a_frags = [0] * (WARP_K_STEPS * WARP_M_STEPS)
-            for ii in range_constexpr(WARP_M_STEPS):
-                warp_atom_m_idx = warp_m_idx + ii * WARP_ATOM_M
-                for kk in range_constexpr(WARP_K_STEPS):
-                    warp_atom_k_idx = warp_k_slice_base + kk * WARP_ATOM_K
-                    row = warp_atom_m_idx + ldmatrix_a_m_idx
-                    col_in_bytes = (warp_atom_k_idx + ldmatrix_a_k_vec_idx) * DTYPE_BYTES
-                    col_in_bytes = swizzle_xor16(row, col_in_bytes, k_blocks16)
-                    vec = as_.vec_load((s, row, col_in_bytes // DTYPE_BYTES), WMMA_A_FRAG_VALUES * MFMA_PER_WARP_K)
-                    a_frags[kk * WARP_M_STEPS + ii] = vec
-            return a_frags
-        
-        def lds_matrix_b(lds_stage):
-            s = fx.Index(lds_stage)
-            b_frags = [0] * (WARP_K_STEPS * WARP_N_STEPS)
-            for ii in range_constexpr(WARP_N_STEPS):
-                warp_atom_n_idx = warp_n_idx + ii * WARP_ATOM_N
-                for kk in range_constexpr(WARP_K_STEPS):
-                    warp_atom_k_idx = warp_k_slice_base + kk * WARP_ATOM_K
-                    row = warp_atom_n_idx + ldmatrix_b_n_idx
-                    col_in_bytes = (warp_atom_k_idx + ldmatrix_b_k_vec_idx) * DTYPE_BYTES
-                    col_in_bytes = swizzle_xor16(row, col_in_bytes, k_blocks16)
-                    vec = bs_.vec_load((s, row, col_in_bytes // DTYPE_BYTES), WMMA_B_FRAG_VALUES * MFMA_PER_WARP_K)
-                    b_frags[kk * WARP_N_STEPS + ii] = vec
-            return b_frags
-        
         def ldg_matrix_b(k_offset):
             vecs = []
             for kk in range_constexpr(WARP_K_STEPS):
@@ -577,53 +522,23 @@ def compile_hgemm_kernel(
                     vecs.append(vec)
             return vecs
         
-        def block_mma_sync(a_frags, b_frags, c_frags):
-            # wmma
-            c_frags_new = [cx for cx in c_frags]
-            for kk in range_constexpr(WARP_K_STEPS):
-                for ii in range_constexpr(WARP_M_STEPS):
-                    a_frag = a_frags[kk * WARP_M_STEPS + ii]
-                    for jj in range_constexpr(WARP_N_STEPS):
-                        b_frag = b_frags[kk * WARP_N_STEPS + jj]
-                        if const_expr(MFMA_PER_WARP_K == 2):
-                            # split a
-                            a_i64x2 = vector.bitcast(T.i64x2, a_frag)
-                            a0_i64 = vector.extract(a_i64x2, static_position=[0], dynamic_position=[])
-                            a1_i64 = vector.extract(a_i64x2, static_position=[1], dynamic_position=[])
-                            a_v0 = vector.bitcast(T.f16x4, vector.from_elements(T.vec(1, T.i64), [a0_i64]))
-                            a_v1 = vector.bitcast(T.f16x4, vector.from_elements(T.vec(1, T.i64), [a1_i64]))
-                            # split b
-                            b_i64x2 = vector.bitcast(T.i64x2, b_frag)
-                            b0_i64 = vector.extract(b_i64x2, static_position=[0], dynamic_position=[])
-                            b1_i64 = vector.extract(b_i64x2, static_position=[1], dynamic_position=[])
-                            b_v0 = vector.bitcast(T.f16x4, vector.from_elements(T.vec(1, T.i64), [b0_i64]))
-                            b_v1 = vector.bitcast(T.f16x4, vector.from_elements(T.vec(1, T.i64), [b1_i64]))
-                            # wmma
-                            c_idx = ii * WARP_N_STEPS + jj
-                            acc_in = c_frags_new[c_idx]
-                            acc_mid = WMMA_IMPL(a_v0, b_v0, acc_in)
-                            c_frags_new[c_idx] = WMMA_IMPL(a_v1, b_v1, acc_mid)
-                        elif const_expr(MFMA_PER_WARP_K == 1):
-                            c_idx = ii * WARP_N_STEPS + jj
-                            c_frags_new[c_idx] = WMMA_IMPL(a_frag, b_frag, c_frags_new[c_idx])
-                        else:
-                            raise NotImplementedError(f"MFMA_PER_WARP_K={MFMA_PER_WARP_K} not supported")
-            return c_frags_new
-        
-        def ldmatrix_compute_tile_streaming(lds_stage, c_frags):
+        def ldmatrix_compute_tile_streaming(lds_stage, c_frags, initial_b_frags=None):
             s = fx.Index(lds_stage)
             c_frags_new = [cx for cx in c_frags]
             for kk in range_constexpr(WARP_K_STEPS):
                 warp_atom_k_idx = warp_k_slice_base + kk * WARP_ATOM_K
-                b_frags = [0] * WARP_N_STEPS
+                if const_expr(initial_b_frags is None):
+                    b_frags = [0] * WARP_N_STEPS
+                    for ii in range_constexpr(WARP_N_STEPS):
+                        warp_atom_n_idx = warp_n_idx + ii * WARP_ATOM_N
+                        row = warp_atom_n_idx + ldmatrix_b_n_idx
+                        col_in_bytes = (warp_atom_k_idx + ldmatrix_b_k_vec_idx) * DTYPE_BYTES
+                        col_in_bytes = swizzle_xor16(row, col_in_bytes, k_blocks16)
+                        vec = bs_.vec_load((s, row, col_in_bytes // DTYPE_BYTES), WMMA_B_FRAG_VALUES * MFMA_PER_WARP_K)
+                        b_frags[ii] = vec
+                else:
+                    b_frags = [initial_b_frags[i] for i in range(kk * WARP_N_STEPS, (kk + 1) * WARP_N_STEPS)]
                 a_frags = [0] * WARP_M_STEPS
-                for ii in range_constexpr(WARP_N_STEPS):
-                    warp_atom_n_idx = warp_n_idx + ii * WARP_ATOM_N
-                    row = warp_atom_n_idx + ldmatrix_b_n_idx
-                    col_in_bytes = (warp_atom_k_idx + ldmatrix_b_k_vec_idx) * DTYPE_BYTES
-                    col_in_bytes = swizzle_xor16(row, col_in_bytes, k_blocks16)
-                    vec = bs_.vec_load((s, row, col_in_bytes // DTYPE_BYTES), WMMA_B_FRAG_VALUES * MFMA_PER_WARP_K)
-                    b_frags[ii] = vec
                 for ii in range_constexpr(WARP_M_STEPS):
                     warp_atom_m_idx = warp_m_idx + ii * WARP_ATOM_M
                     row = warp_atom_m_idx + ldmatrix_a_m_idx
@@ -670,26 +585,23 @@ def compile_hgemm_kernel(
 
             ldg_sts_a_async(ks_begin, 0)
             ldg_sts_b_async(ks_begin, 0)
-            rocdl.s_waitcnt(0)
-            gpu.barrier()
             rocdl.sched_barrier(0)
+            __barrier()
             def hot_loop_scheduler():
-                MFMA_TOTAL = WARP_K_STEPS * WARP_M_STEPS * WARP_N_STEPS * MFMA_PER_WARP_K
                 LDG_REG_A_COUNT_ = LDG_REG_A_COUNT_AS if const_expr(ASYNC_COPY) else LDG_REG_A_COUNT
                 LDG_REG_B_COUNT_ = LDG_REG_B_COUNT_AS if const_expr(ASYNC_COPY) else LDG_REG_B_COUNT
-                mfma_ = OnlineScheduler(MFMA_TOTAL, MFMA_TOTAL)
                 # ================ Ordered ================
-                for i in range_constexpr(LDG_REG_A_COUNT_):
-                    rocdl.sched_vmem(1) # ldg_sts_a_async next
                 for i in range_constexpr(LDG_REG_B_COUNT_):
                     rocdl.sched_vmem(1) # ldg_sts_b_async next
+                for i in range_constexpr(LDG_REG_A_COUNT_):
+                    rocdl.sched_vmem(1) # ldg_sts_a_async next
                 for ki in range_constexpr(WARP_K_STEPS):
                     for i in range_constexpr(WARP_N_STEPS):
                         rocdl.sched_dsrd(1) # lds_matrix_b current
                     for i in range_constexpr(WARP_M_STEPS):
                         rocdl.sched_dsrd(1) # lds_matrix_a current
-                    for i in range_constexpr(WARP_M_STEPS * WARP_N_STEPS):
-                         rocdl.sched_mfma(1)
+                    for i in range_constexpr(WARP_M_STEPS):
+                        rocdl.sched_mfma(WARP_N_STEPS)
                 # ================ Reordered ================
                 rocdl.sched_barrier(0)
             init_state = [ks_begin, arith.constant(0, index=True)] + c_frags
@@ -698,15 +610,13 @@ def compile_hgemm_kernel(
                 current_stage = fx.Index(state[1])
                 next_stage = 1 - current_stage
                 c_frags = state[2 : 2 + C_FRAGS_LEN]
-                b_frags = state[2 + C_FRAGS_LEN : 2 + C_FRAGS_LEN + B_FRAGS_LEN]
+                b_frags = state[2 + C_FRAGS_LEN :]
                 ldg_sts_a_async(k_offset + BLOCK_K, next_stage)
                 ldg_sts_b_async(k_offset + BLOCK_K, next_stage)
                 c_frags_new = ldmatrix_compute_tile_streaming(current_stage, c_frags)
-                hot_loop_scheduler()
-                rocdl.s_waitcnt(0)
-                gpu.barrier()
                 k_offset_next = k_offset + fx.Int32(BLOCK_K)
-                rocdl.sched_barrier(0)
+                hot_loop_scheduler()
+                __barrier()
                 results = yield [k_offset_next, next_stage] + c_frags_new
             current_stage = fx.Index(results[1])
             c_frags = results[2 : 2 + C_FRAGS_LEN]
@@ -715,65 +625,45 @@ def compile_hgemm_kernel(
         else:
 
             sts_a(ldg_a(ks_begin), 0)
-            gpu.barrier()
-            a_frags = lds_matrix_a(0)
-            b_frags = ldg_matrix_b(ks_begin)
+            b_frags_next = ldg_matrix_b(ks_begin)
             rocdl.sched_barrier(0)
+            __barrier()
             def hot_loop_scheduler():
-                MFMA_TOTAL = WARP_K_STEPS * WARP_M_STEPS * WARP_N_STEPS * MFMA_PER_WARP_K
                 LDG_REG_A_COUNT_ = LDG_REG_A_COUNT_AS if const_expr(ASYNC_COPY) else LDG_REG_A_COUNT
                 LDG_TOTAL = LDG_REG_A_COUNT_ + WARP_K_STEPS * WARP_N_STEPS
-                mfma_ = OnlineScheduler(MFMA_TOTAL, MFMA_TOTAL)
-                ldg_ = OnlineScheduler(LDG_TOTAL, LDG_TOTAL)
-                # ================ Ordered ================
-                # for i in range_constexpr(LDG_REG_A_COUNT_AS or LDG_REG_A_COUNT):
-                #     rocdl.sched_vmem(1) # ldg_sts_a_async next
-                # for i in range_constexpr(WARP_K_STEPS * WARP_N_STEPS):
-                #     rocdl.sched_vmem(1) # ldg_matrix_b next
-                # for i in range_constexpr(WARP_K_STEPS * WARP_M_STEPS * WARP_N_STEPS * MFMA_PER_WARP_K):
-                #     rocdl.sched_mfma(1)
+                # ================ Ordered ================                
+                for i in range_constexpr(LDG_TOTAL):
+                    rocdl.sched_vmem(1)
+                for ki in range_constexpr(WARP_K_STEPS):
+                    for i in range_constexpr(WARP_M_STEPS):
+                        rocdl.sched_dsrd(1)
+                    for i in range_constexpr(WARP_M_STEPS):
+                        rocdl.sched_mfma(WARP_N_STEPS) 
                 # ================ Reordered ================
-                if const_expr(ASYNC_COPY):
-                    AVG_MFMA_COUNT = (MFMA_TOTAL + LDG_TOTAL - 1)  // LDG_TOTAL
-                    for i in range_constexpr(LDG_TOTAL):
-                        rocdl.sched_vmem(ldg_.consume(1))
-                        rocdl.sched_mfma(mfma_.consume(AVG_MFMA_COUNT))
-                else:
-                    LDG_STS_TOTAL = LDG_TOTAL + LDG_REG_A_COUNT_
-                    AVG_MFMA_COUNT = (MFMA_TOTAL + LDG_STS_TOTAL - 1)  // LDG_STS_TOTAL
-                    for i in range_constexpr(LDG_TOTAL):
-                        rocdl.sched_vmem(ldg_.consume(1))
-                        rocdl.sched_mfma(mfma_.consume(AVG_MFMA_COUNT))
-                    for i in range_constexpr(LDG_REG_A_COUNT_):
-                        rocdl.sched_dswr(1)
-                        rocdl.sched_mfma(mfma_.consume(AVG_MFMA_COUNT))
                 rocdl.sched_barrier(0)
-            init_state = [ks_begin, arith.constant(0, index=True)] + c_frags + a_frags + b_frags
+            init_state = [ks_begin, arith.constant(0, index=True)] + c_frags + b_frags_next
             for bki, state in range(1, BLOCK_K_LOOPS, init=init_state):
                 k_offset = state[0]
                 current_stage = fx.Index(state[1])
                 next_stage = 1 - current_stage
                 c_frags = state[2 : 2 + C_FRAGS_LEN]
-                a_frags = state[2 + C_FRAGS_LEN : 2 + C_FRAGS_LEN + A_FRAGS_LEN]
-                b_frags = state[2 + C_FRAGS_LEN + A_FRAGS_LEN : 2 + C_FRAGS_LEN + A_FRAGS_LEN + B_FRAGS_LEN]
+                b_frags = state[2 + C_FRAGS_LEN :]
                 if const_expr(ASYNC_COPY):
                     ldg_sts_a_async(k_offset + BLOCK_K, next_stage)
                 else:
                     a_regs_next = ldg_a(k_offset + BLOCK_K)
                 b_frags_next = ldg_matrix_b(k_offset + BLOCK_K)
-                c_frags = block_mma_sync(a_frags, b_frags, c_frags)
+                c_frags_new = ldmatrix_compute_tile_streaming(current_stage, c_frags, b_frags)
                 if const_expr(not ASYNC_COPY):
                     sts_a(a_regs_next, next_stage)
-                hot_loop_scheduler()
-                gpu.barrier()
-                a_frags_next = lds_matrix_a(next_stage)
                 k_offset = k_offset + fx.Int32(BLOCK_K)
-                rocdl.sched_barrier(0)
-                results = yield [k_offset, next_stage] + c_frags + a_frags_next + b_frags_next
+                hot_loop_scheduler()
+                __barrier()
+                results = yield [k_offset, next_stage] + c_frags_new + b_frags_next
+            current_stage = fx.Index(results[1])
             c_frags = results[2 : 2 + C_FRAGS_LEN]
-            a_frags = results[2 + C_FRAGS_LEN : 2 + C_FRAGS_LEN + A_FRAGS_LEN]
-            b_frags = results[2 + C_FRAGS_LEN + A_FRAGS_LEN : 2 + C_FRAGS_LEN + A_FRAGS_LEN + B_FRAGS_LEN]
-            c_frags = block_mma_sync(a_frags, b_frags, c_frags)
+            b_frags = results[2 + C_FRAGS_LEN :]
+            c_frags = ldmatrix_compute_tile_streaming(current_stage, c_frags, b_frags)
 
         # write to lds
         stmatrix_c_m_vec_idx = w_tid // WMMA_N * WMMA_C_FRAG_VALUES
@@ -875,7 +765,7 @@ def get_default_kwargs(m, n, k):
         'TILE_N': 256,
         'TILE_K': 64,
         'SPLIT_K': 1,
-        'BLOCK_M_WARPS': 4,
+        'BLOCK_M_WARPS': 2,
         'BLOCK_N_WARPS': 4,
         'BLOCK_K_WARPS': 1,
         'B_TO_LDS': True,
