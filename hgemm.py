@@ -828,6 +828,7 @@ selections = {
     'TILE_M': [16, 32, 48, 64, 96, 128, 256],
     'TILE_N': [64, 128, 256],
     'TILE_K': [64, 128, 256],
+    'STAGES': [2, 3, 4, 5],
     'SPLIT_K': [i for i in range(1, 17)],
     'BLOCK_M_WARPS': [1, 2, 4],
     'BLOCK_N_WARPS': [1, 2, 4],
