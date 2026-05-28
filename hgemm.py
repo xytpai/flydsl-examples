@@ -147,6 +147,7 @@ def compile_hgemm_kernel(
     assert TILE_M * TILE_N * TILE_K <= 256 * 256 * 64
     if (TILE_M == 256) and (TILE_N == 256):
         assert (TILE_K == 64) and (SPLIT_K == 1) and (STAGES == 2)
+    assert STAGES >= 2
     N_BLOCKS = n // TILE_N
     assert (N_BLOCKS >= 1) and (n % TILE_N == 0)
     IS_SPLIT_K = SPLIT_K > 1
@@ -537,7 +538,7 @@ def compile_hgemm_kernel(
                         vec = bs_.vec_load((s, row, col_in_bytes // DTYPE_BYTES), WMMA_B_FRAG_VALUES * MFMA_PER_WARP_K)
                         b_frags[ii] = vec
                 else:
-                    b_frags = [initial_b_frags[i] for i in range(kk * WARP_N_STEPS, (kk + 1) * WARP_N_STEPS)]
+                    b_frags = [initial_b_frags[i] for i in range_constexpr(kk * WARP_N_STEPS, (kk + 1) * WARP_N_STEPS)]
                 a_frags = [0] * WARP_M_STEPS
                 for ii in range_constexpr(WARP_M_STEPS):
                     warp_atom_m_idx = warp_m_idx + ii * WARP_ATOM_M
@@ -583,17 +584,16 @@ def compile_hgemm_kernel(
         
         if const_expr(B_TO_LDS):
 
-            ldg_sts_a_async(ks_begin, 0)
-            ldg_sts_b_async(ks_begin, 0)
+            assert ASYNC_COPY == True
+            for s in range_constexpr(STAGES - 1):
+                ldg_sts_b_async(ks_begin + s * BLOCK_K, s)
+                ldg_sts_a_async(ks_begin + s * BLOCK_K, s)
             rocdl.sched_barrier(0)
-            __barrier()
             def hot_loop_scheduler():
-                LDG_REG_A_COUNT_ = LDG_REG_A_COUNT_AS if const_expr(ASYNC_COPY) else LDG_REG_A_COUNT
-                LDG_REG_B_COUNT_ = LDG_REG_B_COUNT_AS if const_expr(ASYNC_COPY) else LDG_REG_B_COUNT
                 # ================ Ordered ================
-                for i in range_constexpr(LDG_REG_B_COUNT_):
+                for i in range_constexpr(LDG_REG_B_COUNT_AS):
                     rocdl.sched_vmem(1) # ldg_sts_b_async next
-                for i in range_constexpr(LDG_REG_A_COUNT_):
+                for i in range_constexpr(LDG_REG_A_COUNT_AS):
                     rocdl.sched_vmem(1) # ldg_sts_a_async next
                 for ki in range_constexpr(WARP_K_STEPS):
                     for i in range_constexpr(WARP_N_STEPS):
@@ -604,26 +604,31 @@ def compile_hgemm_kernel(
                         rocdl.sched_mfma(WARP_N_STEPS)
                 # ================ Reordered ================
                 rocdl.sched_barrier(0)
+            LDG_WAIT_COUNT = LDG_REG_B_COUNT_AS + LDG_REG_A_COUNT_AS
             init_state = [ks_begin, arith.constant(0, index=True)] + c_frags
-            for bki, state in range(0, BLOCK_K_LOOPS - 1, 1, init=init_state):
+            for bki, state in range(0, BLOCK_K_LOOPS - (STAGES - 1), 1, init=init_state):
                 k_offset = state[0]
                 current_stage = fx.Index(state[1])
-                next_stage = 1 - current_stage
-                c_frags = state[2 : 2 + C_FRAGS_LEN]
-                b_frags = state[2 + C_FRAGS_LEN :]
-                ldg_sts_a_async(k_offset + BLOCK_K, next_stage)
-                ldg_sts_b_async(k_offset + BLOCK_K, next_stage)
+                c_frags = state[2:]
+                next_stage = (current_stage + 1) % STAGES
+                write_stage = (current_stage + STAGES - 1) % STAGES
+                __barrier((STAGES - 2) * LDG_WAIT_COUNT)
+                ldg_sts_b_async(k_offset + (STAGES - 1) * BLOCK_K, write_stage)
+                ldg_sts_a_async(k_offset + (STAGES - 1) * BLOCK_K, write_stage)
                 c_frags_new = ldmatrix_compute_tile_streaming(current_stage, c_frags)
                 k_offset_next = k_offset + fx.Int32(BLOCK_K)
                 hot_loop_scheduler()
-                __barrier()
                 results = yield [k_offset_next, next_stage] + c_frags_new
             current_stage = fx.Index(results[1])
-            c_frags = results[2 : 2 + C_FRAGS_LEN]
-            c_frags = ldmatrix_compute_tile_streaming(current_stage, c_frags)
+            c_frags = results[2:]
+            for s in range_constexpr(0, STAGES - 1):
+                __barrier((STAGES - 2 - s) * LDG_WAIT_COUNT)
+                c_frags = ldmatrix_compute_tile_streaming(current_stage, c_frags)
+                current_stage = (current_stage + 1) % STAGES
 
         else:
 
+            assert STAGES == 2
             sts_a(ldg_a(ks_begin), 0)
             b_frags_next = ldg_matrix_b(ks_begin)
             rocdl.sched_barrier(0)
@@ -764,6 +769,7 @@ def get_default_kwargs(m, n, k):
         'TILE_M': 256,
         'TILE_N': 256,
         'TILE_K': 64,
+        'STAGES': 2,
         'SPLIT_K': 1,
         'BLOCK_M_WARPS': 2,
         'BLOCK_N_WARPS': 4,
