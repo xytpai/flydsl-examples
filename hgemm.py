@@ -236,6 +236,8 @@ def compile_hgemm_kernel(
     LDG_REG_A_COUNT_AS = BLOCK_MK_SIZE // LDG_ASYNC_VEC_SIZE // BLOCK_THREADS
     LDG_B_X_THREADS_AS = BLOCK_K // LDG_ASYNC_VEC_SIZE
     LDG_REG_B_COUNT_AS = BLOCK_NK_SIZE // LDG_ASYNC_VEC_SIZE // BLOCK_THREADS
+    LDG_WAIT_COUNT = LDG_REG_B_COUNT_AS + LDG_REG_A_COUNT_AS
+    assert ((STAGES - 2) * LDG_WAIT_COUNT) < 63
 
     KERNEL_NAME = f"hgemm_{dtype}_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}x{STAGES}_SPK{SPLIT_K}_W{BLOCK_M_WARPS}x{BLOCK_N_WARPS}x{BLOCK_K_WARPS}_BLDS{int(B_TO_LDS)}_TN"
     KERNEL_NAME += "_AS0" if not ASYNC_COPY else "_AS1"
@@ -604,7 +606,6 @@ def compile_hgemm_kernel(
                         rocdl.sched_mfma(WARP_N_STEPS)
                 # ================ Reordered ================
                 rocdl.sched_barrier(0)
-            LDG_WAIT_COUNT = LDG_REG_B_COUNT_AS + LDG_REG_A_COUNT_AS
             init_state = [ks_begin, arith.constant(0, index=True)] + c_frags
             for bki, state in range(0, BLOCK_K_LOOPS - (STAGES - 1), 1, init=init_state):
                 k_offset = state[0]
@@ -778,9 +779,13 @@ def get_default_kwargs(m, n, k):
     }
     if m == 2048 and n == 2048 and k == 2048:
         kwargs['TILE_M'] = 128
-        kwargs['TILE_N'] = 64
+        kwargs['TILE_N'] = 128
         kwargs['TILE_K'] = 64
+        kwargs['STAGES'] = 4
         kwargs['SPLIT_K'] = 1
+        kwargs['BLOCK_M_WARPS'] = 4
+        kwargs['BLOCK_N_WARPS'] = 4
+        kwargs['BLOCK_K_WARPS'] = 1
     elif m <= 32 and n == 384 and k == 7168:
         kwargs['TILE_M'] = 32
         kwargs['TILE_N'] = 64
