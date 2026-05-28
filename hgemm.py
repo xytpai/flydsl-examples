@@ -815,21 +815,23 @@ def get_default_kwargs(m, n, k):
         kwargs['BLOCK_N_WARPS'] = 4
         kwargs['BLOCK_K_WARPS'] = 1
     elif m <= 16 and n == 5120 and k == 2880:
-        kwargs['TILE_M'] = 32
-        kwargs['TILE_N'] = 128
-        kwargs['TILE_K'] = 64
-        kwargs['SPLIT_K'] = 9
-        kwargs['BLOCK_M_WARPS'] = 1
-        kwargs['BLOCK_N_WARPS'] = 4
-        kwargs['BLOCK_K_WARPS'] = 1
-    elif m <= 32 and n == 2880 and k == 2048:
-        kwargs['TILE_M'] = 32
+        kwargs['TILE_M'] = 16
         kwargs['TILE_N'] = 64
-        kwargs['TILE_K'] = 256
-        kwargs['SPLIT_K'] = 4
+        kwargs['TILE_K'] = 64
+        kwargs['STAGES'] = 5
+        kwargs['SPLIT_K'] = 3
         kwargs['BLOCK_M_WARPS'] = 1
         kwargs['BLOCK_N_WARPS'] = 2
-        kwargs['BLOCK_K_WARPS'] = 2
+        kwargs['BLOCK_K_WARPS'] = 1
+    elif m <= 32 and n == 2880 and k == 2048:
+        kwargs['TILE_M'] = 16
+        kwargs['TILE_N'] = 64
+        kwargs['TILE_K'] = 128
+        kwargs['STAGES'] = 5
+        kwargs['SPLIT_K'] = 2
+        kwargs['BLOCK_M_WARPS'] = 1
+        kwargs['BLOCK_N_WARPS'] = 2
+        kwargs['BLOCK_K_WARPS'] = 1
     return kwargs
 
 
