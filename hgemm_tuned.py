@@ -53,7 +53,7 @@ def create_outputs(args):
     return (c,)
 
 
-def tuning_benchmark(args, hgemm_kwargs={}, warmup=5, niters=10):
+def tuning_benchmark(args, hgemm_kwargs={}, warmup=5, niters=30):
     # correctness test
     a, b, bias = create_inputs(args)
     c = create_outputs(args)[0]
