@@ -241,7 +241,11 @@ def compile_hgemm_kernel(
     LDG_WAIT_COUNT = LDG_REG_B_COUNT_AS + LDG_REG_A_COUNT_AS
     assert ((STAGES - 2) * LDG_WAIT_COUNT) < 63
 
-    KERNEL_NAME = f"hgemm_{dtype}_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}x{STAGES}_SPK{SPLIT_K}_W{BLOCK_M_WARPS}x{BLOCK_N_WARPS}x{BLOCK_K_WARPS}_BLDS{int(B_TO_LDS)}_TN"
+    USE_8WAVE_PIPE = ASYNC_COPY and B_TO_LDS and BLOCK_M == 256 and BLOCK_N == 256 and BLOCK_K == 64 and LDG_REG_A_COUNT_AS == 4 and LDG_REG_B_COUNT_AS == 4 and MFMA_PER_WARP_K == 1
+    USE_8WAVE_PIPE = USE_8WAVE_PIPE and BLOCK_M_WARPS == 2 and BLOCK_N_WARPS == 4 and BLOCK_K_WARPS == 1
+
+    KERNEL_PREFIX = "hgemm8p" if USE_8WAVE_PIPE else "hgemm"
+    KERNEL_NAME = f"{KERNEL_PREFIX}_{dtype}_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}x{STAGES}_SPK{SPLIT_K}_W{BLOCK_M_WARPS}x{BLOCK_N_WARPS}x{BLOCK_K_WARPS}_BLDS{int(B_TO_LDS)}_TN"
     KERNEL_NAME += "_AS0" if not ASYNC_COPY else "_AS1"
     if HAS_BIAS:
         KERNEL_NAME += "_BIAS"
@@ -684,18 +688,21 @@ def compile_hgemm_kernel(
                 )
 
             for kk in range_constexpr(WARP_K_STEPS):
-                warp_atom_k_idx = warp_k_slice_base + kk * WARP_ATOM_K
+                warp_atom_k_idx = kk * WARP_ATOM_K
+                b0_frags = [0] * N_HALF_STEPS
+                b1_frags = [0] * N_HALF_STEPS
+                a0_frags = [0] * M_HALF_STEPS
+                a1_frags = [0] * M_HALF_STEPS
                 if const_expr(kk == 0):
                     lds_ptr_b = ldg_sts_b_async_one(0, lds_ptr_b)
                     lds_ptr_b = ldg_sts_b_async_one(1, lds_ptr_b)
-                b0_frags = [0] * N_HALF_STEPS
                 for ni in range_constexpr(N_HALF_STEPS):
                     b0_frags[ni] = load_b_frag(ni, warp_atom_k_idx)
-                a0_frags = [0] * M_HALF_STEPS
                 for mi in range_constexpr(M_HALF_STEPS):
                     a0_frags[mi] = load_a_frag(mi, warp_atom_k_idx)
                 rocdl.sched_barrier(0)
-                rocdl.s_setprio(1)
+                if const_expr(kk == 0):
+                    rocdl.s_setprio(1)
                 for mi in range_constexpr(M_HALF_STEPS):
                     for ni in range_constexpr(N_HALF_STEPS):
                         c_idx = mi * WARP_N_STEPS + ni
@@ -705,15 +712,16 @@ def compile_hgemm_kernel(
                             c_frags_new[c_idx],
                         )
                 rocdl.sched_barrier(0)
-                rocdl.s_setprio(0)
+                if const_expr(kk == 0):
+                    rocdl.s_setprio(0)
                 if const_expr(kk == 0):
                     lds_ptr_a = ldg_sts_a_async_one(0, lds_ptr_a)
                     lds_ptr_a = ldg_sts_a_async_one(1, lds_ptr_a)
-                b1_frags = [0] * N_HALF_STEPS
                 for ni in range_constexpr(N_HALF_STEPS):
                     b1_frags[ni] = load_b_frag(N_HALF_STEPS + ni, warp_atom_k_idx)
                 rocdl.sched_barrier(0)
-                rocdl.s_setprio(1)
+                if const_expr(kk == 0):
+                    rocdl.s_setprio(1)
                 for mi in range_constexpr(M_HALF_STEPS):
                     for ni in range_constexpr(N_HALF_STEPS):
                         c_idx = mi * WARP_N_STEPS + N_HALF_STEPS + ni
@@ -722,17 +730,17 @@ def compile_hgemm_kernel(
                             b1_frags[ni],
                             c_frags_new[c_idx],
                         )
-
                 rocdl.sched_barrier(0)
-                rocdl.s_setprio(0)
+                if const_expr(kk == 0):
+                    rocdl.s_setprio(0)
                 if const_expr(kk == 0):
                     lds_ptr_b = ldg_sts_b_async_one(2, lds_ptr_b)
                     lds_ptr_b = ldg_sts_b_async_one(3, lds_ptr_b)
-                a1_frags = [0] * M_HALF_STEPS
                 for mi in range_constexpr(M_HALF_STEPS):
                     a1_frags[mi] = load_a_frag(M_HALF_STEPS + mi, warp_atom_k_idx)
                 rocdl.sched_barrier(0)
-                rocdl.s_setprio(1)
+                if const_expr(kk == 0):
+                    rocdl.s_setprio(1)
                 for mi in range_constexpr(M_HALF_STEPS):
                     for ni in range_constexpr(N_HALF_STEPS):
                         c_idx = (M_HALF_STEPS + mi) * WARP_N_STEPS + ni
@@ -797,16 +805,7 @@ def compile_hgemm_kernel(
                 next_stage = (current_stage + 1) % STAGES
                 write_stage = (current_stage + STAGES - 1) % STAGES
                 __barrier((STAGES - 2) * LDG_WAIT_COUNT)
-                if const_expr(
-                    ASYNC_COPY
-                    and B_TO_LDS
-                    and BLOCK_M == 256
-                    and BLOCK_N == 256
-                    and BLOCK_K == 64
-                    and LDG_REG_A_COUNT_AS == 4
-                    and LDG_REG_B_COUNT_AS == 4
-                    and MFMA_PER_WARP_K == 1
-                ):
+                if const_expr(USE_8WAVE_PIPE):
                     c_frags_new = async_copy_ldmatrix_compute_tile_streaming(
                         current_stage,
                         c_frags,
@@ -962,9 +961,10 @@ def compile_hgemm_kernel(
 
         bm = (m + BLOCK_M - 1) // BLOCK_M
         hgemm_kernel._func.__name__ = KERNEL_NAME
+        value_attrs = {"rocdl.waves_per_eu": 2, "rocdl.flat_work_group_size": f"{BLOCK_THREADS},{BLOCK_THREADS}"} if USE_8WAVE_PIPE else None
         hgemm_kernel(C, A, B, BIAS, m, semaphore, signal).launch(
             grid=(bm * N_BLOCKS, SPLIT_K, 1), block=(BLOCK_THREADS, 1, 1), stream=stream,
-            value_attrs={"rocdl.waves_per_eu": 2, "rocdl.flat_work_group_size": f"{BLOCK_THREADS},{BLOCK_THREADS}"},
+            value_attrs=value_attrs,
         )
 
     return launch_hgemm_kernel
@@ -1097,7 +1097,7 @@ def func(a, b, bias, c):
     hgemm_splitk_(c, a, b, bias=bias)
 
 
-def benchmark(args, func, ref_func, warmup=50, niters=150, sole_inputs=False):
+def benchmark(args, func, ref_func, warmup=100, niters=200, sole_inputs=False):
     inputs = create_inputs(args)
     outputs = create_outputs(args)
     ref_outputs = create_outputs(args)
