@@ -700,7 +700,6 @@ def compile_hgemm_kernel(
                     b0_frags[ni] = load_b_frag(ni, warp_atom_k_idx)
                 for mi in range_constexpr(M_HALF_STEPS):
                     a0_frags[mi] = load_a_frag(mi, warp_atom_k_idx)
-                rocdl.sched_barrier(0)
                 if const_expr(kk == 0):
                     rocdl.s_setprio(1)
                 for mi in range_constexpr(M_HALF_STEPS):
@@ -711,7 +710,6 @@ def compile_hgemm_kernel(
                             b0_frags[ni],
                             c_frags_new[c_idx],
                         )
-                rocdl.sched_barrier(0)
                 if const_expr(kk == 0):
                     rocdl.s_setprio(0)
                 if const_expr(kk == 0):
@@ -719,7 +717,6 @@ def compile_hgemm_kernel(
                     lds_ptr_a = ldg_sts_a_async_one(1, lds_ptr_a)
                 for ni in range_constexpr(N_HALF_STEPS):
                     b1_frags[ni] = load_b_frag(N_HALF_STEPS + ni, warp_atom_k_idx)
-                rocdl.sched_barrier(0)
                 if const_expr(kk == 0):
                     rocdl.s_setprio(1)
                 for mi in range_constexpr(M_HALF_STEPS):
@@ -729,16 +726,13 @@ def compile_hgemm_kernel(
                             a0_frags[mi],
                             b1_frags[ni],
                             c_frags_new[c_idx],
-                        )
-                rocdl.sched_barrier(0)
+                        )           
                 if const_expr(kk == 0):
                     rocdl.s_setprio(0)
-                if const_expr(kk == 0):
                     lds_ptr_b = ldg_sts_b_async_one(2, lds_ptr_b)
                     lds_ptr_b = ldg_sts_b_async_one(3, lds_ptr_b)
                 for mi in range_constexpr(M_HALF_STEPS):
                     a1_frags[mi] = load_a_frag(M_HALF_STEPS + mi, warp_atom_k_idx)
-                rocdl.sched_barrier(0)
                 if const_expr(kk == 0):
                     rocdl.s_setprio(1)
                 for mi in range_constexpr(M_HALF_STEPS):
@@ -750,11 +744,9 @@ def compile_hgemm_kernel(
                             c_frags_new[c_idx],
                         )
                 if const_expr(kk == 0):
-                    rocdl.sched_barrier(0)
                     rocdl.s_setprio(0)
                     lds_ptr_a = ldg_sts_a_async_one(2, lds_ptr_a)
                     lds_ptr_a = ldg_sts_a_async_one(3, lds_ptr_a)
-                    rocdl.sched_barrier(0)
                     rocdl.s_setprio(1)
                 for mi in range_constexpr(M_HALF_STEPS):
                     for ni in range_constexpr(N_HALF_STEPS):
@@ -765,7 +757,6 @@ def compile_hgemm_kernel(
                             c_frags_new[c_idx],
                         )
                 if const_expr(kk == 0):
-                    rocdl.sched_barrier(0)
                     rocdl.s_setprio(0)
             return c_frags_new
 
@@ -783,17 +774,37 @@ def compile_hgemm_kernel(
 
             def hot_loop_scheduler():
                 # ================ Ordered ================
-                for i in range_constexpr(LDG_REG_B_COUNT_AS):
-                    rocdl.sched_vmem(1)  # ldg_sts_b_async next
-                for i in range_constexpr(LDG_REG_A_COUNT_AS):
-                    rocdl.sched_vmem(1)  # ldg_sts_a_async next
-                for ki in range_constexpr(WARP_K_STEPS):
-                    for i in range_constexpr(WARP_N_STEPS):
-                        rocdl.sched_dsrd(1)  # lds_matrix_b current
-                    for i in range_constexpr(WARP_M_STEPS):
-                        rocdl.sched_dsrd(1)  # lds_matrix_a current
-                    for i in range_constexpr(WARP_M_STEPS):
-                        rocdl.sched_mfma(WARP_N_STEPS)
+                if const_expr(USE_8WAVE_PIPE):
+                    # 1
+                    for ki in range_constexpr(WARP_K_STEPS):
+                        if const_expr(ki == 0):
+                            rocdl.sched_vmem(2)
+                        rocdl.sched_dsrd(2)
+                        rocdl.sched_dsrd(4)
+                        rocdl.sched_mfma(8)
+                        if const_expr(ki == 0):
+                            rocdl.sched_vmem(2)
+                        rocdl.sched_dsrd(2)
+                        rocdl.sched_mfma(8)
+                        if const_expr(ki == 0):
+                            rocdl.sched_vmem(2)
+                        rocdl.sched_dsrd(4)
+                        rocdl.sched_mfma(8)
+                        if const_expr(ki == 0):
+                            rocdl.sched_vmem(2)
+                        rocdl.sched_mfma(8)
+                else:
+                    for i in range_constexpr(LDG_REG_B_COUNT_AS):
+                        rocdl.sched_vmem(1)  # ldg_sts_b_async next
+                    for i in range_constexpr(LDG_REG_A_COUNT_AS):
+                        rocdl.sched_vmem(1)  # ldg_sts_a_async next
+                    for ki in range_constexpr(WARP_K_STEPS):
+                        for i in range_constexpr(WARP_N_STEPS):
+                            rocdl.sched_dsrd(1)  # lds_matrix_b current
+                        for i in range_constexpr(WARP_M_STEPS):
+                            rocdl.sched_dsrd(1)  # lds_matrix_a current
+                        for i in range_constexpr(WARP_M_STEPS):
+                            rocdl.sched_mfma(WARP_N_STEPS)
                 # ================ Reordered ================
                 rocdl.sched_barrier(0)
 
