@@ -2,6 +2,7 @@ import time
 import torch
 import argparse
 import functools
+import itertools
 import numpy as np
 import torch.nn.functional as F
 from torch.profiler import profile, ProfilerActivity
@@ -127,7 +128,7 @@ class OnlineScheduler:
         return count
 
 
-@functools.lru_cache(maxsize=1024)
+@functools.lru_cache(maxsize=16384)
 def compile_hgemm_kernel(
     dtype: str,
     n: int,
@@ -244,8 +245,7 @@ def compile_hgemm_kernel(
     USE_8WAVE_PIPE = ASYNC_COPY and B_TO_LDS and BLOCK_M == 256 and BLOCK_N == 256 and BLOCK_K == 64 and LDG_REG_A_COUNT_AS == 4 and LDG_REG_B_COUNT_AS == 4 and MFMA_PER_WARP_K == 1
     USE_8WAVE_PIPE = USE_8WAVE_PIPE and BLOCK_M_WARPS == 2 and BLOCK_N_WARPS == 4 and BLOCK_K_WARPS == 1
 
-    KERNEL_PREFIX = "hgemm8p" if USE_8WAVE_PIPE else "hgemm"
-    KERNEL_NAME = f"{KERNEL_PREFIX}_{dtype}_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}x{STAGES}_SPK{SPLIT_K}_W{BLOCK_M_WARPS}x{BLOCK_N_WARPS}x{BLOCK_K_WARPS}_BLDS{int(B_TO_LDS)}_TN"
+    KERNEL_NAME = f"hgemm_{dtype}_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}x{STAGES}_SPK{SPLIT_K}_W{BLOCK_M_WARPS}x{BLOCK_N_WARPS}x{BLOCK_K_WARPS}_BLDS{int(B_TO_LDS)}_TN"
     KERNEL_NAME += "_AS0" if not ASYNC_COPY else "_AS1"
     if HAS_BIAS:
         KERNEL_NAME += "_BIAS"
@@ -994,12 +994,122 @@ selections = {
     'TILE_M': [16, 32, 48, 64, 96, 128, 256],
     'TILE_N': [64, 128, 256],
     'TILE_K': [64, 128, 256],
-    'STAGES': [2, 3, 4, 5],
-    'SPLIT_K': [i for i in range(1, 17)],
+    'STAGES': [i for i in range(2, 33)],
+    'SPLIT_K': [i for i in range(1, 14)],
     'BLOCK_M_WARPS': [1, 2, 4],
     'BLOCK_N_WARPS': [1, 2, 4],
     'BLOCK_K_WARPS': [1, 2, 4],
 }
+
+
+def selection_filter(m, n, k, kwargs):
+    TILE_M = kwargs['TILE_M']
+    TILE_N = kwargs['TILE_N']
+    TILE_K = kwargs['TILE_K']
+    STAGES = kwargs['STAGES']
+    SPLIT_K = kwargs['SPLIT_K']
+    BLOCK_M_WARPS = kwargs['BLOCK_M_WARPS']
+    BLOCK_N_WARPS = kwargs['BLOCK_N_WARPS']
+    BLOCK_K_WARPS = kwargs['BLOCK_K_WARPS']
+    B_TO_LDS = kwargs.get('B_TO_LDS', True)
+    if BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS > 16:
+        return False
+    if TILE_M * TILE_N * TILE_K > 256 * 256 * 64:
+        return False
+    if (TILE_M == 256) and (TILE_N == 256):
+        if not ((TILE_K == 64) and (SPLIT_K == 1) and (STAGES == 2)):
+            return False
+    N_BLOCKS = n // TILE_N
+    if not ((N_BLOCKS >= 1) and (n % TILE_N == 0)):
+        return False
+    BLOCK_K = TILE_K
+    if not ((k % SPLIT_K == 0) and (k // SPLIT_K >= 1)):
+        return False
+    ks = k // SPLIT_K
+    if not ((ks % BLOCK_K == 0) and (ks // BLOCK_K >= 1)):
+        return False
+    GPU_ARCH = get_rocm_arch()
+    BLOCK_K_LOOPS = ks // BLOCK_K
+    if not (BLOCK_K_LOOPS >= STAGES):
+        return False
+    WARP_ATOM_K = 16 if GPU_ARCH == "gfx942" else 32
+    WARP_SIZE = 64
+    WARP_ATOM_M = 16
+    WARP_ATOM_N = 16
+    WARP_GROUP_K = BLOCK_K_WARPS * WARP_ATOM_K
+    WARP_K_STEPS = BLOCK_K // WARP_GROUP_K
+    if not ((BLOCK_K % WARP_GROUP_K == 0) and (WARP_K_STEPS >= 1)):
+        return False
+    K_SLICE = BLOCK_K // BLOCK_K_WARPS
+    if not (K_SLICE % WARP_ATOM_K == 0):
+        return False
+    WARP_M_STEPS = TILE_M // BLOCK_M_WARPS // WARP_ATOM_M
+    WARP_N_STEPS = TILE_N // BLOCK_N_WARPS // WARP_ATOM_N
+    if not ((WARP_M_STEPS >= 1) and (WARP_N_STEPS >= 1)):
+        return False
+    if not (TILE_M % (BLOCK_M_WARPS * WARP_ATOM_M) == 0):
+        return False
+    if not (TILE_N % (BLOCK_N_WARPS * WARP_ATOM_N) == 0):
+        return False
+    WARP_M = WARP_M_STEPS * WARP_ATOM_M
+    WARP_N = WARP_N_STEPS * WARP_ATOM_N
+    BLOCK_M = BLOCK_M_WARPS * WARP_M
+    BLOCK_N = BLOCK_N_WARPS * WARP_N
+    if not ((n >= BLOCK_N) and (n % BLOCK_N == 0)):
+        return False
+    DTYPE_BYTES = 2
+    def get_stage_smem_use(stages_):
+        SMEM_USE = stages_ * BLOCK_M * BLOCK_K * DTYPE_BYTES
+        if B_TO_LDS:
+            SMEM_USE += stages_ * BLOCK_N * BLOCK_K * DTYPE_BYTES
+        SMEM_USE = max(SMEM_USE, BLOCK_K_WARPS * BLOCK_M * BLOCK_N * DTYPE_BYTES)
+        return SMEM_USE
+    smem_use_s0 = get_stage_smem_use(STAGES)
+    smem_use_s1 = get_stage_smem_use(STAGES + 2)
+    smem_cap = SMEM_CAPACITY_MAP[GPU_ARCH]
+    if not (smem_use_s0 <= smem_cap and smem_use_s1 > smem_cap):
+        return False
+    LDG_VEC_SIZE = 8
+    BLOCK_THREADS = BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS * WARP_SIZE
+    BLOCK_VECS = LDG_VEC_SIZE * BLOCK_THREADS
+    BLOCK_MK_SIZE = BLOCK_M * BLOCK_K
+    BLOCK_NK_SIZE = BLOCK_N * BLOCK_K
+    BLOCK_MN_SIZE = BLOCK_M * BLOCK_N
+    LDG_REG_A_COUNT = BLOCK_MK_SIZE // BLOCK_VECS
+    LDG_REG_B_COUNT = BLOCK_NK_SIZE // BLOCK_VECS
+    LDG_REG_C_COUNT = BLOCK_MN_SIZE // BLOCK_VECS
+    valid = (LDG_REG_A_COUNT >= 1) and (LDG_REG_B_COUNT >= 1) and (LDG_REG_C_COUNT >= 1)
+    valid = valid and (BLOCK_MK_SIZE % BLOCK_VECS == 0)
+    valid = valid and (BLOCK_NK_SIZE % BLOCK_VECS == 0)
+    valid = valid and (BLOCK_MN_SIZE % BLOCK_VECS == 0)
+    DMA_BYTES = 4 if GPU_ARCH == "gfx942" else 16
+    LDG_ASYNC_VEC_SIZE = DMA_BYTES // DTYPE_BYTES
+    LDG_REG_A_COUNT_AS = BLOCK_MK_SIZE // LDG_ASYNC_VEC_SIZE // BLOCK_THREADS
+    LDG_REG_B_COUNT_AS = BLOCK_NK_SIZE // LDG_ASYNC_VEC_SIZE // BLOCK_THREADS
+    LDG_WAIT_COUNT = LDG_REG_B_COUNT_AS + LDG_REG_A_COUNT_AS
+    valid = valid and (((STAGES - 2) * LDG_WAIT_COUNT) < 63)
+    if not valid:
+        return False
+    bm = (m + BLOCK_M - 1) // BLOCK_M
+    bn = n // BLOCK_N
+    work = bm * bn * BLOCK_M * BLOCK_N
+    useful = m * n
+    efficienty = float(useful) / float(work)
+    if efficienty < 0.5:
+        return False
+    if m >= 4096 and n >= 4096 and k >= 4096:
+        if not (TILE_M == 256 and TILE_N == 256 and TILE_K == 64 and STAGES == 2 and SPLIT_K == 1 and BLOCK_M_WARPS == 2 and BLOCK_N_WARPS == 4 and BLOCK_K_WARPS == 1):
+            return False
+    return True
+
+
+def hgemm_get_configs(m, n, k):
+    global selections
+    keys = selections.keys()
+    values = selections.values()
+    configs = [dict(zip(keys, combo)) for combo in itertools.product(*values)]
+    configs = [config for config in configs if selection_filter(m, n, k, config)]
+    return configs
 
 
 @functools.lru_cache(maxsize=128)

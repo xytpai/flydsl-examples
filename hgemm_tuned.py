@@ -3,8 +3,6 @@ import json
 import bisect
 import torch
 import argparse
-import functools
-import itertools
 import numpy as np
 from tqdm import tqdm
 from pathlib import Path
@@ -17,7 +15,7 @@ base_dir = Path(__file__).resolve().parent
 temp_dir = base_dir / 'temp'
 temp_dir.mkdir(parents=True, exist_ok=True)
 
-from hgemm import hgemm_splitk_, selections, benchmark, ref_func
+from hgemm import hgemm_splitk_, hgemm_get_configs, benchmark, ref_func
 
 
 @dataclass
@@ -55,7 +53,7 @@ def create_outputs(args):
     return (c,)
 
 
-def tuning_benchmark(args, hgemm_kwargs={}, warmup=5, niters=30):
+def tuning_benchmark(args, hgemm_kwargs={}, warmup=5, niters=10):
     # correctness test
     a, b, bias = create_inputs(args)
     c = create_outputs(args)[0]
@@ -83,9 +81,7 @@ def tuning_benchmark(args, hgemm_kwargs={}, warmup=5, niters=30):
 
 
 def tune_single(args):
-    keys = selections.keys()
-    values = selections.values()
-    configs = [dict(zip(keys, combo)) for combo in itertools.product(*values)]
+    configs = hgemm_get_configs(args.m, args.n, args.k)
     best_duration = float(1e10)
     best_idx = 0
     pbar = tqdm(total=len(configs), desc=f"{args}")
