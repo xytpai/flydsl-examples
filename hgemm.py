@@ -463,67 +463,63 @@ def compile_hgemm_kernel(
                 raise NotImplementedError(f"DMA_BYTES={DMA_BYTES} not supported")
             llvm.InlineAsmOp(None, [lds_ptr, global_offset, rsrc], asm, "s,v,s", has_side_effects=True)
 
+        def ldg_sts_a_async_one(ii, k_offset, write_stage, lds_ptr=None):
+            global_tid = BLOCK_THREADS * ii + tid
+            m_local_idx = global_tid // LDG_A_X_THREADS_AS
+            k_local_idx = global_tid % LDG_A_X_THREADS_AS * LDG_ASYNC_VEC_SIZE
+            col_in_bytes = k_local_idx * DTYPE_BYTES
+            col_in_bytes = swizzle_xor16(m_local_idx, col_in_bytes, k_blocks16)
+            row_idx = m_offset + fx.Index(m_local_idx)
+            safe_row_idx = arith.select(
+                arith.cmpi(arith.CmpIPredicate.ult, row_idx, fx.Index(m)),
+                row_idx,
+                fx.Index(0),
+            )
+            col_idx = fx.Index(k_offset + col_in_bytes // DTYPE_BYTES)
+            global_offset = A_.linear_offset((safe_row_idx, col_idx)) * DTYPE_BYTES
+            global_offset = arith.index_cast(T.i32, global_offset)
+            if const_expr(lds_ptr is None):
+                lds_offset = as_.linear_offset((fx.Index(write_stage), 0, 0)) * DTYPE_BYTES
+                lds_base = memref.extract_aligned_pointer_as_index(as_.memptr) + lds_offset
+                lds_ptr_base = buffer_ops.create_llvm_ptr(arith.index_cast(T.i64, lds_base), address_space=3)
+                lds_ptr = buffer_ops.get_element_ptr(lds_ptr_base, warp_offset)
+            else:
+                lds_ptr = buffer_ops.get_element_ptr(lds_ptr, static_byte_offset=BLOCK_THREADS * DMA_BYTES)
+            buffer_load_lds_inline(A_.rsrc, lds_ptr, global_offset)
+            return lds_ptr
+        
         def ldg_sts_a_async(k_offset, lds_stage):
             for i in range_constexpr(LDG_REG_A_COUNT_AS):
-                global_tid = BLOCK_THREADS * i + tid
-                m_local_idx = global_tid // LDG_A_X_THREADS_AS
-                k_local_idx = global_tid % LDG_A_X_THREADS_AS * LDG_ASYNC_VEC_SIZE
-                col_in_bytes = k_local_idx * DTYPE_BYTES
-                col_in_bytes = swizzle_xor16(m_local_idx, col_in_bytes, k_blocks16)
-                row_idx = m_offset + fx.Index(m_local_idx)
-                safe_row_idx = arith.select(
-                    arith.cmpi(arith.CmpIPredicate.ult, row_idx, fx.Index(m)),
-                    row_idx,
-                    fx.Index(0),
-                )
-                col_idx = fx.Index(k_offset + col_in_bytes // DTYPE_BYTES)
-                # get offset
-                global_offset = A_.linear_offset((safe_row_idx, col_idx)) * DTYPE_BYTES
-                global_offset = arith.index_cast(T.i32, global_offset)
-                # get lds ptr
-                if const_expr(i == 0):
-                    lds_offset = as_.linear_offset((fx.Index(lds_stage), 0, 0)) * DTYPE_BYTES
-                    lds_base = memref.extract_aligned_pointer_as_index(as_.memptr) + lds_offset
-                    lds_ptr_base = buffer_ops.create_llvm_ptr(arith.index_cast(T.i64, lds_base), address_space=3)
-                    lds_ptr = buffer_ops.get_element_ptr(lds_ptr_base, warp_offset)
-                else:
-                    lds_ptr = buffer_ops.get_element_ptr(
-                        lds_ptr,
-                        static_byte_offset=BLOCK_THREADS * DMA_BYTES,
-                    )
-                # dma copy
-                buffer_load_lds_inline(A_.rsrc, lds_ptr, global_offset)
-
+                lds_ptr = ldg_sts_a_async_one(i, k_offset, lds_stage, lds_ptr if i > 0 else None)
+        
+        def ldg_sts_b_async_one(ii, k_offset, write_stage, lds_ptr=None):
+            global_tid = BLOCK_THREADS * ii + tid
+            n_local_idx = global_tid // LDG_B_X_THREADS_AS
+            k_local_idx = global_tid % LDG_B_X_THREADS_AS * LDG_ASYNC_VEC_SIZE
+            col_in_bytes = k_local_idx * DTYPE_BYTES
+            col_in_bytes = swizzle_xor16(n_local_idx, col_in_bytes, k_blocks16)
+            row_idx = n_offset + fx.Index(n_local_idx)
+            safe_row_idx = arith.select(
+                arith.cmpi(arith.CmpIPredicate.ult, row_idx, fx.Index(n)),
+                row_idx,
+                fx.Index(0),
+            )
+            col_idx = fx.Index(k_offset + col_in_bytes // DTYPE_BYTES)
+            global_offset = B_.linear_offset((safe_row_idx, col_idx)) * DTYPE_BYTES
+            global_offset = arith.index_cast(T.i32, global_offset)
+            if const_expr(lds_ptr is None):
+                lds_offset = bs_.linear_offset((fx.Index(write_stage), 0, 0)) * DTYPE_BYTES
+                lds_base = memref.extract_aligned_pointer_as_index(bs_.memptr) + lds_offset
+                lds_ptr_base = buffer_ops.create_llvm_ptr(arith.index_cast(T.i64, lds_base), address_space=3)
+                lds_ptr = buffer_ops.get_element_ptr(lds_ptr_base, warp_offset)
+            else:
+                lds_ptr = buffer_ops.get_element_ptr(lds_ptr, static_byte_offset=BLOCK_THREADS * DMA_BYTES)
+            buffer_load_lds_inline(B_.rsrc, lds_ptr, global_offset)
+            return lds_ptr
+        
         def ldg_sts_b_async(k_offset, lds_stage):
             for i in range_constexpr(LDG_REG_B_COUNT_AS):
-                global_tid = BLOCK_THREADS * i + tid
-                n_local_idx = global_tid // LDG_B_X_THREADS_AS
-                k_local_idx = global_tid % LDG_B_X_THREADS_AS * LDG_ASYNC_VEC_SIZE
-                col_in_bytes = k_local_idx * DTYPE_BYTES
-                col_in_bytes = swizzle_xor16(n_local_idx, col_in_bytes, k_blocks16)
-                row_idx = n_offset + fx.Index(n_local_idx)
-                safe_row_idx = arith.select(
-                    arith.cmpi(arith.CmpIPredicate.ult, row_idx, fx.Index(n)),
-                    row_idx,
-                    fx.Index(0),
-                )
-                col_idx = fx.Index(k_offset + col_in_bytes // DTYPE_BYTES)
-                # get offset
-                global_offset = B_.linear_offset((safe_row_idx, col_idx)) * DTYPE_BYTES
-                global_offset = arith.index_cast(T.i32, global_offset)
-                # get lds ptr
-                if const_expr(i == 0):
-                    lds_offset = bs_.linear_offset((fx.Index(lds_stage), 0, 0)) * DTYPE_BYTES
-                    lds_base = memref.extract_aligned_pointer_as_index(bs_.memptr) + lds_offset
-                    lds_ptr_base = buffer_ops.create_llvm_ptr(arith.index_cast(T.i64, lds_base), address_space=3)
-                    lds_ptr = buffer_ops.get_element_ptr(lds_ptr_base, warp_offset)
-                else:
-                    lds_ptr = buffer_ops.get_element_ptr(
-                        lds_ptr,
-                        static_byte_offset=BLOCK_THREADS * DMA_BYTES,
-                    )
-                # dma copy
-                buffer_load_lds_inline(B_.rsrc, lds_ptr, global_offset)
+                lds_ptr = ldg_sts_b_async_one(i, k_offset, lds_stage, lds_ptr if i > 0 else None)
 
         def ldg_matrix_b(k_offset):
             vecs = []
@@ -610,62 +606,6 @@ def compile_hgemm_kernel(
             c_frags_new = [cx for cx in c_frags]
             lds_ptr_a = None
             lds_ptr_b = None
-
-            def ldg_sts_a_async_one(ii, lds_ptr=None):
-                global_tid = BLOCK_THREADS * ii + tid
-                m_local_idx = global_tid // LDG_A_X_THREADS_AS
-                k_local_idx = global_tid % LDG_A_X_THREADS_AS * LDG_ASYNC_VEC_SIZE
-                col_in_bytes = k_local_idx * DTYPE_BYTES
-                col_in_bytes = swizzle_xor16(m_local_idx, col_in_bytes, k_blocks16)
-                row_idx = m_offset + fx.Index(m_local_idx)
-                safe_row_idx = arith.select(
-                    arith.cmpi(arith.CmpIPredicate.ult, row_idx, fx.Index(m)),
-                    row_idx,
-                    fx.Index(0),
-                )
-                col_idx = fx.Index(k_offset_next_tile + col_in_bytes // DTYPE_BYTES)
-                global_offset = A_.linear_offset((safe_row_idx, col_idx)) * DTYPE_BYTES
-                global_offset = arith.index_cast(T.i32, global_offset)
-                if const_expr(lds_ptr is None):
-                    lds_offset = as_.linear_offset((fx.Index(write_stage), 0, 0)) * DTYPE_BYTES
-                    lds_base = memref.extract_aligned_pointer_as_index(as_.memptr) + lds_offset
-                    lds_ptr_base = buffer_ops.create_llvm_ptr(
-                        arith.index_cast(T.i64, lds_base),
-                        address_space=3,
-                    )
-                    lds_ptr = buffer_ops.get_element_ptr(lds_ptr_base, warp_offset)
-                else:
-                    lds_ptr = buffer_ops.get_element_ptr(lds_ptr, static_byte_offset=BLOCK_THREADS * DMA_BYTES)
-                buffer_load_lds_inline(A_.rsrc, lds_ptr, global_offset)
-                return lds_ptr
-
-            def ldg_sts_b_async_one(ii, lds_ptr=None):
-                global_tid = BLOCK_THREADS * ii + tid
-                n_local_idx = global_tid // LDG_B_X_THREADS_AS
-                k_local_idx = global_tid % LDG_B_X_THREADS_AS * LDG_ASYNC_VEC_SIZE
-                col_in_bytes = k_local_idx * DTYPE_BYTES
-                col_in_bytes = swizzle_xor16(n_local_idx, col_in_bytes, k_blocks16)
-                row_idx = n_offset + fx.Index(n_local_idx)
-                safe_row_idx = arith.select(
-                    arith.cmpi(arith.CmpIPredicate.ult, row_idx, fx.Index(n)),
-                    row_idx,
-                    fx.Index(0),
-                )
-                col_idx = fx.Index(k_offset_next_tile + col_in_bytes // DTYPE_BYTES)
-                global_offset = B_.linear_offset((safe_row_idx, col_idx)) * DTYPE_BYTES
-                global_offset = arith.index_cast(T.i32, global_offset)
-                if const_expr(lds_ptr is None):
-                    lds_offset = bs_.linear_offset((fx.Index(write_stage), 0, 0)) * DTYPE_BYTES
-                    lds_base = memref.extract_aligned_pointer_as_index(bs_.memptr) + lds_offset
-                    lds_ptr_base = buffer_ops.create_llvm_ptr(
-                        arith.index_cast(T.i64, lds_base),
-                        address_space=3,
-                    )
-                    lds_ptr = buffer_ops.get_element_ptr(lds_ptr_base, warp_offset)
-                else:
-                    lds_ptr = buffer_ops.get_element_ptr(lds_ptr, static_byte_offset=BLOCK_THREADS * DMA_BYTES)
-                buffer_load_lds_inline(B_.rsrc, lds_ptr, global_offset)
-                return lds_ptr
             
             def load_b_frag(n_step, warp_atom_k_idx):
                 warp_atom_n_idx = warp_n_idx + n_step * WARP_ATOM_N
@@ -689,13 +629,13 @@ def compile_hgemm_kernel(
 
             for kk in range_constexpr(WARP_K_STEPS):
                 warp_atom_k_idx = kk * WARP_ATOM_K
-                b0_frags = [0] * N_HALF_STEPS
+                b0_frags = [0] * N_HALF_STEPS # 2
                 b1_frags = [0] * N_HALF_STEPS
-                a0_frags = [0] * M_HALF_STEPS
+                a0_frags = [0] * M_HALF_STEPS # 4
                 a1_frags = [0] * M_HALF_STEPS
                 if const_expr(kk == 0):
-                    lds_ptr_b = ldg_sts_b_async_one(0, lds_ptr_b)
-                    lds_ptr_b = ldg_sts_b_async_one(1, lds_ptr_b)
+                    lds_ptr_b = ldg_sts_b_async_one(0, k_offset_next_tile, write_stage, lds_ptr_b)
+                    lds_ptr_b = ldg_sts_b_async_one(1, k_offset_next_tile, write_stage, lds_ptr_b)
                 for ni in range_constexpr(N_HALF_STEPS):
                     b0_frags[ni] = load_b_frag(ni, warp_atom_k_idx)
                 for mi in range_constexpr(M_HALF_STEPS):
@@ -713,8 +653,8 @@ def compile_hgemm_kernel(
                 if const_expr(kk == 0):
                     rocdl.s_setprio(0)
                 if const_expr(kk == 0):
-                    lds_ptr_a = ldg_sts_a_async_one(0, lds_ptr_a)
-                    lds_ptr_a = ldg_sts_a_async_one(1, lds_ptr_a)
+                    lds_ptr_a = ldg_sts_a_async_one(0, k_offset_next_tile, write_stage, lds_ptr_a)
+                    lds_ptr_a = ldg_sts_a_async_one(1, k_offset_next_tile, write_stage, lds_ptr_a)
                 for ni in range_constexpr(N_HALF_STEPS):
                     b1_frags[ni] = load_b_frag(N_HALF_STEPS + ni, warp_atom_k_idx)
                 if const_expr(kk == 0):
@@ -729,8 +669,8 @@ def compile_hgemm_kernel(
                         )           
                 if const_expr(kk == 0):
                     rocdl.s_setprio(0)
-                    lds_ptr_b = ldg_sts_b_async_one(2, lds_ptr_b)
-                    lds_ptr_b = ldg_sts_b_async_one(3, lds_ptr_b)
+                    lds_ptr_b = ldg_sts_b_async_one(2, k_offset_next_tile, write_stage, lds_ptr_b)
+                    lds_ptr_b = ldg_sts_b_async_one(3, k_offset_next_tile, write_stage, lds_ptr_b)
                 for mi in range_constexpr(M_HALF_STEPS):
                     a1_frags[mi] = load_a_frag(M_HALF_STEPS + mi, warp_atom_k_idx)
                 if const_expr(kk == 0):
@@ -745,8 +685,8 @@ def compile_hgemm_kernel(
                         )
                 if const_expr(kk == 0):
                     rocdl.s_setprio(0)
-                    lds_ptr_a = ldg_sts_a_async_one(2, lds_ptr_a)
-                    lds_ptr_a = ldg_sts_a_async_one(3, lds_ptr_a)
+                    lds_ptr_a = ldg_sts_a_async_one(2, k_offset_next_tile, write_stage, lds_ptr_a)
+                    lds_ptr_a = ldg_sts_a_async_one(3, k_offset_next_tile, write_stage, lds_ptr_a)
                     rocdl.s_setprio(1)
                 for mi in range_constexpr(M_HALF_STEPS):
                     for ni in range_constexpr(N_HALF_STEPS):
