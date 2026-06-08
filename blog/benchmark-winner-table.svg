@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="820" viewBox="0 0 1500 820" role="img" aria-labelledby="title desc">
+<title id="title">Hand-drawn fastest backend table</title>
+<desc id="desc">A hand-drawn table showing the fastest backend and latency for each shape.</desc>
+<defs>
+  <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3.5" orient="auto" markerUnits="strokeWidth"><path d="M0,0 C3,1 6,3 9,3.5 C6,4 3,6 0,7 Z" fill="#3f3f46"/></marker>
+  <style>
+    .bg{fill:#fffaf0}.card{fill:#fffdf7;stroke:#cfc5ae;stroke-width:2.2;rx:24;}
+    .sketch{}.title{font:700 34px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive;fill:#22222a}.subtitle{font:500 17px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive;fill:#5f5a50}
+    .label{font:700 16px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive;fill:#26262b}.axis{font:700 13px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive;fill:#665f55}
+    .tiny{font:600 11px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive;fill:#665f55}.num{font:800 21px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive}.subnum{font:600 11px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive}
+    .line{fill:none;stroke-width:3.4;stroke-linejoin:round;stroke-linecap:round;}.dot{stroke:#fffdf7;stroke-width:2;}.tick{stroke:#dfd6c8;stroke-width:1;stroke-dasharray:5 6}.note{font:500 12px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive;fill:#7c4a03;}
+  </style>
+</defs>
+<rect class="bg" width="1500" height="820"/>
+<text x="42" y="54" class="title">Fastest Backend by Shape</text>
+<text x="44" y="84" class="subtitle">Each tile shows the lowest-latency backend for K=7168; use it as a quick win-map across decode shapes.</text>
+<rect class="sketch" x="780" y="124" width="24" height="16" rx="5" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/><text x="814" y="137" class="tiny">Mixed Stream-K</text>
+<rect class="sketch" x="930" y="124" width="24" height="16" rx="5" fill="#ffedd5" stroke="#f97316" stroke-width="2"/><text x="964" y="137" class="tiny">Tuned ASM</text>
+<rect class="sketch" x="1080" y="124" width="24" height="16" rx="5" fill="#f1f5f9" stroke="#64748b" stroke-width="2"/><text x="1114" y="137" class="tiny">Torch</text>
+<rect class="sketch" x="1230" y="124" width="24" height="16" rx="5" fill="#cffafe" stroke="#06b6d4" stroke-width="2"/><text x="1264" y="137" class="tiny">Triton</text>
+<rect class="card sketch" x="70" y="170" width="1360" height="560"/>
+<text x="104" y="226" class="label">N / M</text>
+<text x="268.0" y="226" class="axis">1</text>
+<text x="398.0" y="226" class="axis">2</text>
+<text x="528.0" y="226" class="axis">4</text>
+<text x="658.0" y="226" class="axis">8</text>
+<text x="788.0" y="226" class="axis">16</text>
+<text x="918.0" y="226" class="axis">32</text>
+<text x="1048.0" y="226" class="axis">64</text>
+<text x="1178.0" y="226" class="axis">128</text>
+<text x="104" y="289" class="label">N=64</text>
+<g transform="rotate(-0.48 274 287)"><rect class="sketch" x="215" y="255" width="118" height="64" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/><text x="235" y="282" class="label">Mixed</text><text x="235" y="303" class="tiny">4.58 us</text></g>
+<g transform="rotate(-0.16 404 287)"><rect class="sketch" x="345" y="255" width="118" height="64" rx="14" fill="#ffedd5" stroke="#f97316" stroke-width="2"/><text x="365" y="282" class="label">ASM</text><text x="365" y="303" class="tiny">4.90 us</text></g>
+<g transform="rotate(0.16 534 287)"><rect class="sketch" x="475" y="255" width="118" height="64" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/><text x="495" y="282" class="label">Mixed</text><text x="495" y="303" class="tiny">4.87 us</text></g>
+<g transform="rotate(0.48 664 287)"><rect class="sketch" x="605" y="255" width="118" height="64" rx="14" fill="#ffedd5" stroke="#f97316" stroke-width="2"/><text x="625" y="282" class="label">ASM</text><text x="625" y="303" class="tiny">4.91 us</text></g>
+<g transform="rotate(-0.32 794 287)"><rect class="sketch" x="735" y="255" width="118" height="64" rx="14" fill="#ffedd5" stroke="#f97316" stroke-width="2"/><text x="755" y="282" class="label">ASM</text><text x="755" y="303" class="tiny">5.03 us</text></g>
+<g transform="rotate(0.00 924 287)"><rect class="sketch" x="865" y="255" width="118" height="64" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/><text x="885" y="282" class="label">Mixed</text><text x="885" y="303" class="tiny">5.08 us</text></g>
+<g transform="rotate(0.32 1054 287)"><rect class="sketch" x="995" y="255" width="118" height="64" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/><text x="1015" y="282" class="label">Mixed</text><text x="1015" y="303" class="tiny">4.96 us</text></g>
+<g transform="rotate(-0.48 1184 287)"><rect class="sketch" x="1125" y="255" width="118" height="64" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/><text x="1145" y="282" class="label">Mixed</text><text x="1145" y="303" class="tiny">5.86 us</text></g>
+<text x="104" y="371" class="label">N=384</text>
+<g transform="rotate(0.32 274 369)"><rect class="sketch" x="215" y="337" width="118" height="64" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/><text x="235" y="364" class="label">Mixed</text><text x="235" y="385" class="tiny">5.84 us</text></g>
+<g transform="rotate(-0.48 404 369)"><rect class="sketch" x="345" y="337" width="118" height="64" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/><text x="365" y="364" class="label">Mixed</text><text x="365" y="385" class="tiny">5.81 us</text></g>
+<g transform="rotate(-0.16 534 369)"><rect class="sketch" x="475" y="337" width="118" height="64" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/><text x="495" y="364" class="label">Mixed</text><text x="495" y="385" class="tiny">5.85 us</text></g>
+<g transform="rotate(0.16 664 369)"><rect class="sketch" x="605" y="337" width="118" height="64" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/><text x="625" y="364" class="label">Mixed</text><text x="625" y="385" class="tiny">6.00 us</text></g>
+<g transform="rotate(0.48 794 369)"><rect class="sketch" x="735" y="337" width="118" height="64" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/><text x="755" y="364" class="label">Mixed</text><text x="755" y="385" class="tiny">6.30 us</text></g>
+<g transform="rotate(-0.32 924 369)"><rect class="sketch" x="865" y="337" width="118" height="64" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/><text x="885" y="364" class="label">Mixed</text><text x="885" y="385" class="tiny">6.75 us</text></g>
+<g transform="rotate(0.00 1054 369)"><rect class="sketch" x="995" y="337" width="118" height="64" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/><text x="1015" y="364" class="label">Mixed</text><text x="1015" y="385" class="tiny">7.63 us</text></g>
+<g transform="rotate(0.32 1184 369)"><rect class="sketch" x="1125" y="337" width="118" height="64" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/><text x="1145" y="364" class="label">Mixed</text><text x="1145" y="385" class="tiny">9.70 us</text></g>
+<text x="104" y="453" class="label">N=512</text>
+<g transform="rotate(0.00 274 451)"><rect class="sketch" x="215" y="419" width="118" height="64" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/><text x="235" y="446" class="label">Mixed</text><text x="235" y="467" class="tiny">6.07 us</text></g>
+<g transform="rotate(0.32 404 451)"><rect class="sketch" x="345" y="419" width="118" height="64" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/><text x="365" y="446" class="label">Mixed</text><text x="365" y="467" class="tiny">6.04 us</text></g>
+<g transform="rotate(-0.48 534 451)"><rect class="sketch" x="475" y="419" width="118" height="64" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/><text x="495" y="446" class="label">Mixed</text><text x="495" y="467" class="tiny">6.14 us</text></g>
+<g transform="rotate(-0.16 664 451)"><rect class="sketch" x="605" y="419" width="118" height="64" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/><text x="625" y="446" class="label">Mixed</text><text x="625" y="467" class="tiny">6.41 us</text></g>
+<g transform="rotate(0.16 794 451)"><rect class="sketch" x="735" y="419" width="118" height="64" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/><text x="755" y="446" class="label">Mixed</text><text x="755" y="467" class="tiny">6.76 us</text></g>
+<g transform="rotate(0.48 924 451)"><rect class="sketch" x="865" y="419" width="118" height="64" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/><text x="885" y="446" class="label">Mixed</text><text x="885" y="467" class="tiny">7.01 us</text></g>
+<g transform="rotate(-0.32 1054 451)"><rect class="sketch" x="995" y="419" width="118" height="64" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/><text x="1015" y="446" class="label">Mixed</text><text x="1015" y="467" class="tiny">7.77 us</text></g>
+<g transform="rotate(0.00 1184 451)"><rect class="sketch" x="1125" y="419" width="118" height="64" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/><text x="1145" y="446" class="label">Mixed</text><text x="1145" y="467" class="tiny">9.65 us</text></g>
+<text x="104" y="535" class="label">N=1024</text>
+<g transform="rotate(-0.32 274 533)"><rect class="sketch" x="215" y="501" width="118" height="64" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/><text x="235" y="528" class="label">Mixed</text><text x="235" y="549" class="tiny">6.58 us</text></g>
+<g transform="rotate(0.00 404 533)"><rect class="sketch" x="345" y="501" width="118" height="64" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/><text x="365" y="528" class="label">Mixed</text><text x="365" y="549" class="tiny">6.52 us</text></g>
+<g transform="rotate(0.32 534 533)"><rect class="sketch" x="475" y="501" width="118" height="64" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/><text x="495" y="528" class="label">Mixed</text><text x="495" y="549" class="tiny">6.59 us</text></g>
+<g transform="rotate(-0.48 664 533)"><rect class="sketch" x="605" y="501" width="118" height="64" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/><text x="625" y="528" class="label">Mixed</text><text x="625" y="549" class="tiny">6.86 us</text></g>
+<g transform="rotate(-0.16 794 533)"><rect class="sketch" x="735" y="501" width="118" height="64" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/><text x="755" y="528" class="label">Mixed</text><text x="755" y="549" class="tiny">7.28 us</text></g>
+<g transform="rotate(0.16 924 533)"><rect class="sketch" x="865" y="501" width="118" height="64" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/><text x="885" y="528" class="label">Mixed</text><text x="885" y="549" class="tiny">7.80 us</text></g>
+<g transform="rotate(0.48 1054 533)"><rect class="sketch" x="995" y="501" width="118" height="64" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/><text x="1015" y="528" class="label">Mixed</text><text x="1015" y="549" class="tiny">9.62 us</text></g>
+<g transform="rotate(-0.32 1184 533)"><rect class="sketch" x="1125" y="501" width="118" height="64" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/><text x="1145" y="528" class="label">Mixed</text><text x="1145" y="549" class="tiny">11.16 us</text></g>
+<text x="92" y="768" class="note">Win count across 32 shapes: Mixed 29, ASM 3, Torch 0, Triton 0. Purple cells mark the tuned Stream-K path; orange cells mark tuned ASM.</text>
+</svg>

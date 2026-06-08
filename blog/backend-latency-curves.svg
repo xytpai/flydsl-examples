@@ -1,0 +1,234 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="960" viewBox="0 0 1500 960" role="img" aria-labelledby="title desc">
+<title id="title">Hand-drawn decode GEMM latency curves</title>
+<desc id="desc">Hand-drawn latency curves for backend comparison across M and N.</desc>
+<defs>
+  <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3.5" orient="auto" markerUnits="strokeWidth"><path d="M0,0 C3,1 6,3 9,3.5 C6,4 3,6 0,7 Z" fill="#3f3f46"/></marker>
+  <style>
+    .bg{fill:#fffaf0}.card{fill:#fffdf7;stroke:#cfc5ae;stroke-width:2.2;rx:24;}
+    .sketch{}.title{font:700 34px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive;fill:#22222a}.subtitle{font:500 17px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive;fill:#5f5a50}
+    .label{font:700 16px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive;fill:#26262b}.axis{font:700 13px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive;fill:#665f55}
+    .tiny{font:600 11px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive;fill:#665f55}.num{font:800 21px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive}.subnum{font:600 11px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive}
+    .line{fill:none;stroke-width:3.4;stroke-linejoin:round;stroke-linecap:round;}.dot{stroke:#fffdf7;stroke-width:2;}.tick{stroke:#dfd6c8;stroke-width:1;stroke-dasharray:5 6}.note{font:500 12px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive;fill:#7c4a03;}
+  </style>
+</defs>
+<rect class="bg" width="1500" height="960"/>
+<text x="42" y="54" class="title">Kernel Latency Across Decode GEMM Shapes</text>
+<text x="44" y="84" class="subtitle">BF16 GEMM, K=7168, gfx950 / 256 CUs. Lower is better; curves are intentionally kept as detailed backup.</text>
+<line class="line" x1="930" y1="56" x2="962" y2="56" stroke="#64748b"/><text x="970" y="61" class="axis">Torch</text>
+<line class="line" x1="1060" y1="56" x2="1092" y2="56" stroke="#06b6d4"/><text x="1100" y="61" class="axis">Triton</text>
+<line class="line" x1="1190" y1="56" x2="1222" y2="56" stroke="#f97316"/><text x="1230" y="61" class="axis">Tuned ASM</text>
+<line class="line" x1="1320" y1="56" x2="1352" y2="56" stroke="#7c3aed"/><text x="1360" y="61" class="axis">Mixed Stream-K</text>
+<rect class="card sketch" x="45" y="105" width="715" height="405"/>
+<text x="90" y="137" class="label">N = 64</text>
+<line class="tick" x1="90" y1="455.0" x2="710" y2="455.0"/><text x="56" y="459.0" class="axis">0</text>
+<line class="tick" x1="90" y1="392.11429104625034" x2="710" y2="392.11429104625034"/><text x="56" y="396.11429104625034" class="axis">10</text>
+<line class="tick" x1="90" y1="329.2285820925007" x2="710" y2="329.2285820925007"/><text x="56" y="333.2285820925007" class="axis">20</text>
+<line class="tick" x1="90" y1="266.3428731387511" x2="710" y2="266.3428731387511"/><text x="56" y="270.3428731387511" class="axis">30</text>
+<line class="tick" x1="90" y1="203.45716418500143" x2="710" y2="203.45716418500143"/><text x="56" y="207.45716418500143" class="axis">40</text>
+<line class="tick" x1="90.0" y1="165" x2="90.0" y2="455"/><text x="83.0" y="479" class="axis">1</text>
+<line class="tick" x1="178.57142857142856" y1="165" x2="178.57142857142856" y2="455"/><text x="171.57142857142856" y="479" class="axis">2</text>
+<line class="tick" x1="267.1428571428571" y1="165" x2="267.1428571428571" y2="455"/><text x="260.1428571428571" y="479" class="axis">4</text>
+<line class="tick" x1="355.7142857142857" y1="165" x2="355.7142857142857" y2="455"/><text x="348.7142857142857" y="479" class="axis">8</text>
+<line class="tick" x1="444.2857142857143" y1="165" x2="444.2857142857143" y2="455"/><text x="437.2857142857143" y="479" class="axis">16</text>
+<line class="tick" x1="532.8571428571429" y1="165" x2="532.8571428571429" y2="455"/><text x="525.8571428571429" y="479" class="axis">32</text>
+<line class="tick" x1="621.4285714285714" y1="165" x2="621.4285714285714" y2="455"/><text x="614.4285714285714" y="479" class="axis">64</text>
+<line class="tick" x1="710.0" y1="165" x2="710.0" y2="455"/><text x="703.0" y="479" class="axis">128</text>
+<text x="368.0" y="505" class="axis">M</text>
+<text x="42" y="310.0" class="axis" transform="rotate(-90 42 310.0)">latency (us)</text>
+<path class="line" d="M 90.0,398.9 L 178.6,401.8 L 267.1,401.4 L 355.7,401.2 L 444.3,403.5 L 532.9,397.0 L 621.4,399.1 L 710.0,386.8" stroke="#64748b"/>
+<circle class="dot" cx="90.0" cy="398.9" r="4" fill="#64748b"/>
+<circle class="dot" cx="178.6" cy="401.8" r="4" fill="#64748b"/>
+<circle class="dot" cx="267.1" cy="401.4" r="4" fill="#64748b"/>
+<circle class="dot" cx="355.7" cy="401.2" r="4" fill="#64748b"/>
+<circle class="dot" cx="444.3" cy="403.5" r="4" fill="#64748b"/>
+<circle class="dot" cx="532.9" cy="397.0" r="4" fill="#64748b"/>
+<circle class="dot" cx="621.4" cy="399.1" r="4" fill="#64748b"/>
+<circle class="dot" cx="710.0" cy="386.8" r="4" fill="#64748b"/>
+<path class="line" d="M 90.0,307.5 L 178.6,307.5 L 267.1,306.9 L 355.7,307.2 L 444.3,343.2 L 532.9,329.7 L 621.4,288.9 L 710.0,185.9" stroke="#06b6d4"/>
+<circle class="dot" cx="90.0" cy="307.5" r="4" fill="#06b6d4"/>
+<circle class="dot" cx="178.6" cy="307.5" r="4" fill="#06b6d4"/>
+<circle class="dot" cx="267.1" cy="306.9" r="4" fill="#06b6d4"/>
+<circle class="dot" cx="355.7" cy="307.2" r="4" fill="#06b6d4"/>
+<circle class="dot" cx="444.3" cy="343.2" r="4" fill="#06b6d4"/>
+<circle class="dot" cx="532.9" cy="329.7" r="4" fill="#06b6d4"/>
+<circle class="dot" cx="621.4" cy="288.9" r="4" fill="#06b6d4"/>
+<circle class="dot" cx="710.0" cy="185.9" r="4" fill="#06b6d4"/>
+<path class="line" d="M 90.0,424.8 L 178.6,424.2 L 267.1,423.6 L 355.7,424.1 L 444.3,423.3 L 532.9,422.4 L 621.4,418.6 L 710.0,410.4" stroke="#f97316"/>
+<circle class="dot" cx="90.0" cy="424.8" r="4" fill="#f97316"/>
+<circle class="dot" cx="178.6" cy="424.2" r="4" fill="#f97316"/>
+<circle class="dot" cx="267.1" cy="423.6" r="4" fill="#f97316"/>
+<circle class="dot" cx="355.7" cy="424.1" r="4" fill="#f97316"/>
+<circle class="dot" cx="444.3" cy="423.3" r="4" fill="#f97316"/>
+<circle class="dot" cx="532.9" cy="422.4" r="4" fill="#f97316"/>
+<circle class="dot" cx="621.4" cy="418.6" r="4" fill="#f97316"/>
+<circle class="dot" cx="710.0" cy="410.4" r="4" fill="#f97316"/>
+<path class="line" d="M 90.0,426.2 L 178.6,423.8 L 267.1,424.4 L 355.7,423.9 L 444.3,422.6 L 532.9,423.1 L 621.4,423.8 L 710.0,418.1" stroke="#7c3aed"/>
+<circle class="dot" cx="90.0" cy="426.2" r="4" fill="#7c3aed"/>
+<circle class="dot" cx="178.6" cy="423.8" r="4" fill="#7c3aed"/>
+<circle class="dot" cx="267.1" cy="424.4" r="4" fill="#7c3aed"/>
+<circle class="dot" cx="355.7" cy="423.9" r="4" fill="#7c3aed"/>
+<circle class="dot" cx="444.3" cy="422.6" r="4" fill="#7c3aed"/>
+<circle class="dot" cx="532.9" cy="423.1" r="4" fill="#7c3aed"/>
+<circle class="dot" cx="621.4" cy="423.8" r="4" fill="#7c3aed"/>
+<circle class="dot" cx="710.0" cy="418.1" r="4" fill="#7c3aed"/>
+<rect class="card sketch" x="745" y="105" width="715" height="405"/>
+<text x="790" y="137" class="label">N = 384</text>
+<line class="tick" x1="790" y1="455.0" x2="1410" y2="455.0"/><text x="756" y="459.0" class="axis">0</text>
+<line class="tick" x1="790" y1="392.11429104625034" x2="1410" y2="392.11429104625034"/><text x="756" y="396.11429104625034" class="axis">10</text>
+<line class="tick" x1="790" y1="329.2285820925007" x2="1410" y2="329.2285820925007"/><text x="756" y="333.2285820925007" class="axis">20</text>
+<line class="tick" x1="790" y1="266.3428731387511" x2="1410" y2="266.3428731387511"/><text x="756" y="270.3428731387511" class="axis">30</text>
+<line class="tick" x1="790" y1="203.45716418500143" x2="1410" y2="203.45716418500143"/><text x="756" y="207.45716418500143" class="axis">40</text>
+<line class="tick" x1="790.0" y1="165" x2="790.0" y2="455"/><text x="783.0" y="479" class="axis">1</text>
+<line class="tick" x1="878.5714285714286" y1="165" x2="878.5714285714286" y2="455"/><text x="871.5714285714286" y="479" class="axis">2</text>
+<line class="tick" x1="967.1428571428571" y1="165" x2="967.1428571428571" y2="455"/><text x="960.1428571428571" y="479" class="axis">4</text>
+<line class="tick" x1="1055.7142857142858" y1="165" x2="1055.7142857142858" y2="455"/><text x="1048.7142857142858" y="479" class="axis">8</text>
+<line class="tick" x1="1144.2857142857142" y1="165" x2="1144.2857142857142" y2="455"/><text x="1137.2857142857142" y="479" class="axis">16</text>
+<line class="tick" x1="1232.857142857143" y1="165" x2="1232.857142857143" y2="455"/><text x="1225.857142857143" y="479" class="axis">32</text>
+<line class="tick" x1="1321.4285714285716" y1="165" x2="1321.4285714285716" y2="455"/><text x="1314.4285714285716" y="479" class="axis">64</text>
+<line class="tick" x1="1410.0" y1="165" x2="1410.0" y2="455"/><text x="1403.0" y="479" class="axis">128</text>
+<text x="1068.0" y="505" class="axis">M</text>
+<text x="742" y="310.0" class="axis" transform="rotate(-90 742 310.0)">latency (us)</text>
+<path class="line" d="M 790.0,393.1 L 878.6,390.1 L 967.1,389.9 L 1055.7,392.4 L 1144.3,390.5 L 1232.9,382.1 L 1321.4,381.3 L 1410.0,387.5" stroke="#64748b"/>
+<circle class="dot" cx="790.0" cy="393.1" r="4" fill="#64748b"/>
+<circle class="dot" cx="878.6" cy="390.1" r="4" fill="#64748b"/>
+<circle class="dot" cx="967.1" cy="389.9" r="4" fill="#64748b"/>
+<circle class="dot" cx="1055.7" cy="392.4" r="4" fill="#64748b"/>
+<circle class="dot" cx="1144.3" cy="390.5" r="4" fill="#64748b"/>
+<circle class="dot" cx="1232.9" cy="382.1" r="4" fill="#64748b"/>
+<circle class="dot" cx="1321.4" cy="381.3" r="4" fill="#64748b"/>
+<circle class="dot" cx="1410.0" cy="387.5" r="4" fill="#64748b"/>
+<path class="line" d="M 790.0,402.0 L 878.6,402.8 L 967.1,395.8 L 1055.7,402.1 L 1144.3,393.7 L 1232.9,404.8 L 1321.4,391.1 L 1410.0,385.3" stroke="#06b6d4"/>
+<circle class="dot" cx="790.0" cy="402.0" r="4" fill="#06b6d4"/>
+<circle class="dot" cx="878.6" cy="402.8" r="4" fill="#06b6d4"/>
+<circle class="dot" cx="967.1" cy="395.8" r="4" fill="#06b6d4"/>
+<circle class="dot" cx="1055.7" cy="402.1" r="4" fill="#06b6d4"/>
+<circle class="dot" cx="1144.3" cy="393.7" r="4" fill="#06b6d4"/>
+<circle class="dot" cx="1232.9" cy="404.8" r="4" fill="#06b6d4"/>
+<circle class="dot" cx="1321.4" cy="391.1" r="4" fill="#06b6d4"/>
+<circle class="dot" cx="1410.0" cy="385.3" r="4" fill="#06b6d4"/>
+<path class="line" d="M 790.0,398.6 L 878.6,398.7 L 967.1,398.6 L 1055.7,397.7 L 1144.3,398.6 L 1232.9,398.1 L 1321.4,394.4 L 1410.0,377.6" stroke="#f97316"/>
+<circle class="dot" cx="790.0" cy="398.6" r="4" fill="#f97316"/>
+<circle class="dot" cx="878.6" cy="398.7" r="4" fill="#f97316"/>
+<circle class="dot" cx="967.1" cy="398.6" r="4" fill="#f97316"/>
+<circle class="dot" cx="1055.7" cy="397.7" r="4" fill="#f97316"/>
+<circle class="dot" cx="1144.3" cy="398.6" r="4" fill="#f97316"/>
+<circle class="dot" cx="1232.9" cy="398.1" r="4" fill="#f97316"/>
+<circle class="dot" cx="1321.4" cy="394.4" r="4" fill="#f97316"/>
+<circle class="dot" cx="1410.0" cy="377.6" r="4" fill="#f97316"/>
+<path class="line" d="M 790.0,418.3 L 878.6,418.4 L 967.1,418.2 L 1055.7,417.3 L 1144.3,415.4 L 1232.9,412.5 L 1321.4,407.0 L 1410.0,394.0" stroke="#7c3aed"/>
+<circle class="dot" cx="790.0" cy="418.3" r="4" fill="#7c3aed"/>
+<circle class="dot" cx="878.6" cy="418.4" r="4" fill="#7c3aed"/>
+<circle class="dot" cx="967.1" cy="418.2" r="4" fill="#7c3aed"/>
+<circle class="dot" cx="1055.7" cy="417.3" r="4" fill="#7c3aed"/>
+<circle class="dot" cx="1144.3" cy="415.4" r="4" fill="#7c3aed"/>
+<circle class="dot" cx="1232.9" cy="412.5" r="4" fill="#7c3aed"/>
+<circle class="dot" cx="1321.4" cy="407.0" r="4" fill="#7c3aed"/>
+<circle class="dot" cx="1410.0" cy="394.0" r="4" fill="#7c3aed"/>
+<rect class="card sketch" x="45" y="470" width="715" height="405"/>
+<text x="90" y="502" class="label">N = 512</text>
+<line class="tick" x1="90" y1="820.0" x2="710" y2="820.0"/><text x="56" y="824.0" class="axis">0</text>
+<line class="tick" x1="90" y1="757.1142910462504" x2="710" y2="757.1142910462504"/><text x="56" y="761.1142910462504" class="axis">10</text>
+<line class="tick" x1="90" y1="694.2285820925007" x2="710" y2="694.2285820925007"/><text x="56" y="698.2285820925007" class="axis">20</text>
+<line class="tick" x1="90" y1="631.3428731387511" x2="710" y2="631.3428731387511"/><text x="56" y="635.3428731387511" class="axis">30</text>
+<line class="tick" x1="90" y1="568.4571641850014" x2="710" y2="568.4571641850014"/><text x="56" y="572.4571641850014" class="axis">40</text>
+<line class="tick" x1="90.0" y1="530" x2="90.0" y2="820"/><text x="83.0" y="844" class="axis">1</text>
+<line class="tick" x1="178.57142857142856" y1="530" x2="178.57142857142856" y2="820"/><text x="171.57142857142856" y="844" class="axis">2</text>
+<line class="tick" x1="267.1428571428571" y1="530" x2="267.1428571428571" y2="820"/><text x="260.1428571428571" y="844" class="axis">4</text>
+<line class="tick" x1="355.7142857142857" y1="530" x2="355.7142857142857" y2="820"/><text x="348.7142857142857" y="844" class="axis">8</text>
+<line class="tick" x1="444.2857142857143" y1="530" x2="444.2857142857143" y2="820"/><text x="437.2857142857143" y="844" class="axis">16</text>
+<line class="tick" x1="532.8571428571429" y1="530" x2="532.8571428571429" y2="820"/><text x="525.8571428571429" y="844" class="axis">32</text>
+<line class="tick" x1="621.4285714285714" y1="530" x2="621.4285714285714" y2="820"/><text x="614.4285714285714" y="844" class="axis">64</text>
+<line class="tick" x1="710.0" y1="530" x2="710.0" y2="820"/><text x="703.0" y="844" class="axis">128</text>
+<text x="368.0" y="870" class="axis">M</text>
+<text x="42" y="675.0" class="axis" transform="rotate(-90 42 675.0)">latency (us)</text>
+<path class="line" d="M 90.0,756.4 L 178.6,756.2 L 267.1,755.7 L 355.7,753.2 L 444.3,753.1 L 532.9,752.0 L 621.4,745.3 L 710.0,748.7" stroke="#64748b"/>
+<circle class="dot" cx="90.0" cy="756.4" r="4" fill="#64748b"/>
+<circle class="dot" cx="178.6" cy="756.2" r="4" fill="#64748b"/>
+<circle class="dot" cx="267.1" cy="755.7" r="4" fill="#64748b"/>
+<circle class="dot" cx="355.7" cy="753.2" r="4" fill="#64748b"/>
+<circle class="dot" cx="444.3" cy="753.1" r="4" fill="#64748b"/>
+<circle class="dot" cx="532.9" cy="752.0" r="4" fill="#64748b"/>
+<circle class="dot" cx="621.4" cy="745.3" r="4" fill="#64748b"/>
+<circle class="dot" cx="710.0" cy="748.7" r="4" fill="#64748b"/>
+<path class="line" d="M 90.0,640.7 L 178.6,642.0 L 267.1,641.6 L 355.7,640.3 L 444.3,674.3 L 532.9,641.1 L 621.4,614.1 L 710.0,546.4" stroke="#06b6d4"/>
+<circle class="dot" cx="90.0" cy="640.7" r="4" fill="#06b6d4"/>
+<circle class="dot" cx="178.6" cy="642.0" r="4" fill="#06b6d4"/>
+<circle class="dot" cx="267.1" cy="641.6" r="4" fill="#06b6d4"/>
+<circle class="dot" cx="355.7" cy="640.3" r="4" fill="#06b6d4"/>
+<circle class="dot" cx="444.3" cy="674.3" r="4" fill="#06b6d4"/>
+<circle class="dot" cx="532.9" cy="641.1" r="4" fill="#06b6d4"/>
+<circle class="dot" cx="621.4" cy="614.1" r="4" fill="#06b6d4"/>
+<circle class="dot" cx="710.0" cy="546.4" r="4" fill="#06b6d4"/>
+<path class="line" d="M 90.0,757.7 L 178.6,757.0 L 267.1,757.3 L 355.7,757.3 L 444.3,755.6 L 532.9,756.2 L 621.4,752.5 L 710.0,735.1" stroke="#f97316"/>
+<circle class="dot" cx="90.0" cy="757.7" r="4" fill="#f97316"/>
+<circle class="dot" cx="178.6" cy="757.0" r="4" fill="#f97316"/>
+<circle class="dot" cx="267.1" cy="757.3" r="4" fill="#f97316"/>
+<circle class="dot" cx="355.7" cy="757.3" r="4" fill="#f97316"/>
+<circle class="dot" cx="444.3" cy="755.6" r="4" fill="#f97316"/>
+<circle class="dot" cx="532.9" cy="756.2" r="4" fill="#f97316"/>
+<circle class="dot" cx="621.4" cy="752.5" r="4" fill="#f97316"/>
+<circle class="dot" cx="710.0" cy="735.1" r="4" fill="#f97316"/>
+<path class="line" d="M 90.0,781.8 L 178.6,782.0 L 267.1,781.4 L 355.7,779.7 L 444.3,777.5 L 532.9,775.9 L 621.4,771.2 L 710.0,759.3" stroke="#7c3aed"/>
+<circle class="dot" cx="90.0" cy="781.8" r="4" fill="#7c3aed"/>
+<circle class="dot" cx="178.6" cy="782.0" r="4" fill="#7c3aed"/>
+<circle class="dot" cx="267.1" cy="781.4" r="4" fill="#7c3aed"/>
+<circle class="dot" cx="355.7" cy="779.7" r="4" fill="#7c3aed"/>
+<circle class="dot" cx="444.3" cy="777.5" r="4" fill="#7c3aed"/>
+<circle class="dot" cx="532.9" cy="775.9" r="4" fill="#7c3aed"/>
+<circle class="dot" cx="621.4" cy="771.2" r="4" fill="#7c3aed"/>
+<circle class="dot" cx="710.0" cy="759.3" r="4" fill="#7c3aed"/>
+<rect class="card sketch" x="745" y="470" width="715" height="405"/>
+<text x="790" y="502" class="label">N = 1024</text>
+<line class="tick" x1="790" y1="820.0" x2="1410" y2="820.0"/><text x="756" y="824.0" class="axis">0</text>
+<line class="tick" x1="790" y1="757.1142910462504" x2="1410" y2="757.1142910462504"/><text x="756" y="761.1142910462504" class="axis">10</text>
+<line class="tick" x1="790" y1="694.2285820925007" x2="1410" y2="694.2285820925007"/><text x="756" y="698.2285820925007" class="axis">20</text>
+<line class="tick" x1="790" y1="631.3428731387511" x2="1410" y2="631.3428731387511"/><text x="756" y="635.3428731387511" class="axis">30</text>
+<line class="tick" x1="790" y1="568.4571641850014" x2="1410" y2="568.4571641850014"/><text x="756" y="572.4571641850014" class="axis">40</text>
+<line class="tick" x1="790.0" y1="530" x2="790.0" y2="820"/><text x="783.0" y="844" class="axis">1</text>
+<line class="tick" x1="878.5714285714286" y1="530" x2="878.5714285714286" y2="820"/><text x="871.5714285714286" y="844" class="axis">2</text>
+<line class="tick" x1="967.1428571428571" y1="530" x2="967.1428571428571" y2="820"/><text x="960.1428571428571" y="844" class="axis">4</text>
+<line class="tick" x1="1055.7142857142858" y1="530" x2="1055.7142857142858" y2="820"/><text x="1048.7142857142858" y="844" class="axis">8</text>
+<line class="tick" x1="1144.2857142857142" y1="530" x2="1144.2857142857142" y2="820"/><text x="1137.2857142857142" y="844" class="axis">16</text>
+<line class="tick" x1="1232.857142857143" y1="530" x2="1232.857142857143" y2="820"/><text x="1225.857142857143" y="844" class="axis">32</text>
+<line class="tick" x1="1321.4285714285716" y1="530" x2="1321.4285714285716" y2="820"/><text x="1314.4285714285716" y="844" class="axis">64</text>
+<line class="tick" x1="1410.0" y1="530" x2="1410.0" y2="820"/><text x="1403.0" y="844" class="axis">128</text>
+<text x="1068.0" y="870" class="axis">M</text>
+<text x="742" y="675.0" class="axis" transform="rotate(-90 742 675.0)">latency (us)</text>
+<path class="line" d="M 790.0,728.1 L 878.6,723.0 L 967.1,727.5 L 1055.7,728.6 L 1144.3,744.1 L 1232.9,742.9 L 1321.4,744.3 L 1410.0,720.9" stroke="#64748b"/>
+<circle class="dot" cx="790.0" cy="728.1" r="4" fill="#64748b"/>
+<circle class="dot" cx="878.6" cy="723.0" r="4" fill="#64748b"/>
+<circle class="dot" cx="967.1" cy="727.5" r="4" fill="#64748b"/>
+<circle class="dot" cx="1055.7" cy="728.6" r="4" fill="#64748b"/>
+<circle class="dot" cx="1144.3" cy="744.1" r="4" fill="#64748b"/>
+<circle class="dot" cx="1232.9" cy="742.9" r="4" fill="#64748b"/>
+<circle class="dot" cx="1321.4" cy="744.3" r="4" fill="#64748b"/>
+<circle class="dot" cx="1410.0" cy="720.9" r="4" fill="#64748b"/>
+<path class="line" d="M 790.0,629.2 L 878.6,629.1 L 967.1,629.2 L 1055.7,628.0 L 1144.3,665.6 L 1232.9,641.7 L 1321.4,613.1 L 1410.0,548.7" stroke="#06b6d4"/>
+<circle class="dot" cx="790.0" cy="629.2" r="4" fill="#06b6d4"/>
+<circle class="dot" cx="878.6" cy="629.1" r="4" fill="#06b6d4"/>
+<circle class="dot" cx="967.1" cy="629.2" r="4" fill="#06b6d4"/>
+<circle class="dot" cx="1055.7" cy="628.0" r="4" fill="#06b6d4"/>
+<circle class="dot" cx="1144.3" cy="665.6" r="4" fill="#06b6d4"/>
+<circle class="dot" cx="1232.9" cy="641.7" r="4" fill="#06b6d4"/>
+<circle class="dot" cx="1321.4" cy="613.1" r="4" fill="#06b6d4"/>
+<circle class="dot" cx="1410.0" cy="548.7" r="4" fill="#06b6d4"/>
+<path class="line" d="M 790.0,738.4 L 878.6,739.1 L 967.1,738.7 L 1055.7,738.8 L 1144.3,738.8 L 1232.9,736.7 L 1321.4,734.4 L 1410.0,728.0" stroke="#f97316"/>
+<circle class="dot" cx="790.0" cy="738.4" r="4" fill="#f97316"/>
+<circle class="dot" cx="878.6" cy="739.1" r="4" fill="#f97316"/>
+<circle class="dot" cx="967.1" cy="738.7" r="4" fill="#f97316"/>
+<circle class="dot" cx="1055.7" cy="738.8" r="4" fill="#f97316"/>
+<circle class="dot" cx="1144.3" cy="738.8" r="4" fill="#f97316"/>
+<circle class="dot" cx="1232.9" cy="736.7" r="4" fill="#f97316"/>
+<circle class="dot" cx="1321.4" cy="734.4" r="4" fill="#f97316"/>
+<circle class="dot" cx="1410.0" cy="728.0" r="4" fill="#f97316"/>
+<path class="line" d="M 790.0,778.6 L 878.6,779.0 L 967.1,778.6 L 1055.7,776.9 L 1144.3,774.2 L 1232.9,771.0 L 1321.4,759.5 L 1410.0,749.8" stroke="#7c3aed"/>
+<circle class="dot" cx="790.0" cy="778.6" r="4" fill="#7c3aed"/>
+<circle class="dot" cx="878.6" cy="779.0" r="4" fill="#7c3aed"/>
+<circle class="dot" cx="967.1" cy="778.6" r="4" fill="#7c3aed"/>
+<circle class="dot" cx="1055.7" cy="776.9" r="4" fill="#7c3aed"/>
+<circle class="dot" cx="1144.3" cy="774.2" r="4" fill="#7c3aed"/>
+<circle class="dot" cx="1232.9" cy="771.0" r="4" fill="#7c3aed"/>
+<circle class="dot" cx="1321.4" cy="759.5" r="4" fill="#7c3aed"/>
+<circle class="dot" cx="1410.0" cy="749.8" r="4" fill="#7c3aed"/>
+<text x="92" y="914" class="note">Detailed latency view generated from the measured backend CSV files under blog/data.</text>
+</svg>

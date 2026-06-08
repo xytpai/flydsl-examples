@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="900" viewBox="0 0 1500 900" role="img" aria-labelledby="title desc">
+<title id="title">Mixed Stream-K hand-drawn benchmark summary table</title>
+<desc id="desc">A hand-drawn visual table of Mixed Stream-K speedups versus the faster generic backend across M and N.</desc>
+<defs>
+  <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3.5" orient="auto" markerUnits="strokeWidth"><path d="M0,0 C3,1 6,3 9,3.5 C6,4 3,6 0,7 Z" fill="#3f3f46"/></marker>
+  <style>
+    .bg{fill:#fffaf0}.card{fill:#fffdf7;stroke:#cfc5ae;stroke-width:2.2;rx:24;}
+    .sketch{}.title{font:700 34px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive;fill:#22222a}.subtitle{font:500 17px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive;fill:#5f5a50}
+    .label{font:700 16px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive;fill:#26262b}.axis{font:700 13px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive;fill:#665f55}
+    .tiny{font:600 11px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive;fill:#665f55}.num{font:800 21px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive}.subnum{font:600 11px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive}
+    .line{fill:none;stroke-width:3.4;stroke-linejoin:round;stroke-linecap:round;}.dot{stroke:#fffdf7;stroke-width:2;}.tick{stroke:#dfd6c8;stroke-width:1;stroke-dasharray:5 6}.note{font:500 12px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive;fill:#7c4a03;}
+  </style>
+</defs>
+<rect class="bg" width="1500" height="900"/>
+<text x="42" y="54" class="title">Benchmark Summary: Mixed Stream-K Speedup</text>
+<text x="44" y="84" class="subtitle">BF16 GEMM on gfx950, K=7168. Each tile shows speedup vs min(Torch, Triton), with latency shown underneath.</text>
+<g transform="rotate(-1.2 143 150)"><rect class="card sketch" x="44" y="112" width="198" height="76"/><text x="68" y="148" class="title" style="font-size:28px">32</text><text x="68" y="172" class="tiny">decode shapes</text></g>
+<g transform="rotate(0.8 368 150)"><rect class="card sketch" x="269" y="112" width="198" height="76"/><text x="293" y="148" class="title" style="font-size:28px">1.64x</text><text x="293" y="172" class="tiny">avg speedup</text></g>
+<g transform="rotate(-0.7 593 150)"><rect class="card sketch" x="494" y="112" width="198" height="76"/><text x="518" y="148" class="title" style="font-size:28px">1.79x</text><text x="518" y="172" class="tiny">avg speedup, M&lt;=8</text></g>
+<g transform="rotate(1.1 818 150)"><rect class="card sketch" x="719" y="112" width="198" height="76"/><text x="743" y="148" class="title" style="font-size:28px">2.37x</text><text x="743" y="172" class="tiny">best observed</text></g>
+<rect class="sketch" x="1040" y="114" width="22" height="16" rx="5" fill="#fee2e2" stroke="#7c6f64" stroke-width="1.2"/><text x="1072" y="127" class="tiny">&lt;1.0x slower</text>
+<rect class="sketch" x="1040" y="138" width="22" height="16" rx="5" fill="#fffbeb" stroke="#7c6f64" stroke-width="1.2"/><text x="1072" y="151" class="tiny">~1.0x similar</text>
+<rect class="sketch" x="1040" y="162" width="22" height="16" rx="5" fill="#c4b5fd" stroke="#7c6f64" stroke-width="1.2"/><text x="1072" y="175" class="tiny">&gt;1.5x faster</text>
+<rect class="sketch" x="1040" y="186" width="22" height="16" rx="5" fill="#6d28d9" stroke="#7c6f64" stroke-width="1.2"/><text x="1072" y="199" class="tiny">&gt;2.0x faster</text>
+<rect class="card sketch" x="70" y="198" width="1360" height="600"/>
+<text x="104" y="254" class="label">N / M</text>
+<text x="273.0" y="254" class="axis">1</text>
+<text x="403.0" y="254" class="axis">2</text>
+<text x="533.0" y="254" class="axis">4</text>
+<text x="663.0" y="254" class="axis">8</text>
+<text x="793.0" y="254" class="axis">16</text>
+<text x="923.0" y="254" class="axis">32</text>
+<text x="1053.0" y="254" class="axis">64</text>
+<text x="1183.0" y="254" class="axis">128</text>
+<text x="104" y="314" class="label">N=64</text>
+<rect class="sketch" x="1165" y="290" width="170" height="38" rx="16" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.2"/><text x="1184" y="315" class="axis">row avg 1.77x</text>
+<g transform="rotate(-0.54 279 317)"><rect class="sketch" x="220" y="280" width="118" height="74" rx="14" fill="#a887f1" stroke="#fffdf7" stroke-width="2"/><text x="242" y="311" class="num" fill="#111827">1.95x</text><text x="238" y="333" class="subnum" fill="#475569">4.6us vs 8.9us</text></g>
+<g transform="rotate(0.00 409 317)"><rect class="sketch" x="350" y="280" width="118" height="74" rx="14" fill="#c6b9fd" stroke="#fffdf7" stroke-width="2"/><text x="372" y="311" class="num" fill="#111827">1.71x</text><text x="368" y="333" class="subnum" fill="#475569">5.0us vs 8.5us</text></g>
+<g transform="rotate(0.54 539 317)"><rect class="sketch" x="480" y="280" width="118" height="74" rx="14" fill="#c4b5fd" stroke="#fffdf7" stroke-width="2"/><text x="502" y="311" class="num" fill="#111827">1.75x</text><text x="498" y="333" class="subnum" fill="#475569">4.9us vs 8.5us</text></g>
+<g transform="rotate(-0.18 669 317)"><rect class="sketch" x="610" y="280" width="118" height="74" rx="14" fill="#c5b7fd" stroke="#fffdf7" stroke-width="2"/><text x="632" y="311" class="num" fill="#111827">1.73x</text><text x="628" y="333" class="subnum" fill="#475569">5.0us vs 8.5us</text></g>
+<g transform="rotate(0.36 799 317)"><rect class="sketch" x="740" y="280" width="118" height="74" rx="14" fill="#cdc5fb" stroke="#fffdf7" stroke-width="2"/><text x="762" y="311" class="num" fill="#111827">1.59x</text><text x="758" y="333" class="subnum" fill="#475569">5.2us vs 8.2us</text></g>
+<g transform="rotate(-0.36 929 317)"><rect class="sketch" x="870" y="280" width="118" height="74" rx="14" fill="#bba6f9" stroke="#fffdf7" stroke-width="2"/><text x="892" y="311" class="num" fill="#111827">1.82x</text><text x="888" y="333" class="subnum" fill="#475569">5.1us vs 9.2us</text></g>
+<g transform="rotate(0.18 1059 317)"><rect class="sketch" x="1000" y="280" width="118" height="74" rx="14" fill="#bfacfb" stroke="#fffdf7" stroke-width="2"/><text x="1022" y="311" class="num" fill="#111827">1.79x</text><text x="1018" y="333" class="subnum" fill="#475569">5.0us vs 8.9us</text></g>
+<g transform="rotate(-0.54 1189 317)"><rect class="sketch" x="1130" y="280" width="118" height="74" rx="14" fill="#b69ef7" stroke="#fffdf7" stroke-width="2"/><text x="1152" y="311" class="num" fill="#111827">1.85x</text><text x="1148" y="333" class="subnum" fill="#475569">5.9us vs 10.8us</text></g>
+<text x="104" y="398" class="label">N=384</text>
+<rect class="sketch" x="1165" y="374" width="170" height="38" rx="16" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.2"/><text x="1184" y="399" class="axis">row avg 1.38x</text>
+<g transform="rotate(-0.54 279 401)"><rect class="sketch" x="220" y="364" width="118" height="74" rx="14" fill="#d4d2fa" stroke="#fffdf7" stroke-width="2"/><text x="242" y="395" class="num" fill="#111827">1.44x</text><text x="238" y="417" class="subnum" fill="#475569">5.8us vs 8.4us</text></g>
+<g transform="rotate(0.00 409 401)"><rect class="sketch" x="350" y="364" width="118" height="74" rx="14" fill="#d5d4fa" stroke="#fffdf7" stroke-width="2"/><text x="372" y="395" class="num" fill="#111827">1.43x</text><text x="368" y="417" class="subnum" fill="#475569">5.8us vs 8.3us</text></g>
+<g transform="rotate(0.54 539 401)"><rect class="sketch" x="480" y="364" width="118" height="74" rx="14" fill="#ccc3fb" stroke="#fffdf7" stroke-width="2"/><text x="502" y="395" class="num" fill="#111827">1.61x</text><text x="498" y="417" class="subnum" fill="#475569">5.8us vs 9.4us</text></g>
+<g transform="rotate(-0.18 669 401)"><rect class="sketch" x="610" y="364" width="118" height="74" rx="14" fill="#d7d7f9" stroke="#fffdf7" stroke-width="2"/><text x="632" y="395" class="num" fill="#111827">1.40x</text><text x="628" y="417" class="subnum" fill="#475569">6.0us vs 8.4us</text></g>
+<g transform="rotate(0.36 799 401)"><rect class="sketch" x="740" y="364" width="118" height="74" rx="14" fill="#cfc9fb" stroke="#fffdf7" stroke-width="2"/><text x="762" y="395" class="num" fill="#111827">1.55x</text><text x="758" y="417" class="subnum" fill="#475569">6.3us vs 9.7us</text></g>
+<g transform="rotate(-0.36 929 401)"><rect class="sketch" x="870" y="364" width="118" height="74" rx="14" fill="#e2ecf7" stroke="#fffdf7" stroke-width="2"/><text x="892" y="395" class="num" fill="#111827">1.18x</text><text x="888" y="417" class="subnum" fill="#475569">6.8us vs 8.0us</text></g>
+<g transform="rotate(0.18 1059 401)"><rect class="sketch" x="1000" y="364" width="118" height="74" rx="14" fill="#daddf9" stroke="#fffdf7" stroke-width="2"/><text x="1022" y="395" class="num" fill="#111827">1.33x</text><text x="1018" y="417" class="subnum" fill="#475569">7.6us vs 10.2us</text></g>
+<g transform="rotate(-0.54 1189 401)"><rect class="sketch" x="1130" y="364" width="118" height="74" rx="14" fill="#e6f3f6" stroke="#fffdf7" stroke-width="2"/><text x="1152" y="395" class="num" fill="#111827">1.11x</text><text x="1148" y="417" class="subnum" fill="#475569">9.7us vs 10.7us</text></g>
+<text x="104" y="482" class="label">N=512</text>
+<rect class="sketch" x="1165" y="458" width="170" height="38" rx="16" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.2"/><text x="1184" y="483" class="axis">row avg 1.56x</text>
+<g transform="rotate(-0.54 279 485)"><rect class="sketch" x="220" y="448" width="118" height="74" rx="14" fill="#c9bdfc" stroke="#fffdf7" stroke-width="2"/><text x="242" y="479" class="num" fill="#111827">1.67x</text><text x="238" y="501" class="subnum" fill="#475569">6.1us vs 10.1us</text></g>
+<g transform="rotate(0.00 409 485)"><rect class="sketch" x="350" y="448" width="118" height="74" rx="14" fill="#c8bcfc" stroke="#fffdf7" stroke-width="2"/><text x="372" y="479" class="num" fill="#111827">1.68x</text><text x="368" y="501" class="subnum" fill="#475569">6.0us vs 10.1us</text></g>
+<g transform="rotate(0.54 539 485)"><rect class="sketch" x="480" y="448" width="118" height="74" rx="14" fill="#c9bdfc" stroke="#fffdf7" stroke-width="2"/><text x="502" y="479" class="num" fill="#111827">1.66x</text><text x="498" y="501" class="subnum" fill="#475569">6.1us vs 10.2us</text></g>
+<g transform="rotate(-0.18 669 485)"><rect class="sketch" x="610" y="448" width="118" height="74" rx="14" fill="#c9befc" stroke="#fffdf7" stroke-width="2"/><text x="632" y="479" class="num" fill="#111827">1.66x</text><text x="628" y="501" class="subnum" fill="#475569">6.4us vs 10.6us</text></g>
+<g transform="rotate(0.36 799 485)"><rect class="sketch" x="740" y="448" width="118" height="74" rx="14" fill="#cdc6fb" stroke="#fffdf7" stroke-width="2"/><text x="762" y="479" class="num" fill="#111827">1.57x</text><text x="758" y="501" class="subnum" fill="#475569">6.8us vs 10.6us</text></g>
+<g transform="rotate(-0.36 929 485)"><rect class="sketch" x="870" y="448" width="118" height="74" rx="14" fill="#cfc9fb" stroke="#fffdf7" stroke-width="2"/><text x="892" y="479" class="num" fill="#111827">1.54x</text><text x="888" y="501" class="subnum" fill="#475569">7.0us vs 10.8us</text></g>
+<g transform="rotate(0.18 1059 485)"><rect class="sketch" x="1000" y="448" width="118" height="74" rx="14" fill="#d0cafb" stroke="#fffdf7" stroke-width="2"/><text x="1022" y="479" class="num" fill="#111827">1.53x</text><text x="1018" y="501" class="subnum" fill="#475569">7.8us vs 11.9us</text></g>
+<g transform="rotate(-0.54 1189 485)"><rect class="sketch" x="1130" y="448" width="118" height="74" rx="14" fill="#e3ecf7" stroke="#fffdf7" stroke-width="2"/><text x="1152" y="479" class="num" fill="#111827">1.17x</text><text x="1148" y="501" class="subnum" fill="#475569">9.7us vs 11.3us</text></g>
+<text x="104" y="566" class="label">N=1024</text>
+<rect class="sketch" x="1165" y="542" width="170" height="38" rx="16" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.2"/><text x="1184" y="567" class="axis">row avg 1.85x</text>
+<g transform="rotate(-0.54 279 569)"><rect class="sketch" x="220" y="532" width="118" height="74" rx="14" fill="#8149e1" stroke="#fffdf7" stroke-width="2"/><text x="242" y="563" class="num" fill="#ffffff">2.22x</text><text x="238" y="585" class="subnum" fill="#f8fafc">6.6us vs 14.6us</text></g>
+<g transform="rotate(0.00 409 569)"><rect class="sketch" x="350" y="532" width="118" height="74" rx="14" fill="#6d28d9" stroke="#fffdf7" stroke-width="2"/><text x="372" y="563" class="num" fill="#ffffff">2.37x</text><text x="368" y="585" class="subnum" fill="#f8fafc">6.5us vs 15.4us</text></g>
+<g transform="rotate(0.54 539 569)"><rect class="sketch" x="480" y="532" width="118" height="74" rx="14" fill="#8047e1" stroke="#fffdf7" stroke-width="2"/><text x="502" y="563" class="num" fill="#ffffff">2.23x</text><text x="498" y="585" class="subnum" fill="#f8fafc">6.6us vs 14.7us</text></g>
+<g transform="rotate(-0.18 669 569)"><rect class="sketch" x="610" y="532" width="118" height="74" rx="14" fill="#9060e7" stroke="#fffdf7" stroke-width="2"/><text x="632" y="563" class="num" fill="#ffffff">2.12x</text><text x="628" y="585" class="subnum" fill="#f8fafc">6.9us vs 14.5us</text></g>
+<g transform="rotate(0.36 799 569)"><rect class="sketch" x="740" y="532" width="118" height="74" rx="14" fill="#c9befc" stroke="#fffdf7" stroke-width="2"/><text x="762" y="563" class="num" fill="#111827">1.66x</text><text x="758" y="585" class="subnum" fill="#475569">7.3us vs 12.1us</text></g>
+<g transform="rotate(-0.36 929 569)"><rect class="sketch" x="870" y="532" width="118" height="74" rx="14" fill="#cec6fb" stroke="#fffdf7" stroke-width="2"/><text x="892" y="563" class="num" fill="#111827">1.57x</text><text x="888" y="585" class="subnum" fill="#475569">7.8us vs 12.3us</text></g>
+<g transform="rotate(0.18 1059 569)"><rect class="sketch" x="1000" y="532" width="118" height="74" rx="14" fill="#dfe5f8" stroke="#fffdf7" stroke-width="2"/><text x="1022" y="563" class="num" fill="#111827">1.25x</text><text x="1018" y="585" class="subnum" fill="#475569">9.6us vs 12.0us</text></g>
+<g transform="rotate(-0.54 1189 569)"><rect class="sketch" x="1130" y="532" width="118" height="74" rx="14" fill="#d6d6f9" stroke="#fffdf7" stroke-width="2"/><text x="1152" y="563" class="num" fill="#111827">1.41x</text><text x="1148" y="585" class="subnum" fill="#475569">11.2us vs 15.8us</text></g>
+<path class="line" d="M92 818 C310 804, 520 816, 720 802 C930 786, 1120 808, 1385 792" stroke="#f59e0b" stroke-dasharray="8 8" marker-end="url(#arrow)"/>
+<text x="92" y="846" class="note">Values above 1.0x mean Mixed Stream-K is faster. The small-M area is where extra K parallelism is most visible.</text>
+</svg>

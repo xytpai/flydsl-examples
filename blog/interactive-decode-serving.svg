@@ -5,25 +5,22 @@
     <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
       <path d="M0,0 L0,6 L9,3 z" fill="#475569"/>
     </marker>
-    <filter id="rough">
-      <feTurbulence type="fractalNoise" baseFrequency="0.018" numOctaves="2" seed="3" result="noise"/>
-      <feDisplacementMap in="SourceGraphic" in2="noise" scale="1.1"/>
-    </filter>
     <style>
-      .bg { fill: #fffdf7; }
-      .title { font: 700 30px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive; fill: #111827; }
-      .subtitle { font: 500 16px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive; fill: #475569; }
-      .label { font: 700 18px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive; fill: #111827; }
-      .small { font: 500 14px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive; fill: #475569; }
-      .tiny { font: 600 12px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive; fill: #64748b; }
-      .panel { fill: #fffaf0; stroke: #d8d3c4; stroke-width: 2; rx: 22; filter: url(#rough); }
-      .request { fill: #eef2ff; stroke: #4f46e5; stroke-width: 3; rx: 18; filter: url(#rough); }
-      .prefill { fill: #ecfeff; stroke: #0891b2; stroke-width: 3; rx: 14; filter: url(#rough); }
-      .decode { fill: #fff7ed; stroke: #f97316; stroke-width: 3; rx: 14; filter: url(#rough); }
-      .gemm { fill: #fdf2f8; stroke: #db2777; stroke-width: 2; rx: 10; filter: url(#rough); }
-      .metric { fill: #f0fdf4; stroke: #16a34a; stroke-width: 2; rx: 14; filter: url(#rough); }
-      .arrow { stroke: #475569; stroke-width: 2.5; fill: none; marker-end: url(#arrow); filter: url(#rough); }
-      .dash { stroke-dasharray: 7 6; }
+      .bg { fill: #fffaf0;}
+      .title { font: 700 30px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive; fill: #111827;}
+      .subtitle { font: 500 16px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive; fill: #475569;}
+      .label { font: 700 18px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive; fill: #111827;}
+      .small { font: 500 14px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive; fill: #475569;}
+      .tiny { font: 600 12px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive; fill: #64748b;}
+      .panel { fill: #fffaf0; stroke: #d8d3c4; stroke-width: 2; rx: 22;}
+      .request { fill: #eef2ff; stroke: #4f46e5; stroke-width: 3; rx: 18;}
+      .prefill { fill: #ecfeff; stroke: #0891b2; stroke-width: 3; rx: 14;}
+      .decode { fill: #fff7ed; stroke: #f97316; stroke-width: 3; rx: 14;}
+      .gemm { fill: #fdf2f8; stroke: #db2777; stroke-width: 2; rx: 10;}
+      .metric { fill: #f0fdf4; stroke: #16a34a; stroke-width: 2; rx: 14;}
+      .arrow { stroke: #475569; stroke-width: 2.5; fill: none; marker-end: url(#arrow); ; stroke-linecap: round; stroke-linejoin: round}
+      .dash { stroke-dasharray: 7 6;}
+      .sketch {}
     </style>
   </defs>
 
