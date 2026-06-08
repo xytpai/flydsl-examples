@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="560" viewBox="0 0 1280 560" role="img" aria-labelledby="title desc">
+  <title id="title">Split-K synchronization protocol</title>
+  <desc id="desc">A Split-K synchronization protocol where partition 0 initializes C, publishes a signal, all partitions atomically accumulate partial sums, and the last partition resets the state.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#475569"/>
+    </marker>
+    <filter id="rough">
+      <feTurbulence type="fractalNoise" baseFrequency="0.018" numOctaves="2" seed="9" result="noise"/>
+      <feDisplacementMap in="SourceGraphic" in2="noise" scale="1.1"/>
+    </filter>
+    <style>
+      .bg { fill: #fffdf7; }
+      .title { font: 700 30px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive; fill: #111827; }
+      .subtitle { font: 500 16px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive; fill: #475569; }
+      .label { font: 700 18px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive; fill: #111827; }
+      .small { font: 500 14px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive; fill: #475569; }
+      .tiny { font: 600 12px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive; fill: #64748b; }
+      .panel { fill: #fffaf0; stroke: #d8d3c4; stroke-width: 2; rx: 22; filter: url(#rough); }
+      .init { fill: #eef2ff; stroke: #4f46e5; stroke-width: 3; rx: 14; filter: url(#rough); }
+      .sync { fill: #fff7ed; stroke: #f97316; stroke-width: 3; rx: 14; filter: url(#rough); }
+      .compute { fill: #ecfeff; stroke: #0891b2; stroke-width: 3; rx: 14; filter: url(#rough); }
+      .atomic { fill: #fdf2f8; stroke: #db2777; stroke-width: 3; rx: 14; filter: url(#rough); }
+      .reset { fill: #f0fdf4; stroke: #16a34a; stroke-width: 3; rx: 14; filter: url(#rough); }
+      .arrow { stroke: #475569; stroke-width: 2.5; fill: none; marker-end: url(#arrow); filter: url(#rough); }
+      .dash { stroke-dasharray: 7 6; }
+    </style>
+  </defs>
+
+  <rect class="bg" width="1280" height="560"/>
+  <text x="44" y="52" class="title">Single-Launch Split-K Synchronization</text>
+  <text x="44" y="82" class="subtitle">A lightweight signal/semaphore protocol lets multiple Split-K CTAs safely contribute to the same C tile.</text>
+
+  <rect class="panel" x="42" y="122" width="1196" height="350"/>
+
+  <rect class="init" x="80" y="202" width="178" height="92"/>
+  <text x="116" y="235" class="label">Partition 0</text>
+  <text x="104" y="261" class="small">initialize C</text>
+  <text x="106" y="282" class="tiny">zero or bias</text>
+
+  <path class="arrow" d="M 258 248 L 334 248"/>
+
+  <rect class="sync" x="342" y="202" width="158" height="92"/>
+  <text x="382" y="235" class="label">signal[]</text>
+  <text x="379" y="261" class="small">publish 1</text>
+
+  <rect class="init" x="342" y="340" width="158" height="74" opacity="0.85"/>
+  <text x="365" y="371" class="label">Other CTAs</text>
+  <text x="374" y="394" class="small">spin-wait</text>
+  <path class="arrow dash" d="M 421 340 L 421 300"/>
+
+  <path class="arrow" d="M 500 248 L 576 248"/>
+
+  <rect class="compute" x="584" y="180" width="190" height="136"/>
+  <text x="632" y="217" class="label">Compute</text>
+  <text x="614" y="243" class="small">partial C over</text>
+  <text x="622" y="266" class="small">one K range</text>
+  <text x="624" y="292" class="tiny">all Split-K partitions</text>
+
+  <path class="arrow" d="M 774 248 L 850 248"/>
+
+  <rect class="atomic" x="858" y="202" width="170" height="92"/>
+  <text x="900" y="235" class="label">atomic add</text>
+  <text x="892" y="261" class="small">partial into C</text>
+
+  <path class="arrow" d="M 1028 248 L 1098 248"/>
+
+  <rect class="sync" x="1106" y="170" width="92" height="74"/>
+  <text x="1122" y="201" class="label">sem</text>
+  <text x="1125" y="224" class="tiny">arrive</text>
+
+  <path class="arrow" d="M 1152 244 L 1152 306"/>
+
+  <rect class="reset" x="1060" y="312" width="184" height="86"/>
+  <text x="1094" y="346" class="label">last arrival</text>
+  <text x="1086" y="372" class="small">reset signal + sem</text>
+
+  <text x="82" y="508" class="small">Invariant 1: no CTA accumulates before C is initialized. Invariant 2: state resets only after all Split-K partitions arrive.</text>
+</svg>
