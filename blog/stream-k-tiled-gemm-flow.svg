@@ -1,251 +1,102 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="980" viewBox="0 0 1500 980" role="img" aria-labelledby="title desc">
-  <title id="title">Mixed Stream-K tiled GEMM algorithm flow</title>
-  <desc id="desc">A tiled matrix diagram showing how a C tile is computed from A and B tiles, how K is split across CTAs, how each CTA slices K across warp groups, and how the partial sums are reduced.</desc>
-  <defs>
-    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3.5" orient="auto" markerUnits="strokeWidth">
-      <path d="M0,0 L9,3.5 L0,7 Z" fill="#263238"/>
-    </marker>
-    <style>
-      .bg { fill: #fffaf0;}
-      .card { fill: #fffdf7; stroke: #ded6c3; stroke-width: 1.5; rx: 22;}
-      .title { font: 800 34px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive; fill: #172033;}
-      .subtitle { font: 500 17px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive; fill: #5b6472;}
-      .step { font: 800 18px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive; fill: #172033;}
-      .label { font: 700 16px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive; fill: #172033;}
-      .small { font: 500 13px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive; fill: #4b5563;}
-      .tiny { font: 600 11px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive; fill: #64748b;}
-      .math { font: 800 18px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive; fill: #111827;}
-      .axis { font: 700 12px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive; fill: #64748b;}
-      .arrow { stroke: #263238; stroke-width: 2.5; fill: none; marker-end: url(#arrow); stroke-linecap: round; stroke-linejoin: round}
-      .dash { stroke-dasharray: 7 6;}
-      .tile { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1;}
-      .a0 { fill: #dfe7ff; stroke: #4f46e5; stroke-width: 2;}
-      .a1 { fill: #d7f6ff; stroke: #0891b2; stroke-width: 2;}
-      .a2 { fill: #dcfce7; stroke: #16a34a; stroke-width: 2;}
-      .b0 { fill: #f4e8ff; stroke: #7c3aed; stroke-width: 2;}
-      .b1 { fill: #ffedd5; stroke: #f97316; stroke-width: 2;}
-      .b2 { fill: #ffe4f1; stroke: #db2777; stroke-width: 2;}
-      .c { fill: #fff7ed; stroke: #f97316; stroke-width: 1.2;}
-      .csel { fill: #ffe4f1; stroke: #db2777; stroke-width: 3;}
-      .partial0 { fill: #e8edff; stroke: #4f46e5; stroke-width: 2; rx: 10;}
-      .partial1 { fill: #ecfeff; stroke: #0891b2; stroke-width: 2; rx: 10;}
-      .partial2 { fill: #f0fdf4; stroke: #16a34a; stroke-width: 2; rx: 10;}
-      .warp { fill: #fff7ed; stroke: #f97316; stroke-width: 2; rx: 8;}
-      .lds { fill: #f5f3ff; stroke: #7c3aed; stroke-width: 2.5; rx: 12;}
-      .atomic { fill: #fdf2f8; stroke: #db2777; stroke-width: 2.5; rx: 12;}
-      .pipeline { fill: #eff6ff; stroke: #2563eb; stroke-width: 2; rx: 12;}
-      .note { fill: #fff7ed; stroke: #f59e0b; stroke-width: 1.5; rx: 14;}
-      .sketch {}
-    </style>
-  </defs>
-
-  <rect class="bg" width="1500" height="980"/>
-  <text x="42" y="54" class="title">Mixed Stream-K GEMM: tiled matrix view</text>
-  <text x="44" y="84" class="subtitle">A selected C tile is accumulated from multiple K tile ranges, then reduced across CTAs and warp groups.</text>
-
-  <!-- Step 1 card: actual tiled GEMM -->
-  <rect class="card" x="40" y="118" width="930" height="430"/>
-  <text x="68" y="154" class="step">1. Start from tiled GEMM: C[M,N] = A[M,K] @ B[N,K]^T</text>
-
-  <!-- A matrix -->
-  <text x="82" y="196" class="label">A[M, K]</text>
-  <text x="226" y="196" class="axis">K tiles</text>
-  <text x="52" y="288" class="axis" transform="rotate(-90 52 288)">M tiles</text>
-  <g transform="translate(82 212)">
-    <!-- A grid 3 x 9 -->
-    <rect class="tile" x="0" y="0" width="36" height="34"/>
-    <rect class="tile" x="36" y="0" width="36" height="34"/>
-    <rect class="tile" x="72" y="0" width="36" height="34"/>
-    <rect class="tile" x="108" y="0" width="36" height="34"/>
-    <rect class="tile" x="144" y="0" width="36" height="34"/>
-    <rect class="tile" x="180" y="0" width="36" height="34"/>
-    <rect class="tile" x="216" y="0" width="36" height="34"/>
-    <rect class="tile" x="252" y="0" width="36" height="34"/>
-    <rect class="tile" x="288" y="0" width="36" height="34"/>
-    <rect class="a0" x="0" y="34" width="36" height="34"/>
-    <rect class="a0" x="36" y="34" width="36" height="34"/>
-    <rect class="a0" x="72" y="34" width="36" height="34"/>
-    <rect class="a1" x="108" y="34" width="36" height="34"/>
-    <rect class="a1" x="144" y="34" width="36" height="34"/>
-    <rect class="a1" x="180" y="34" width="36" height="34"/>
-    <rect class="a2" x="216" y="34" width="36" height="34"/>
-    <rect class="a2" x="252" y="34" width="36" height="34"/>
-    <rect class="a2" x="288" y="34" width="36" height="34"/>
-    <rect class="tile" x="0" y="68" width="36" height="34"/>
-    <rect class="tile" x="36" y="68" width="36" height="34"/>
-    <rect class="tile" x="72" y="68" width="36" height="34"/>
-    <rect class="tile" x="108" y="68" width="36" height="34"/>
-    <rect class="tile" x="144" y="68" width="36" height="34"/>
-    <rect class="tile" x="180" y="68" width="36" height="34"/>
-    <rect class="tile" x="216" y="68" width="36" height="34"/>
-    <rect class="tile" x="252" y="68" width="36" height="34"/>
-    <rect class="tile" x="288" y="68" width="36" height="34"/>
-    <text x="36" y="124" class="tiny">K range 0</text>
-    <text x="142" y="124" class="tiny">K range 1</text>
-    <text x="250" y="124" class="tiny">K range 2</text>
-  </g>
-
-  <!-- B^T matrix -->
-  <text x="82" y="402" class="label">B^T[K, N]</text>
-  <text x="226" y="402" class="axis">N tiles</text>
-  <text x="52" y="464" class="axis" transform="rotate(-90 52 464)">K tiles</text>
-  <g transform="translate(82 418)">
-    <!-- B^T grid 9 x 5; selected N col tiles highlighted by K ranges -->
-    <rect class="b0" x="72" y="0" width="38" height="24"/>
-    <rect class="b0" x="72" y="24" width="38" height="24"/>
-    <rect class="b0" x="72" y="48" width="38" height="24"/>
-    <rect class="b1" x="72" y="72" width="38" height="24"/>
-    <rect class="b1" x="72" y="96" width="38" height="24"/>
-    <rect class="b1" x="72" y="120" width="38" height="24"/>
-    <rect class="b2" x="72" y="144" width="38" height="24"/>
-    <rect class="b2" x="72" y="168" width="38" height="24"/>
-    <rect class="b2" x="72" y="192" width="38" height="24"/>
-    <rect class="tile" x="0" y="0" width="38" height="24"/>
-    <rect class="tile" x="38" y="0" width="38" height="24"/>
-    <rect class="tile" x="110" y="0" width="38" height="24"/>
-    <rect class="tile" x="148" y="0" width="38" height="24"/>
-    <rect class="tile" x="0" y="24" width="38" height="24"/>
-    <rect class="tile" x="38" y="24" width="38" height="24"/>
-    <rect class="tile" x="110" y="24" width="38" height="24"/>
-    <rect class="tile" x="148" y="24" width="38" height="24"/>
-    <rect class="tile" x="0" y="48" width="38" height="24"/>
-    <rect class="tile" x="38" y="48" width="38" height="24"/>
-    <rect class="tile" x="110" y="48" width="38" height="24"/>
-    <rect class="tile" x="148" y="48" width="38" height="24"/>
-    <rect class="tile" x="0" y="72" width="38" height="24"/>
-    <rect class="tile" x="38" y="72" width="38" height="24"/>
-    <rect class="tile" x="110" y="72" width="38" height="24"/>
-    <rect class="tile" x="148" y="72" width="38" height="24"/>
-    <rect class="tile" x="0" y="96" width="38" height="24"/>
-    <rect class="tile" x="38" y="96" width="38" height="24"/>
-    <rect class="tile" x="110" y="96" width="38" height="24"/>
-    <rect class="tile" x="148" y="96" width="38" height="24"/>
-    <rect class="tile" x="0" y="120" width="38" height="24"/>
-    <rect class="tile" x="38" y="120" width="38" height="24"/>
-    <rect class="tile" x="110" y="120" width="38" height="24"/>
-    <rect class="tile" x="148" y="120" width="38" height="24"/>
-    <rect class="tile" x="0" y="144" width="38" height="24"/>
-    <rect class="tile" x="38" y="144" width="38" height="24"/>
-    <rect class="tile" x="110" y="144" width="38" height="24"/>
-    <rect class="tile" x="148" y="144" width="38" height="24"/>
-    <rect class="tile" x="0" y="168" width="38" height="24"/>
-    <rect class="tile" x="38" y="168" width="38" height="24"/>
-    <rect class="tile" x="110" y="168" width="38" height="24"/>
-    <rect class="tile" x="148" y="168" width="38" height="24"/>
-    <rect class="tile" x="0" y="192" width="38" height="24"/>
-    <rect class="tile" x="38" y="192" width="38" height="24"/>
-    <rect class="tile" x="110" y="192" width="38" height="24"/>
-    <rect class="tile" x="148" y="192" width="38" height="24"/>
-  </g>
-
-  <!-- C matrix -->
-  <text x="622" y="196" class="label">C[M, N]</text>
-  <text x="724" y="196" class="axis">N tiles</text>
-  <text x="592" y="286" class="axis" transform="rotate(-90 592 286)">M tiles</text>
-  <g transform="translate(622 212)">
-    <rect class="c" x="0" y="0" width="58" height="48"/>
-    <rect class="c" x="58" y="0" width="58" height="48"/>
-    <rect class="csel" x="116" y="0" width="58" height="48"/>
-    <rect class="c" x="174" y="0" width="58" height="48"/>
-    <rect class="c" x="232" y="0" width="58" height="48"/>
-    <rect class="c" x="0" y="48" width="58" height="48"/>
-    <rect class="c" x="58" y="48" width="58" height="48"/>
-    <rect class="c" x="116" y="48" width="58" height="48"/>
-    <rect class="c" x="174" y="48" width="58" height="48"/>
-    <rect class="c" x="232" y="48" width="58" height="48"/>
-    <rect class="c" x="0" y="96" width="58" height="48"/>
-    <rect class="c" x="58" y="96" width="58" height="48"/>
-    <rect class="c" x="116" y="96" width="58" height="48"/>
-    <rect class="c" x="174" y="96" width="58" height="48"/>
-    <rect class="c" x="232" y="96" width="58" height="48"/>
-    <text x="118" y="-10" class="tiny">selected output tile</text>
-  </g>
-
-  <path class="arrow" d="M 430 285 C 500 250, 540 236, 610 234"/>
-  <path class="arrow" d="M 285 505 C 438 520, 552 372, 664 264"/>
-  <text x="434" y="328" class="math">Ctile = sum_k Arow,k x Bk,col</text>
-
-  <!-- Step 2 card: Stream-K partials -->
-  <rect class="card" x="1000" y="118" width="450" height="430"/>
-  <text x="1028" y="154" class="step">2. Stream K ranges into partial C tiles</text>
-  <text x="1028" y="184" class="small">Each inter-CTA K stream owns a different K range.</text>
-
-  <rect class="partial0" x="1036" y="226" width="120" height="66"/>
-  <text x="1062" y="253" class="label">CTA 0</text>
-  <text x="1061" y="275" class="tiny">K range 0</text>
-  <rect class="partial1" x="1170" y="226" width="120" height="66"/>
-  <text x="1196" y="253" class="label">CTA 1</text>
-  <text x="1195" y="275" class="tiny">K range 1</text>
-  <rect class="partial2" x="1304" y="226" width="120" height="66"/>
-  <text x="1330" y="253" class="label">CTA 2</text>
-  <text x="1329" y="275" class="tiny">K range 2</text>
-
-  <path class="arrow" d="M 1096 292 L 1096 350"/>
-  <path class="arrow" d="M 1230 292 L 1230 350"/>
-  <path class="arrow" d="M 1364 292 L 1364 350"/>
-
-  <rect class="partial0" x="1028" y="356" width="128" height="54"/>
-  <text x="1058" y="389" class="tiny">partial C0</text>
-  <rect class="partial1" x="1166" y="356" width="128" height="54"/>
-  <text x="1196" y="389" class="tiny">partial C1</text>
-  <rect class="partial2" x="1304" y="356" width="128" height="54"/>
-  <text x="1334" y="389" class="tiny">partial C2</text>
-
-  <path class="arrow" d="M 1092 410 C 1128 470, 1190 480, 1228 460"/>
-  <path class="arrow" d="M 1368 410 C 1332 470, 1270 480, 1232 460"/>
-  <rect class="atomic" x="1138" y="466" width="180" height="54"/>
-  <text x="1178" y="499" class="label">atomic add</text>
-
-  <!-- Step 3 card: inside CTA -->
-  <rect class="card" x="40" y="592" width="670" height="320"/>
-  <text x="68" y="628" class="step">3. Inside one CTA: slice the K range across warp groups</text>
-  <rect class="partial1" x="74" y="676" width="560" height="46"/>
-  <line x1="214" y1="676" x2="214" y2="722" stroke="#0891b2" stroke-width="2"/>
-  <line x1="354" y1="676" x2="354" y2="722" stroke="#0891b2" stroke-width="2"/>
-  <line x1="494" y1="676" x2="494" y2="722" stroke="#0891b2" stroke-width="2"/>
-  <text x="112" y="704" class="tiny">slice 0</text>
-  <text x="252" y="704" class="tiny">slice 1</text>
-  <text x="392" y="704" class="tiny">slice 2</text>
-  <text x="532" y="704" class="tiny">slice 3</text>
-  <text x="260" y="666" class="small">one CTA K range</text>
-
-  <rect class="warp" x="82" y="764" width="116" height="54"/>
-  <rect class="warp" x="222" y="764" width="116" height="54"/>
-  <rect class="warp" x="362" y="764" width="116" height="54"/>
-  <rect class="warp" x="502" y="764" width="116" height="54"/>
-  <text x="106" y="794" class="tiny">warp group 0</text>
-  <text x="246" y="794" class="tiny">warp group 1</text>
-  <text x="386" y="794" class="tiny">warp group 2</text>
-  <text x="526" y="794" class="tiny">warp group 3</text>
-
-  <path class="arrow" d="M 132 722 L 132 760"/>
-  <path class="arrow" d="M 272 722 L 272 760"/>
-  <path class="arrow" d="M 412 722 L 412 760"/>
-  <path class="arrow" d="M 552 722 L 552 760"/>
-
-  <rect class="lds" x="242" y="852" width="220" height="44"/>
-  <text x="292" y="880" class="label">LDS local reduce</text>
-  <path class="arrow" d="M 140 818 C 168 850, 210 858, 242 868"/>
-  <path class="arrow" d="M 280 818 L 310 850"/>
-  <path class="arrow" d="M 420 818 L 394 850"/>
-  <path class="arrow" d="M 560 818 C 532 850, 494 858, 462 868"/>
-
-  <!-- Step 4 card: multi-stage pipeline -->
-  <rect class="card" x="748" y="592" width="702" height="320"/>
-  <text x="776" y="628" class="step">4. Multi-stage pipeline keeps the K stream moving</text>
-  <rect class="pipeline" x="792" y="684" width="132" height="58"/>
-  <text x="820" y="708" class="label">stage s+2</text>
-  <text x="812" y="729" class="tiny">async copy</text>
-  <path class="arrow" d="M 924 714 L 996 714"/>
-  <rect class="pipeline" x="1004" y="684" width="132" height="58"/>
-  <text x="1032" y="708" class="label">stage s+1</text>
-  <text x="1032" y="729" class="tiny">LDS ready</text>
-  <path class="arrow" d="M 1136 714 L 1208 714"/>
-  <rect class="pipeline" x="1216" y="684" width="132" height="58"/>
-  <text x="1252" y="708" class="label">stage s</text>
-  <text x="1243" y="729" class="tiny">MFMA compute</text>
-
-  <rect class="note" x="826" y="792" width="470" height="72"/>
-  <text x="858" y="822" class="label">Stream-K loop</text>
-  <text x="858" y="848" class="small">current_stage is consumed, write_stage receives the next K block, then the ring advances.</text>
-</svg>
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="920" viewBox="0 0 1500 920" role="img" aria-labelledby="title desc">
+<title id="title">Mixed Stream-K tiled GEMM flow</title>
+<desc id="desc">Selected C tile computed from A and B K ranges, then reduced across local and global parallelism.</desc>
+<defs>
+  <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L9,4 L0,8 Z" fill="#334155"/></marker>
+  <style>
+    .bg{fill:#fffaf0}.panel{fill:#fffdf7;stroke:#c9bfae;stroke-width:2;rx:20}.panel2{fill:#fffdf7;stroke:#c9bfae;stroke-width:2;rx:14}
+    .title{font:800 32px "Comic Sans MS","Comic Neue","Chalkboard SE",cursive;fill:#1f2937}.subtitle{font:500 16px "Comic Sans MS","Comic Neue","Chalkboard SE",cursive;fill:#5f5a50}.section{font:800 18px "Comic Sans MS","Comic Neue","Chalkboard SE",cursive;fill:#1f2937}
+    .label{font:700 14px "Comic Sans MS","Comic Neue","Chalkboard SE",cursive;fill:#1f2937}.small{font:500 13px "Comic Sans MS","Comic Neue","Chalkboard SE",cursive;fill:#5f5a50}.tiny{font:600 11px "Comic Sans MS","Comic Neue","Chalkboard SE",cursive;fill:#665f55}.axis{font:700 12px "Comic Sans MS","Comic Neue","Chalkboard SE",cursive;fill:#665f55}.num{font:800 18px "Comic Sans MS","Comic Neue","Chalkboard SE",cursive;fill:#1f2937}.stat{font:800 26px "Comic Sans MS","Comic Neue","Chalkboard SE",cursive;fill:#1f2937}
+    .grid{fill:#ffffff;stroke:#cbd5e1;stroke-width:1}.a{fill:#dbeafe;stroke:#2563eb;stroke-width:1.7}.b{fill:#ccfbf1;stroke:#0f766e;stroke-width:1.7}.c{fill:#ffedd5;stroke:#f97316;stroke-width:1.5}.hot{fill:#fce7f3;stroke:#db2777;stroke-width:3}.k0{fill:#dbeafe;stroke:#2563eb;stroke-width:2}.k1{fill:#dcfce7;stroke:#16a34a;stroke-width:2}.k2{fill:#fef3c7;stroke:#f59e0b;stroke-width:2}.k3{fill:#fce7f3;stroke:#db2777;stroke-width:2}
+    .stage{fill:#eef2ff;stroke:#4f46e5;stroke-width:2;rx:12}.lds{fill:#f5f3ff;stroke:#7c3aed;stroke-width:2;rx:12}.mfma{fill:#fff7ed;stroke:#f97316;stroke-width:2;rx:12}.ok{fill:#ecfdf5;stroke:#10b981;stroke-width:2;rx:12}.warn{fill:#fff7ed;stroke:#f59e0b;stroke-width:2;rx:12}.bad{fill:#fef2f2;stroke:#ef4444;stroke-width:2;rx:12}.arrow{stroke:#3f3f46;stroke-width:2.4;fill:none;marker-end:url(#arrow);stroke-linecap:round;stroke-linejoin:round}.dash{stroke-dasharray:6 6}.muted{fill:#f1f5f9;stroke:#94a3b8;stroke-width:1.2}.line{fill:none;stroke-width:3;stroke-linejoin:round;stroke-linecap:round}.tick{stroke:#e2e8f0;stroke-width:1}
+  </style>
+</defs>
+<rect class="bg" width="1500" height="920"/>
+<text x="42" y="54" class="title">Mixed Stream-K: one C tile, many K ranges</text>
+<text x="44" y="84" class="subtitle">Start from ordinary tiled GEMM; then make the long K reduction visible as parallel work.</text>
+<rect class="panel" x="44" y="122" width="850" height="360" data-sketch="1"/><rect x="43.6" y="122.0" width="850" height="360" rx="10" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/><text x="72" y="160" class="section">1. Tiled GEMM view</text>
+<text x="84" y="212" class="label">A[M,K]</text><rect class="grid" x="84" y="232" width="34" height="32"/>
+<rect class="grid" x="118" y="232" width="34" height="32"/>
+<rect class="grid" x="152" y="232" width="34" height="32"/>
+<rect class="grid" x="186" y="232" width="34" height="32"/>
+<rect class="grid" x="220" y="232" width="34" height="32"/>
+<rect class="grid" x="254" y="232" width="34" height="32"/>
+<rect class="grid" x="288" y="232" width="34" height="32"/>
+<rect class="grid" x="322" y="232" width="34" height="32"/>
+<rect class="grid" x="356" y="232" width="34" height="32"/>
+<rect class="k0" x="84" y="264" width="34" height="32"/>
+<rect class="k0" x="118" y="264" width="34" height="32"/>
+<rect class="k0" x="152" y="264" width="34" height="32"/>
+<rect class="k1" x="186" y="264" width="34" height="32"/>
+<rect class="k1" x="220" y="264" width="34" height="32"/>
+<rect class="k1" x="254" y="264" width="34" height="32"/>
+<rect class="k2" x="288" y="264" width="34" height="32"/>
+<rect class="k2" x="322" y="264" width="34" height="32"/>
+<rect class="k2" x="356" y="264" width="34" height="32"/>
+<rect class="grid" x="84" y="296" width="34" height="32"/>
+<rect class="grid" x="118" y="296" width="34" height="32"/>
+<rect class="grid" x="152" y="296" width="34" height="32"/>
+<rect class="grid" x="186" y="296" width="34" height="32"/>
+<rect class="grid" x="220" y="296" width="34" height="32"/>
+<rect class="grid" x="254" y="296" width="34" height="32"/>
+<rect class="grid" x="288" y="296" width="34" height="32"/>
+<rect class="grid" x="322" y="296" width="34" height="32"/>
+<rect class="grid" x="356" y="296" width="34" height="32"/><text x="84" y="382" class="label">B^T[K,N]</text><rect class="grid" x="84" y="402" width="36" height="22"/>
+<rect class="grid" x="120" y="402" width="36" height="22"/>
+<rect class="k0" x="156" y="402" width="36" height="22"/>
+<rect class="grid" x="192" y="402" width="36" height="22"/>
+<rect class="grid" x="228" y="402" width="36" height="22"/>
+<rect class="grid" x="84" y="424" width="36" height="22"/>
+<rect class="grid" x="120" y="424" width="36" height="22"/>
+<rect class="k0" x="156" y="424" width="36" height="22"/>
+<rect class="grid" x="192" y="424" width="36" height="22"/>
+<rect class="grid" x="228" y="424" width="36" height="22"/>
+<rect class="grid" x="84" y="446" width="36" height="22"/>
+<rect class="grid" x="120" y="446" width="36" height="22"/>
+<rect class="k0" x="156" y="446" width="36" height="22"/>
+<rect class="grid" x="192" y="446" width="36" height="22"/>
+<rect class="grid" x="228" y="446" width="36" height="22"/>
+<rect class="grid" x="84" y="468" width="36" height="22"/>
+<rect class="grid" x="120" y="468" width="36" height="22"/>
+<rect class="k1" x="156" y="468" width="36" height="22"/>
+<rect class="grid" x="192" y="468" width="36" height="22"/>
+<rect class="grid" x="228" y="468" width="36" height="22"/>
+<rect class="grid" x="84" y="490" width="36" height="22"/>
+<rect class="grid" x="120" y="490" width="36" height="22"/>
+<rect class="k1" x="156" y="490" width="36" height="22"/>
+<rect class="grid" x="192" y="490" width="36" height="22"/>
+<rect class="grid" x="228" y="490" width="36" height="22"/>
+<rect class="grid" x="84" y="512" width="36" height="22"/>
+<rect class="grid" x="120" y="512" width="36" height="22"/>
+<rect class="k1" x="156" y="512" width="36" height="22"/>
+<rect class="grid" x="192" y="512" width="36" height="22"/>
+<rect class="grid" x="228" y="512" width="36" height="22"/>
+<rect class="grid" x="84" y="534" width="36" height="22"/>
+<rect class="grid" x="120" y="534" width="36" height="22"/>
+<rect class="k2" x="156" y="534" width="36" height="22"/>
+<rect class="grid" x="192" y="534" width="36" height="22"/>
+<rect class="grid" x="228" y="534" width="36" height="22"/>
+<rect class="grid" x="84" y="556" width="36" height="22"/>
+<rect class="grid" x="120" y="556" width="36" height="22"/>
+<rect class="k2" x="156" y="556" width="36" height="22"/>
+<rect class="grid" x="192" y="556" width="36" height="22"/>
+<rect class="grid" x="228" y="556" width="36" height="22"/>
+<rect class="grid" x="84" y="578" width="36" height="22"/>
+<rect class="grid" x="120" y="578" width="36" height="22"/>
+<rect class="k2" x="156" y="578" width="36" height="22"/>
+<rect class="grid" x="192" y="578" width="36" height="22"/>
+<rect class="grid" x="228" y="578" width="36" height="22"/><text x="620" y="212" class="label">C[M,N]</text><rect class="c" x="620" y="232" width="54" height="44"/>
+<rect class="c" x="674" y="232" width="54" height="44"/>
+<rect class="hot" x="728" y="232" width="54" height="44" data-sketch="1"/><rect x="727.3" y="231.7" width="54" height="44" rx="10" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/>
+<rect class="c" x="782" y="232" width="54" height="44"/>
+<rect class="c" x="836" y="232" width="54" height="44"/>
+<rect class="c" x="620" y="276" width="54" height="44"/>
+<rect class="c" x="674" y="276" width="54" height="44"/>
+<rect class="c" x="728" y="276" width="54" height="44"/>
+<rect class="c" x="782" y="276" width="54" height="44"/>
+<rect class="c" x="836" y="276" width="54" height="44"/>
+<rect class="c" x="620" y="320" width="54" height="44"/>
+<rect class="c" x="674" y="320" width="54" height="44"/>
+<rect class="c" x="728" y="320" width="54" height="44"/>
+<rect class="c" x="782" y="320" width="54" height="44"/>
+<rect class="c" x="836" y="320" width="54" height="44"/><path class="arrow" d="M410 280 C500 250 560 244 616 250" data-sketch="1"/><path d="M410 280 C500 250 560 244 616 250" stroke="#3f3f46" stroke-width="1.1" opacity="0.45" fill="none"/><path class="arrow" d="M292 500 C430 490 540 360 676 280" data-sketch="1"/><path d="M292 500 C430 490 540 360 676 280" stroke="#3f3f46" stroke-width="1.1" opacity="0.45" fill="none"/><text x="430" y="344" class="section">Ctile = sum over K blocks</text><rect class="panel" x="940" y="122" width="500" height="360" data-sketch="1"/><rect x="940.0" y="122.3" width="500" height="360" rx="10" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/><text x="970" y="160" class="section">2. Inter-CTA Stream-K</text><text x="970" y="186" class="small">Each CTA owns one K range and produces a partial C tile.</text><rect class="k0" x="984" y="230" width="96" height="58"/><text x="1014" y="264" class="label">K0</text><path class="arrow" d="M1032 288 L1032 338" data-sketch="1"/><path d="M1032 288 L1032 338" stroke="#3f3f46" stroke-width="1.1" opacity="0.45" fill="none"/><rect class="hot" x="1002" y="350" width="62" height="48" data-sketch="1"/><rect x="1002.0" y="350.0" width="62" height="48" rx="10" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/><text x="1009" y="379" class="tiny">partial</text><rect class="k1" x="1129" y="230" width="96" height="58"/><text x="1159" y="264" class="label">K1</text><path class="arrow" d="M1177 288 L1177 338" data-sketch="1"/><path d="M1177 288 L1177 338" stroke="#3f3f46" stroke-width="1.1" opacity="0.45" fill="none"/><rect class="hot" x="1147" y="350" width="62" height="48" data-sketch="1"/><rect x="1147.0" y="350.0" width="62" height="48" rx="10" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/><text x="1154" y="379" class="tiny">partial</text><rect class="k2" x="1274" y="230" width="96" height="58"/><text x="1304" y="264" class="label">K2</text><path class="arrow" d="M1322 288 L1322 338" data-sketch="1"/><path d="M1322 288 L1322 338" stroke="#3f3f46" stroke-width="1.1" opacity="0.45" fill="none"/><rect class="hot" x="1292" y="350" width="62" height="48" data-sketch="1"/><rect x="1292.0" y="350.0" width="62" height="48" rx="10" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/><text x="1299" y="379" class="tiny">partial</text><path class="arrow" d="M1050 405 C1124 450 1228 450 1300 405" data-sketch="1"/><path d="M1050 405 C1124 450 1228 450 1300 405" stroke="#3f3f46" stroke-width="1.1" opacity="0.45" fill="none"/><rect class="ok" x="1128" y="436" width="154" height="48" data-sketch="1"/><rect x="1128.7" y="436.0" width="154" height="48" rx="10" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/><text x="1162" y="466" class="label">atomic add</text><rect class="panel" x="44" y="540" width="640" height="290" data-sketch="1"/><rect x="44.7" y="540.6" width="640" height="290" rx="10" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/><text x="72" y="578" class="section">3. Intra-CTA Stream-K</text><text x="72" y="604" class="small">Inside one CTA, warp groups split the local K range.</text><rect class="k1" x="96" y="654" width="90" height="44"/><text x="120" y="682" class="tiny">slice 0</text><path class="arrow" d="M141 698 L141 746" data-sketch="1"/><path d="M141 698 L141 746" stroke="#3f3f46" stroke-width="1.1" opacity="0.45" fill="none"/><rect class="warn" x="92" y="750" width="98" height="46" data-sketch="1"/><rect x="92.0" y="750.0" width="98" height="46" rx="10" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/><text x="114" y="779" class="tiny">warp group</text><rect class="k1" x="216" y="654" width="90" height="44"/><text x="240" y="682" class="tiny">slice 1</text><path class="arrow" d="M261 698 L261 746" data-sketch="1"/><path d="M261 698 L261 746" stroke="#3f3f46" stroke-width="1.1" opacity="0.45" fill="none"/><rect class="warn" x="212" y="750" width="98" height="46" data-sketch="1"/><rect x="212.0" y="750.0" width="98" height="46" rx="10" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/><text x="234" y="779" class="tiny">warp group</text><rect class="k1" x="336" y="654" width="90" height="44"/><text x="360" y="682" class="tiny">slice 2</text><path class="arrow" d="M381 698 L381 746" data-sketch="1"/><path d="M381 698 L381 746" stroke="#3f3f46" stroke-width="1.1" opacity="0.45" fill="none"/><rect class="warn" x="332" y="750" width="98" height="46" data-sketch="1"/><rect x="332.0" y="750.0" width="98" height="46" rx="10" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/><text x="354" y="779" class="tiny">warp group</text><rect class="k1" x="456" y="654" width="90" height="44"/><text x="480" y="682" class="tiny">slice 3</text><path class="arrow" d="M501 698 L501 746" data-sketch="1"/><path d="M501 698 L501 746" stroke="#3f3f46" stroke-width="1.1" opacity="0.45" fill="none"/><rect class="warn" x="452" y="750" width="98" height="46" data-sketch="1"/><rect x="452.0" y="750.0" width="98" height="46" rx="10" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/><text x="474" y="779" class="tiny">warp group</text><path class="arrow" d="M140 796 C210 838 410 838 486 796" data-sketch="1"/><path d="M140 796 C210 838 410 838 486 796" stroke="#3f3f46" stroke-width="1.1" opacity="0.45" fill="none"/><rect class="lds" x="258" y="810" width="160" height="44" data-sketch="1"/><rect x="258.4" y="810.3" width="160" height="44" rx="10" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/><text x="302" y="838" class="label">LDS reduce</text><rect class="panel" x="740" y="540" width="700" height="290" data-sketch="1"/><rect x="739.3" y="539.4" width="700" height="290" rx="10" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/><text x="768" y="578" class="section">4. Multi-stage K pipeline</text><text x="768" y="604" class="small">While one K block computes, later blocks are already staged.</text><rect class="mfma" x="810" y="666" width="140" height="70" data-sketch="1"/><rect x="809.6" y="666.6" width="140" height="70" rx="10" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/><text x="855" y="694" class="label">K i</text><text x="848" y="716" class="tiny">MFMA</text><path class="arrow" d="M950 700 L994 700" data-sketch="1"/><path d="M950 700 L994 700" stroke="#3f3f46" stroke-width="1.1" opacity="0.45" fill="none"/><rect class="lds" x="1000" y="666" width="140" height="70" data-sketch="1"/><rect x="999.6" y="666.6" width="140" height="70" rx="10" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/><text x="1045" y="694" class="label">K i+1</text><text x="1038" y="716" class="tiny">LDS ready</text><path class="arrow" d="M1140 700 L1184 700" data-sketch="1"/><path d="M1140 700 L1184 700" stroke="#3f3f46" stroke-width="1.1" opacity="0.45" fill="none"/><rect class="stage" x="1190" y="666" width="140" height="70" data-sketch="1"/><rect x="1189.7" y="666.6" width="140" height="70" rx="10" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/><text x="1235" y="694" class="label">K i+2</text><text x="1228" y="716" class="tiny">async copy</text></svg>

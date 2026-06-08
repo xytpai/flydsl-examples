@@ -1,76 +1,16 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="560" viewBox="0 0 1280 560" role="img" aria-labelledby="title desc">
-  <title id="title">Stream-K synchronization protocol</title>
-  <desc id="desc">An inter-CTA Stream-K synchronization protocol where partition 0 initializes C, publishes a signal, all partitions atomically accumulate partial sums, and the last partition resets the state.</desc>
-  <defs>
-    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
-      <path d="M0,0 L0,6 L9,3 z" fill="#475569"/>
-    </marker>
-    <style>
-      .bg { fill: #fffaf0;}
-      .title { font: 700 30px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive; fill: #111827;}
-      .subtitle { font: 500 16px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive; fill: #475569;}
-      .label { font: 700 18px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive; fill: #111827;}
-      .small { font: 500 14px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive; fill: #475569;}
-      .tiny { font: 600 12px "Comic Sans MS", "Comic Neue", "Chalkboard SE", cursive; fill: #64748b;}
-      .panel { fill: #fffaf0; stroke: #d8d3c4; stroke-width: 2; rx: 22;}
-      .init { fill: #eef2ff; stroke: #4f46e5; stroke-width: 3; rx: 14;}
-      .sync { fill: #fff7ed; stroke: #f97316; stroke-width: 3; rx: 14;}
-      .compute { fill: #ecfeff; stroke: #0891b2; stroke-width: 3; rx: 14;}
-      .atomic { fill: #fdf2f8; stroke: #db2777; stroke-width: 3; rx: 14;}
-      .reset { fill: #f0fdf4; stroke: #16a34a; stroke-width: 3; rx: 14;}
-      .arrow { stroke: #475569; stroke-width: 2.5; fill: none; marker-end: url(#arrow); ; stroke-linecap: round; stroke-linejoin: round}
-      .dash { stroke-dasharray: 7 6;}
-      .sketch {}
-    </style>
-  </defs>
-
-  <rect class="bg" width="1280" height="560"/>
-  <text x="44" y="52" class="title">Single-Launch Stream-K Synchronization</text>
-  <text x="44" y="82" class="subtitle">A lightweight signal/semaphore protocol lets multiple K-stream CTAs safely contribute to the same C tile.</text>
-
-  <rect class="panel" x="42" y="122" width="1196" height="350"/>
-
-  <rect class="init" x="80" y="202" width="178" height="92"/>
-  <text x="116" y="235" class="label">Partition 0</text>
-  <text x="104" y="261" class="small">initialize C</text>
-  <text x="106" y="282" class="tiny">zero or bias</text>
-
-  <path class="arrow" d="M 258 248 L 334 248"/>
-
-  <rect class="sync" x="342" y="202" width="158" height="92"/>
-  <text x="382" y="235" class="label">signal[]</text>
-  <text x="379" y="261" class="small">publish 1</text>
-
-  <rect class="init" x="342" y="340" width="158" height="74" opacity="0.85"/>
-  <text x="365" y="371" class="label">Other CTAs</text>
-  <text x="374" y="394" class="small">spin-wait</text>
-  <path class="arrow dash" d="M 421 340 L 421 300"/>
-
-  <path class="arrow" d="M 500 248 L 576 248"/>
-
-  <rect class="compute" x="584" y="180" width="190" height="136"/>
-  <text x="632" y="217" class="label">Compute</text>
-  <text x="614" y="243" class="small">partial C over</text>
-  <text x="622" y="266" class="small">one K range</text>
-  <text x="624" y="292" class="tiny">all K-stream partitions</text>
-
-  <path class="arrow" d="M 774 248 L 850 248"/>
-
-  <rect class="atomic" x="858" y="202" width="170" height="92"/>
-  <text x="900" y="235" class="label">atomic add</text>
-  <text x="892" y="261" class="small">partial into C</text>
-
-  <path class="arrow" d="M 1028 248 L 1098 248"/>
-
-  <rect class="sync" x="1106" y="170" width="92" height="74"/>
-  <text x="1122" y="201" class="label">sem</text>
-  <text x="1125" y="224" class="tiny">arrive</text>
-
-  <path class="arrow" d="M 1152 244 L 1152 306"/>
-
-  <rect class="reset" x="1060" y="312" width="184" height="86"/>
-  <text x="1094" y="346" class="label">last arrival</text>
-  <text x="1086" y="372" class="small">reset signal + sem</text>
-
-  <text x="82" y="508" class="small">Invariant 1: no CTA accumulates before C is initialized. Invariant 2: state resets only after all K-stream partitions arrive.</text>
-</svg>
+<title id="title">Stream-K synchronization protocol</title>
+<desc id="desc">Single-launch protocol for initializing C, accumulating partials, and resetting state.</desc>
+<defs>
+  <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L9,4 L0,8 Z" fill="#334155"/></marker>
+  <style>
+    .bg{fill:#fffaf0}.panel{fill:#fffdf7;stroke:#c9bfae;stroke-width:2;rx:20}.panel2{fill:#fffdf7;stroke:#c9bfae;stroke-width:2;rx:14}
+    .title{font:800 32px "Comic Sans MS","Comic Neue","Chalkboard SE",cursive;fill:#1f2937}.subtitle{font:500 16px "Comic Sans MS","Comic Neue","Chalkboard SE",cursive;fill:#5f5a50}.section{font:800 18px "Comic Sans MS","Comic Neue","Chalkboard SE",cursive;fill:#1f2937}
+    .label{font:700 14px "Comic Sans MS","Comic Neue","Chalkboard SE",cursive;fill:#1f2937}.small{font:500 13px "Comic Sans MS","Comic Neue","Chalkboard SE",cursive;fill:#5f5a50}.tiny{font:600 11px "Comic Sans MS","Comic Neue","Chalkboard SE",cursive;fill:#665f55}.axis{font:700 12px "Comic Sans MS","Comic Neue","Chalkboard SE",cursive;fill:#665f55}.num{font:800 18px "Comic Sans MS","Comic Neue","Chalkboard SE",cursive;fill:#1f2937}.stat{font:800 26px "Comic Sans MS","Comic Neue","Chalkboard SE",cursive;fill:#1f2937}
+    .grid{fill:#ffffff;stroke:#cbd5e1;stroke-width:1}.a{fill:#dbeafe;stroke:#2563eb;stroke-width:1.7}.b{fill:#ccfbf1;stroke:#0f766e;stroke-width:1.7}.c{fill:#ffedd5;stroke:#f97316;stroke-width:1.5}.hot{fill:#fce7f3;stroke:#db2777;stroke-width:3}.k0{fill:#dbeafe;stroke:#2563eb;stroke-width:2}.k1{fill:#dcfce7;stroke:#16a34a;stroke-width:2}.k2{fill:#fef3c7;stroke:#f59e0b;stroke-width:2}.k3{fill:#fce7f3;stroke:#db2777;stroke-width:2}
+    .stage{fill:#eef2ff;stroke:#4f46e5;stroke-width:2;rx:12}.lds{fill:#f5f3ff;stroke:#7c3aed;stroke-width:2;rx:12}.mfma{fill:#fff7ed;stroke:#f97316;stroke-width:2;rx:12}.ok{fill:#ecfdf5;stroke:#10b981;stroke-width:2;rx:12}.warn{fill:#fff7ed;stroke:#f59e0b;stroke-width:2;rx:12}.bad{fill:#fef2f2;stroke:#ef4444;stroke-width:2;rx:12}.arrow{stroke:#3f3f46;stroke-width:2.4;fill:none;marker-end:url(#arrow);stroke-linecap:round;stroke-linejoin:round}.dash{stroke-dasharray:6 6}.muted{fill:#f1f5f9;stroke:#94a3b8;stroke-width:1.2}.line{fill:none;stroke-width:3;stroke-linejoin:round;stroke-linecap:round}.tick{stroke:#e2e8f0;stroke-width:1}
+  </style>
+</defs>
+<rect class="bg" width="1280" height="560"/>
+<text x="44" y="52" class="title">Single-Launch Stream-K Synchronization</text><text x="44" y="82" class="subtitle">All K-stream CTAs contribute to the same C tile without a separate initialization kernel.</text>
+<rect class="panel" x="50" y="125" width="1180" height="330" data-sketch="1"/><rect x="49.3" y="124.4" width="1180" height="330" rx="10" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/><rect class="stage" x="88" y="220" width="160" height="92" data-sketch="1"/><rect x="88.3" y="220.3" width="160" height="92" rx="10" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/><text x="110" y="252" class="label">1. init C</text><text x="106" y="278" class="tiny">partition 0 zeroes C or writes bias</text><path class="arrow" d="M248 266 L298 266" data-sketch="1"/><path d="M248 266 L298 266" stroke="#3f3f46" stroke-width="1.1" opacity="0.45" fill="none"/><rect class="warn" x="308" y="220" width="160" height="92" data-sketch="1"/><rect x="308.4" y="220.3" width="160" height="92" rx="10" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/><text x="330" y="252" class="label">2. signal ready</text><text x="326" y="278" class="tiny">other partitions wait</text><path class="arrow" d="M468 266 L518 266" data-sketch="1"/><path d="M468 266 L518 266" stroke="#3f3f46" stroke-width="1.1" opacity="0.45" fill="none"/><rect class="mfma" x="528" y="220" width="160" height="92" data-sketch="1"/><rect x="528.4" y="220.3" width="160" height="92" rx="10" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/><text x="550" y="252" class="label">3. compute partial</text><text x="546" y="278" class="tiny">each CTA owns one K range</text><path class="arrow" d="M688 266 L738 266" data-sketch="1"/><path d="M688 266 L738 266" stroke="#3f3f46" stroke-width="1.1" opacity="0.45" fill="none"/><rect class="hot" x="748" y="220" width="160" height="92" data-sketch="1"/><rect x="748.4" y="220.3" width="160" height="92" rx="10" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/><text x="770" y="252" class="label">4. atomic add</text><text x="766" y="278" class="tiny">partial C accumulates globally</text><path class="arrow" d="M908 266 L958 266" data-sketch="1"/><path d="M908 266 L958 266" stroke="#3f3f46" stroke-width="1.1" opacity="0.45" fill="none"/><rect class="ok" x="968" y="220" width="160" height="92" data-sketch="1"/><rect x="968.4" y="220.3" width="160" height="92" rx="10" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/><text x="990" y="252" class="label">5. reset state</text><text x="986" y="278" class="tiny">last partition clears counters</text><rect class="panel2" x="345" y="355" width="560" height="54" data-sketch="1"/><rect x="344.3" y="354.4" width="560" height="54" rx="10" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/><text x="374" y="388" class="label">Invariant: no partition accumulates before C initialization is visible</text></svg>
