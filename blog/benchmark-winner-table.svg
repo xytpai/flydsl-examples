@@ -33,9 +33,9 @@
 <text x="1225" y="141" class="tiny">Triton</text>
 <rect class="" x="70" y="165" width="1360" height="520" rx="22" fill="#fffdf7" stroke="#c9bfae" stroke-width="2"/>
 <rect x="69.3" y="164.4" width="1360" height="520" rx="22" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/>
-<rect class="" x="1040" y="186" width="300" height="36" rx="18" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
-<rect x="1039.3" y="185.4" width="300" height="36" rx="18" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
-<text x="1070" y="210" class="label">LDS-SK wins 29/32 shapes</text>
+<rect class="" x="1040" y="169" width="300" height="26" rx="13" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
+<rect x="1039.3" y="168.4" width="300" height="26" rx="13" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
+<text x="1082" y="187" class="tiny">LDS-SK wins 29/32 shapes</text>
 <text x="105" y="222" class="label">shape / M</text>
 <rect class="" x="373" y="200" width="58" height="26" rx="13" fill="#fff7ed" stroke="#ead7bd" stroke-width="1.4"/>
 <rect x="372.3" y="199.4" width="58" height="26" rx="13" fill="none" stroke="#ead7bd" stroke-width="1" opacity="0.45"/>
