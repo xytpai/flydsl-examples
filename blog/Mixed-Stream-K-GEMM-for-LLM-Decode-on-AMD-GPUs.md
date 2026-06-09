@@ -605,6 +605,18 @@ For readers who want to inspect the raw latency trend, the curve view below keep
 
 ![Decode GEMM backend latency curves](./backend-latency-curves.svg)
 
+The same benchmark data also includes an additional BF16 model-shape sweep beyond the regular `K = 7168` grid. These shapes cover projection sizes such as `N = 128`, `640`, `2112`, `2880`, `5120`, and `7168`, with both bias and no-bias cases. The view below keeps the same visual convention, but groups rows by `(N, K, bias)`.
+
+![BF16 model-shape Mixed Stream-K speedup table](./bf16-model-speedup-table.svg)
+
+Across these 56 additional model-shape GEMMs, Mixed Stream-K improves the average latency against the faster generic backend by about `1.44x`. For `M <= 8`, the average speedup is about `1.54x`, with the best observed shape reaching about `2.34x`.
+
+![BF16 model-shape fastest backend table](./bf16-model-winner-table.svg)
+
+For raw latency comparison, the curve view fixes one model-shape family per panel and sweeps `M` from `1` to `128`.
+
+![BF16 model-shape backend latency curves](./bf16-model-latency-curves.svg)
+
 The important benchmark question is not “does this kernel win every GEMM?” The right question is: **does Mixed Stream-K improve the decode-heavy GEMMs that matter for interactive serving?**
 
 ---
