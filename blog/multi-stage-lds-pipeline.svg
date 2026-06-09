@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="820" viewBox="0 0 1500 820" role="img" aria-labelledby="title desc">
+<title id="title">Multi-stage LDS pipeline</title>
+<desc id="desc">A single CTA overlaps K tile copy, LDS staging, MFMA compute, and C accumulation.</desc>
+<defs>
+  <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0,0 C3,1 6,3 9,4 C6,5 3,7 0,8 Z" fill="#3f3f46"/></marker>
+  <style>
+    .bg{fill:#fffaf0}.panel{fill:#fffdf7;stroke:#c9bfae;stroke-width:2;rx:20}.panel2{fill:#fffdf7;stroke:#c9bfae;stroke-width:2;rx:14}
+    .title{font:800 32px "Comic Sans MS","Comic Neue","Chalkboard SE",cursive;fill:#1f2937}.subtitle{font:500 16px "Comic Sans MS","Comic Neue","Chalkboard SE",cursive;fill:#5f5a50}.section{font:800 18px "Comic Sans MS","Comic Neue","Chalkboard SE",cursive;fill:#1f2937}
+    .label{font:700 14px "Comic Sans MS","Comic Neue","Chalkboard SE",cursive;fill:#1f2937}.small{font:500 13px "Comic Sans MS","Comic Neue","Chalkboard SE",cursive;fill:#5f5a50}.tiny{font:600 11px "Comic Sans MS","Comic Neue","Chalkboard SE",cursive;fill:#665f55}.axis{font:700 12px "Comic Sans MS","Comic Neue","Chalkboard SE",cursive;fill:#665f55}.num{font:800 18px "Comic Sans MS","Comic Neue","Chalkboard SE",cursive;fill:#1f2937}.stat{font:800 26px "Comic Sans MS","Comic Neue","Chalkboard SE",cursive;fill:#1f2937}
+    .grid{fill:#ffffff;stroke:#cbd5e1;stroke-width:1}.a{fill:#dbeafe;stroke:#2563eb;stroke-width:1.7}.b{fill:#ccfbf1;stroke:#0f766e;stroke-width:1.7}.c{fill:#ffedd5;stroke:#f97316;stroke-width:1.5}.hot{fill:#fce7f3;stroke:#db2777;stroke-width:3}.k0{fill:#dbeafe;stroke:#2563eb;stroke-width:2}.k1{fill:#dcfce7;stroke:#16a34a;stroke-width:2}.k2{fill:#fef3c7;stroke:#f59e0b;stroke-width:2}.k3{fill:#fce7f3;stroke:#db2777;stroke-width:2}
+    .stage{fill:#eef2ff;stroke:#4f46e5;stroke-width:2;rx:12}.lds{fill:#f5f3ff;stroke:#7c3aed;stroke-width:2;rx:12}.mfma{fill:#fff7ed;stroke:#f97316;stroke-width:2;rx:12}.ok{fill:#ecfdf5;stroke:#10b981;stroke-width:2;rx:12}.warn{fill:#fff7ed;stroke:#f59e0b;stroke-width:2;rx:12}.bad{fill:#fef2f2;stroke:#ef4444;stroke-width:2;rx:12}.arrow{stroke:#3f3f46;stroke-width:2.4;fill:none;marker-end:url(#arrow);stroke-linecap:round;stroke-linejoin:round}.dash{stroke-dasharray:6 6}.muted{fill:#f1f5f9;stroke:#94a3b8;stroke-width:1.2}.line{fill:none;stroke-width:3;stroke-linejoin:round;stroke-linecap:round}.tick{stroke:#e2e8f0;stroke-width:1}
+  </style>
+</defs>
+<rect class="bg" width="1500" height="820"/>
+<text x="42" y="54" class="title">Multi-Stage LDS Pipeline</text>
+<text x="44" y="84" class="subtitle">The math is still C += A_i x B_i; the pipeline changes where each K block is in time.</text>
+
+<rect class="panel" x="50" y="130" width="560" height="300" data-sketch="1"/>
+<rect x="49.3" y="129.4" width="560" height="300" rx="20" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/>
+<text x="82" y="170" class="section">1. Same tiled GEMM math</text>
+<text x="92" y="220" class="label">A row over K</text>
+<rect class="k0" x="92" y="240" width="40" height="38"/><rect class="k0" x="132" y="240" width="40" height="38"/>
+<rect class="k1" x="172" y="240" width="40" height="38"/><rect class="k1" x="212" y="240" width="40" height="38"/>
+<rect class="k2" x="252" y="240" width="40" height="38"/><rect class="k2" x="292" y="240" width="40" height="38"/>
+<rect class="grid" x="332" y="240" width="40" height="38"/><rect class="grid" x="372" y="240" width="40" height="38"/>
+<text x="92" y="320" class="label">B column over K</text>
+<rect class="k0" x="258" y="310" width="46" height="16"/><rect class="k0" x="258" y="326" width="46" height="16"/>
+<rect class="k1" x="258" y="342" width="46" height="16"/><rect class="k1" x="258" y="358" width="46" height="16"/>
+<rect class="k2" x="258" y="374" width="46" height="16"/><rect class="k2" x="258" y="390" width="46" height="16"/>
+<path class="arrow" d="M418 258 C470 268 512 292 545 330" data-sketch="1"/>
+<path d="M418 258 C470 268 512 292 545 330" stroke="#3f3f46" stroke-width="1.1" opacity="0.45" fill="none"/>
+<path class="arrow" d="M304 366 C386 366 466 358 542 358" data-sketch="1"/>
+<path d="M304 366 C386 366 466 358 542 358" stroke="#3f3f46" stroke-width="1.1" opacity="0.45" fill="none"/>
+<rect class="hot" x="530" y="334" width="58" height="46" data-sketch="1"/>
+<rect x="530.4" y="334.3" width="58" height="46" rx="10" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/>
+<text x="540" y="362" class="tiny">C tile</text>
+
+<rect class="panel" x="660" y="130" width="780" height="300" data-sketch="1"/>
+<rect x="659.3" y="129.4" width="780" height="300" rx="20" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/>
+<text x="692" y="170" class="section">2. Three K blocks in flight at time t</text>
+<rect class="stage" x="720" y="252" width="130" height="70" data-sketch="1"/><rect x="720.0" y="252.3" width="130" height="70" rx="12" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/>
+<text x="758" y="280" class="label">K i+2</text><text x="750" y="304" class="tiny">global copy</text>
+<path class="arrow" d="M850 286 L884 286" data-sketch="1"/><path d="M850 286 L884 286" stroke="#3f3f46" stroke-width="1.1" opacity="0.45" fill="none"/>
+<rect class="lds" x="890" y="252" width="130" height="70" data-sketch="1"/><rect x="890.0" y="252.3" width="130" height="70" rx="12" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/>
+<text x="928" y="280" class="label">K i+1</text><text x="920" y="304" class="tiny">ready in LDS</text>
+<path class="arrow" d="M1020 286 L1054 286" data-sketch="1"/><path d="M1020 286 L1054 286" stroke="#3f3f46" stroke-width="1.1" opacity="0.45" fill="none"/>
+<rect class="mfma" x="1060" y="252" width="130" height="70" data-sketch="1"/><rect x="1060.0" y="252.3" width="130" height="70" rx="12" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/>
+<text x="1098" y="280" class="label">K i</text><text x="1090" y="304" class="tiny">MFMA compute</text>
+<path class="arrow" d="M1190 286 L1224 286" data-sketch="1"/><path d="M1190 286 L1224 286" stroke="#3f3f46" stroke-width="1.1" opacity="0.45" fill="none"/>
+<rect class="ok" x="1230" y="252" width="130" height="70" data-sketch="1"/><rect x="1230.0" y="252.3" width="130" height="70" rx="12" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/>
+<text x="1268" y="280" class="label">C frag</text><text x="1260" y="304" class="tiny">accumulate</text>
+
+<rect class="panel" x="50" y="490" width="1390" height="230" data-sketch="1"/>
+<rect x="49.3" y="489.4" width="1390" height="230" rx="20" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/>
+<text x="82" y="530" class="section">3. Ring buffer over time</text>
+<text x="92" y="604" class="label">time t</text>
+<rect class="mfma" x="230" y="570" width="190" height="52" data-sketch="1"/><rect x="229.3" y="569.4" width="190" height="52" rx="12" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/><text x="256" y="602" class="label">compute K i</text>
+<path class="arrow" d="M420 596 L468 596" data-sketch="1"/><path d="M420 596 L468 596" stroke="#3f3f46" stroke-width="1.1" opacity="0.45" fill="none"/>
+<rect class="lds" x="480" y="570" width="190" height="52" data-sketch="1"/><rect x="479.3" y="569.4" width="190" height="52" rx="12" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/><text x="506" y="602" class="label">ready K i+1</text>
+<path class="arrow" d="M670 596 L718 596" data-sketch="1"/><path d="M670 596 L718 596" stroke="#3f3f46" stroke-width="1.1" opacity="0.45" fill="none"/>
+<rect class="stage" x="730" y="570" width="190" height="52" data-sketch="1"/><rect x="729.3" y="569.4" width="190" height="52" rx="12" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/><text x="756" y="602" class="label">copy K i+2</text>
+<path class="arrow" d="M920 596 L968 596" data-sketch="1"/><path d="M920 596 L968 596" stroke="#3f3f46" stroke-width="1.1" opacity="0.45" fill="none"/>
+<rect class="ok" x="980" y="570" width="190" height="52" data-sketch="1"/><rect x="979.3" y="569.4" width="190" height="52" rx="12" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/><text x="1006" y="602" class="label">C += partial i</text>
+<text x="92" y="686" class="label">time t+1</text>
+<rect class="mfma" x="230" y="652" width="190" height="52" data-sketch="1"/><rect x="230.0" y="652.3" width="190" height="52" rx="12" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/><text x="256" y="684" class="label">compute K i+1</text>
+<path class="arrow" d="M420 678 L468 678" data-sketch="1"/><path d="M420 678 L468 678" stroke="#3f3f46" stroke-width="1.1" opacity="0.45" fill="none"/>
+<rect class="lds" x="480" y="652" width="190" height="52" data-sketch="1"/><rect x="480.0" y="652.3" width="190" height="52" rx="12" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/><text x="506" y="684" class="label">ready K i+2</text>
+<path class="arrow" d="M670 678 L718 678" data-sketch="1"/><path d="M670 678 L718 678" stroke="#3f3f46" stroke-width="1.1" opacity="0.45" fill="none"/>
+<rect class="stage" x="730" y="652" width="190" height="52" data-sketch="1"/><rect x="730.0" y="652.3" width="190" height="52" rx="12" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/><text x="756" y="684" class="label">copy K i+3</text>
+<path class="arrow" d="M920 678 L968 678" data-sketch="1"/><path d="M920 678 L968 678" stroke="#3f3f46" stroke-width="1.1" opacity="0.45" fill="none"/>
+<rect class="ok" x="980" y="652" width="190" height="52" data-sketch="1"/><rect x="980.0" y="652.3" width="190" height="52" rx="12" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/><text x="1006" y="684" class="label">C += partial i+1</text>
+</svg>
