@@ -14,11 +14,11 @@
 </defs>
 <rect class="bg" width="1500" height="920"/>
 <text x="42" y="54" class="title">Kernel Latency Across Decode GEMM Shapes</text>
-<text x="44" y="84" class="subtitle">K=7168, gfx950. Lower is better; Mixed Stream-K is highlighted in purple.</text>
+<text x="44" y="84" class="subtitle">K=7168, gfx950. Lower is better; LDS-Pipelined Split-K is highlighted in purple.</text>
 <rect class="" x="875" y="44" width="118" height="30" rx="15" fill="#fffdf7" stroke="#c9bfae" stroke-width="1.4"/>
 <rect x="874.3" y="43.4" width="118" height="30" rx="15" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/>
 <path class="line" d="M 889 59 C 905 54, 921 64, 937 59" stroke="#7c3aed" stroke-width="4.2" opacity="1"/>
-<text x="947" y="64" class="tiny">Mixed</text>
+<text x="947" y="64" class="tiny">LDS-SK</text>
 <rect class="" x="1025" y="44" width="118" height="30" rx="15" fill="#fffdf7" stroke="#c9bfae" stroke-width="1.4"/>
 <rect x="1024.3" y="43.4" width="118" height="30" rx="15" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/>
 <path class="line" d="M 1039 59 C 1055 54, 1071 64, 1087 59" stroke="#f97316" stroke-width="2.8" opacity="0.72"/>
@@ -97,7 +97,7 @@
 <circle class="dot" cx="644.0" cy="370.1" r="4.8" fill="#7c3aed" opacity="1"/>
 <rect class="" x="595" y="358.13937" width="80" height="28" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="1.5"/>
 <rect x="594.3" y="357.5" width="80" height="28" rx="14" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
-<text x="609" y="377.13937" class="tiny">Mixed</text>
+<text x="609" y="377.13937" class="tiny">LDS-SK</text>
 <rect class="" x="785" y="120" width="650" height="330" rx="20" fill="#fffdf7" stroke="#c9bfae" stroke-width="2"/>
 <rect x="784.3" y="119.4" width="650" height="330" rx="20" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/>
 <rect class="" x="813" y="138" width="210" height="34" rx="17" fill="#fff7ed" stroke="#ead7bd" stroke-width="1.5"/>
@@ -164,7 +164,7 @@
 <circle class="dot" cx="1379.0" cy="266.9" r="4.8" fill="#7c3aed" opacity="1"/>
 <rect class="" x="1330" y="254.9065" width="80" height="28" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="1.5"/>
 <rect x="1329.3" y="254.3" width="80" height="28" rx="14" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
-<text x="1344" y="273.9065" class="tiny">Mixed</text>
+<text x="1344" y="273.9065" class="tiny">LDS-SK</text>
 <rect class="" x="50" y="510" width="650" height="330" rx="20" fill="#fffdf7" stroke="#c9bfae" stroke-width="2"/>
 <rect x="49.3" y="509.4" width="650" height="330" rx="20" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/>
 <rect class="" x="78" y="528" width="210" height="34" rx="17" fill="#fff7ed" stroke="#ead7bd" stroke-width="1.5"/>
@@ -231,7 +231,7 @@
 <circle class="dot" cx="644.0" cy="745.4" r="4.8" fill="#7c3aed" opacity="1"/>
 <rect class="" x="595" y="733.35759" width="80" height="28" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="1.5"/>
 <rect x="594.3" y="732.8" width="80" height="28" rx="14" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
-<text x="609" y="752.35759" class="tiny">Mixed</text>
+<text x="609" y="752.35759" class="tiny">LDS-SK</text>
 <rect class="" x="785" y="510" width="650" height="330" rx="20" fill="#fffdf7" stroke="#c9bfae" stroke-width="2"/>
 <rect x="784.3" y="509.4" width="650" height="330" rx="20" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/>
 <rect class="" x="813" y="528" width="210" height="34" rx="17" fill="#fff7ed" stroke="#ead7bd" stroke-width="1.5"/>
@@ -298,6 +298,6 @@
 <circle class="dot" cx="1379.0" cy="739.5" r="4.8" fill="#7c3aed" opacity="1"/>
 <rect class="" x="1330" y="727.48497" width="80" height="28" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="1.5"/>
 <rect x="1329.3" y="726.9" width="80" height="28" rx="14" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
-<text x="1344" y="746.48497" class="tiny">Mixed</text>
+<text x="1344" y="746.48497" class="tiny">LDS-SK</text>
 <text x="92" y="885" class="note">Each panel fixes N and sweeps M from 1 to 128.</text>
 </svg>

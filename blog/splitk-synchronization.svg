@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="560" viewBox="0 0 1280 560" role="img" aria-labelledby="title desc">
-<title id="title">Stream-K synchronization protocol</title>
+<title id="title">Split-K synchronization protocol</title>
 <desc id="desc">Single-launch protocol for initializing C, accumulating partials, and resetting state.</desc>
 <defs>
   <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L9,4 L0,8 Z" fill="#334155"/></marker>
@@ -12,8 +12,8 @@
   </style>
 </defs>
 <rect class="bg" width="1280" height="560"/>
-<text x="44" y="52" class="title">Single-Launch Stream-K Synchronization</text>
-<text x="44" y="82" class="subtitle">All K-stream CTAs contribute to the same C tile without a separate initialization kernel.</text>
+<text x="44" y="52" class="title">Single-Launch Split-K Synchronization</text>
+<text x="44" y="82" class="subtitle">All Split-K CTAs contribute to the same C tile without a separate initialization kernel.</text>
 
 <rect class="panel" x="50" y="125" width="1180" height="330" data-sketch="1"/>
 <rect x="49.3" y="124.4" width="1180" height="330" rx="10" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/>

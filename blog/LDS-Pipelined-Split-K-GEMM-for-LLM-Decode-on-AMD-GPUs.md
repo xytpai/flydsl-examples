@@ -1,14 +1,14 @@
-# Mixed Stream-K GEMM for LLM Decode on AMD GPUs
+# LDS-Pipelined Split-K GEMM for LLM Decode on AMD GPUs
 
 Large language model serving is becoming increasingly interactive. Users expect chatbots, coding assistants, agents, and real-time copilots to respond quickly, stream tokens smoothly, and stay responsive under concurrent load. In that setting, decode-time latency is not just a backend metric. It directly affects perceived quality.
 
 This blog focuses on one small but important part of that problem: **decode-time GEMMs with small `M`, large `N/K`, BF16/FP16 inputs, optional bias, and shapes that repeat across real models**.
 
-The algorithmic idea is **Mixed Stream-K GEMM**: the long `K` dimension is treated as a stream and parallelized at multiple levels: across CTAs, inside each CTA, and through a multi-stage memory/compute pipeline.
+The algorithmic idea is **LDS-Pipelined Split-K GEMM**: the long `K` reduction is split across CTAs, further sliced across warp groups inside each CTA, and kept moving through a multi-stage LDS memory pipeline.
 
 ## TL;DR
 
-Decode GEMM in LLM serving often has very small `M` and large `K`, which leaves conventional GEMM tiling short of parallel work. We propose **Mixed Stream-K**, a decode-focused GEMM optimization that combines **inter-CTA K streaming**, **intra-CTA K slicing**, and a **multi-stage Stream-K pipeline**.
+Decode GEMM in LLM serving often has very small `M` and large `K`, which leaves conventional GEMM tiling short of parallel work. We propose **LDS-Pipelined Split-K**, a decode-focused GEMM optimization that combines **inter-CTA Split-K**, **intra-CTA K-slice splitting**, and a **multi-stage LDS pipeline**.
 
 The result is a shape-specialized decode GEMM path optimized for the shapes that actually appear in serving: small `M`, large `K`, moderate-to-large `N`, BF16/FP16 inputs, optional bias, and repeated model projection sizes.
 
@@ -95,26 +95,26 @@ General GEMM optimization usually focuses on large matrix efficiency: bigger til
 | Split-K-style partitioning | Creates more CTAs along K | Each CTA may still have limited intra-block utilization |
 | Slice-K-style partitioning | Uses more warp groups inside a CTA | Does not solve global under-occupancy when `M` is very small |
 
-This is why Mixed Stream-K combines multiple forms of K parallelism. One layer increases global work across the GPU. Another increases useful work inside each CTA. A third keeps K blocks moving through a staged pipeline.
+This is why LDS-Pipelined Split-K combines multiple forms of K parallelism. One layer increases global work across the GPU. Another increases useful work inside each CTA. A third keeps K blocks moving through a staged pipeline.
 
 ---
 
-## In This Blog: Mixed Stream-K GEMM
+## In This Blog: LDS-Pipelined Split-K GEMM
 
-We propose a decode-focused GEMM optimization that treats the long `K` dimension as a stream and combines three levels of K execution:
+We propose a decode-focused GEMM optimization that exposes the long `K` reduction as parallel work at three levels:
 
-- **Inter-CTA Stream-K** to increase global parallelism when the `M x N` tile grid is too small.
-- **Intra-CTA Stream-K** to let multiple warp groups cooperate on K-heavy tiles.
-- **Multi-stage Stream-K pipeline** to overlap global-to-LDS movement, LDS reads, and MFMA compute while K blocks are streamed through the CTA.
+- **Inter-CTA Split-K** to increase global parallelism when the `M x N` tile grid is too small.
+- **Intra-CTA K-Slice Split** to let multiple warp groups cooperate on K-heavy tiles.
+- **Multi-stage LDS pipeline** to overlap global-to-LDS movement, LDS reads, and MFMA compute while K blocks are pipelined through the CTA.
 - **LDS reduction** to combine intra-CTA K-slice partials locally.
-- **Global atomic accumulation** to combine inter-CTA K-stream partials globally.
+- **Global atomic accumulation** to combine inter-CTA Split-K partials globally.
 - **A lightweight signal/semaphore protocol** to keep the whole operation in one GEMM launch.
 
-The optimization path is therefore to stream the long `K` dimension through three cooperating layers: globally across CTAs, locally across warp groups, and temporally through a staged memory/compute pipeline.
+The optimization path is therefore to split the long `K` reduction through three cooperating layers: globally across CTAs, locally across warp groups, and temporally through a staged LDS memory/compute pipeline.
 
-The figure below shows the algorithm from the matrix-tile point of view. A selected `C` tile is not produced by one monolithic CTA. Instead, the long `K` dimension is broken into stream ranges. Each range multiplies the matching `A` row tiles and `B^T` column tiles, produces a partial `C` tile, and then participates in the reduction path.
+The figure below shows the algorithm from the matrix-tile point of view. A selected `C` tile is not produced by one monolithic CTA. Instead, the long `K` dimension is broken into Split-K ranges. Each range multiplies the matching `A` row tiles and `B^T` column tiles, produces a partial `C` tile, and then participates in the reduction path.
 
-![Mixed Stream-K tiled GEMM algorithm flow](./stream-k-tiled-gemm-flow.svg)
+![LDS-Pipelined Split-K tiled GEMM algorithm flow](./lds-pipelined-splitk-tiled-gemm-flow.svg)
 
 The rest of this blog focuses on the algorithmic flow first, then briefly shows how the design is implemented as a tunable kernel family.
 
@@ -122,29 +122,29 @@ The rest of this blog focuses on the algorithmic flow first, then briefly shows 
 
 This work combines several ideas into one decode-focused GEMM path:
 
-1. **Mixed Stream-K parallelism.**  
-   Inter-CTA K streaming increases global parallelism, while intra-CTA K slicing increases warp-group utilization for K-heavy tiles.
+1. **Hierarchical Split-K parallelism.**  
+   Inter-CTA Split-K increases global parallelism, while intra-CTA K-slice splitting increases warp-group utilization for K-heavy tiles.
 
-2. **Multi-stage Stream-K pipeline.**  
+2. **Multi-stage LDS pipeline.**  
    The implementation streams K blocks through staged LDS buffers and schedules global loads, LDS reads, and MFMA work together.
 
-3. **Single-launch Stream-K synchronization.**  
-   A lightweight `signal[]` / `semaphore[]` protocol initializes `C`, coordinates inter-CTA K-stream partitions, and resets state without a separate initialization kernel.
+3. **Single-launch Split-K synchronization.**  
+   A lightweight `signal[]` / `semaphore[]` protocol initializes `C`, coordinates inter-CTA Split-K partitions, and resets state without a separate initialization kernel.
 
 4. **LDS-based intra-CTA reduction.**  
    Warp-group partials are reduced in LDS before the tile is stored or globally accumulated.
 
 5. **Shape-specialized kernel variants.**  
-   Tile sizes, inter-CTA K streaming, intra-CTA K slicing, LDS policy, bias handling, dtype, and architecture paths are specialized per decode shape.
+   Tile sizes, inter-CTA Split-K, intra-CTA K slicing, LDS policy, bias handling, dtype, and architecture paths are specialized per decode shape.
 
 6. **Architecture-aware MFMA path.**  
    The kernel selects the appropriate BF16/FP16 MFMA path, including the newer `m16n16k32` path used for gfx950-style tuning.
 
 ---
 
-## The Core Idea: Mixed Stream-K
+## The Core Idea: LDS-Pipelined Split-K
 
-The kernel treats `K` as a stream of work rather than just a reduction dimension. For one output tile `C[m_tile, n_tile]`, the computation is:
+The kernel treats `K` as splittable reduction work rather than a private serial loop inside one CTA. For one output tile `C[m_tile, n_tile]`, the computation is:
 
 ```text
 C_tile =
@@ -154,34 +154,34 @@ C_tile =
   + ...
 ```
 
-Mixed Stream-K exposes those `K0/K1/K2/...` chunks at three levels:
+LDS-Pipelined Split-K exposes those `K0/K1/K2/...` chunks at three levels:
 
-1. **Inter-CTA Stream-K**: split the full K dimension across multiple CTAs / workgroups.
-2. **Intra-CTA Stream-K**: split one CTA’s K tile across multiple warp groups inside the block.
-3. **Multi-stage Stream-K pipeline**: stream K blocks through staged LDS buffers while overlapping global memory movement, LDS reads, and MFMA compute.
+1. **Inter-CTA Split-K**: split the full K dimension across multiple CTAs / workgroups.
+2. **Intra-CTA K-Slice Split**: split one CTA’s K tile across multiple warp groups inside the block.
+3. **Multi-stage LDS pipeline**: pipeline K blocks through staged LDS buffers while overlapping global memory movement, LDS reads, and MFMA compute.
 
 These layers solve different problems.
 
 | Technique | Where it adds parallelism | What it helps | What it needs |
 |---|---|---|---|
-| Inter-CTA Stream-K | Across CTAs / workgroups | Better GPU occupancy when `M x N` has too few tiles | Global accumulation and synchronization |
-| Intra-CTA Stream-K | Inside one CTA | Better use of warp groups for K-heavy tiles | LDS staging and local reduction |
-| Multi-stage Stream-K pipeline | Across time inside a CTA | Overlap loading, LDS reads, and MFMA while K blocks advance | Staged LDS buffers and scheduling |
-| Mixed Stream-K | All three levels | More work across the GPU, more useful work per CTA, and smoother K-block streaming | A coordinated reduction and pipeline path |
+| Inter-CTA Split-K | Across CTAs / workgroups | Better GPU occupancy when `M x N` has too few tiles | Global accumulation and synchronization |
+| Intra-CTA K-Slice Split | Inside one CTA | Better use of warp groups for K-heavy tiles | LDS staging and local reduction |
+| Multi-stage LDS pipeline | Across time inside a CTA | Overlap loading, LDS reads, and MFMA while K blocks advance | Staged LDS buffers and scheduling |
+| LDS-Pipelined Split-K | All three levels | More work across the GPU, more useful work per CTA, and smoother K-block pipelining | A coordinated reduction and pipeline path |
 
-### Inter-CTA Stream-K: More CTAs for Small-M GEMM
+### Inter-CTA Split-K: More CTAs for Small-M GEMM
 
 When `M` is small, the normal `M x N` tile grid may not launch enough CTAs to saturate the GPU.
 
-Inter-CTA Stream-K expands the grid along K:
+Inter-CTA Split-K expands the grid along K:
 
 ```text
 grid = [M/N tiles, split_k]
 ```
 
-Each K-stream partition computes a partial sum over a different K range. The partial results are accumulated into the same output tile.
+Each Split-K partition computes a partial sum over a different K range. The partial results are accumulated into the same output tile.
 
-In the launch wrapper, inter-CTA Stream-K is visible as the second grid dimension:
+In the launch wrapper, inter-CTA Split-K is visible as the second grid dimension:
 
 ```python
 bm = (m + BLOCK_M - 1) // BLOCK_M
@@ -200,11 +200,11 @@ N = 2560 / 2880 / 5120
 K = 2880 / 4096 / 7168
 ```
 
-Without this extra K-stream dimension, there may simply not be enough independent work.
+Without this extra Split-K dimension, there may simply not be enough independent work.
 
-### Intra-CTA Stream-K: More Warp-Group Parallelism
+### Intra-CTA K-Slice Split: More Warp-Group Parallelism
 
-Inter-CTA Stream-K increases the number of CTAs. Intra-CTA Stream-K increases useful work inside one CTA.
+Inter-CTA Split-K increases the number of CTAs. Intra-CTA K-Slice Split increases useful work inside one CTA.
 
 The kernel assigns multiple warp groups to different K slices of the same tile. Each group computes a partial accumulation. At the end of the CTA, those partial results are reduced through LDS before writing back.
 
@@ -213,7 +213,7 @@ This helps in two ways:
 - It increases parallelism for K-heavy tiles.
 - It controls register pressure by distributing work across warp groups.
 
-### Multi-Stage Stream-K Pipeline
+### Multi-Stage LDS Pipeline
 
 The third layer is temporal. Once a CTA owns a K range, it still has to repeatedly compute:
 
@@ -251,27 +251,27 @@ stage t + 1  : LDS has K block i + 1 ready
 stage t + 2  : async copy brings K block i + 2
 ```
 
-The scheduler hints in `hot_loop_scheduler()` order VMEM, LDS reads, and MFMA instructions so the K stream keeps moving through the CTA.
+The scheduler hints in `hot_loop_scheduler()` order VMEM, LDS reads, and MFMA instructions so the staged K pipeline keeps moving through the CTA.
 
 ### Why Mix Them?
 
 For decode GEMM, no single layer is sufficient.
 
-- Inter-CTA Stream-K gives more CTAs, but each CTA may still be inefficient.
-- Intra-CTA Stream-K improves block-level utilization, but cannot fix global under-occupancy when `M` is tiny.
-- Multi-stage Stream-K keeps K-block movement and MFMA compute overlapped, but it needs enough global and local parallel work to matter.
+- Inter-CTA Split-K gives more CTAs, but each CTA may still be inefficient.
+- Intra-CTA K-Slice Split improves block-level utilization, but cannot fix global under-occupancy when `M` is tiny.
+- Multi-stage LDS pipeline keeps K-block movement and MFMA compute overlapped, but it needs enough global and local parallel work to matter.
 - Combining them gives:
   - more CTAs across the GPU,
   - more useful warp-group work inside each CTA,
   - a K-block pipeline that keeps memory movement and compute coordinated.
 
-That is the reason for the Mixed Stream-K design.
+That is the reason for the LDS-Pipelined Split-K design.
 
 ---
 
-## Single-Launch Stream-K Synchronization
+## Single-Launch Split-K Synchronization
 
-Inter-CTA Stream-K creates a correctness problem: multiple CTAs contribute to the same output tile.
+Inter-CTA Split-K creates a correctness problem: multiple CTAs contribute to the same output tile.
 
 This kernel uses a lightweight global synchronization protocol with two global buffers:
 
@@ -282,26 +282,26 @@ semaphore[]
 
 The flow is:
 
-1. The first K-stream partition initializes the output tile.
+1. The first Split-K partition initializes the output tile.
    - If bias is enabled, it writes bias into `C`.
    - Otherwise, it zeroes `C`.
 
 2. After initialization, it writes a `signal`.
 
-3. Other K-stream partitions spin-wait on that signal before accumulating.
+3. Other Split-K partitions spin-wait on that signal before accumulating.
 
-4. Each K-stream partition computes its partial result.
+4. Each Split-K partition computes its partial result.
 
 5. The partial result is accumulated into global `C` with atomic add.
 
-6. A semaphore counts how many K-stream partitions have arrived.
+6. A semaphore counts how many Split-K partitions have arrived.
 
 7. The last arriving partition resets both `signal` and `semaphore`.
 
 Conceptually:
 
 ```text
-Stream-K group:
+Split-K group:
     partition 0:
         initialize C
         signal ready
@@ -315,9 +315,9 @@ Stream-K group:
         reset synchronization state
 ```
 
-The same flow can be viewed as a small protocol among the inter-CTA K-stream partitions:
+The same flow can be viewed as a small protocol among the inter-CTA Split-K partitions:
 
-![Stream-K synchronization protocol](./splitk-synchronization.svg)
+![Split-K synchronization protocol](./splitk-synchronization.svg)
 
 This avoids a separate initialization kernel and keeps the entire operation inside one GEMM launch.
 
@@ -325,10 +325,10 @@ That matters for decode, where launch overhead and small-kernel overhead are vis
 
 The protocol relies on two simple correctness invariants:
 
-1. **No K-stream partition accumulates into `C` before initialization is visible.**  
+1. **No Split-K partition accumulates into `C` before initialization is visible.**  
    Partition 0 initializes the output tile and publishes `signal = 1`; the other partitions spin-wait on that signal before doing global atomic accumulation.
 
-2. **Synchronization state is reset only after all K-stream partitions arrive.**  
+2. **Synchronization state is reset only after all Split-K partitions arrive.**  
    Each partition increments `semaphore[]`; the last arriving partition resets both `signal[]` and `semaphore[]` for reuse.
 
 In the implementation, the protocol stays close to the algorithm. Partition 0 initializes `C` and publishes the signal:
@@ -348,7 +348,7 @@ llvm.InlineAsmOp(
 )
 ```
 
-Every K-stream partition later enters the barrier, increments the semaphore, and the last partition clears the state:
+Every Split-K partition later enters the barrier, increments the semaphore, and the last partition clears the state:
 
 ```python
 arrive_idx = llvm.AtomicRMWOp(
@@ -373,9 +373,9 @@ with ir.InsertionPoint(cond_ksl_if.then_block):
 
 ---
 
-## LDS Reduction for Intra-CTA Stream-K
+## LDS Reduction for Intra-CTA K-Slice Split
 
-Intra-CTA Stream-K happens inside a CTA.
+Intra-CTA K-Slice Split happens inside a CTA.
 
 Each K-slice warp group produces partial `C` fragments. Instead of immediately writing each partial to global memory, the kernel stages the partial results through LDS:
 
@@ -390,9 +390,9 @@ LDS reduction
 global store or global atomic
 ```
 
-When inter-CTA Stream-K is disabled, the CTA reduces local K-slice partials and stores the final result.
+When inter-CTA Split-K is disabled, the CTA reduces local K-slice partials and stores the final result.
 
-When inter-CTA Stream-K is enabled, the CTA first reduces its local K-slice partials, then participates in the global accumulation.
+When inter-CTA Split-K is enabled, the CTA first reduces its local K-slice partials, then participates in the global accumulation.
 
 So the full reduction hierarchy is:
 
@@ -400,7 +400,7 @@ So the full reduction hierarchy is:
 MFMA fragments
     → per-warp accumulation
         → intra-CTA K-slice reduction in LDS
-            → inter-CTA Stream-K accumulation through global atomic
+            → inter-CTA Split-K accumulation through global atomic
 ```
 
 This hierarchy is the key design choice.
@@ -417,7 +417,7 @@ smem_c_ptr = SmemPtr(
 cs_ = STensor(smem_c_ptr, dtype_, shape=(BLOCK_K_WARPS, BLOCK_M, BLOCK_N))
 ```
 
-Each warp group writes its own K-slice partial into `cs_[wid_k, ...]`. The epilogue then reduces those partials before either storing the tile or participating in inter-CTA Stream-K atomic accumulation:
+Each warp group writes its own K-slice partial into `cs_[wid_k, ...]`. The epilogue then reduces those partials before either storing the tile or participating in inter-CTA Split-K atomic accumulation:
 
 ```python
 vec = cs_.vec_load((0, m_local_idx, n_local_idx), LDG_VEC_SIZE)
@@ -427,7 +427,7 @@ for ksi in range_constexpr(1, BLOCK_K_WARPS):
 
 ---
 
-## Multi-Stage Stream-K Memory Pipeline
+## Multi-Stage LDS Memory Pipeline
 
 The memory pipeline is easiest to understand from the same tiled-GEMM view. For one selected output tile, the CTA walks through a stream of K blocks:
 
@@ -441,7 +441,7 @@ C_tile =
 
 The multi-stage pipeline does not change this math. It changes **where each K block is while the loop is running**. At a given moment, `K_i` may be feeding MFMA, `K_i+1` may already be staged in LDS, and `K_i+2` may be arriving from global memory.
 
-![Multi-stage Stream-K pipeline with tiled GEMM](./multi-stage-stream-k-pipeline.svg)
+![Multi-stage LDS pipeline with tiled GEMM](./multi-stage-lds-pipeline.svg)
 
 The kernel uses a conventional high-performance GEMM pipeline, but tuned for skinny decode shapes:
 
@@ -466,9 +466,9 @@ For decode tuning on gfx950, the `m16n16k32` BF16/FP16 path is the main target.
 
 ## Implementation Notes: From Algorithm to Kernel
 
-Mixed Stream-K is not one fixed kernel. It is a family of specialized kernels whose best configuration depends on shape, dtype, bias, and GPU architecture.
+LDS-Pipelined Split-K is not one fixed kernel. It is a family of specialized kernels whose best configuration depends on shape, dtype, bias, and GPU architecture.
 
-The algorithm has low-level pieces: MFMA selection, LDS allocation, async copies, global atomics, `s_waitcnt`, barriers, and inline assembly for specific global memory operations. The implementation keeps those details explicit so the kernel can specialize the tile shape, Stream-K split, memory path, and epilogue together.
+The algorithm has low-level pieces: MFMA selection, LDS allocation, async copies, global atomics, `s_waitcnt`, barriers, and inline assembly for specific global memory operations. The implementation keeps those details explicit so the kernel can specialize the tile shape, Split-K factor, memory path, and epilogue together.
 
 In `splitk_hgemm.py`, the kernel family is parameterized directly in the builder:
 
@@ -541,10 +541,10 @@ class WmmaHalf_m16n16k32(WmmaHalfBase):
 The result is a useful middle ground:
 
 1. **The kernel is generated as a family of specialized kernels.**  
-   Each shape can JIT to the right tile, inter-CTA K stream, intra-CTA K slicing, LDS policy, MFMA path, and bias path.
+   Each shape can JIT to the right tile, inter-CTA Split-K factor, intra-CTA K slicing, LDS policy, MFMA path, and bias path.
 
 2. **The synchronization logic stays connected to the algorithm.**  
-   K-stream initialization, signal wait, semaphore reset, LDS reduction, and epilogue logic are written in one kernel instead of being scattered across several auxiliary launches.
+   Split-K initialization, signal wait, semaphore reset, LDS reduction, and epilogue logic are written in one kernel instead of being scattered across several auxiliary launches.
 
 3. **The compiler can specialize aggressively.**  
    Branches like `HAS_BIAS`, `B_TO_LDS`, `SPLIT_K > 1`, `BLOCK_K_WARPS > 1`, and architecture-specific MFMA paths become compile-time constants.
@@ -568,7 +568,7 @@ large K
 moderate or large N
 ```
 
-That is where the normal `M x N` tile grid is too small to keep the GPU busy, and where additional K parallelism can help. Inter-CTA Stream-K increases global work across CTAs. Intra-CTA Stream-K improves warp-group utilization. The multi-stage pipeline keeps K blocks moving through memory and compute. The signal/semaphore protocol and LDS reduction make these layers compose inside one GEMM launch.
+That is where the normal `M x N` tile grid is too small to keep the GPU busy, and where additional K parallelism can help. Inter-CTA Split-K increases global work across CTAs. Intra-CTA K-Slice Split improves warp-group utilization. The multi-stage LDS pipeline keeps K blocks moving through memory and compute. The signal/semaphore protocol and LDS reduction make these layers compose inside one GEMM launch.
 
 The design is intentionally shape-specialized. It is strongest when small `M` limits occupancy and large `K` gives useful reduction work to split. It is less about replacing every GEMM path and more about making the decode-heavy path explicit, tunable, and maintainable.
 
@@ -576,26 +576,28 @@ The design is intentionally shape-specialized. It is strongest when small `M` li
 
 ## Benchmark Results
 
-We evaluate Mixed Stream-K as a concrete BF16/FP16 GEMM kernel family on representative decode GEMM shapes. The data below uses `K = 7168`, `gfx950`, `256` CUs, and compares four backend paths:
+We evaluate LDS-Pipelined Split-K as a concrete BF16/FP16 GEMM kernel family on representative decode GEMM shapes. The data below uses `K = 7168`, `gfx950`, `256` CUs, and compares four backend paths:
 
 - `Torch native`
 - `Triton`
 - `Tuned ASM`
-- `Mixed Stream-K`
+- `LDS-Pipelined Split-K`
 
-The main view is a visual speedup table. Each cell corresponds to one `(M, N, K)` shape. The large number is the speedup of Mixed Stream-K against the faster generic backend, and the small text shows the two measured latencies.
+In the figures, `LDS-SK` is the compact label for LDS-Pipelined Split-K.
 
-![Mixed Stream-K visual speedup table](./benchmark-speedup-table.svg)
+The main view is a visual speedup table. Each cell corresponds to one `(M, N, K)` shape. The large number is the speedup of LDS-Pipelined Split-K against the faster generic backend, and the small text shows the two measured latencies.
+
+![LDS-Pipelined Split-K visual speedup table](./benchmark-speedup-table.svg)
 
 For each `(M, N, K)` shape, the baseline is the faster of `Torch native` and `Triton`, and the cell value is:
 
 ```text
-speedup = min(torch_latency, triton_latency) / mixed_stream_k_latency
+speedup = min(torch_latency, triton_latency) / lds_pipelined_splitk_latency
 ```
 
-Across these 32 decode GEMM shapes, Mixed Stream-K improves the average latency against the faster generic backend by about `1.64x`. For the most decode-sensitive region, `M <= 8`, the average speedup is about `1.79x`, with the best observed shape reaching about `2.37x`.
+Across these 32 decode GEMM shapes, LDS-Pipelined Split-K improves the average latency against the faster generic backend by about `1.64x`. For the most decode-sensitive region, `M <= 8`, the average speedup is about `1.79x`, with the best observed shape reaching about `2.37x`.
 
-Compared with the tuned ASM path, Mixed Stream-K is also competitive across the sweep: the average speedup is about `1.44x`, with a best observed speedup around `1.97x`. A few shapes remain close, which is expected because the best backend depends on the exact `(M, N, K)` tile geometry and reduction balance.
+Compared with the tuned ASM path, LDS-Pipelined Split-K is also competitive across the sweep: the average speedup is about `1.44x`, with a best observed speedup around `1.97x`. A few shapes remain close, which is expected because the best backend depends on the exact `(M, N, K)` tile geometry and reduction balance.
 
 The next table shows the fastest backend for each shape directly. This is useful as a sanity check because it answers a simpler question: which path wins this shape?
 
@@ -607,9 +609,9 @@ For readers who want to inspect the raw latency trend, the curve view below keep
 
 The same benchmark data also includes an additional BF16 model-shape sweep beyond the regular `K = 7168` grid. These shapes cover projection sizes such as `N = 128`, `640`, `2112`, `2880`, `5120`, and `7168`, with both bias and no-bias cases. The view below keeps the same visual convention, but groups rows by `(N, K, bias)`.
 
-![BF16 model-shape Mixed Stream-K speedup table](./bf16-model-speedup-table.svg)
+![BF16 model-shape LDS-Pipelined Split-K speedup table](./bf16-model-speedup-table.svg)
 
-Across these 56 additional model-shape GEMMs, Mixed Stream-K improves the average latency against the faster generic backend by about `1.44x`. For `M <= 8`, the average speedup is about `1.54x`, with the best observed shape reaching about `2.34x`.
+Across these 56 additional model-shape GEMMs, LDS-Pipelined Split-K improves the average latency against the faster generic backend by about `1.44x`. For `M <= 8`, the average speedup is about `1.54x`, with the best observed shape reaching about `2.34x`.
 
 ![BF16 model-shape fastest backend table](./bf16-model-winner-table.svg)
 
@@ -617,7 +619,7 @@ For raw latency comparison, the curve view fixes one model-shape family per pane
 
 ![BF16 model-shape backend latency curves](./bf16-model-latency-curves.svg)
 
-The important benchmark question is not “does this kernel win every GEMM?” The right question is: **does Mixed Stream-K improve the decode-heavy GEMMs that matter for interactive serving?**
+The important benchmark question is not “does this kernel win every GEMM?” The right question is: **does LDS-Pipelined Split-K improve the decode-heavy GEMMs that matter for interactive serving?**
 
 ---
 
@@ -632,13 +634,13 @@ The main lessons are:
    The kernel is treated as a parameterized family, then specialized by shape, dtype, bias, and architecture.
 
 3. **Small `M` needs more parallelism.**  
-   Inter-CTA Stream-K increases global work when the `M x N` tile grid is too small.
+   Inter-CTA Split-K increases global work when the `M x N` tile grid is too small.
 
 4. **K-heavy tiles need better intra-block utilization.**  
-   Intra-CTA Stream-K lets multiple warp groups cooperate on one output tile.
+   Intra-CTA K-Slice Split lets multiple warp groups cooperate on one output tile.
 
-5. **The Stream-K layers compose.**  
-   Inter-CTA streaming handles GPU occupancy; intra-CTA slicing handles block-level parallelism and register pressure; the multi-stage pipeline keeps K blocks flowing.
+5. **The Split-K and LDS pipeline layers compose.**  
+   Inter-CTA Split-K handles GPU occupancy; intra-CTA K-slice splitting handles block-level parallelism and register pressure; the multi-stage LDS pipeline keeps K blocks flowing.
 
 6. **Synchronization must be integrated into the kernel.**  
    The signal/semaphore protocol avoids separate initialization kernels and keeps decode overhead low.
@@ -655,12 +657,12 @@ The main lessons are:
 
 This is a GEMM optimization for the real shape distribution of LLM decode: small `M`, large `K`, BF16/FP16 inputs, optional bias, and many repeated model-specific projection sizes.
 
-The key design is a three-layer Stream-K strategy:
+The key design is a three-layer Split-K plus LDS-pipeline strategy:
 
 ```text
-Inter-CTA Stream-K across CTAs
-Intra-CTA Stream-K inside each CTA
-Multi-stage Stream-K pipeline through LDS and MFMA
+Inter-CTA Split-K across CTAs
+Intra-CTA K-Slice Split inside each CTA
+Multi-stage LDS pipeline through LDS and MFMA
 ```
 
 with a lightweight global signal/semaphore protocol for inter-CTA correctness and LDS-based partial reduction for intra-CTA K slices.

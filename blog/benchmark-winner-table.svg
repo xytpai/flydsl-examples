@@ -14,11 +14,11 @@
 </defs>
 <rect class="bg" width="1500" height="780"/>
 <text x="42" y="54" class="title">Fastest Backend by Shape</text>
-<text x="44" y="84" class="subtitle">K=7168. Purple = Mixed Stream-K, orange = tuned ASM, gray = Torch, cyan = Triton.</text>
+<text x="44" y="84" class="subtitle">K=7168. Purple = LDS-Pipelined Split-K, orange = tuned ASM, gray = Torch, cyan = Triton.</text>
 <rect class="" x="760" y="122" width="105" height="28" rx="12" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
 <rect x="759.3" y="121.4" width="105" height="28" rx="12" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
 <circle cx="777" cy="136" r="4.5" fill="#7c3aed"/>
-<text x="790" y="141" class="tiny">Mixed</text>
+<text x="790" y="141" class="tiny">LDS-SK</text>
 <rect class="" x="905" y="122" width="105" height="28" rx="12" fill="#ffedd5" stroke="#f97316" stroke-width="2"/>
 <rect x="904.3" y="121.4" width="105" height="28" rx="12" fill="none" stroke="#f97316" stroke-width="1" opacity="0.45"/>
 <circle cx="922" cy="136" r="4.5" fill="#f97316"/>
@@ -35,7 +35,7 @@
 <rect x="69.3" y="164.4" width="1360" height="520" rx="22" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/>
 <rect class="" x="1040" y="186" width="300" height="36" rx="18" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
 <rect x="1039.3" y="185.4" width="300" height="36" rx="18" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
-<text x="1070" y="210" class="label">Mixed wins 29/32 shapes</text>
+<text x="1070" y="210" class="label">LDS-SK wins 29/32 shapes</text>
 <text x="105" y="222" class="label">shape / M</text>
 <rect class="" x="373" y="200" width="58" height="26" rx="13" fill="#fff7ed" stroke="#ead7bd" stroke-width="1.4"/>
 <rect x="372.3" y="199.4" width="58" height="26" rx="13" fill="none" stroke="#ead7bd" stroke-width="1" opacity="0.45"/>
@@ -67,7 +67,7 @@
 <g transform="rotate(-0.26 401 274)">
 <rect class="" x="345" y="245" width="112" height="58" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
 <rect x="344.3" y="244.4" width="112" height="58" rx="14" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
-<text x="365" y="269" class="label">Mixed</text>
+<text x="365" y="269" class="label">LDS-SK</text>
 <text x="365" y="289" class="tiny">4.6us</text>
 </g>
 <g transform="rotate(0.04 529 274)">
@@ -79,7 +79,7 @@
 <g transform="rotate(0.26 657 274)">
 <rect class="" x="601" y="245" width="112" height="58" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
 <rect x="600.3" y="244.4" width="112" height="58" rx="14" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
-<text x="621" y="269" class="label">Mixed</text>
+<text x="621" y="269" class="label">LDS-SK</text>
 <text x="621" y="289" class="tiny">4.9us</text>
 </g>
 <g transform="rotate(-0.12 785 274)">
@@ -97,19 +97,19 @@
 <g transform="rotate(-0.18 1041 274)">
 <rect class="" x="985" y="245" width="112" height="58" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
 <rect x="984.3" y="244.4" width="112" height="58" rx="14" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
-<text x="1005" y="269" class="label">Mixed</text>
+<text x="1005" y="269" class="label">LDS-SK</text>
 <text x="1005" y="289" class="tiny">5.1us</text>
 </g>
 <g transform="rotate(0.10 1169 274)">
 <rect class="" x="1113" y="245" width="112" height="58" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
 <rect x="1112.3" y="244.4" width="112" height="58" rx="14" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
-<text x="1133" y="269" class="label">Mixed</text>
+<text x="1133" y="269" class="label">LDS-SK</text>
 <text x="1133" y="289" class="tiny">5.0us</text>
 </g>
 <g transform="rotate(-0.24 1297 274)">
 <rect class="" x="1241" y="245" width="112" height="58" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
 <rect x="1240.3" y="244.4" width="112" height="58" rx="14" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
-<text x="1261" y="269" class="label">Mixed</text>
+<text x="1261" y="269" class="label">LDS-SK</text>
 <text x="1261" y="289" class="tiny">5.9us</text>
 </g>
 <text x="105" y="346" class="label">N=384  K=7168</text>
@@ -117,49 +117,49 @@
 <g transform="rotate(0.04 401 352)">
 <rect class="" x="345" y="323" width="112" height="58" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
 <rect x="344.3" y="322.4" width="112" height="58" rx="14" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
-<text x="365" y="347" class="label">Mixed</text>
+<text x="365" y="347" class="label">LDS-SK</text>
 <text x="365" y="367" class="tiny">5.8us</text>
 </g>
 <g transform="rotate(0.26 529 352)">
 <rect class="" x="473" y="323" width="112" height="58" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
 <rect x="472.3" y="322.4" width="112" height="58" rx="14" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
-<text x="493" y="347" class="label">Mixed</text>
+<text x="493" y="347" class="label">LDS-SK</text>
 <text x="493" y="367" class="tiny">5.8us</text>
 </g>
 <g transform="rotate(-0.12 657 352)">
 <rect class="" x="601" y="323" width="112" height="58" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
 <rect x="600.3" y="322.4" width="112" height="58" rx="14" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
-<text x="621" y="347" class="label">Mixed</text>
+<text x="621" y="347" class="label">LDS-SK</text>
 <text x="621" y="367" class="tiny">5.8us</text>
 </g>
 <g transform="rotate(0.18 785 352)">
 <rect class="" x="729" y="323" width="112" height="58" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
 <rect x="728.3" y="322.4" width="112" height="58" rx="14" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
-<text x="749" y="347" class="label">Mixed</text>
+<text x="749" y="347" class="label">LDS-SK</text>
 <text x="749" y="367" class="tiny">6.0us</text>
 </g>
 <g transform="rotate(-0.18 913 352)">
 <rect class="" x="857" y="323" width="112" height="58" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
 <rect x="856.3" y="322.4" width="112" height="58" rx="14" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
-<text x="877" y="347" class="label">Mixed</text>
+<text x="877" y="347" class="label">LDS-SK</text>
 <text x="877" y="367" class="tiny">6.3us</text>
 </g>
 <g transform="rotate(0.10 1041 352)">
 <rect class="" x="985" y="323" width="112" height="58" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
 <rect x="984.3" y="322.4" width="112" height="58" rx="14" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
-<text x="1005" y="347" class="label">Mixed</text>
+<text x="1005" y="347" class="label">LDS-SK</text>
 <text x="1005" y="367" class="tiny">6.8us</text>
 </g>
 <g transform="rotate(-0.24 1169 352)">
 <rect class="" x="1113" y="323" width="112" height="58" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
 <rect x="1112.3" y="322.4" width="112" height="58" rx="14" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
-<text x="1133" y="347" class="label">Mixed</text>
+<text x="1133" y="347" class="label">LDS-SK</text>
 <text x="1133" y="367" class="tiny">7.6us</text>
 </g>
 <g transform="rotate(-0.26 1297 352)">
 <rect class="" x="1241" y="323" width="112" height="58" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
 <rect x="1240.3" y="322.4" width="112" height="58" rx="14" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
-<text x="1261" y="347" class="label">Mixed</text>
+<text x="1261" y="347" class="label">LDS-SK</text>
 <text x="1261" y="367" class="tiny">9.7us</text>
 </g>
 <rect class="stripe" x="92" y="393" width="1315" height="74" rx="18"/>
@@ -168,49 +168,49 @@
 <g transform="rotate(0.26 401 430)">
 <rect class="" x="345" y="401" width="112" height="58" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
 <rect x="344.3" y="400.4" width="112" height="58" rx="14" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
-<text x="365" y="425" class="label">Mixed</text>
+<text x="365" y="425" class="label">LDS-SK</text>
 <text x="365" y="445" class="tiny">6.1us</text>
 </g>
 <g transform="rotate(-0.12 529 430)">
 <rect class="" x="473" y="401" width="112" height="58" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
 <rect x="472.3" y="400.4" width="112" height="58" rx="14" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
-<text x="493" y="425" class="label">Mixed</text>
+<text x="493" y="425" class="label">LDS-SK</text>
 <text x="493" y="445" class="tiny">6.0us</text>
 </g>
 <g transform="rotate(0.18 657 430)">
 <rect class="" x="601" y="401" width="112" height="58" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
 <rect x="600.3" y="400.4" width="112" height="58" rx="14" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
-<text x="621" y="425" class="label">Mixed</text>
+<text x="621" y="425" class="label">LDS-SK</text>
 <text x="621" y="445" class="tiny">6.1us</text>
 </g>
 <g transform="rotate(-0.18 785 430)">
 <rect class="" x="729" y="401" width="112" height="58" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
 <rect x="728.3" y="400.4" width="112" height="58" rx="14" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
-<text x="749" y="425" class="label">Mixed</text>
+<text x="749" y="425" class="label">LDS-SK</text>
 <text x="749" y="445" class="tiny">6.4us</text>
 </g>
 <g transform="rotate(0.10 913 430)">
 <rect class="" x="857" y="401" width="112" height="58" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
 <rect x="856.3" y="400.4" width="112" height="58" rx="14" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
-<text x="877" y="425" class="label">Mixed</text>
+<text x="877" y="425" class="label">LDS-SK</text>
 <text x="877" y="445" class="tiny">6.8us</text>
 </g>
 <g transform="rotate(-0.24 1041 430)">
 <rect class="" x="985" y="401" width="112" height="58" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
 <rect x="984.3" y="400.4" width="112" height="58" rx="14" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
-<text x="1005" y="425" class="label">Mixed</text>
+<text x="1005" y="425" class="label">LDS-SK</text>
 <text x="1005" y="445" class="tiny">7.0us</text>
 </g>
 <g transform="rotate(-0.26 1169 430)">
 <rect class="" x="1113" y="401" width="112" height="58" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
 <rect x="1112.3" y="400.4" width="112" height="58" rx="14" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
-<text x="1133" y="425" class="label">Mixed</text>
+<text x="1133" y="425" class="label">LDS-SK</text>
 <text x="1133" y="445" class="tiny">7.8us</text>
 </g>
 <g transform="rotate(0.04 1297 430)">
 <rect class="" x="1241" y="401" width="112" height="58" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
 <rect x="1240.3" y="400.4" width="112" height="58" rx="14" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
-<text x="1261" y="425" class="label">Mixed</text>
+<text x="1261" y="425" class="label">LDS-SK</text>
 <text x="1261" y="445" class="tiny">9.7us</text>
 </g>
 <text x="105" y="502" class="label">N=1024  K=7168</text>
@@ -218,50 +218,50 @@
 <g transform="rotate(-0.12 401 508)">
 <rect class="" x="345" y="479" width="112" height="58" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
 <rect x="344.3" y="478.4" width="112" height="58" rx="14" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
-<text x="365" y="503" class="label">Mixed</text>
+<text x="365" y="503" class="label">LDS-SK</text>
 <text x="365" y="523" class="tiny">6.6us</text>
 </g>
 <g transform="rotate(0.18 529 508)">
 <rect class="" x="473" y="479" width="112" height="58" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
 <rect x="472.3" y="478.4" width="112" height="58" rx="14" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
-<text x="493" y="503" class="label">Mixed</text>
+<text x="493" y="503" class="label">LDS-SK</text>
 <text x="493" y="523" class="tiny">6.5us</text>
 </g>
 <g transform="rotate(-0.18 657 508)">
 <rect class="" x="601" y="479" width="112" height="58" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
 <rect x="600.3" y="478.4" width="112" height="58" rx="14" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
-<text x="621" y="503" class="label">Mixed</text>
+<text x="621" y="503" class="label">LDS-SK</text>
 <text x="621" y="523" class="tiny">6.6us</text>
 </g>
 <g transform="rotate(0.10 785 508)">
 <rect class="" x="729" y="479" width="112" height="58" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
 <rect x="728.3" y="478.4" width="112" height="58" rx="14" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
-<text x="749" y="503" class="label">Mixed</text>
+<text x="749" y="503" class="label">LDS-SK</text>
 <text x="749" y="523" class="tiny">6.9us</text>
 </g>
 <g transform="rotate(-0.24 913 508)">
 <rect class="" x="857" y="479" width="112" height="58" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
 <rect x="856.3" y="478.4" width="112" height="58" rx="14" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
-<text x="877" y="503" class="label">Mixed</text>
+<text x="877" y="503" class="label">LDS-SK</text>
 <text x="877" y="523" class="tiny">7.3us</text>
 </g>
 <g transform="rotate(-0.26 1041 508)">
 <rect class="" x="985" y="479" width="112" height="58" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
 <rect x="984.3" y="478.4" width="112" height="58" rx="14" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
-<text x="1005" y="503" class="label">Mixed</text>
+<text x="1005" y="503" class="label">LDS-SK</text>
 <text x="1005" y="523" class="tiny">7.8us</text>
 </g>
 <g transform="rotate(0.04 1169 508)">
 <rect class="" x="1113" y="479" width="112" height="58" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
 <rect x="1112.3" y="478.4" width="112" height="58" rx="14" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
-<text x="1133" y="503" class="label">Mixed</text>
+<text x="1133" y="503" class="label">LDS-SK</text>
 <text x="1133" y="523" class="tiny">9.6us</text>
 </g>
 <g transform="rotate(0.26 1297 508)">
 <rect class="" x="1241" y="479" width="112" height="58" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
 <rect x="1240.3" y="478.4" width="112" height="58" rx="14" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
-<text x="1261" y="503" class="label">Mixed</text>
+<text x="1261" y="503" class="label">LDS-SK</text>
 <text x="1261" y="523" class="tiny">11.2us</text>
 </g>
-<text x="92" y="740" class="note">Regular K=7168 decode sweep. Win count: Mixed 29, ASM 3, Torch 0, Triton 0.</text>
+<text x="92" y="740" class="note">Regular K=7168 decode sweep. Win count: LDS-SK 29, ASM 3, Torch 0, Triton 0.</text>
 </svg>

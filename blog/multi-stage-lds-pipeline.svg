@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1500" height="820" viewBox="0 0 1500 820" role="img" aria-labelledby="title desc">
-<title id="title">Multi-stage Stream-K pipeline</title>
+<title id="title">Multi-stage LDS pipeline</title>
 <desc id="desc">A single CTA overlaps K tile copy, LDS staging, MFMA compute, and C accumulation.</desc>
 <defs>
   <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0,0 C3,1 6,3 9,4 C6,5 3,7 0,8 Z" fill="#3f3f46"/></marker>
@@ -12,7 +12,7 @@
   </style>
 </defs>
 <rect class="bg" width="1500" height="820"/>
-<text x="42" y="54" class="title">Multi-Stage Stream-K Pipeline</text>
+<text x="42" y="54" class="title">Multi-Stage LDS Pipeline</text>
 <text x="44" y="84" class="subtitle">The math is still C += A_i x B_i; the pipeline changes where each K block is in time.</text>
 
 <rect class="panel" x="50" y="130" width="560" height="300" data-sketch="1"/>

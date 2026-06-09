@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1500" height="980" viewBox="0 0 1500 980" role="img" aria-labelledby="title desc">
-<title id="title">BF16 Model-Shape Sweep: Mixed Stream-K Speedup</title>
-<desc id="desc">Hand-drawn Mixed Stream-K speedup table.</desc>
+<title id="title">BF16 Model-Shape Sweep: LDS-Pipelined Split-K Speedup</title>
+<desc id="desc">Hand-drawn LDS-Pipelined Split-K speedup table.</desc>
 <defs>
   <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0,0 C3,1 6,3 9,4 C6,5 3,7 0,8 Z" fill="#3f3f46"/></marker>
   <style>
@@ -13,8 +13,8 @@
   </style>
 </defs>
 <rect class="bg" width="1500" height="980"/>
-<text x="42" y="54" class="title">BF16 Model-Shape Sweep: Mixed Stream-K Speedup</text>
-<text x="44" y="84" class="subtitle">Additional BF16 model-trace shapes. Cell = faster generic backend latency / Mixed Stream-K latency.</text>
+<text x="42" y="54" class="title">BF16 Model-Shape Sweep: LDS-Pipelined Split-K Speedup</text>
+<text x="44" y="84" class="subtitle">Additional BF16 model-trace shapes. Cell = faster generic backend latency / LDS-Pipelined Split-K latency.</text>
 <g transform="rotate(-0.8 155 151)">
 <rect class="" x="60" y="116" width="190" height="72" rx="18" fill="#fffdf7" stroke="#c9bfae" stroke-width="2"/>
 <rect x="59.3" y="115.4" width="190" height="72" rx="18" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/>
@@ -31,7 +31,7 @@
 <rect class="" x="500" y="116" width="190" height="72" rx="18" fill="#fffdf7" stroke="#c9bfae" stroke-width="2"/>
 <rect x="499.3" y="115.4" width="190" height="72" rx="18" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/>
 <text x="524" y="151" class="stat">1.54x</text>
-<text x="524" y="174" class="tiny">M &amp;lt;= 8 avg</text>
+<text x="524" y="174" class="tiny">M &lt;= 8 avg</text>
 </g>
 <g transform="rotate(0.7 815 151)">
 <rect class="" x="720" y="116" width="190" height="72" rx="18" fill="#fffdf7" stroke="#c9bfae" stroke-width="2"/>
@@ -42,7 +42,7 @@
 <rect class="" x="955" y="126" width="105" height="28" rx="12" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
 <rect x="954.3" y="125.4" width="105" height="28" rx="12" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
 <circle cx="972" cy="140" r="4.5" fill="#7c3aed"/>
-<text x="985" y="145" class="tiny">Mixed</text>
+<text x="985" y="145" class="tiny">LDS-SK</text>
 <rect class="" x="1100" y="126" width="105" height="28" rx="12" fill="#ffedd5" stroke="#f97316" stroke-width="2"/>
 <rect x="1099.3" y="125.4" width="105" height="28" rx="12" fill="none" stroke="#f97316" stroke-width="1" opacity="0.45"/>
 <circle cx="1117" cy="140" r="4.5" fill="#f97316"/>

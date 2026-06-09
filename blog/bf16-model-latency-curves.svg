@@ -14,11 +14,11 @@
 </defs>
 <rect class="bg" width="1500" height="1500"/>
 <text x="42" y="54" class="title">BF16 Model-Shape Backend Latency</text>
-<text x="44" y="84" class="subtitle">Lower is better. Each panel fixes one model-shape family; Mixed Stream-K is highlighted in purple.</text>
+<text x="44" y="84" class="subtitle">Lower is better. Each panel fixes one model-shape family; LDS-Pipelined Split-K is highlighted in purple.</text>
 <rect class="" x="820" y="44" width="118" height="30" rx="15" fill="#fffdf7" stroke="#c9bfae" stroke-width="1.4"/>
 <rect x="819.3" y="43.4" width="118" height="30" rx="15" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/>
 <path class="line" d="M 834 59 C 850 54, 866 64, 882 59" stroke="#7c3aed" stroke-width="4.2" opacity="1"/>
-<text x="892" y="64" class="tiny">Mixed</text>
+<text x="892" y="64" class="tiny">LDS-SK</text>
 <rect class="" x="970" y="44" width="118" height="30" rx="15" fill="#fffdf7" stroke="#c9bfae" stroke-width="1.4"/>
 <rect x="969.3" y="43.4" width="118" height="30" rx="15" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/>
 <path class="line" d="M 984 59 C 1000 54, 1016 64, 1032 59" stroke="#f97316" stroke-width="2.8" opacity="0.72"/>
@@ -100,7 +100,7 @@
 <circle class="dot" cx="644.0" cy="308.7" r="4.8" fill="#7c3aed" opacity="1"/>
 <rect class="" x="595" y="296.70826666666665" width="80" height="28" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="1.5"/>
 <rect x="594.3" y="296.1" width="80" height="28" rx="14" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
-<text x="609" y="315.70826666666665" class="tiny">Mixed</text>
+<text x="609" y="315.70826666666665" class="tiny">LDS-SK</text>
 <rect class="" x="785" y="120" width="650" height="295" rx="20" fill="#fffdf7" stroke="#c9bfae" stroke-width="2"/>
 <rect x="784.3" y="119.4" width="650" height="295" rx="20" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/>
 <rect class="" x="813" y="138" width="210" height="34" rx="17" fill="#fff7ed" stroke="#ead7bd" stroke-width="1.5"/>
@@ -170,7 +170,7 @@
 <circle class="dot" cx="1379.0" cy="297.4" r="4.8" fill="#7c3aed" opacity="1"/>
 <rect class="" x="1330" y="285.3768" width="80" height="28" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="1.5"/>
 <rect x="1329.3" y="284.8" width="80" height="28" rx="14" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
-<text x="1344" y="304.3768" class="tiny">Mixed</text>
+<text x="1344" y="304.3768" class="tiny">LDS-SK</text>
 <rect class="" x="50" y="455" width="650" height="295" rx="20" fill="#fffdf7" stroke="#c9bfae" stroke-width="2"/>
 <rect x="49.3" y="454.4" width="650" height="295" rx="20" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/>
 <rect class="" x="78" y="473" width="210" height="34" rx="17" fill="#fff7ed" stroke="#ead7bd" stroke-width="1.5"/>
@@ -237,7 +237,7 @@
 <circle class="dot" cx="644.0" cy="626.1" r="4.8" fill="#7c3aed" opacity="1"/>
 <rect class="" x="595" y="614.10816" width="80" height="28" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="1.5"/>
 <rect x="594.3" y="613.5" width="80" height="28" rx="14" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
-<text x="609" y="633.10816" class="tiny">Mixed</text>
+<text x="609" y="633.10816" class="tiny">LDS-SK</text>
 <rect class="" x="785" y="455" width="650" height="295" rx="20" fill="#fffdf7" stroke="#c9bfae" stroke-width="2"/>
 <rect x="784.3" y="454.4" width="650" height="295" rx="20" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/>
 <rect class="" x="813" y="473" width="210" height="34" rx="17" fill="#fff7ed" stroke="#ead7bd" stroke-width="1.5"/>
@@ -307,7 +307,7 @@
 <circle class="dot" cx="1379.0" cy="612.9" r="4.8" fill="#7c3aed" opacity="1"/>
 <rect class="" x="1330" y="600.9376" width="80" height="28" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="1.5"/>
 <rect x="1329.3" y="600.3" width="80" height="28" rx="14" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
-<text x="1344" y="619.9376" class="tiny">Mixed</text>
+<text x="1344" y="619.9376" class="tiny">LDS-SK</text>
 <rect class="" x="50" y="790" width="650" height="295" rx="20" fill="#fffdf7" stroke="#c9bfae" stroke-width="2"/>
 <rect x="49.3" y="789.4" width="650" height="295" rx="20" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/>
 <rect class="" x="78" y="808" width="210" height="34" rx="17" fill="#fff7ed" stroke="#ead7bd" stroke-width="1.5"/>
@@ -377,7 +377,7 @@
 <circle class="dot" cx="644.0" cy="896.1" r="4.8" fill="#7c3aed" opacity="1"/>
 <rect class="" x="595" y="884.0896" width="80" height="28" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="1.5"/>
 <rect x="594.3" y="883.5" width="80" height="28" rx="14" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
-<text x="609" y="903.0896" class="tiny">Mixed</text>
+<text x="609" y="903.0896" class="tiny">LDS-SK</text>
 <rect class="" x="785" y="790" width="650" height="295" rx="20" fill="#fffdf7" stroke="#c9bfae" stroke-width="2"/>
 <rect x="784.3" y="789.4" width="650" height="295" rx="20" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/>
 <rect class="" x="813" y="808" width="210" height="34" rx="17" fill="#fff7ed" stroke="#ead7bd" stroke-width="1.5"/>
@@ -447,7 +447,7 @@
 <circle class="dot" cx="1379.0" cy="931.7" r="4.8" fill="#7c3aed" opacity="1"/>
 <rect class="" x="1330" y="919.6953599999999" width="80" height="28" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="1.5"/>
 <rect x="1329.3" y="919.1" width="80" height="28" rx="14" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
-<text x="1344" y="938.6953599999999" class="tiny">Mixed</text>
+<text x="1344" y="938.6953599999999" class="tiny">LDS-SK</text>
 <rect class="" x="50" y="1125" width="650" height="295" rx="20" fill="#fffdf7" stroke="#c9bfae" stroke-width="2"/>
 <rect x="49.3" y="1124.4" width="650" height="295" rx="20" fill="none" stroke="#c9bfae" stroke-width="1" opacity="0.45"/>
 <rect class="" x="78" y="1143" width="210" height="34" rx="17" fill="#fff7ed" stroke="#ead7bd" stroke-width="1.5"/>
@@ -514,6 +514,6 @@
 <circle class="dot" cx="644.0" cy="1275.9" r="4.8" fill="#7c3aed" opacity="1"/>
 <rect class="" x="595" y="1263.8656" width="80" height="28" rx="14" fill="#ede9fe" stroke="#7c3aed" stroke-width="1.5"/>
 <rect x="594.3" y="1263.3" width="80" height="28" rx="14" fill="none" stroke="#7c3aed" stroke-width="1" opacity="0.45"/>
-<text x="609" y="1282.8656" class="tiny">Mixed</text>
-<text x="92" y="1465" class="note">Latency is in microseconds. Mixed Stream-K is the FlyDSL generated/tuned kernel family.</text>
+<text x="609" y="1282.8656" class="tiny">LDS-SK</text>
+<text x="92" y="1465" class="note">Latency is in microseconds. LDS-Pipelined Split-K is the FlyDSL generated/tuned kernel family.</text>
 </svg>
