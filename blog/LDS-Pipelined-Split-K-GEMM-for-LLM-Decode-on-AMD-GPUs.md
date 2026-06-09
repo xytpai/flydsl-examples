@@ -2,15 +2,17 @@
 
 Large language model serving is becoming increasingly interactive. Users expect chatbots, coding assistants, agents, and real-time copilots to respond quickly, stream tokens smoothly, and stay responsive under concurrent load. In that setting, decode-time latency is not just a backend metric. It directly affects perceived quality.
 
-This blog focuses on one small but important part of that problem: **decode-time GEMMs with small `M`, large `N/K`, BF16/FP16 inputs, optional bias, and shapes that repeat across real models**.
+This post focuses on one small but important part of that problem: **decode-time GEMMs with small `M`, large `N` and `K`, BF16/FP16 inputs, optional bias, and shapes that repeat across real models**.
 
-The algorithmic idea is **LDS-Pipelined Split-K GEMM**: the long `K` reduction is split across CTAs, further sliced across warp groups inside each CTA, and kept moving through a multi-stage LDS memory pipeline.
+The algorithmic idea is **LDS-Pipelined Split-K GEMM**: the long `K` reduction is split across CTAs, further sliced across warp groups inside each CTA, and kept moving through a multi-stage LDS memory pipeline. On AMD GPUs, LDS means Local Data Share, the on-chip scratchpad memory used for fast cooperation inside a CTA.
 
 ## TL;DR
 
-Decode GEMM in LLM serving often has very small `M` and large `K`, which leaves conventional GEMM tiling short of parallel work. We propose **LDS-Pipelined Split-K**, a decode-focused GEMM optimization that combines **inter-CTA Split-K**, **intra-CTA K-slice splitting**, and a **multi-stage LDS pipeline**.
+Decode GEMM in LLM serving often has very small `M` and large `K`, which leaves conventional GEMM tiling short of parallel work. **LDS-Pipelined Split-K** is a decode-focused GEMM optimization that combines **inter-CTA Split-K**, **intra-CTA K-slice splitting**, and a **multi-stage LDS pipeline**.
 
 The result is a shape-specialized decode GEMM path optimized for the shapes that actually appear in serving: small `M`, large `K`, moderate-to-large `N`, BF16/FP16 inputs, optional bias, and repeated model projection sizes.
+
+On the benchmark sweeps in this post, the generated FlyDSL kernel family improves latency against the faster generic backend by about `1.64x` on the regular `K = 7168` decode grid and about `1.44x` on the additional BF16 model-shape sweep. Read those numbers as evidence for a targeted decode path, not as a claim that one kernel should replace every GEMM backend.
 
 ## The Scenario: Interactive LLM Decode
 
@@ -60,9 +62,9 @@ Across current LLMs, decode GEMM shapes repeatedly show the same pattern:
 |---|---|
 | DeepSeek V3 | `M = 1–256`, `N = 256 / 2112 / 3072 / 7168 / 16160`, `K = 1536 / 2048 / 7168` |
 | GPT-OSS | `M = 1–256`, `N = 128 / 640 / 2560 / 2880 / 5120`, `K = 512 / 2048 / 2880 / 4096` |
-| GLM5 | `M = 1–256`, plus prefill-like large `M`, with `N/K` around `6144`, `4096`, `2048`, etc. |
+| GLM5 | `M = 1–256`, plus prefill-like large `M`, with `N` and `K` around `6144`, `4096`, `2048`, etc. |
 | Kimi K2 | many skinny decode shapes such as `M = 8–512`, `N = 384 or 1024`, `K = 7168` |
-| Llama 70B / 450B | `M = 1–32768`, but decode-critical cases include `M = 1/16/32/64`, with large `N/K` |
+| Llama 70B / 450B | `M = 1–32768`, but decode-critical cases include `M = 1/16/32/64`, with large `N` and `K` |
 | Qwen32B | `M = 1–32768`, with decode-heavy skinny projections such as `N = 100/200/800`, `K = 5120` |
 
 The important observation is not just “small `M` exists.” It is that **small-`M`, large-`K` GEMMs occur everywhere in decode paths**, and they affect end-to-end serving throughput.
@@ -74,7 +76,7 @@ small M
 large K
 moderate-to-large N
 BF16/FP16 input
-BF16 output
+BF16/FP16 output
 optional bias
 low launch overhead
 good occupancy even when M is tiny
@@ -95,11 +97,11 @@ General GEMM optimization usually focuses on large matrix efficiency: bigger til
 | Split-K-style partitioning | Creates more CTAs along K | Each CTA may still have limited intra-block utilization |
 | Slice-K-style partitioning | Uses more warp groups inside a CTA | Does not solve global under-occupancy when `M` is very small |
 
-This is why LDS-Pipelined Split-K combines multiple forms of K parallelism. One layer increases global work across the GPU. Another increases useful work inside each CTA. A third keeps K blocks moving through a staged pipeline.
+This is why LDS-Pipelined Split-K combines multiple forms of K parallelism. Inter-CTA Split-K creates more global work, intra-CTA K-slice splitting improves block-level utilization, and the LDS pipeline keeps K blocks moving without turning the hot loop into a simple load-then-compute sequence.
 
 ---
 
-## In This Blog: LDS-Pipelined Split-K GEMM
+## The Design at a Glance
 
 We propose a decode-focused GEMM optimization that exposes the long `K` reduction as parallel work at three levels:
 
@@ -116,11 +118,11 @@ The figure below shows the algorithm from the matrix-tile point of view. A selec
 
 ![LDS-Pipelined Split-K tiled GEMM algorithm flow](./lds-pipelined-splitk-tiled-gemm-flow.svg)
 
-The rest of this blog focuses on the algorithmic flow first, then briefly shows how the design is implemented as a tunable kernel family.
+The rest of this post follows that path: first the algorithmic flow, then the synchronization and LDS reduction details, then the implementation knobs that make the kernel tunable per model shape.
 
-## Key Contributions
+## What This Design Adds
 
-This work combines several ideas into one decode-focused GEMM path:
+This design combines several ideas into one decode-focused GEMM path:
 
 1. **Hierarchical Split-K parallelism.**  
    Inter-CTA Split-K increases global parallelism, while intra-CTA K-slice splitting increases warp-group utilization for K-heavy tiles.
@@ -213,7 +215,7 @@ This helps in two ways:
 - It increases parallelism for K-heavy tiles.
 - It controls register pressure by distributing work across warp groups.
 
-### Multi-Stage LDS Pipeline
+### Multi-Stage LDS Pipeline: Keep K Blocks in Flight
 
 The third layer is temporal. Once a CTA owns a K range, it still has to repeatedly compute:
 
@@ -253,17 +255,14 @@ stage t + 2  : async copy brings K block i + 2
 
 The scheduler hints in `hot_loop_scheduler()` order VMEM, LDS reads, and MFMA instructions so the staged K pipeline keeps moving through the CTA.
 
-### Why Mix Them?
+### Why Combine These Layers?
 
 For decode GEMM, no single layer is sufficient.
 
 - Inter-CTA Split-K gives more CTAs, but each CTA may still be inefficient.
 - Intra-CTA K-Slice Split improves block-level utilization, but cannot fix global under-occupancy when `M` is tiny.
 - Multi-stage LDS pipeline keeps K-block movement and MFMA compute overlapped, but it needs enough global and local parallel work to matter.
-- Combining them gives:
-  - more CTAs across the GPU,
-  - more useful warp-group work inside each CTA,
-  - a K-block pipeline that keeps memory movement and compute coordinated.
+- Together, they provide more CTAs across the GPU, more useful warp-group work inside each CTA, and a K-block pipeline that keeps memory movement and compute coordinated.
 
 That is the reason for the LDS-Pipelined Split-K design.
 
@@ -427,7 +426,7 @@ for ksi in range_constexpr(1, BLOCK_K_WARPS):
 
 ---
 
-## Multi-Stage LDS Memory Pipeline
+## Memory Pipeline Details
 
 The memory pipeline is easiest to understand from the same tiled-GEMM view. For one selected output tile, the CTA walks through a stream of K blocks:
 
@@ -464,13 +463,35 @@ For decode tuning on gfx950, the `m16n16k32` BF16/FP16 path is the main target.
 
 ---
 
+## Why This Maps Well to MI355X / gfx950
+
+This design is hardware-aware, not only algorithmic. It is shaped by the profile of MI355X-class `gfx950` GPUs.
+
+The important hardware point is that MI355X has a lot of compute to feed. With 256 CUs, a small-`M` decode GEMM can easily run out of independent `M x N` output tiles before it runs out of arithmetic capability. Inter-CTA Split-K directly targets that problem by creating more CTAs along the long `K` dimension.
+
+The rest of the design follows from the same hardware mapping:
+
+| MI355X / gfx950 trait | Kernel-design implication |
+|---|---|
+| 256 CUs | Small `M x N` grids need extra K-parallel work to keep the GPU occupied. |
+| 160 KB addressable LDS | Staging A/B tiles and reducing partial C fragments in LDS becomes a practical design point. |
+| Higher LDS bandwidth on CDNA4 | The multi-stage LDS pipeline can hide more of the global-memory movement behind MFMA work. |
+| Wider global-to-LDS transfer path | The `gfx950` path uses wider async copy granularity, visible in the implementation as `DMA_BYTES = 16`. |
+| BF16/FP16 `m16n16k32` MFMA | The kernel can consume a larger K slice per MFMA instruction than the `gfx942` `m16n16k16` path. |
+
+That is why the kernel does more than split K globally. It also uses `BLOCK_K_WARPS` to expose local K-slice work, `STAGES` to keep the LDS pipeline full, and `B_TO_LDS` to choose whether B should participate in the LDS pipeline for a particular shape.
+
+For this workload, the MI355X/gfx950 story is not just “more peak FLOPS.” The relevant question is whether a skinny decode GEMM can expose enough work, move K tiles through LDS efficiently, and feed CDNA4 MFMA instructions without spending too much time on launch overhead or global synchronization. LDS-Pipelined Split-K is designed around that question.
+
+---
+
 ## Implementation Notes: From Algorithm to Kernel
 
 LDS-Pipelined Split-K is not one fixed kernel. It is a family of specialized kernels whose best configuration depends on shape, dtype, bias, and GPU architecture.
 
 The algorithm has low-level pieces: MFMA selection, LDS allocation, async copies, global atomics, `s_waitcnt`, barriers, and inline assembly for specific global memory operations. The implementation keeps those details explicit so the kernel can specialize the tile shape, Split-K factor, memory path, and epilogue together.
 
-In `splitk_hgemm.py`, the kernel family is parameterized directly in the builder:
+In `splitk_hgemm.py`, the naming maps directly to implementation knobs: `SPLIT_K` controls inter-CTA K partitioning, `BLOCK_K_WARPS` controls intra-CTA K-slice parallelism, `STAGES` controls the LDS pipeline depth, and `B_TO_LDS` controls whether B is staged through LDS. The kernel family is parameterized directly in the builder:
 
 ```python
 @functools.lru_cache(maxsize=1024)
@@ -538,7 +559,7 @@ class WmmaHalf_m16n16k32(WmmaHalfBase):
         )
 ```
 
-The result is a useful middle ground:
+The result sits between a generic GEMM call and a fully hand-written assembly kernel:
 
 1. **The kernel is generated as a family of specialized kernels.**  
    Each shape can JIT to the right tile, inter-CTA Split-K factor, intra-CTA K slicing, LDS policy, MFMA path, and bias path.
@@ -552,7 +573,7 @@ The result is a useful middle ground:
 4. **Tuning moves faster than hand-written assembly iteration.**  
    For model-serving kernels, this matters. We need to test many real model shapes, not just one benchmark shape.
 
-In other words, the implementation strategy matters because the algorithm needs many tuned variants, not one universal kernel.
+That implementation strategy matters because the algorithm needs many tuned variants, not one universal kernel.
 
 ---
 
@@ -572,11 +593,13 @@ That is where the normal `M x N` tile grid is too small to keep the GPU busy, an
 
 The design is intentionally shape-specialized. It is strongest when small `M` limits occupancy and large `K` gives useful reduction work to split. It is less about replacing every GEMM path and more about making the decode-heavy path explicit, tunable, and maintainable.
 
+The expected trade-off is also clear: as `M` grows and the ordinary `M x N` tile grid becomes large enough, the extra Split-K reduction and synchronization can stop being worthwhile. This is why the kernel is presented as a specialized decode path rather than a universal GEMM replacement.
+
 ---
 
 ## Benchmark Results
 
-We evaluate LDS-Pipelined Split-K as a concrete BF16/FP16 GEMM kernel family on representative decode GEMM shapes. The data below uses `K = 7168`, `gfx950`, `256` CUs, and compares four backend paths:
+We evaluate LDS-Pipelined Split-K as a concrete BF16/FP16 GEMM kernel family on representative decode GEMM shapes. The data below uses `K = 7168`, an MI355X-class `gfx950` GPU with `256` CUs, and compares four backend paths:
 
 - `Torch native`
 - `Triton`
@@ -584,6 +607,8 @@ We evaluate LDS-Pipelined Split-K as a concrete BF16/FP16 GEMM kernel family on 
 - `LDS-Pipelined Split-K`
 
 In the figures, `LDS-SK` is the compact label for LDS-Pipelined Split-K.
+
+The benchmark section should be read shape by shape. The goal is to show where a generated, shape-specialized kernel improves decode latency, where it is merely competitive, and where another backend remains the better choice.
 
 The main view is a visual speedup table. Each cell corresponds to one `(M, N, K)` shape. The large number is the speedup of LDS-Pipelined Split-K against the faster generic backend, and the small text shows the two measured latencies.
 
@@ -603,11 +628,11 @@ The next table shows the fastest backend for each shape directly. This is useful
 
 ![Fastest backend by decode GEMM shape](./benchmark-winner-table.svg)
 
-For readers who want to inspect the raw latency trend, the curve view below keeps the original backend-by-backend comparison. Each panel fixes `N`, while the x-axis changes `M` from `1` to `128`.
+For readers who want to inspect the raw latency trend, the curve view below keeps the original backend-by-backend comparison. Each panel fixes `N`, while the x-axis changes `M` from `1` to `128`. These curves are useful because they show where the shape-specialized path wins cleanly and where the tuned ASM path remains close.
 
 ![Decode GEMM backend latency curves](./backend-latency-curves.svg)
 
-The same benchmark data also includes an additional BF16 model-shape sweep beyond the regular `K = 7168` grid. These shapes cover projection sizes such as `N = 128`, `640`, `2112`, `2880`, `5120`, and `7168`, with both bias and no-bias cases. The view below keeps the same visual convention, but groups rows by `(N, K, bias)`.
+The same benchmark data also includes an additional BF16 model-shape sweep beyond the regular `K = 7168` grid. These shapes cover projection sizes such as `N = 128`, `640`, `2112`, `2880`, `5120`, and `7168`, with both bias and no-bias cases. The view below keeps the same visual convention, but groups rows by `(N, K, bias)` so the reader can compare families rather than isolated points.
 
 ![BF16 model-shape LDS-Pipelined Split-K speedup table](./bf16-model-speedup-table.svg)
 
@@ -655,7 +680,7 @@ The main lessons are:
 
 ## Summary
 
-This is a GEMM optimization for the real shape distribution of LLM decode: small `M`, large `K`, BF16/FP16 inputs, optional bias, and many repeated model-specific projection sizes.
+LDS-Pipelined Split-K is a GEMM optimization for the real shape distribution of LLM decode: small `M`, large `K`, BF16/FP16 inputs, optional bias, and many repeated model-specific projection sizes.
 
 The key design is a three-layer Split-K plus LDS-pipeline strategy:
 
@@ -667,7 +692,4 @@ Multi-stage LDS pipeline through LDS and MFMA
 
 with a lightweight global signal/semaphore protocol for inter-CTA correctness and LDS-based partial reduction for intra-CTA K slices.
 
-The key point for a serving stack is that decode-heavy shapes need targeted kernels, not a single universal GEMM path.
-
-The point is not to chase peak TFLOPS. The point is to make the GEMMs that actually appear in LLM decode run faster.  
-That is where this kernel wins.
+For a serving stack, the takeaway is simple: decode-heavy shapes need targeted kernels, not a single universal GEMM path. The goal is not to chase peak TFLOPS on square matrices. The goal is to make the GEMMs that actually appear in LLM decode run faster.
