@@ -114,9 +114,9 @@ We propose a decode-focused GEMM optimization that exposes the long `K` reductio
 
 The optimization path is therefore to split the long `K` reduction through three cooperating layers: globally across CTAs, locally across warp groups, and temporally through a staged LDS memory/compute pipeline.
 
-The animated figure below shows the algorithm from the matrix-tile point of view. A selected `C` tile is not produced by one monolithic CTA. Instead, the long `K` dimension is broken into Split-K ranges. Each range multiplies the matching `A` row tiles and `B^T` column tiles, produces a partial `C` tile, and then participates in the reduction path.
+The figure below shows the algorithm from the matrix-tile point of view. A selected `C` tile is not produced by one monolithic CTA. Instead, the long `K` dimension is broken into Split-K ranges. Each range multiplies the matching `A` row tiles and `B^T` column tiles, produces a partial `C` tile, and then participates in the reduction path.
 
-![Animated LDS-Pipelined Split-K tiled GEMM algorithm flow](./lds-pipelined-splitk-tiled-gemm-flow-animated.svg)
+![LDS-Pipelined Split-K tiled GEMM algorithm flow](./lds-pipelined-splitk-tiled-gemm-flow.svg)
 
 The rest of this post follows that path: first the algorithmic flow, then the synchronization and LDS reduction details, then the implementation knobs that make the kernel tunable per model shape.
 
@@ -181,7 +181,7 @@ Inter-CTA Split-K expands the grid along K:
 grid = [M/N tiles, split_k]
 ```
 
-Each Split-K partition computes a partial sum over a different K range. The partial results are accumulated into the same output tile.
+Each Split-K partition computes a partial sum over a different K range. After that partition finishes its local pipeline work and intra-CTA LDS reduction, the partial result is accumulated into the same output tile.
 
 In the launch wrapper, inter-CTA Split-K is visible as the second grid dimension:
 
@@ -440,7 +440,7 @@ C_tile =
 
 The multi-stage pipeline does not change this math. It changes **where each K block is while the loop is running**. At a given moment, `K_i` may be feeding MFMA, `K_i+1` may already be staged in LDS, and `K_i+2` may be arriving from global memory.
 
-![Animated multi-stage LDS pipeline with tiled GEMM](./multi-stage-lds-pipeline-animated.svg)
+![Multi-stage LDS pipeline with tiled GEMM](./multi-stage-lds-pipeline.svg)
 
 The kernel uses a conventional high-performance GEMM pipeline, but tuned for skinny decode shapes:
 
