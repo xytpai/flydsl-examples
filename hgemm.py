@@ -1281,7 +1281,7 @@ def compile_hgemm_ht_kernel(
             col_in_bytes = swizzle_xor16(
                 m_local_idx, k_local_idx * DTYPE_BYTES, fx.Int32(k_blocks16)
             )
-            swizzle_cache_a[i] = m_local_idx * k + col_in_bytes // DTYPE_BYTES
+            swizzle_cache_a[i] = col_in_bytes // DTYPE_BYTES
 
         swizzle_cache_b = [0] * LDG_REG_B_COUNT_AS
         for i in range_constexpr(LDG_REG_B_COUNT_AS):
@@ -1471,10 +1471,18 @@ def compile_hgemm_ht_kernel(
             )
 
         def ldg_sts_a_async_one(m_part, k_buf, k_offset, ii, lds_ptr=None):
+            global_tid = BLOCK_THREADS * ii + tid
+            m_local_idx = global_tid // LDG_X_THREADS_AS
+            row_idx = m_offset + fx.Index(m_part * HALF_BLOCK_M + m_local_idx)
+            safe_row_idx = arith.select(
+                arith.cmpi(arith.CmpIPredicate.ult, row_idx, fx.Index(m)),
+                row_idx,
+                fx.Index(0),
+            )
             global_offset = (
-                (m_offset + fx.Index(m_part * HALF_BLOCK_M)) * k
+                safe_row_idx * k
                 + fx.Index(k_offset + k_buf * BLOCK_K)
-                + swizzle_cache_a[ii]
+                + fx.Index(swizzle_cache_a[ii])
             ) * DTYPE_BYTES
             global_offset = arith.index_cast(T.i32, global_offset)
             static_bytes_offset = (
@@ -1488,7 +1496,7 @@ def compile_hgemm_ht_kernel(
             global_offset = (
                 (n_offset + fx.Index(n_part * HALF_BLOCK_N)) * k
                 + fx.Index(k_offset + k_buf * BLOCK_K)
-                + swizzle_cache_b[ii]
+                + fx.Index(swizzle_cache_b[ii])
             ) * DTYPE_BYTES
             global_offset = arith.index_cast(T.i32, global_offset)
             static_bytes_offset = (
@@ -1977,6 +1985,8 @@ def selection_filter(m, n, k, kwargs):
             and BLOCK_K_WARPS == 1
         ):
             return False
+    if not ((k % SPLIT_K == 0) and (k // SPLIT_K >= 1)):
+        return False
     return True
 
 
