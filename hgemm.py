@@ -168,7 +168,6 @@ class OnlineScheduler:
 @functools.lru_cache(maxsize=16384)
 def compile_hgemm_ft_kernel(
     dtype: str,
-    n: int,
     k: int,
     TILE_M: int = 128,
     TILE_N: int = 128,
@@ -186,8 +185,6 @@ def compile_hgemm_ft_kernel(
     if (TILE_M == 256) and (TILE_N == 256):
         assert (TILE_K == 64) and (SPLIT_K == 1) and (STAGES == 2)
     assert STAGES >= 2
-    N_BLOCKS = n // TILE_N
-    assert (N_BLOCKS >= 1) and (n % TILE_N == 0)
     IS_SPLIT_K = SPLIT_K > 1
     IS_SLICE_K = BLOCK_K_WARPS > 1
     BLOCK_K = TILE_K
@@ -240,7 +237,6 @@ def compile_hgemm_ft_kernel(
     WARP_N = WARP_N_STEPS * WARP_ATOM_N
     BLOCK_M = BLOCK_M_WARPS * WARP_M
     BLOCK_N = BLOCK_N_WARPS * WARP_N
-    assert (n >= BLOCK_N) and (n % BLOCK_N == 0)
     BLOCK_MK_SIZE = BLOCK_M * BLOCK_K
     BLOCK_NK_SIZE = BLOCK_N * BLOCK_K
     BLOCK_MN_SIZE = BLOCK_M * BLOCK_N
@@ -291,6 +287,7 @@ def compile_hgemm_ft_kernel(
         B: fx.Pointer,
         BIAS: fx.Pointer,
         m: fx.Int32,
+        n: fx.Int32,
         semaphore: fx.Pointer,
         signal: fx.Pointer,
     ):
@@ -298,9 +295,10 @@ def compile_hgemm_ft_kernel(
         c_zero_d = arith.constant(0.0, type=dtype_)
         acc_init = arith.constant_vector(0.0, T.vec(WMMA_C_FRAG_VALUES, T.f32))
 
+        n_stride = fx.Index(n)
         A_ = GTensor(A, dtype=dtype_, shape=(-1, k))
-        B_ = GTensor(B, dtype=dtype_, shape=(n, k))
-        C_ = GTensor(C, dtype=dtype_, shape=(-1, n))
+        B_ = GTensor(B, dtype=dtype_, shape=(-1, k), stride=(k, 1))
+        C_ = GTensor(C, dtype=dtype_, shape=(-1, n), stride=(n_stride, 1))
         if const_expr(HAS_BIAS):
             BIAS_ = GTensor(BIAS, dtype=dtype_, shape=(n,))
         base_ptr = allocator.get_base()
@@ -322,6 +320,7 @@ def compile_hgemm_ft_kernel(
             signal_ = GTensor(signal, dtype=T.i32, shape=(-1,))
             signal_idx = fx.Int32(fx.block_idx.x)
 
+        n_blocks = fx.Index((n + BLOCK_N - 1) // BLOCK_N)
         tid = fx.thread_idx.x
         wid = tid // WARP_SIZE
         wid_mn = wid % BLOCK_MN_WARPS
@@ -330,7 +329,7 @@ def compile_hgemm_ft_kernel(
 
         def swizzle_for_cache_reuse(pid):
             # Do nothing currently
-            return pid // N_BLOCKS, pid % N_BLOCKS
+            return pid // n_blocks, pid % n_blocks
 
         block_m_idx, block_n_idx = swizzle_for_cache_reuse(fx.block_idx.x)
         ks_idx = fx.Index(fx.block_idx.y)
@@ -355,7 +354,13 @@ def compile_hgemm_ft_kernel(
             for jj in range_constexpr(WARP_N_STEPS):
                 warp_atom_n_idx = warp_n_idx + jj * WARP_ATOM_N
                 lds_n_idx = fx.Index(warp_atom_n_idx + stmatrix_c_n_idx)
-                bias_val = BIAS_[n_offset + lds_n_idx].extf(T.f32)
+                n_idx = n_offset + lds_n_idx
+                safe_n_idx = arith.select(
+                    arith.cmpi(arith.CmpIPredicate.ult, n_idx, fx.Index(n)),
+                    n_idx,
+                    fx.Index(0),
+                )
+                bias_val = BIAS_[safe_n_idx].extf(T.f32)
                 if const_expr(IS_SLICE_K):
                     is_first_k_slice = arith.cmpi(
                         arith.CmpIPredicate.eq, fx.Index(wid_k), fx.Index(0)
@@ -408,21 +413,29 @@ def compile_hgemm_ft_kernel(
                     m_local_idx = global_tid // LDG_C_X_THREADS
                     n_local_idx = global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE
                     row_idx = m_offset + fx.Index(m_local_idx)
+                    n_idx = n_offset + fx.Index(n_local_idx)
                     init_vec = zero_vec
                     if const_expr(HAS_BIAS):
-                        init_vec = BIAS_.vec_load(
-                            (n_offset + n_local_idx,), LDG_VEC_SIZE
+                        safe_n_idx = arith.select(
+                            arith.cmpi(arith.CmpIPredicate.ult, n_idx, fx.Index(n)),
+                            n_idx,
+                            fx.Index(0),
                         )
-                    cond_boundary = arith.cmpi(
+                        init_vec = BIAS_.vec_load(
+                            (safe_n_idx,), LDG_VEC_SIZE
+                        )
+                    cond_m_boundary = arith.cmpi(
                         arith.CmpIPredicate.ult, row_idx, fx.Index(m)
                     )
+                    cond_n_boundary = arith.cmpi(
+                        arith.CmpIPredicate.ult, n_idx, fx.Index(n)
+                    )
+                    cond_boundary = arith.andi(cond_m_boundary, cond_n_boundary)
                     cond_boundary_if = scf.IfOp(
                         cond_boundary, results_=[], has_else=False
                     )
                     with ir.InsertionPoint(cond_boundary_if.then_block):
-                        bytes_offset = C_.linear_offset(
-                            (row_idx, n_offset + n_local_idx)
-                        )
+                        bytes_offset = C_.linear_offset((row_idx, n_idx))
                         bytes_offset_i32 = arith.index_cast(T.i32, bytes_offset)
                         c_ptr = get_llvm_ptr(C, bytes_offset_i32, DTYPE_BYTES)
                         llvm.InlineAsmOp(
@@ -645,9 +658,14 @@ def compile_hgemm_ft_kernel(
                     warp_atom_n_idx = warp_n_idx + ii * WARP_ATOM_N
                     warp_atom_k_idx = warp_k_slice_base + kk * WARP_ATOM_K
                     n_idx = n_offset + warp_atom_n_idx + ldmatrix_b_n_idx
+                    safe_n_idx = arith.select(
+                        arith.cmpi(arith.CmpIPredicate.ult, n_idx, fx.Index(n)),
+                        n_idx,
+                        fx.Index(0),
+                    )
                     k_idx = k_offset + warp_atom_k_idx + ldmatrix_b_k_vec_idx
                     vec = B_.vec_load(
-                        (n_idx, k_idx), WMMA_B_FRAG_VALUES * MFMA_PER_WARP_K
+                        (safe_n_idx, k_idx), WMMA_B_FRAG_VALUES * MFMA_PER_WARP_K
                     )
                     vecs.append(vec)
             return vecs
@@ -1003,9 +1021,13 @@ def compile_hgemm_ft_kernel(
                 n_local_idx = fx.Index(global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE)
                 m_global_idx = m_offset + m_local_idx
                 n_global_idx = n_offset + n_local_idx
-                cond_boundary = arith.cmpi(
+                cond_m_boundary = arith.cmpi(
                     arith.CmpIPredicate.ult, m_global_idx, fx.Index(m)
                 )
+                cond_n_boundary = arith.cmpi(
+                    arith.CmpIPredicate.ult, n_global_idx, fx.Index(n)
+                )
+                cond_boundary = arith.andi(cond_m_boundary, cond_n_boundary)
                 cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
                 with ir.InsertionPoint(cond_boundary_if.then_block):
                     pk_val = cs_.vec_load((0, m_local_idx, n_local_idx), LDG_VEC_SIZE)
@@ -1048,9 +1070,14 @@ def compile_hgemm_ft_kernel(
                 m_local_idx = fx.Index(global_tid // LDG_C_X_THREADS)
                 n_local_idx = fx.Index(global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE)
                 m_global_idx = m_offset + m_local_idx
-                cond_boundary = arith.cmpi(
+                n_global_idx = n_offset + n_local_idx
+                cond_m_boundary = arith.cmpi(
                     arith.CmpIPredicate.ult, m_global_idx, fx.Index(m)
                 )
+                cond_n_boundary = arith.cmpi(
+                    arith.CmpIPredicate.ult, n_global_idx, fx.Index(n)
+                )
+                cond_boundary = arith.andi(cond_m_boundary, cond_n_boundary)
                 cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
                 with ir.InsertionPoint(cond_boundary_if.then_block):
                     vec = cs_.vec_load((0, m_local_idx, n_local_idx), LDG_VEC_SIZE)
@@ -1059,7 +1086,7 @@ def compile_hgemm_ft_kernel(
                             (ksi, m_local_idx, n_local_idx), LDG_VEC_SIZE
                         )
                     C_.vec_store(
-                        (m_global_idx, n_offset + n_local_idx), vec, LDG_VEC_SIZE
+                        (m_global_idx, n_global_idx), vec, LDG_VEC_SIZE
                     )
                     scf.YieldOp([])
         return
@@ -1071,6 +1098,7 @@ def compile_hgemm_ft_kernel(
         B: fx.Pointer,
         BIAS: fx.Pointer,
         m: fx.Int32,
+        n: fx.Int32,
         semaphore: fx.Pointer,
         signal: fx.Pointer,
         stream: fx.Stream = fx.Stream(None),
@@ -1081,9 +1109,10 @@ def compile_hgemm_ft_kernel(
             allocator.finalize()
 
         bm = (m + BLOCK_M - 1) // BLOCK_M
+        bn = (n + BLOCK_N - 1) // BLOCK_N
         hgemm_ft_kernel._func.__name__ = KERNEL_NAME
-        hgemm_ft_kernel(C, A, B, BIAS, m, semaphore, signal).launch(
-            grid=(bm * N_BLOCKS, SPLIT_K, 1), block=(BLOCK_THREADS, 1, 1), stream=stream
+        hgemm_ft_kernel(C, A, B, BIAS, m, n, semaphore, signal).launch(
+            grid=(bm * bn, SPLIT_K, 1), block=(BLOCK_THREADS, 1, 1), stream=stream
         )
 
     return launch_hgemm_ft_kernel
@@ -1092,7 +1121,6 @@ def compile_hgemm_ft_kernel(
 @functools.lru_cache(maxsize=16384)
 def compile_hgemm_ht_kernel(
     dtype: str,
-    n: int,
     k: int,
     TILE_M: int = 128,
     TILE_N: int = 128,
@@ -1102,7 +1130,6 @@ def compile_hgemm_ht_kernel(
     BLOCK_N_WARPS: int = 2,
     HAS_BIAS: bool = False,
 ):
-    assert n % TILE_N == 0
     IS_SPLIT_K = SPLIT_K > 1
     assert (k % SPLIT_K == 0) and (k // SPLIT_K >= 1)
     ks = k // SPLIT_K
@@ -1201,6 +1228,7 @@ def compile_hgemm_ht_kernel(
         B: fx.Pointer,
         BIAS: fx.Pointer,
         m: fx.Int32,
+        n: fx.Int32,
         semaphore: fx.Pointer,
         signal: fx.Pointer,
     ):
@@ -1208,9 +1236,10 @@ def compile_hgemm_ht_kernel(
         c_zero_d = arith.constant(0.0, type=dtype_)
         acc_init = arith.constant_vector(0.0, T.vec(WMMA_C_FRAG_VALUES, T.f32))
 
+        n_stride = fx.Index(n)
         A_ = GTensor(A, dtype=dtype_, shape=(-1, k))
-        B_ = GTensor(B, dtype=dtype_, shape=(n, k))
-        C_ = GTensor(C, dtype=dtype_, shape=(-1, n))
+        B_ = GTensor(B, dtype=dtype_, shape=(-1, k), stride=(k, 1))
+        C_ = GTensor(C, dtype=dtype_, shape=(-1, n), stride=(n_stride, 1))
         if const_expr(HAS_BIAS):
             BIAS_ = GTensor(BIAS, dtype=dtype_, shape=(n,))
         if const_expr(IS_SPLIT_K):
@@ -1235,8 +1264,9 @@ def compile_hgemm_ht_kernel(
         tid = fx.thread_idx.x
         wid = tid // WARP_SIZE
         w_tid = tid % WARP_SIZE
-        block_m_idx = fx.block_idx.x // (n // BLOCK_N)
-        block_n_idx = fx.block_idx.x % (n // BLOCK_N)
+        n_blocks = fx.Index((n + BLOCK_N - 1) // BLOCK_N)
+        block_m_idx = fx.block_idx.x // n_blocks
+        block_n_idx = fx.block_idx.x % n_blocks
         ks_idx = fx.Index(fx.block_idx.y)
         ks_begin = arith.index_cast(T.i32, ks_idx * ks)
         m_offset = fx.Index(block_m_idx * BLOCK_M)
@@ -1258,7 +1288,13 @@ def compile_hgemm_ht_kernel(
                     lds_n_idx = fx.Index(
                         n_part * HALF_BLOCK_N + warp_atom_n_idx + stmatrix_c_n_idx
                     )
-                    bias_val = BIAS_[n_offset + lds_n_idx].extf(T.f32)
+                    n_idx = n_offset + lds_n_idx
+                    safe_n_idx = arith.select(
+                        arith.cmpi(arith.CmpIPredicate.ult, n_idx, fx.Index(n)),
+                        n_idx,
+                        fx.Index(0),
+                    )
+                    bias_val = BIAS_[safe_n_idx].extf(T.f32)
                     bias_frags[n_part * WARP_N_STEPS + ni] = vector.broadcast(
                         T.vec(WMMA_C_FRAG_VALUES, T.f32), bias_val
                     )
@@ -1291,7 +1327,7 @@ def compile_hgemm_ht_kernel(
             col_in_bytes = swizzle_xor16(
                 n_local_idx, k_local_idx * DTYPE_BYTES, fx.Int32(k_blocks16)
             )
-            swizzle_cache_b[i] = n_local_idx * k + col_in_bytes // DTYPE_BYTES
+            swizzle_cache_b[i] = col_in_bytes // DTYPE_BYTES
 
         def __barrier(vmcnt=0):
             llvm.InlineAsmOp(
@@ -1333,21 +1369,29 @@ def compile_hgemm_ht_kernel(
                     m_local_idx = global_tid // LDG_C_X_THREADS
                     n_local_idx = global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE
                     row_idx = m_offset + fx.Index(m_local_idx)
+                    n_idx = n_offset + fx.Index(n_local_idx)
                     init_vec = zero_vec
                     if const_expr(HAS_BIAS):
-                        init_vec = BIAS_.vec_load(
-                            (n_offset + n_local_idx,), LDG_VEC_SIZE
+                        safe_n_idx = arith.select(
+                            arith.cmpi(arith.CmpIPredicate.ult, n_idx, fx.Index(n)),
+                            n_idx,
+                            fx.Index(0),
                         )
-                    cond_boundary = arith.cmpi(
+                        init_vec = BIAS_.vec_load(
+                            (safe_n_idx,), LDG_VEC_SIZE
+                        )
+                    cond_m_boundary = arith.cmpi(
                         arith.CmpIPredicate.ult, row_idx, fx.Index(m)
                     )
+                    cond_n_boundary = arith.cmpi(
+                        arith.CmpIPredicate.ult, n_idx, fx.Index(n)
+                    )
+                    cond_boundary = arith.andi(cond_m_boundary, cond_n_boundary)
                     cond_boundary_if = scf.IfOp(
                         cond_boundary, results_=[], has_else=False
                     )
                     with ir.InsertionPoint(cond_boundary_if.then_block):
-                        bytes_offset = C_.linear_offset(
-                            (row_idx, n_offset + n_local_idx)
-                        )
+                        bytes_offset = C_.linear_offset((row_idx, n_idx))
                         bytes_offset_i32 = arith.index_cast(T.i32, bytes_offset)
                         c_ptr = get_llvm_ptr(C, bytes_offset_i32, DTYPE_BYTES)
                         llvm.InlineAsmOp(
@@ -1493,8 +1537,16 @@ def compile_hgemm_ht_kernel(
             return lds_ptr
 
         def ldg_sts_b_async_one(n_part, k_buf, k_offset, ii, lds_ptr=None):
+            global_tid = BLOCK_THREADS * ii + tid
+            n_local_idx = global_tid // LDG_X_THREADS_AS
+            row_idx = n_offset + fx.Index(n_part * HALF_BLOCK_N + n_local_idx)
+            safe_row_idx = arith.select(
+                arith.cmpi(arith.CmpIPredicate.ult, row_idx, fx.Index(n)),
+                row_idx,
+                fx.Index(0),
+            )
             global_offset = (
-                (n_offset + fx.Index(n_part * HALF_BLOCK_N)) * k
+                safe_row_idx * k
                 + fx.Index(k_offset + k_buf * BLOCK_K)
                 + fx.Index(swizzle_cache_b[ii])
             ) * DTYPE_BYTES
@@ -1704,9 +1756,13 @@ def compile_hgemm_ht_kernel(
                 n_local_idx = fx.Index(global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE)
                 m_global_idx = m_offset + m_local_idx
                 n_global_idx = n_offset + n_local_idx
-                cond_boundary = arith.cmpi(
+                cond_m_boundary = arith.cmpi(
                     arith.CmpIPredicate.ult, m_global_idx, fx.Index(m)
                 )
+                cond_n_boundary = arith.cmpi(
+                    arith.CmpIPredicate.ult, n_global_idx, fx.Index(n)
+                )
+                cond_boundary = arith.andi(cond_m_boundary, cond_n_boundary)
                 cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
                 with ir.InsertionPoint(cond_boundary_if.then_block):
                     pk_val = cs_.vec_load((m_local_idx, n_local_idx), LDG_VEC_SIZE)
@@ -1744,14 +1800,19 @@ def compile_hgemm_ht_kernel(
                 m_local_idx = fx.Index(global_tid // LDG_C_X_THREADS)
                 n_local_idx = fx.Index(global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE)
                 m_global_idx = m_offset + m_local_idx
-                cond_boundary = arith.cmpi(
+                n_global_idx = n_offset + n_local_idx
+                cond_m_boundary = arith.cmpi(
                     arith.CmpIPredicate.ult, m_global_idx, fx.Index(m)
                 )
+                cond_n_boundary = arith.cmpi(
+                    arith.CmpIPredicate.ult, n_global_idx, fx.Index(n)
+                )
+                cond_boundary = arith.andi(cond_m_boundary, cond_n_boundary)
                 cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
                 with ir.InsertionPoint(cond_boundary_if.then_block):
                     vec = cs_.vec_load((m_local_idx, n_local_idx), LDG_VEC_SIZE)
                     C_.vec_store(
-                        (m_global_idx, n_offset + n_local_idx), vec, LDG_VEC_SIZE
+                        (m_global_idx, n_global_idx), vec, LDG_VEC_SIZE
                     )
                     scf.YieldOp([])
         return
@@ -1763,6 +1824,7 @@ def compile_hgemm_ht_kernel(
         B: fx.Pointer,
         BIAS: fx.Pointer,
         m: fx.Int32,
+        n: fx.Int32,
         semaphore: fx.Pointer,
         signal: fx.Pointer,
         stream: fx.Stream = fx.Stream(None),
@@ -1773,9 +1835,9 @@ def compile_hgemm_ht_kernel(
             allocator.finalize()
 
         bm = (m + BLOCK_M - 1) // BLOCK_M
-        bn = n // BLOCK_N
+        bn = (n + BLOCK_N - 1) // BLOCK_N
         hgemm_ht_kernel._func.__name__ = KERNEL_NAME
-        hgemm_ht_kernel(C, A, B, BIAS, m, semaphore, signal).launch(
+        hgemm_ht_kernel(C, A, B, BIAS, m, n, semaphore, signal).launch(
             grid=(bm * bn, SPLIT_K, 1), block=(BLOCK_THREADS, 1, 1), stream=stream
         )
 
@@ -1799,13 +1861,13 @@ def compile_hgemm_kernel(
     USE_HT: bool = False,
 ):
     assert n % 8 == 0
+    assert n >= 8
     if USE_HT:
         assert STAGES == 2
         assert BLOCK_K_WARPS == 1
         assert B_TO_LDS == True
         return compile_hgemm_ht_kernel(
             dtype=dtype,
-            n=n,
             k=k,
             TILE_M=TILE_M,
             TILE_N=TILE_N,
@@ -1818,7 +1880,6 @@ def compile_hgemm_kernel(
     else:
         return compile_hgemm_ft_kernel(
             dtype=dtype,
-            n=n,
             k=k,
             TILE_M=TILE_M,
             TILE_N=TILE_N,
@@ -2026,10 +2087,10 @@ def hgemm_splitk_(
         raise NotImplementedError()
     if kwargs["SPLIT_K"] > 1:
         bm = (m + kwargs["TILE_M"] - 1) // kwargs["TILE_M"]
-        bn = n // kwargs["TILE_N"]
+        bn = (n + kwargs["TILE_N"] - 1) // kwargs["TILE_N"]
         assert bm * bn <= SPLIT_K_SEMAPHORE_MAX_LEN
     bias_tensor = a if bias is None else bias
-    _run_compiled(exe, c, a, b, bias_tensor, m, semaphore, signal, stream)
+    _run_compiled(exe, c, a, b, bias_tensor, m, n, semaphore, signal, stream)
 
 
 def func(a, b, bias, c):
