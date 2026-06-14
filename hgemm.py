@@ -421,9 +421,7 @@ def compile_hgemm_ft_kernel(
                             n_idx,
                             fx.Index(0),
                         )
-                        init_vec = BIAS_.vec_load(
-                            (safe_n_idx,), LDG_VEC_SIZE
-                        )
+                        init_vec = BIAS_.vec_load((safe_n_idx,), LDG_VEC_SIZE)
                     cond_m_boundary = arith.cmpi(
                         arith.CmpIPredicate.ult, row_idx, fx.Index(m)
                     )
@@ -1085,9 +1083,7 @@ def compile_hgemm_ft_kernel(
                         vec += cs_.vec_load(
                             (ksi, m_local_idx, n_local_idx), LDG_VEC_SIZE
                         )
-                    C_.vec_store(
-                        (m_global_idx, n_global_idx), vec, LDG_VEC_SIZE
-                    )
+                    C_.vec_store((m_global_idx, n_global_idx), vec, LDG_VEC_SIZE)
                     scf.YieldOp([])
         return
 
@@ -1377,9 +1373,7 @@ def compile_hgemm_ht_kernel(
                             n_idx,
                             fx.Index(0),
                         )
-                        init_vec = BIAS_.vec_load(
-                            (safe_n_idx,), LDG_VEC_SIZE
-                        )
+                        init_vec = BIAS_.vec_load((safe_n_idx,), LDG_VEC_SIZE)
                     cond_m_boundary = arith.cmpi(
                         arith.CmpIPredicate.ult, row_idx, fx.Index(m)
                     )
@@ -1811,9 +1805,7 @@ def compile_hgemm_ht_kernel(
                 cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
                 with ir.InsertionPoint(cond_boundary_if.then_block):
                     vec = cs_.vec_load((m_local_idx, n_local_idx), LDG_VEC_SIZE)
-                    C_.vec_store(
-                        (m_global_idx, n_global_idx), vec, LDG_VEC_SIZE
-                    )
+                    C_.vec_store((m_global_idx, n_global_idx), vec, LDG_VEC_SIZE)
                     scf.YieldOp([])
         return
 
