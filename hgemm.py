@@ -118,15 +118,33 @@ class WmmaHalf_m16n16k32(WmmaHalfBase):
     WMMA_B_FRAG_VALUES = 8
     WMMA_C_FRAG_VALUES = 4
 
-    def __init__(self, dtype: str):
+    def __init__(self, dtype: str, agpr: bool = False):
         self.dtype = dtype
+        self.agpr = agpr
 
     def __call__(self, a_frag, b_frag, c_frag):
         res_ty = T.vec(self.WMMA_C_FRAG_VALUES, T.f32)
         operands = [a_frag, b_frag, c_frag, 0, 0, 0]
         if self.dtype == "bf16":
-            return rocdl.mfma_f32_16x16x32_bf16(res_ty, operands)
+            if self.agpr:
+                return llvm.inline_asm(
+                    res_ty,
+                    [_to_raw(c_frag), _to_raw(a_frag), _to_raw(b_frag)],
+                    "v_mfma_f32_16x16x32_bf16 $0, $2, $3, $0",
+                    "=a,0,v,v",
+                    has_side_effects=False,
+                )
+            else:
+                return rocdl.mfma_f32_16x16x32_bf16(res_ty, operands)
         else:
+            if self.agpr:
+                return llvm.inline_asm(
+                    res_ty,
+                    [_to_raw(c_frag), _to_raw(a_frag), _to_raw(b_frag)],
+                    "v_mfma_f32_16x16x32_f16 $0, $2, $3, $0",
+                    "=a,0,v,v",
+                    has_side_effects=False,
+                )
             return rocdl.mfma_f32_16x16x32_f16(res_ty, operands)
 
 
@@ -261,23 +279,6 @@ def compile_hgemm_ft_kernel(
     LDG_WAIT_COUNT = LDG_REG_B_COUNT_AS + LDG_REG_A_COUNT_AS
     assert ((STAGES - 2) * LDG_WAIT_COUNT) < 63
 
-    USE_8WAVE_PIPE = (
-        ASYNC_COPY
-        and B_TO_LDS
-        and BLOCK_M == 256
-        and BLOCK_N == 256
-        and BLOCK_K == 64
-        and LDG_REG_A_COUNT_AS == 4
-        and LDG_REG_B_COUNT_AS == 4
-        and MFMA_PER_WARP_K == 1
-    )
-    USE_8WAVE_PIPE = (
-        USE_8WAVE_PIPE
-        and BLOCK_M_WARPS == 2
-        and BLOCK_N_WARPS == 4
-        and BLOCK_K_WARPS == 1
-    )
-
     KERNEL_NAME = f"hgemm_ft_{dtype}_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}x{STAGES}_SPK{SPLIT_K}_W{BLOCK_M_WARPS}x{BLOCK_N_WARPS}x{BLOCK_K_WARPS}_BLDS{int(B_TO_LDS)}_TN"
     KERNEL_NAME += "_AS0" if not ASYNC_COPY else "_AS1"
     if HAS_BIAS:
@@ -348,6 +349,35 @@ def compile_hgemm_ft_kernel(
         warp_k_slice_base = wid_k * K_SLICE
         C_FRAGS_LEN = WARP_M_STEPS * WARP_N_STEPS
         c_frags = [acc_init] * C_FRAGS_LEN
+        stmatrix_c_n_idx = w_tid % WMMA_N
+        if const_expr(HAS_BIAS and not IS_SPLIT_K):
+            bias_frags = [acc_init] * WARP_N_STEPS
+            for jj in range_constexpr(WARP_N_STEPS):
+                warp_atom_n_idx = warp_n_idx + jj * WARP_ATOM_N
+                lds_n_idx = fx.Index(warp_atom_n_idx + stmatrix_c_n_idx)
+                bias_vec_base = (lds_n_idx // LDG_VEC_SIZE) * LDG_VEC_SIZE
+                bias_vec_lane = lds_n_idx % LDG_VEC_SIZE
+                bias_vec = BIAS_.vec_load((n_offset + bias_vec_base,), LDG_VEC_SIZE)
+                bias_val = vector.extract(
+                    bias_vec,
+                    static_position=[],
+                    dynamic_position=[bias_vec_lane],
+                ).extf(T.f32)
+                if const_expr(IS_SLICE_K):
+                    is_first_k_slice = arith.cmpi(
+                        arith.CmpIPredicate.eq, fx.Index(wid_k), fx.Index(0)
+                    )
+                    bias_val = arith.select(
+                        is_first_k_slice,
+                        bias_val,
+                        arith.constant(0.0, type=T.f32),
+                    )
+                bias_frags[jj] = vector.broadcast(
+                    T.vec(WMMA_C_FRAG_VALUES, T.f32), bias_val
+                )
+            for ii in range_constexpr(WARP_M_STEPS):
+                for jj in range_constexpr(WARP_N_STEPS):
+                    c_frags[ii * WARP_N_STEPS + jj] = bias_frags[jj]
 
         def __barrier(vmcnt=0, use_s_barrier=True):
             if const_expr(use_s_barrier):
@@ -861,36 +891,17 @@ def compile_hgemm_ft_kernel(
 
             def hot_loop_scheduler():
                 # ================ Ordered ================
-                if const_expr(USE_8WAVE_PIPE):
-                    for ki in range_constexpr(WARP_K_STEPS):
-                        if const_expr(ki == 0):
-                            rocdl.sched_vmem(2)
-                        rocdl.sched_dsrd(2)
-                        rocdl.sched_dsrd(4)
-                        rocdl.sched_mfma(8)
-                        if const_expr(ki == 0):
-                            rocdl.sched_vmem(2)
-                        rocdl.sched_dsrd(2)
-                        rocdl.sched_mfma(8)
-                        if const_expr(ki == 0):
-                            rocdl.sched_vmem(2)
-                        rocdl.sched_dsrd(4)
-                        rocdl.sched_mfma(8)
-                        if const_expr(ki == 0):
-                            rocdl.sched_vmem(2)
-                        rocdl.sched_mfma(8)
-                else:
-                    for i in range_constexpr(LDG_REG_B_COUNT_AS):
-                        rocdl.sched_vmem(1)  # ldg_sts_b_async next
-                    for i in range_constexpr(LDG_REG_A_COUNT_AS):
-                        rocdl.sched_vmem(1)  # ldg_sts_a_async next
-                    for ki in range_constexpr(WARP_K_STEPS):
-                        for i in range_constexpr(WARP_N_STEPS):
-                            rocdl.sched_dsrd(1)  # lds_matrix_b current
-                        for i in range_constexpr(WARP_M_STEPS):
-                            rocdl.sched_dsrd(1)  # lds_matrix_a current
-                        for i in range_constexpr(WARP_M_STEPS):
-                            rocdl.sched_mfma(WARP_N_STEPS)
+                for i in range_constexpr(LDG_REG_B_COUNT_AS):
+                    rocdl.sched_vmem(1)  # ldg_sts_b_async next
+                for i in range_constexpr(LDG_REG_A_COUNT_AS):
+                    rocdl.sched_vmem(1)  # ldg_sts_a_async next
+                for ki in range_constexpr(WARP_K_STEPS):
+                    for i in range_constexpr(WARP_N_STEPS):
+                        rocdl.sched_dsrd(1)  # lds_matrix_b current
+                    for i in range_constexpr(WARP_M_STEPS):
+                        rocdl.sched_dsrd(1)  # lds_matrix_a current
+                    for i in range_constexpr(WARP_M_STEPS):
+                        rocdl.sched_mfma(WARP_N_STEPS)
                 # ================ Reordered ================
                 rocdl.sched_barrier(0)
 
@@ -904,19 +915,9 @@ def compile_hgemm_ft_kernel(
                 next_stage = (current_stage + 1) % STAGES
                 write_stage = (current_stage + STAGES - 1) % STAGES
                 __barrier((STAGES - 2) * LDG_WAIT_COUNT)
-                if const_expr(USE_8WAVE_PIPE):
-                    c_frags_new = async_copy_ldmatrix_compute_tile_streaming(
-                        current_stage,
-                        c_frags,
-                        k_offset + (STAGES - 1) * BLOCK_K,
-                        write_stage,
-                    )
-                else:
-                    ldg_sts_b_async(k_offset + (STAGES - 1) * BLOCK_K, write_stage)
-                    ldg_sts_a_async(k_offset + (STAGES - 1) * BLOCK_K, write_stage)
-                    c_frags_new = ldmatrix_compute_tile_streaming(
-                        current_stage, c_frags
-                    )
+                ldg_sts_b_async(k_offset + (STAGES - 1) * BLOCK_K, write_stage)
+                ldg_sts_a_async(k_offset + (STAGES - 1) * BLOCK_K, write_stage)
+                c_frags_new = ldmatrix_compute_tile_streaming(current_stage, c_frags)
                 k_offset_next = k_offset + fx.Int32(BLOCK_K)
                 hot_loop_scheduler()
                 results = yield [k_offset_next, next_stage] + c_frags_new
@@ -981,7 +982,6 @@ def compile_hgemm_ft_kernel(
 
         # write to lds
         stmatrix_c_m_vec_idx = w_tid // WMMA_N * WMMA_C_FRAG_VALUES
-        stmatrix_c_n_idx = w_tid % WMMA_N
         gpu.barrier()
         for ii in range_constexpr(WARP_M_STEPS):
             warp_atom_m_idx = warp_m_idx + ii * WARP_ATOM_M
@@ -1065,11 +1065,6 @@ def compile_hgemm_ft_kernel(
                         vec += cs_.vec_load(
                             (ksi, m_local_idx, n_local_idx), LDG_VEC_SIZE
                         )
-                    if const_expr(HAS_BIAS):
-                        bias_vec = BIAS_.vec_load(
-                            (n_offset + n_local_idx,), LDG_VEC_SIZE
-                        )
-                        vec = vec + bias_vec
                     C_.vec_store(
                         (m_global_idx, n_offset + n_local_idx), vec, LDG_VEC_SIZE
                     )
@@ -1094,19 +1089,8 @@ def compile_hgemm_ft_kernel(
 
         bm = (m + BLOCK_M - 1) // BLOCK_M
         hgemm_ft_kernel._func.__name__ = KERNEL_NAME
-        value_attrs = (
-            {
-                "rocdl.waves_per_eu": 2,
-                "rocdl.flat_work_group_size": f"{BLOCK_THREADS},{BLOCK_THREADS}",
-            }
-            if USE_8WAVE_PIPE
-            else None
-        )
         hgemm_ft_kernel(C, A, B, BIAS, m, semaphore, signal).launch(
-            grid=(bm * N_BLOCKS, SPLIT_K, 1),
-            block=(BLOCK_THREADS, 1, 1),
-            stream=stream,
-            value_attrs=value_attrs,
+            grid=(bm * N_BLOCKS, SPLIT_K, 1), block=(BLOCK_THREADS, 1, 1), stream=stream
         )
 
     return launch_hgemm_ft_kernel
@@ -1272,6 +1256,36 @@ def compile_hgemm_ht_kernel(
         ldmatrix_b_n_idx = w_tid % WMMA_N
         ldmatrix_b_k_vec_idx = w_tid // WMMA_N * WMMA_B_FRAG_VALUES
         c_frags = [acc_init] * C_QUADS_LEN
+        stmatrix_c_n_idx = w_tid % WMMA_N
+        if const_expr(HAS_BIAS and not IS_SPLIT_K):
+            bias_frags = [acc_init] * (2 * WARP_N_STEPS)
+            for n_part in range_constexpr(2):
+                for ni in range_constexpr(WARP_N_STEPS):
+                    warp_atom_n_idx = warp_n_idx + ni * WARP_ATOM_N
+                    lds_n_idx = fx.Index(
+                        n_part * HALF_BLOCK_N + warp_atom_n_idx + stmatrix_c_n_idx
+                    )
+                    bias_vec_base = (lds_n_idx // LDG_VEC_SIZE) * LDG_VEC_SIZE
+                    bias_vec_lane = lds_n_idx % LDG_VEC_SIZE
+                    bias_vec = BIAS_.vec_load((n_offset + bias_vec_base,), LDG_VEC_SIZE)
+                    bias_val = vector.extract(
+                        bias_vec,
+                        static_position=[],
+                        dynamic_position=[bias_vec_lane],
+                    ).extf(T.f32)
+                    bias_frags[n_part * WARP_N_STEPS + ni] = vector.broadcast(
+                        T.vec(WMMA_C_FRAG_VALUES, T.f32), bias_val
+                    )
+            for m_part in range_constexpr(2):
+                for n_part in range_constexpr(2):
+                    for mi in range_constexpr(WARP_M_STEPS):
+                        for ni in range_constexpr(WARP_N_STEPS):
+                            c_idx = (
+                                (m_part * 2 + n_part) * C_FRAGS_LEN
+                                + mi * WARP_N_STEPS
+                                + ni
+                            )
+                            c_frags[c_idx] = bias_frags[n_part * WARP_N_STEPS + ni]
 
         swizzle_cache_a = [0] * LDG_REG_A_COUNT_AS
         for i in range_constexpr(LDG_REG_A_COUNT_AS):
@@ -1667,7 +1681,6 @@ def compile_hgemm_ht_kernel(
         c_frags = compute_double_tile(k_offset, c_frags, False)
 
         stmatrix_c_m_vec_idx = w_tid // WMMA_N * WMMA_C_FRAG_VALUES
-        stmatrix_c_n_idx = w_tid % WMMA_N
         gpu.barrier()
         for m_part in range_constexpr(2):
             for n_part in range_constexpr(2):
@@ -1751,11 +1764,6 @@ def compile_hgemm_ht_kernel(
                 cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
                 with ir.InsertionPoint(cond_boundary_if.then_block):
                     vec = cs_.vec_load((m_local_idx, n_local_idx), LDG_VEC_SIZE)
-                    if const_expr(HAS_BIAS):
-                        bias_vec = BIAS_.vec_load(
-                            (n_offset + n_local_idx,), LDG_VEC_SIZE
-                        )
-                        vec = vec + bias_vec
                     C_.vec_store(
                         (m_global_idx, n_offset + n_local_idx), vec, LDG_VEC_SIZE
                     )
@@ -1782,13 +1790,7 @@ def compile_hgemm_ht_kernel(
         bn = n // BLOCK_N
         hgemm_ht_kernel._func.__name__ = KERNEL_NAME
         hgemm_ht_kernel(C, A, B, BIAS, m, semaphore, signal).launch(
-            grid=(bm * bn, SPLIT_K, 1),
-            block=(BLOCK_THREADS, 1, 1),
-            stream=stream,
-            value_attrs={
-                "rocdl.waves_per_eu": 2,
-                "rocdl.flat_work_group_size": f"{BLOCK_THREADS},{BLOCK_THREADS}",
-            },
+            grid=(bm * bn, SPLIT_K, 1), block=(BLOCK_THREADS, 1, 1), stream=stream
         )
 
     return launch_hgemm_ht_kernel
@@ -1810,6 +1812,7 @@ def compile_hgemm_kernel(
     HAS_BIAS: bool = False,
     USE_HT: bool = False,
 ):
+    assert n % 8 == 0
     if USE_HT:
         assert STAGES == 2
         assert BLOCK_K_WARPS == 1
