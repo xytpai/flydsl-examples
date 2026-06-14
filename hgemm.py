@@ -355,14 +355,7 @@ def compile_hgemm_ft_kernel(
             for jj in range_constexpr(WARP_N_STEPS):
                 warp_atom_n_idx = warp_n_idx + jj * WARP_ATOM_N
                 lds_n_idx = fx.Index(warp_atom_n_idx + stmatrix_c_n_idx)
-                bias_vec_base = (lds_n_idx // LDG_VEC_SIZE) * LDG_VEC_SIZE
-                bias_vec_lane = lds_n_idx % LDG_VEC_SIZE
-                bias_vec = BIAS_.vec_load((n_offset + bias_vec_base,), LDG_VEC_SIZE)
-                bias_val = vector.extract(
-                    bias_vec,
-                    static_position=[],
-                    dynamic_position=[bias_vec_lane],
-                ).extf(T.f32)
+                bias_val = BIAS_[n_offset + lds_n_idx].extf(T.f32)
                 if const_expr(IS_SLICE_K):
                     is_first_k_slice = arith.cmpi(
                         arith.CmpIPredicate.eq, fx.Index(wid_k), fx.Index(0)
@@ -1265,14 +1258,7 @@ def compile_hgemm_ht_kernel(
                     lds_n_idx = fx.Index(
                         n_part * HALF_BLOCK_N + warp_atom_n_idx + stmatrix_c_n_idx
                     )
-                    bias_vec_base = (lds_n_idx // LDG_VEC_SIZE) * LDG_VEC_SIZE
-                    bias_vec_lane = lds_n_idx % LDG_VEC_SIZE
-                    bias_vec = BIAS_.vec_load((n_offset + bias_vec_base,), LDG_VEC_SIZE)
-                    bias_val = vector.extract(
-                        bias_vec,
-                        static_position=[],
-                        dynamic_position=[bias_vec_lane],
-                    ).extf(T.f32)
+                    bias_val = BIAS_[n_offset + lds_n_idx].extf(T.f32)
                     bias_frags[n_part * WARP_N_STEPS + ni] = vector.broadcast(
                         T.vec(WMMA_C_FRAG_VALUES, T.f32), bias_val
                     )
