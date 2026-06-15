@@ -1097,6 +1097,7 @@ def compile_hgemm_ht_kernel(
     TILE_M: int = 128,
     TILE_N: int = 128,
     TILE_K: int = 64,
+    STAGES: int = 2,
     SPLIT_K: int = 1,
     BLOCK_M_WARPS: int = 2,
     BLOCK_N_WARPS: int = 2,
@@ -1107,6 +1108,7 @@ def compile_hgemm_ht_kernel(
     assert (k % SPLIT_K == 0) and (k // SPLIT_K >= 1)
     ks = k // SPLIT_K
     assert ks % (2 * TILE_K) == 0 and ks >= 2 * TILE_K
+    assert STAGES >= 2 and STAGES % 2 == 0
     assert BLOCK_M_WARPS * BLOCK_N_WARPS <= 16
 
     GPU_ARCH = get_rocm_arch()
@@ -1135,6 +1137,11 @@ def compile_hgemm_ht_kernel(
     HALF_BLOCK_M = BLOCK_M // 2
     HALF_BLOCK_N = BLOCK_N // 2
     BLOCK_K_LOOPS = ks // BLOCK_K
+    DOUBLE_K_LOOPS = BLOCK_K_LOOPS // 2
+    HT_STAGES = STAGES
+    DOUBLE_STAGES = STAGES // 2
+    assert DOUBLE_K_LOOPS >= DOUBLE_STAGES
+    assert DOUBLE_K_LOOPS % DOUBLE_STAGES == 0
     assert BLOCK_K % WARP_ATOM_K == 0
     WARP_K_STEPS = BLOCK_K // WARP_ATOM_K
     WARP_M_STEPS = HALF_BLOCK_M // BLOCK_M_WARPS // WARP_ATOM_M
@@ -1173,21 +1180,23 @@ def compile_hgemm_ht_kernel(
 
     allocator = SmemAllocator(None, arch=GPU_ARCH, global_sym_name="smem")
     smem_a_offset = allocator._align(allocator.ptr, 16)
-    AS_BYTES = 2 * 2 * HALF_BLOCK_M * BLOCK_K * DTYPE_BYTES
+    AS_BYTES = HT_STAGES * 2 * HALF_BLOCK_M * BLOCK_K * DTYPE_BYTES
     allocator.ptr = smem_a_offset + AS_BYTES
     SMEM_USE = AS_BYTES
     smem_b_offset = allocator._align(allocator.ptr, 16)
-    BS_BYTES = 2 * 2 * HALF_BLOCK_N * BLOCK_K * DTYPE_BYTES
+    BS_BYTES = HT_STAGES * 2 * HALF_BLOCK_N * BLOCK_K * DTYPE_BYTES
     allocator.ptr = smem_b_offset + BS_BYTES
     SMEM_USE += BS_BYTES
     CS_BYTES = BLOCK_M * BLOCK_N * DTYPE_BYTES
     SMEM_USE_ = max(SMEM_USE, CS_BYTES)
     allocator.ptr += SMEM_USE_ - SMEM_USE
-    assert SMEM_USE <= SMEM_CAPACITY_MAP[GPU_ARCH]
+    assert SMEM_USE_ <= SMEM_CAPACITY_MAP[GPU_ARCH]
+
+    # TODO:
     assert (2 * LDG_REG_B_COUNT_AS + 2 * LDG_REG_A_COUNT_AS) < 63
 
     KERNEL_NAME = (
-        f"hgemm_ht_{dtype}_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}"
+        f"hgemm_ht_{dtype}_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}x{HT_STAGES}"
         f"_SPK{SPLIT_K}"
         f"_W{BLOCK_M_WARPS}x{BLOCK_N_WARPS}"
     )
@@ -1220,16 +1229,22 @@ def compile_hgemm_ht_kernel(
 
         base_ptr = allocator.get_base()
         smem_a_ptr = SmemPtr(
-            base_ptr, smem_a_offset, dtype_, shape=(2 * 2 * HALF_BLOCK_M * BLOCK_K,)
+            base_ptr,
+            smem_a_offset,
+            dtype_,
+            shape=(HT_STAGES * 2 * HALF_BLOCK_M * BLOCK_K,),
         )
         smem_b_ptr = SmemPtr(
-            base_ptr, smem_b_offset, dtype_, shape=(2 * 2 * HALF_BLOCK_N * BLOCK_K,)
+            base_ptr,
+            smem_b_offset,
+            dtype_,
+            shape=(HT_STAGES * 2 * HALF_BLOCK_N * BLOCK_K,),
         )
         smem_c_ptr = SmemPtr(
             base_ptr, smem_a_offset, dtype_, shape=(BLOCK_M * BLOCK_N,)
         )
-        as_ = STensor(smem_a_ptr, dtype_, shape=(2, 2, HALF_BLOCK_M, BLOCK_K))
-        bs_ = STensor(smem_b_ptr, dtype_, shape=(2, 2, HALF_BLOCK_N, BLOCK_K))
+        as_ = STensor(smem_a_ptr, dtype_, shape=(HT_STAGES, 2, HALF_BLOCK_M, BLOCK_K))
+        bs_ = STensor(smem_b_ptr, dtype_, shape=(HT_STAGES, 2, HALF_BLOCK_N, BLOCK_K))
         cs_ = STensor(smem_c_ptr, dtype_, shape=(BLOCK_M, BLOCK_N))
 
         tid = fx.thread_idx.x
@@ -1451,26 +1466,24 @@ def compile_hgemm_ht_kernel(
 
         warp_offset = get_dma_copy_warp_offset()
 
-        def get_smem_warp_ptr(tensor):
-            lds_base = memref.extract_aligned_pointer_as_index(tensor.memptr)
+        def get_smem_warp_ptr(tensor, lds_offset):
+            lds_base = (
+                memref.extract_aligned_pointer_as_index(tensor.memptr) + lds_offset
+            )
             lds_ptr_base = buffer_ops.create_llvm_ptr(
                 arith.index_cast(T.i64, lds_base), address_space=3
             )
             return buffer_ops.get_element_ptr(lds_ptr_base, warp_offset)
 
-        as_warp_ptr = get_smem_warp_ptr(as_)
-        bs_warp_ptr = get_smem_warp_ptr(bs_)
-
-        def get_lds_ptr(base_ptr, static_bytes_offset, lds_ptr=None):
+        def get_lds_ptr(tensor, indices, lds_ptr=None):
             if const_expr(lds_ptr is None):
-                return buffer_ops.get_element_ptr(
-                    base_ptr, static_byte_offset=static_bytes_offset
-                )
+                lds_offset = tensor.linear_offset(indices) * DTYPE_BYTES
+                return get_smem_warp_ptr(tensor, lds_offset)
             return buffer_ops.get_element_ptr(
                 lds_ptr, static_byte_offset=BLOCK_THREADS * DMA_BYTES
             )
 
-        def ldg_sts_a_async_one(m_part, k_buf, k_offset, ii, lds_ptr=None):
+        def ldg_sts_a_async_one(m_part, k_stage, k_offset, ii, lds_ptr=None):
             global_tid = BLOCK_THREADS * ii + tid
             m_local_idx = global_tid // LDG_X_THREADS_AS
             row_idx = m_offset + fx.Index(m_part * HALF_BLOCK_M + m_local_idx)
@@ -1480,47 +1493,39 @@ def compile_hgemm_ht_kernel(
                 fx.Index(0),
             )
             global_offset = (
-                safe_row_idx * k
-                + fx.Index(k_offset + k_buf * BLOCK_K)
-                + fx.Index(swizzle_cache_a[ii])
+                safe_row_idx * k + fx.Index(k_offset) + fx.Index(swizzle_cache_a[ii])
             ) * DTYPE_BYTES
             global_offset = arith.index_cast(T.i32, global_offset)
-            static_bytes_offset = (
-                (k_buf * 2 + m_part) * HALF_BLOCK_M * BLOCK_K * DTYPE_BYTES
-            )
-            lds_ptr = get_lds_ptr(as_warp_ptr, static_bytes_offset, lds_ptr)
+            lds_ptr = get_lds_ptr(as_, (fx.Index(k_stage), m_part, 0, 0), lds_ptr)
             buffer_load_lds_inline(A_.rsrc, lds_ptr, global_offset)
             return lds_ptr
 
-        def ldg_sts_b_async_one(n_part, k_buf, k_offset, ii, lds_ptr=None):
+        def ldg_sts_b_async_one(n_part, k_stage, k_offset, ii, lds_ptr=None):
             global_offset = (
                 (n_offset + fx.Index(n_part * HALF_BLOCK_N)) * k
-                + fx.Index(k_offset + k_buf * BLOCK_K)
+                + fx.Index(k_offset)
                 + fx.Index(swizzle_cache_b[ii])
             ) * DTYPE_BYTES
             global_offset = arith.index_cast(T.i32, global_offset)
-            static_bytes_offset = (
-                (k_buf * 2 + n_part) * HALF_BLOCK_N * BLOCK_K * DTYPE_BYTES
-            )
-            lds_ptr = get_lds_ptr(bs_warp_ptr, static_bytes_offset, lds_ptr)
+            lds_ptr = get_lds_ptr(bs_, (fx.Index(k_stage), n_part, 0, 0), lds_ptr)
             buffer_load_lds_inline(B_.rsrc, lds_ptr, global_offset)
             return lds_ptr
 
-        def ldg_sts_a_async(m_part, k_buf, k_offset):
+        def ldg_sts_a_async(m_part, k_stage, k_offset):
             lds_ptr = None
             for i in range_constexpr(LDG_REG_A_COUNT_AS):
                 lds_ptr = ldg_sts_a_async_one(
-                    m_part, k_buf, k_offset, i, lds_ptr if i > 0 else None
+                    m_part, k_stage, k_offset, i, lds_ptr if i > 0 else None
                 )
 
-        def ldg_sts_b_async(n_part, k_buf, k_offset):
+        def ldg_sts_b_async(n_part, k_stage, k_offset):
             lds_ptr = None
             for i in range_constexpr(LDG_REG_B_COUNT_AS):
                 lds_ptr = ldg_sts_b_async_one(
-                    n_part, k_buf, k_offset, i, lds_ptr if i > 0 else None
+                    n_part, k_stage, k_offset, i, lds_ptr if i > 0 else None
                 )
 
-        def ldmatrix_a(m_part, k_buf):
+        def ldmatrix_a(m_part, k_stage):
             a_frags = [0] * A_FRAGS_LEN
             for mi in range_constexpr(WARP_M_STEPS):
                 warp_atom_m_idx = warp_m_idx + mi * WARP_ATOM_M
@@ -1535,7 +1540,7 @@ def compile_hgemm_ht_kernel(
                     )
                     a_frags[ki * WARP_M_STEPS + mi] = as_.vec_load(
                         (
-                            fx.Index(k_buf),
+                            fx.Index(k_stage),
                             m_part,
                             row,
                             col_in_bytes // DTYPE_BYTES,
@@ -1544,7 +1549,7 @@ def compile_hgemm_ht_kernel(
                     )
             return a_frags
 
-        def ldmatrix_b(n_part, k_buf):
+        def ldmatrix_b(n_part, k_stage):
             b_frags = [0] * B_FRAGS_LEN
             for ni in range_constexpr(WARP_N_STEPS):
                 warp_atom_n_idx = warp_n_idx + ni * WARP_ATOM_N
@@ -1559,7 +1564,7 @@ def compile_hgemm_ht_kernel(
                     )
                     b_frags[ki * WARP_N_STEPS + ni] = bs_.vec_load(
                         (
-                            fx.Index(k_buf),
+                            fx.Index(k_stage),
                             n_part,
                             row,
                             col_in_bytes // DTYPE_BYTES,
@@ -1592,21 +1597,12 @@ def compile_hgemm_ht_kernel(
         if const_expr(IS_SPLIT_K):
             zero_c()
 
-        ldg_sts_b_async(0, 0, ks_begin)
-        ldg_sts_a_async(0, 0, ks_begin)
-        ldg_sts_b_async(1, 0, ks_begin)
-        ldg_sts_a_async(1, 0, ks_begin)
-        ldg_sts_b_async(0, 1, ks_begin)
-        ldg_sts_a_async(0, 1, ks_begin)
-        ldg_sts_b_async(1, 1, ks_begin)
-        __barrier(2 * LDG_REG_B_COUNT_AS + 2 * LDG_REG_A_COUNT_AS)
-
         def compute_double_tile(k_offset, c_frags_in, do_prefetch):
             next_k_offset = k_offset + fx.Int32(2 * BLOCK_K)
 
             b0_frags = ldmatrix_b(0, 0)
             a0_frags = ldmatrix_a(0, 0)
-            ldg_sts_a_async(1, 1, k_offset)
+            ldg_sts_a_async(1, 1, k_offset + fx.Int32(BLOCK_K))
             c_frags_out = consume(0, 0, a0_frags, b0_frags, c_frags_in)
 
             b1_frags = ldmatrix_b(1, 0)
@@ -1636,21 +1632,29 @@ def compile_hgemm_ht_kernel(
 
             b1_frags = ldmatrix_b(1, 1)
             if const_expr(do_prefetch):
-                ldg_sts_b_async(0, 1, next_k_offset)
+                ldg_sts_b_async(0, 1, next_k_offset + fx.Int32(BLOCK_K))
             c_frags_out = consume(0, 1, a0_frags, b1_frags, c_frags_out)
 
             a1_frags = ldmatrix_a(1, 1)
             if const_expr(do_prefetch):
                 hip_s_barrier()
-                ldg_sts_a_async(0, 1, next_k_offset)
+                ldg_sts_a_async(0, 1, next_k_offset + fx.Int32(BLOCK_K))
             c_frags_out = consume(1, 0, a1_frags, b0_frags, c_frags_out)
 
             if const_expr(do_prefetch):
-                ldg_sts_b_async(1, 1, next_k_offset)
+                ldg_sts_b_async(1, 1, next_k_offset + fx.Int32(BLOCK_K))
                 __barrier(2 * LDG_REG_B_COUNT_AS + 2 * LDG_REG_A_COUNT_AS)
             c_frags_out = consume(1, 1, a1_frags, b1_frags, c_frags_out)
             return c_frags_out
 
+        ldg_sts_b_async(0, 0, ks_begin)
+        ldg_sts_a_async(0, 0, ks_begin)
+        ldg_sts_b_async(1, 0, ks_begin)
+        ldg_sts_a_async(1, 0, ks_begin)
+        ldg_sts_b_async(0, 1, ks_begin + fx.Int32(BLOCK_K))
+        ldg_sts_a_async(0, 1, ks_begin + fx.Int32(BLOCK_K))
+        ldg_sts_b_async(1, 1, ks_begin + fx.Int32(BLOCK_K))
+        __barrier(2 * LDG_REG_B_COUNT_AS + 2 * LDG_REG_A_COUNT_AS)
         if const_expr(BLOCK_K_LOOPS > 2):
             init_state = [ks_begin] + c_frags
             for _, state in range(0, BLOCK_K_LOOPS - 2, 2, init=init_state):
@@ -1662,7 +1666,6 @@ def compile_hgemm_ht_kernel(
             c_frags = results[1:]
         else:
             k_offset = ks_begin
-
         __barrier(0)
         c_frags = compute_double_tile(k_offset, c_frags, False)
 
