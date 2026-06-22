@@ -1570,9 +1570,9 @@ def compile_hgemm_ht_kernel(
 
         def consume(m_part, n_part, a_frags, b_frags, c_frags_in):
             c_frags_new = [cx for cx in c_frags_in]
-            rocdl.sched_barrier(0)
-            rocdl.s_setprio(1)
-            rocdl.sched_barrier(0)
+            # rocdl.sched_barrier(0)
+            # rocdl.s_setprio(1)
+            # rocdl.sched_barrier(0)
             for mi in range_constexpr(WARP_M_STEPS):
                 for ni in range_constexpr(WARP_N_STEPS):
                     for ki in range_constexpr(WARP_K_STEPS):
@@ -1584,8 +1584,8 @@ def compile_hgemm_ht_kernel(
                             b_frags[ki * WARP_N_STEPS + ni],
                             c_frags_new[c_idx],
                         )
-            rocdl.sched_barrier(0)
-            rocdl.s_setprio(0)
+            # rocdl.sched_barrier(0)
+            # rocdl.s_setprio(0)
             rocdl.sched_barrier(0)
             return c_frags_new
 
@@ -1663,7 +1663,7 @@ def compile_hgemm_ht_kernel(
         else:
             k_offset = ks_begin
 
-        __barrier(0)
+        __barrier(1 * LDG_REG_B_COUNT_AS + 1 * LDG_REG_A_COUNT_AS)
         c_frags = compute_double_tile(k_offset, c_frags, False)
 
         stmatrix_c_m_vec_idx = w_tid // WMMA_N * WMMA_C_FRAG_VALUES
