@@ -41,6 +41,7 @@ fm_fast = arith.FastMathFlags.fast
 
 
 SPLIT_K_SEMAPHORE_MAX_LEN = 256
+ROTARY_INPUTS_TARGET_BYTES = 8 * 1024**3
 
 
 @dataclass
@@ -2036,7 +2037,17 @@ def func(a, b, bias, c):
     hgemm_splitk_(c, a, b, bias=bias)
 
 
-def benchmark(args, func, ref_func, warmup=100, niters=200, sole_inputs=False):
+def tensor_nbytes(tensors):
+    return sum(t.numel() * t.element_size() for t in tensors)
+
+
+def get_rotary_inputs(sample_inputs, sample_outputs):
+    slot_bytes = 2 * (tensor_nbytes(sample_inputs) + tensor_nbytes(sample_outputs))
+    rotary_inputs = ROTARY_INPUTS_TARGET_BYTES // slot_bytes
+    return max(1, int(rotary_inputs))
+
+
+def benchmark(args, func, ref_func, warmup=500, niters=600):
     inputs = create_inputs(args)
     outputs = create_outputs(args)
     ref_outputs = create_outputs(args)
@@ -2053,44 +2064,45 @@ def benchmark(args, func, ref_func, warmup=100, niters=200, sole_inputs=False):
             print(f"maxdiff_out:{maxdiff_out}")
             # assert is_allclose == True
 
-    niters_ = niters if not sole_inputs else 1
-    inputs = [create_inputs(args) for i in range(niters_)]
-    ref_inputs = [create_inputs(args) for i in range(niters_)]
-    outputs = [create_outputs(args) for i in range(niters_)]
-    ref_outputs = [create_outputs(args) for i in range(niters_)]
+    rotary_inputs = get_rotary_inputs(inputs, outputs)
+    inputs = [create_inputs(args) for _ in range(rotary_inputs)]
+    ref_inputs = [create_inputs(args) for _ in range(rotary_inputs)]
+    outputs = [create_outputs(args) for _ in range(rotary_inputs)]
+    ref_outputs = [create_outputs(args) for _ in range(rotary_inputs)]
+    print(
+        f"rotary_inputs:{rotary_inputs}, target_bytes:{ROTARY_INPUTS_TARGET_BYTES}, "
+        f"warmup:{warmup}, niters:{niters}"
+    )
 
-    # get ref_func perf
-    print("===================== [REF] =====================")
-    for i in range(warmup):
-        idx = i % niters_
+    def run_ref(idx):
         ref_func(*(ref_inputs[idx] + ref_outputs[idx]))
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-    with profile(
-        activities=[ProfilerActivity.CUDA],
-    ) as prof:
-        for i in range(warmup, niters):
-            idx = i % niters_
-            ref_func(*(ref_inputs[idx] + ref_outputs[idx]))
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-    print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))
 
-    # get func perf
-    print("===================== [FLYDSL] =====================")
-    for i in range(warmup):
-        idx = i % niters_
+    def run_flydsl(idx):
         func(*(inputs[idx] + outputs[idx]))
+
+    print("===================== [INTERLEAVED] =====================")
+    for i in range(warmup):
+        idx = i % rotary_inputs
+        if i % 2 == 0:
+            run_ref(idx)
+            run_flydsl(idx)
+        else:
+            run_flydsl(idx)
+            run_ref(idx)
         torch.cuda.synchronize()
-        torch.cuda.empty_cache()
+
     with profile(
         activities=[ProfilerActivity.CUDA],
     ) as prof:
         for i in range(warmup, niters):
-            idx = i % niters_
-            func(*(inputs[idx] + outputs[idx]))
+            idx = i % rotary_inputs
+            if i % 2 == 0:
+                run_ref(idx)
+                run_flydsl(idx)
+            else:
+                run_flydsl(idx)
+                run_ref(idx)
             torch.cuda.synchronize()
-            torch.cuda.empty_cache()
     print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))
 
 
@@ -2108,6 +2120,7 @@ if __name__ == "__main__":
     benchmark(args, func, ref_func)
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=2048 --n=2048 --k=2048 --dtype=bf16
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=4096 --n=4096 --k=4096 --dtype=bf16
+    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=4096 --n=4096 --k=8192 --dtype=bf16
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8192 --n=8192 --k=8192 --dtype=bf16
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=32 --n=384 --k=7168 --dtype=bf16
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=32 --n=7168 --k=2048 --dtype=bf16
