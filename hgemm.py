@@ -1569,7 +1569,7 @@ def compile_hgemm_ht_kernel(
                     )
             return b_frags
 
-        def consume(m_part, n_part, a_frags, b_frags, c_frags_in):
+        def consume(m_part, n_part, a_frags, b_frags, c_frags_in, emit_sched_barrier):
             c_frags_new = [cx for cx in c_frags_in]
             # rocdl.sched_barrier(0)
             # rocdl.s_setprio(1)
@@ -1587,7 +1587,8 @@ def compile_hgemm_ht_kernel(
                         )
             # rocdl.sched_barrier(0)
             # rocdl.s_setprio(0)
-            rocdl.sched_barrier(0)
+            if const_expr(emit_sched_barrier):
+                rocdl.sched_barrier(0)
             return c_frags_new
 
         if const_expr(IS_SPLIT_K):
@@ -1608,24 +1609,24 @@ def compile_hgemm_ht_kernel(
             b0_frags = ldmatrix_b(0, 0)
             a0_frags = ldmatrix_a(0, 0)
             ldg_sts_a_async(1, 1, k_offset)
-            c_frags_out = consume(0, 0, a0_frags, b0_frags, c_frags_in)
+            c_frags_out = consume(0, 0, a0_frags, b0_frags, c_frags_in, True)
 
             b1_frags = ldmatrix_b(1, 0)
             if const_expr(do_prefetch):
                 __barrier(1 * LDG_REG_B_COUNT_AS + 2 * LDG_REG_A_COUNT_AS)
                 ldg_sts_b_async(0, 0, next_k_offset)
-            c_frags_out = consume(0, 1, a0_frags, b1_frags, c_frags_out)
+            c_frags_out = consume(0, 1, a0_frags, b1_frags, c_frags_out, False)
 
             a1_frags = ldmatrix_a(1, 0)
             if const_expr(do_prefetch):
                 ldg_sts_a_async(0, 0, next_k_offset)
-            c_frags_out = consume(1, 0, a1_frags, b0_frags, c_frags_out)
+            c_frags_out = consume(1, 0, a1_frags, b0_frags, c_frags_out, True)
 
             b0_frags = ldmatrix_b(0, 1)
             if const_expr(do_prefetch):
                 ldg_sts_b_async(1, 0, next_k_offset)
                 __barrier(2 * LDG_REG_B_COUNT_AS + 1 * LDG_REG_A_COUNT_AS)
-            c_frags_out = consume(1, 1, a1_frags, b1_frags, c_frags_out)
+            c_frags_out = consume(1, 1, a1_frags, b1_frags, c_frags_out, False)
 
             if const_expr(not do_prefetch):
                 __barrier(0)
@@ -1633,23 +1634,23 @@ def compile_hgemm_ht_kernel(
             a0_frags = ldmatrix_a(0, 1)
             if const_expr(do_prefetch):
                 ldg_sts_a_async(1, 0, next_k_offset)
-            c_frags_out = consume(0, 0, a0_frags, b0_frags, c_frags_out)
+            c_frags_out = consume(0, 0, a0_frags, b0_frags, c_frags_out, True)
 
             b1_frags = ldmatrix_b(1, 1)
             if const_expr(do_prefetch):
                 ldg_sts_b_async(0, 1, next_k_offset)
-            c_frags_out = consume(0, 1, a0_frags, b1_frags, c_frags_out)
+            c_frags_out = consume(0, 1, a0_frags, b1_frags, c_frags_out, False)
 
             a1_frags = ldmatrix_a(1, 1)
             if const_expr(do_prefetch):
                 hip_s_barrier()
                 ldg_sts_a_async(0, 1, next_k_offset)
-            c_frags_out = consume(1, 0, a1_frags, b0_frags, c_frags_out)
+            c_frags_out = consume(1, 0, a1_frags, b0_frags, c_frags_out, True)
 
             if const_expr(do_prefetch):
                 ldg_sts_b_async(1, 1, next_k_offset)
                 __barrier(2 * LDG_REG_B_COUNT_AS + 2 * LDG_REG_A_COUNT_AS)
-            c_frags_out = consume(1, 1, a1_frags, b1_frags, c_frags_out)
+            c_frags_out = consume(1, 1, a1_frags, b1_frags, c_frags_out, False)
             return c_frags_out
 
         if const_expr(BLOCK_K_LOOPS > 2):
