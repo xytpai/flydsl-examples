@@ -1156,16 +1156,18 @@ def compile_hgemm_ht_kernel(
     LDG_REG_B_COUNT_AS = HALF_BLOCK_N * BLOCK_K // BLOCK_THREADS // LDG_ASYNC_VEC_SIZE
     LDG_REG_C_COUNT = BLOCK_M * BLOCK_N // BLOCK_THREADS // LDG_VEC_SIZE
     LDG_C_X_THREADS = BLOCK_N // LDG_VEC_SIZE
+    LDG_C_QUAD_X_THREADS = HALF_BLOCK_N // LDG_VEC_SIZE
     assert LDG_REG_A_COUNT >= 1 and LDG_REG_B_COUNT >= 1
     assert LDG_REG_A_COUNT_AS >= 1 and LDG_REG_B_COUNT_AS >= 1
     assert LDG_REG_C_COUNT >= 1
     assert LDG_C_X_THREADS >= 1
+    assert LDG_C_QUAD_X_THREADS >= 1
     assert (HALF_BLOCK_M * BLOCK_K) % (BLOCK_THREADS * LDG_VEC_SIZE) == 0
     assert (HALF_BLOCK_N * BLOCK_K) % (BLOCK_THREADS * LDG_VEC_SIZE) == 0
     assert (HALF_BLOCK_M * BLOCK_K) % (BLOCK_THREADS * LDG_ASYNC_VEC_SIZE) == 0
     assert (HALF_BLOCK_N * BLOCK_K) % (BLOCK_THREADS * LDG_ASYNC_VEC_SIZE) == 0
     assert (BLOCK_M * BLOCK_N) % (BLOCK_THREADS * LDG_VEC_SIZE) == 0
-    assert BLOCK_N % LDG_VEC_SIZE == 0
+    assert HALF_BLOCK_N % LDG_VEC_SIZE == 0
 
     A_FRAGS_LEN = WARP_K_STEPS * WARP_M_STEPS
     B_FRAGS_LEN = WARP_K_STEPS * WARP_N_STEPS
@@ -1712,36 +1714,67 @@ def compile_hgemm_ht_kernel(
         c_frags = compute_double_tile(k_offset, c_frags, False)
 
         stmatrix_c_m_vec_idx = w_tid // WMMA_N * WMMA_C_FRAG_VALUES
-        gpu.barrier()
-        for m_part in range_constexpr(2):
-            for n_part in range_constexpr(2):
-                for mi in range_constexpr(WARP_M_STEPS):
-                    warp_atom_m_idx = warp_m_idx + mi * WARP_ATOM_M
-                    for ni in range_constexpr(WARP_N_STEPS):
-                        warp_atom_n_idx = warp_n_idx + ni * WARP_ATOM_N
-                        c_idx = (
-                            (m_part * 2 + n_part) * C_FRAGS_LEN + mi * WARP_N_STEPS + ni
-                        )
-                        for kk in range_constexpr(WMMA_C_FRAG_VALUES):
-                            lds_m_idx = fx.Index(
-                                m_part * HALF_BLOCK_M
-                                + warp_atom_m_idx
-                                + stmatrix_c_m_vec_idx
-                                + kk
-                            )
-                            lds_n_idx = fx.Index(
-                                n_part * HALF_BLOCK_N
-                                + warp_atom_n_idx
-                                + stmatrix_c_n_idx
-                            )
-                            val = vector.extract(
-                                c_frags[c_idx],
-                                static_position=[kk],
-                                dynamic_position=[],
-                            )
-                            cs_[lds_m_idx, lds_n_idx] = val.truncf(dtype_)
+
+        def write_c_mi_to_lds(m_part, n_part, mi):
+            warp_atom_m_idx = warp_m_idx + mi * WARP_ATOM_M
+            for ni in range_constexpr(WARP_N_STEPS):
+                warp_atom_n_idx = warp_n_idx + ni * WARP_ATOM_N
+                c_idx = (m_part * 2 + n_part) * C_FRAGS_LEN + mi * WARP_N_STEPS + ni
+                for kk in range_constexpr(WMMA_C_FRAG_VALUES):
+                    lds_m_idx = fx.Index(
+                        m_part * HALF_BLOCK_M
+                        + warp_atom_m_idx
+                        + stmatrix_c_m_vec_idx
+                        + kk
+                    )
+                    lds_n_idx = fx.Index(
+                        n_part * HALF_BLOCK_N + warp_atom_n_idx + stmatrix_c_n_idx
+                    )
+                    val = vector.extract(
+                        c_frags[c_idx],
+                        static_position=[kk],
+                        dynamic_position=[],
+                    )
+                    cs_[lds_m_idx, lds_n_idx] = val.truncf(dtype_)
+
+        def store_c_mi(m_part, n_part, mi):
+            for i in range_constexpr(
+                BLOCK_M_WARPS
+                * WARP_ATOM_M
+                * HALF_BLOCK_N
+                // BLOCK_THREADS
+                // LDG_VEC_SIZE
+            ):
+                global_tid = BLOCK_THREADS * i + tid
+                m_band_idx = fx.Index(global_tid // LDG_C_QUAD_X_THREADS)
+                n_local_idx = fx.Index(global_tid % LDG_C_QUAD_X_THREADS * LDG_VEC_SIZE)
+                warp_m_band = m_band_idx // fx.Index(WARP_ATOM_M)
+                atom_m_idx = m_band_idx % fx.Index(WARP_ATOM_M)
+                m_tile_idx = (
+                    fx.Index(m_part * HALF_BLOCK_M)
+                    + warp_m_band * fx.Index(WARP_M)
+                    + fx.Index(mi * WARP_ATOM_M)
+                    + atom_m_idx
+                )
+                n_tile_idx = fx.Index(n_part * HALF_BLOCK_N) + n_local_idx
+                m_global_idx = m_offset + m_tile_idx
+                cond_boundary = arith.cmpi(
+                    arith.CmpIPredicate.ult, m_global_idx, fx.Index(m)
+                )
+                cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
+                with ir.InsertionPoint(cond_boundary_if.then_block):
+                    vec = cs_.vec_load((m_tile_idx, n_tile_idx), LDG_VEC_SIZE)
+                    C_.vec_store(
+                        (m_global_idx, n_offset + n_tile_idx), vec, LDG_VEC_SIZE
+                    )
+                    scf.YieldOp([])
 
         if const_expr(IS_SPLIT_K):
+            gpu.barrier()
+            for m_part in range_constexpr(2):
+                for n_part in range_constexpr(2):
+                    for mi in range_constexpr(WARP_M_STEPS):
+                        write_c_mi_to_lds(m_part, n_part, mi)
             split_k_barrier()
             for i in range_constexpr(LDG_REG_C_COUNT):
                 global_tid = BLOCK_THREADS * i + tid
@@ -1784,21 +1817,13 @@ def compile_hgemm_ht_kernel(
                     scf.YieldOp([])
         else:
             gpu.barrier()
-            for i in range_constexpr(LDG_REG_C_COUNT):
-                global_tid = BLOCK_THREADS * i + tid
-                m_local_idx = fx.Index(global_tid // LDG_C_X_THREADS)
-                n_local_idx = fx.Index(global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE)
-                m_global_idx = m_offset + m_local_idx
-                cond_boundary = arith.cmpi(
-                    arith.CmpIPredicate.ult, m_global_idx, fx.Index(m)
-                )
-                cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
-                with ir.InsertionPoint(cond_boundary_if.then_block):
-                    vec = cs_.vec_load((m_local_idx, n_local_idx), LDG_VEC_SIZE)
-                    C_.vec_store(
-                        (m_global_idx, n_offset + n_local_idx), vec, LDG_VEC_SIZE
-                    )
-                    scf.YieldOp([])
+            for m_part in range_constexpr(2):
+                for n_part in range_constexpr(2):
+                    for mi in range_constexpr(WARP_M_STEPS):
+                        write_c_mi_to_lds(m_part, n_part, mi)
+                        # gpu.barrier()
+                        hip_s_barrier()
+                        store_c_mi(m_part, n_part, mi)
         return
 
     @flyc.jit
