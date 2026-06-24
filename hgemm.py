@@ -1102,6 +1102,7 @@ def compile_hgemm_ht_kernel(
     BLOCK_M_WARPS: int = 2,
     BLOCK_N_WARPS: int = 2,
     HAS_BIAS: bool = False,
+    XCD_SWIZZLE: int = 0,
 ):
     assert n % TILE_N == 0
     IS_SPLIT_K = SPLIT_K > 1
@@ -1133,6 +1134,7 @@ def compile_hgemm_ht_kernel(
     BLOCK_M = TILE_M
     BLOCK_N = TILE_N
     BLOCK_K = TILE_K
+    N_BLOCKS = n // BLOCK_N
     HALF_BLOCK_M = BLOCK_M // 2
     HALF_BLOCK_N = BLOCK_N // 2
     BLOCK_K_LOOPS = ks // BLOCK_K
@@ -1194,6 +1196,8 @@ def compile_hgemm_ht_kernel(
     )
     if HAS_BIAS:
         KERNEL_NAME += "_BIAS"
+    if XCD_SWIZZLE > 0:
+        KERNEL_NAME += f"_XCD{XCD_SWIZZLE}"
 
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
     def hgemm_ht_kernel(
