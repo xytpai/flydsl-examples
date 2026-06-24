@@ -1156,16 +1156,18 @@ def compile_hgemm_ht_kernel(
     LDG_REG_B_COUNT_AS = HALF_BLOCK_N * BLOCK_K // BLOCK_THREADS // LDG_ASYNC_VEC_SIZE
     LDG_REG_C_COUNT = BLOCK_M * BLOCK_N // BLOCK_THREADS // LDG_VEC_SIZE
     LDG_C_X_THREADS = BLOCK_N // LDG_VEC_SIZE
+    LDG_C_QUAD_X_THREADS = HALF_BLOCK_N // LDG_VEC_SIZE
     assert LDG_REG_A_COUNT >= 1 and LDG_REG_B_COUNT >= 1
     assert LDG_REG_A_COUNT_AS >= 1 and LDG_REG_B_COUNT_AS >= 1
     assert LDG_REG_C_COUNT >= 1
     assert LDG_C_X_THREADS >= 1
+    assert LDG_C_QUAD_X_THREADS >= 1
     assert (HALF_BLOCK_M * BLOCK_K) % (BLOCK_THREADS * LDG_VEC_SIZE) == 0
     assert (HALF_BLOCK_N * BLOCK_K) % (BLOCK_THREADS * LDG_VEC_SIZE) == 0
     assert (HALF_BLOCK_M * BLOCK_K) % (BLOCK_THREADS * LDG_ASYNC_VEC_SIZE) == 0
     assert (HALF_BLOCK_N * BLOCK_K) % (BLOCK_THREADS * LDG_ASYNC_VEC_SIZE) == 0
     assert (BLOCK_M * BLOCK_N) % (BLOCK_THREADS * LDG_VEC_SIZE) == 0
-    assert BLOCK_N % LDG_VEC_SIZE == 0
+    assert HALF_BLOCK_N % LDG_VEC_SIZE == 0
 
     A_FRAGS_LEN = WARP_K_STEPS * WARP_M_STEPS
     B_FRAGS_LEN = WARP_K_STEPS * WARP_N_STEPS
@@ -1712,36 +1714,67 @@ def compile_hgemm_ht_kernel(
         c_frags = compute_double_tile(k_offset, c_frags, False)
 
         stmatrix_c_m_vec_idx = w_tid // WMMA_N * WMMA_C_FRAG_VALUES
-        gpu.barrier()
-        for m_part in range_constexpr(2):
-            for n_part in range_constexpr(2):
-                for mi in range_constexpr(WARP_M_STEPS):
-                    warp_atom_m_idx = warp_m_idx + mi * WARP_ATOM_M
-                    for ni in range_constexpr(WARP_N_STEPS):
-                        warp_atom_n_idx = warp_n_idx + ni * WARP_ATOM_N
-                        c_idx = (
-                            (m_part * 2 + n_part) * C_FRAGS_LEN + mi * WARP_N_STEPS + ni
-                        )
-                        for kk in range_constexpr(WMMA_C_FRAG_VALUES):
-                            lds_m_idx = fx.Index(
-                                m_part * HALF_BLOCK_M
-                                + warp_atom_m_idx
-                                + stmatrix_c_m_vec_idx
-                                + kk
-                            )
-                            lds_n_idx = fx.Index(
-                                n_part * HALF_BLOCK_N
-                                + warp_atom_n_idx
-                                + stmatrix_c_n_idx
-                            )
-                            val = vector.extract(
-                                c_frags[c_idx],
-                                static_position=[kk],
-                                dynamic_position=[],
-                            )
-                            cs_[lds_m_idx, lds_n_idx] = val.truncf(dtype_)
+
+        def write_c_mi_to_lds(m_part, n_part, mi):
+            warp_atom_m_idx = warp_m_idx + mi * WARP_ATOM_M
+            for ni in range_constexpr(WARP_N_STEPS):
+                warp_atom_n_idx = warp_n_idx + ni * WARP_ATOM_N
+                c_idx = (m_part * 2 + n_part) * C_FRAGS_LEN + mi * WARP_N_STEPS + ni
+                for kk in range_constexpr(WMMA_C_FRAG_VALUES):
+                    lds_m_idx = fx.Index(
+                        m_part * HALF_BLOCK_M
+                        + warp_atom_m_idx
+                        + stmatrix_c_m_vec_idx
+                        + kk
+                    )
+                    lds_n_idx = fx.Index(
+                        n_part * HALF_BLOCK_N + warp_atom_n_idx + stmatrix_c_n_idx
+                    )
+                    val = vector.extract(
+                        c_frags[c_idx],
+                        static_position=[kk],
+                        dynamic_position=[],
+                    )
+                    cs_[lds_m_idx, lds_n_idx] = val.truncf(dtype_)
+
+        def store_c_mi(m_part, n_part, mi):
+            for i in range_constexpr(
+                BLOCK_M_WARPS
+                * WARP_ATOM_M
+                * HALF_BLOCK_N
+                // BLOCK_THREADS
+                // LDG_VEC_SIZE
+            ):
+                global_tid = BLOCK_THREADS * i + tid
+                m_band_idx = fx.Index(global_tid // LDG_C_QUAD_X_THREADS)
+                n_local_idx = fx.Index(global_tid % LDG_C_QUAD_X_THREADS * LDG_VEC_SIZE)
+                warp_m_band = m_band_idx // fx.Index(WARP_ATOM_M)
+                atom_m_idx = m_band_idx % fx.Index(WARP_ATOM_M)
+                m_tile_idx = (
+                    fx.Index(m_part * HALF_BLOCK_M)
+                    + warp_m_band * fx.Index(WARP_M)
+                    + fx.Index(mi * WARP_ATOM_M)
+                    + atom_m_idx
+                )
+                n_tile_idx = fx.Index(n_part * HALF_BLOCK_N) + n_local_idx
+                m_global_idx = m_offset + m_tile_idx
+                cond_boundary = arith.cmpi(
+                    arith.CmpIPredicate.ult, m_global_idx, fx.Index(m)
+                )
+                cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
+                with ir.InsertionPoint(cond_boundary_if.then_block):
+                    vec = cs_.vec_load((m_tile_idx, n_tile_idx), LDG_VEC_SIZE)
+                    C_.vec_store(
+                        (m_global_idx, n_offset + n_tile_idx), vec, LDG_VEC_SIZE
+                    )
+                    scf.YieldOp([])
 
         if const_expr(IS_SPLIT_K):
+            gpu.barrier()
+            for m_part in range_constexpr(2):
+                for n_part in range_constexpr(2):
+                    for mi in range_constexpr(WARP_M_STEPS):
+                        write_c_mi_to_lds(m_part, n_part, mi)
             split_k_barrier()
             for i in range_constexpr(LDG_REG_C_COUNT):
                 global_tid = BLOCK_THREADS * i + tid
@@ -1784,21 +1817,13 @@ def compile_hgemm_ht_kernel(
                     scf.YieldOp([])
         else:
             gpu.barrier()
-            for i in range_constexpr(LDG_REG_C_COUNT):
-                global_tid = BLOCK_THREADS * i + tid
-                m_local_idx = fx.Index(global_tid // LDG_C_X_THREADS)
-                n_local_idx = fx.Index(global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE)
-                m_global_idx = m_offset + m_local_idx
-                cond_boundary = arith.cmpi(
-                    arith.CmpIPredicate.ult, m_global_idx, fx.Index(m)
-                )
-                cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
-                with ir.InsertionPoint(cond_boundary_if.then_block):
-                    vec = cs_.vec_load((m_local_idx, n_local_idx), LDG_VEC_SIZE)
-                    C_.vec_store(
-                        (m_global_idx, n_offset + n_local_idx), vec, LDG_VEC_SIZE
-                    )
-                    scf.YieldOp([])
+            for m_part in range_constexpr(2):
+                for n_part in range_constexpr(2):
+                    for mi in range_constexpr(WARP_M_STEPS):
+                        write_c_mi_to_lds(m_part, n_part, mi)
+                        # gpu.barrier()
+                        hip_s_barrier()
+                        store_c_mi(m_part, n_part, mi)
         return
 
     @flyc.jit
@@ -2084,7 +2109,17 @@ def func(a, b, bias, c):
     hgemm_splitk_(c, a, b, bias=bias)
 
 
-def benchmark(args, func, ref_func, warmup=100, niters=200, sole_inputs=False):
+def tensor_nbytes(tensors):
+    return sum(t.numel() * t.element_size() for t in tensors)
+
+
+def get_rotary_inputs(sample_inputs, sample_outputs):
+    slot_bytes = 2 * (tensor_nbytes(sample_inputs) + tensor_nbytes(sample_outputs))
+    rotary_inputs = ROTARY_INPUTS_TARGET_BYTES // slot_bytes
+    return max(1, int(rotary_inputs))
+
+
+def benchmark(args, func, ref_func, warmup=500, niters=600):
     inputs = create_inputs(args)
     outputs = create_outputs(args)
     ref_outputs = create_outputs(args)
@@ -2101,44 +2136,45 @@ def benchmark(args, func, ref_func, warmup=100, niters=200, sole_inputs=False):
             print(f"maxdiff_out:{maxdiff_out}")
             # assert is_allclose == True
 
-    niters_ = niters if not sole_inputs else 1
-    inputs = [create_inputs(args) for i in range(niters_)]
-    ref_inputs = [create_inputs(args) for i in range(niters_)]
-    outputs = [create_outputs(args) for i in range(niters_)]
-    ref_outputs = [create_outputs(args) for i in range(niters_)]
+    rotary_inputs = get_rotary_inputs(inputs, outputs)
+    inputs = [create_inputs(args) for _ in range(rotary_inputs)]
+    ref_inputs = [create_inputs(args) for _ in range(rotary_inputs)]
+    outputs = [create_outputs(args) for _ in range(rotary_inputs)]
+    ref_outputs = [create_outputs(args) for _ in range(rotary_inputs)]
+    print(
+        f"rotary_inputs:{rotary_inputs}, target_bytes:{ROTARY_INPUTS_TARGET_BYTES}, "
+        f"warmup:{warmup}, niters:{niters}"
+    )
 
-    # get ref_func perf
-    print("===================== [REF] =====================")
-    for i in range(warmup):
-        idx = i % niters_
+    def run_ref(idx):
         ref_func(*(ref_inputs[idx] + ref_outputs[idx]))
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-    with profile(
-        activities=[ProfilerActivity.CUDA],
-    ) as prof:
-        for i in range(warmup, niters):
-            idx = i % niters_
-            ref_func(*(ref_inputs[idx] + ref_outputs[idx]))
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-    print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))
 
-    # get func perf
-    print("===================== [FLYDSL] =====================")
-    for i in range(warmup):
-        idx = i % niters_
+    def run_flydsl(idx):
         func(*(inputs[idx] + outputs[idx]))
+
+    print("===================== [INTERLEAVED] =====================")
+    for i in range(warmup):
+        idx = i % rotary_inputs
+        if i % 2 == 0:
+            run_ref(idx)
+            run_flydsl(idx)
+        else:
+            run_flydsl(idx)
+            run_ref(idx)
         torch.cuda.synchronize()
-        torch.cuda.empty_cache()
+
     with profile(
         activities=[ProfilerActivity.CUDA],
     ) as prof:
         for i in range(warmup, niters):
-            idx = i % niters_
-            func(*(inputs[idx] + outputs[idx]))
+            idx = i % rotary_inputs
+            if i % 2 == 0:
+                run_ref(idx)
+                run_flydsl(idx)
+            else:
+                run_flydsl(idx)
+                run_ref(idx)
             torch.cuda.synchronize()
-            torch.cuda.empty_cache()
     print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))
 
 
@@ -2156,6 +2192,7 @@ if __name__ == "__main__":
     benchmark(args, func, ref_func)
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=2048 --n=2048 --k=2048 --dtype=bf16
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=4096 --n=4096 --k=4096 --dtype=bf16
+    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=4096 --n=4096 --k=8192 --dtype=bf16
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8192 --n=8192 --k=8192 --dtype=bf16
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=32 --n=384 --k=7168 --dtype=bf16
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=32 --n=7168 --k=2048 --dtype=bf16
