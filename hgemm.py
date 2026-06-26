@@ -1876,65 +1876,6 @@ def compile_hgemm_ht_kernel(
                     )
                     scf.YieldOp([])
 
-        def direct_store_c_mi(m_part, n_part, mi):
-            warp_atom_m_idx = warp_m_idx + mi * WARP_ATOM_M
-            for ni in range_constexpr(WARP_N_STEPS):
-                warp_atom_n_idx = warp_n_idx + ni * WARP_ATOM_N
-                c_idx = (m_part * 2 + n_part) * C_FRAGS_LEN + mi * WARP_N_STEPS + ni
-                col_global = n_offset + fx.Index(
-                    n_part * HALF_BLOCK_N + warp_atom_n_idx + stmatrix_c_n_idx
-                )
-                row_global_base = m_offset + fx.Index(
-                    m_part * HALF_BLOCK_M + warp_atom_m_idx + stmatrix_c_m_vec_idx
-                )
-                if const_expr(IS_FP8_PTPC):
-                    scale_b_common = SCALE_B_[col_global]
-                    bias_common = (
-                        BIAS_[col_global].extf(T.f32)
-                        if const_expr(HAS_BIAS)
-                        else fx.Float32(0.0)
-                    )
-                    full_scale_rows = arith.cmpi(
-                        arith.CmpIPredicate.ule,
-                        row_global_base + fx.Index(WMMA_C_FRAG_VALUES),
-                        fx.Index(m),
-                    )
-                    scale_a_vec_base = arith.select(
-                        full_scale_rows, row_global_base, fx.Index(0)
-                    )
-                    scale_a_vec = SCALE_A_.vec_load(
-                        (scale_a_vec_base,), WMMA_C_FRAG_VALUES
-                    )
-                for kk in range_constexpr(WMMA_C_FRAG_VALUES):
-                    row_global = row_global_base + fx.Index(kk)
-                    cond_boundary = arith.cmpi(
-                        arith.CmpIPredicate.ult, row_global, fx.Index(m)
-                    )
-                    cond_boundary_if = scf.IfOp(
-                        cond_boundary, results_=[], has_else=False
-                    )
-                    with ir.InsertionPoint(cond_boundary_if.then_block):
-                        val = vector.extract(
-                            c_frags[c_idx],
-                            static_position=[kk],
-                            dynamic_position=[],
-                        )
-                        if const_expr(IS_FP8_PTPC):
-                            scale_a_fast = vector.extract(
-                                scale_a_vec,
-                                static_position=[kk],
-                                dynamic_position=[],
-                            )
-                            scale_a_safe = SCALE_A_[row_global]
-                            scale_a = arith.select(
-                                full_scale_rows, scale_a_fast, scale_a_safe
-                            )
-                            val = val * scale_a * scale_b_common
-                            if const_expr(HAS_BIAS):
-                                val = val + bias_common
-                        C_[row_global, col_global] = val.truncf(out_dtype_)
-                        scf.YieldOp([])
-
         if const_expr(IS_SPLIT_K):
             gpu.barrier()
             for m_part in range_constexpr(2):
