@@ -5,15 +5,17 @@ import functools
 import itertools
 import numpy as np
 import torch.nn.functional as F
+import sys
 from torch.profiler import profile, ProfilerActivity
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Optional
 
 import flydsl
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr.typing import T
+from flydsl.expr.typing import T, Vector as Vec
 from flydsl.expr import (
     range_constexpr,
     const_expr,
@@ -35,6 +37,21 @@ from utils.tensor_shim import (
     STensor,
     _to_raw,
     _run_compiled,
+)
+
+_FLYDSL_KERNELS_ROOT = Path(__file__).resolve().parents[1] / "FlyDSL"
+if _FLYDSL_KERNELS_ROOT.exists():
+    sys.path.append(str(_FLYDSL_KERNELS_ROOT))
+
+from kernels.fp8_gemm_utils import (  # noqa: E402
+    G2SLoader,
+    Mfma16x16x128,
+    S2RLoader,
+    ceildiv,
+    compute_global_swizzle,
+    divmod,
+    make_fp8_buffer_tensor,
+    wait_barrier,
 )
 
 fm_fast = arith.FastMathFlags.fast
@@ -203,21 +220,31 @@ class WmmaFp8_m16n16k128:
     WMMA_B_FRAG_VALUES = 32
     WMMA_C_FRAG_VALUES = 4
 
+    def __init__(self, agpr: bool = False):
+        self.agpr = agpr
+
+    def _make_atom_call(self, a_frag, b_frag, c_frag):
+        atom = fx.make_mma_atom(fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, fx.Float8E4M3FN))
+        accum_type = Vec.make_type(4, fx.Float32)
+        return fly.mma_atom_call_ssa([accum_type], atom, a_frag, b_frag, c_frag)
+
     def __call__(self, a_frag, b_frag, c_frag):
-        return rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-            T.f32x4,
-            [
-                a_frag,
-                b_frag,
-                c_frag,
-                0,
-                0,
-                0,
-                0x7F7F7F7F,
-                0,
-                0x7F7F7F7F,
-            ],
-        )
+        if self.agpr:
+            neutral_scale = arith.constant(0x7F7F7F7F, type=T.i32)
+            return llvm.inline_asm(
+                T.f32x4,
+                [
+                    _to_raw(c_frag),
+                    _to_raw(a_frag),
+                    _to_raw(b_frag),
+                    _to_raw(neutral_scale),
+                    _to_raw(neutral_scale),
+                ],
+                "v_mfma_scale_f32_16x16x128_f8f6f4 $0, $2, $3, $0, $4, $5 op_sel_hi:[0,0,0]",
+                "=a,0,v,v,v,v",
+                has_side_effects=False,
+            )
+        return self._make_atom_call(a_frag, b_frag, c_frag)
 
 
 class OnlineScheduler:
@@ -1045,6 +1072,8 @@ def compile_hgemm_ht_kernel(
     BLOCK_N_WARPS: int = 2,
     HAS_BIAS: bool = False,
     XCD_SWIZZLE: int = 0,
+    ASSUME_FULL_M: bool = False,
+    USE_AGPR: bool = False,
 ):
     assert n % TILE_N == 0
     IS_SPLIT_K = SPLIT_K > 1
@@ -1060,7 +1089,9 @@ def compile_hgemm_ht_kernel(
             SPLIT_K == 1
         ), "fp8_ptpc hgemm_ht currently applies scales in epilogue and does not support split-k"
         assert k % 32 == 0
-    WMMA_IMPL = WmmaFp8_m16n16k128() if IS_FP8_PTPC else WmmaHalf_m16n16k32(dtype)
+    WMMA_IMPL = (
+        WmmaFp8_m16n16k128(agpr=USE_AGPR) if IS_FP8_PTPC else WmmaHalf_m16n16k32(dtype)
+    )
 
     WARP_SIZE = 64
     DTYPE_BYTES = 1 if IS_FP8_PTPC else 2
@@ -1122,7 +1153,6 @@ def compile_hgemm_ht_kernel(
     A_FRAGS_LEN = WARP_K_STEPS * WARP_M_STEPS
     B_FRAGS_LEN = WARP_K_STEPS * WARP_N_STEPS
     C_FRAGS_LEN = WARP_M_STEPS * WARP_N_STEPS
-    C_QUADS_LEN = 4 * C_FRAGS_LEN
     BLOCK_K_BYTES = BLOCK_K * DTYPE_BYTES
     k_blocks16 = BLOCK_K_BYTES // 16
 
@@ -1148,6 +1178,10 @@ def compile_hgemm_ht_kernel(
     )
     if HAS_BIAS:
         KERNEL_NAME += "_BIAS"
+    if ASSUME_FULL_M:
+        KERNEL_NAME += "_FM"
+    if USE_AGPR:
+        KERNEL_NAME += "_AGPR"
     if XCD_SWIZZLE > 0:
         KERNEL_NAME += f"_XCD{XCD_SWIZZLE}"
 
@@ -1266,7 +1300,7 @@ def compile_hgemm_ht_kernel(
         ldmatrix_a_k_vec_idx = w_tid // WMMA_M * WMMA_A_FRAG_VALUES
         ldmatrix_b_n_idx = w_tid % WMMA_N
         ldmatrix_b_k_vec_idx = w_tid // WMMA_N * WMMA_B_FRAG_VALUES
-        c_frags = [acc_init] * C_QUADS_LEN
+        c_frags = [acc_init] * (4 * C_FRAGS_LEN)
         stmatrix_c_n_idx = w_tid % WMMA_N
         stmatrix_c_m_vec_idx = w_tid // WMMA_N * WMMA_C_FRAG_VALUES
         if const_expr(HAS_BIAS and not IS_SPLIT_K and not IS_FP8_PTPC):
@@ -1286,12 +1320,11 @@ def compile_hgemm_ht_kernel(
                 for n_part in range_constexpr(2):
                     for mi in range_constexpr(WARP_M_STEPS):
                         for ni in range_constexpr(WARP_N_STEPS):
-                            c_idx = (
+                            c_frags[
                                 (m_part * 2 + n_part) * C_FRAGS_LEN
                                 + mi * WARP_N_STEPS
                                 + ni
-                            )
-                            c_frags[c_idx] = bias_frags[n_part * WARP_N_STEPS + ni]
+                            ] = bias_frags[n_part * WARP_N_STEPS + ni]
 
         swizzle_cache_a = [0] * LDG_REG_A_COUNT_AS
         for i in range_constexpr(LDG_REG_A_COUNT_AS):
@@ -1530,10 +1563,14 @@ def compile_hgemm_ht_kernel(
             global_tid = BLOCK_THREADS * ii + tid
             m_local_idx = global_tid // LDG_X_THREADS_AS
             row_idx = m_offset + fx.Index(m_part * HALF_BLOCK_M + m_local_idx)
-            safe_row_idx = arith.select(
-                arith.cmpi(arith.CmpIPredicate.ult, row_idx, fx.Index(m)),
-                row_idx,
-                fx.Index(0),
+            safe_row_idx = (
+                row_idx
+                if const_expr(ASSUME_FULL_M)
+                else arith.select(
+                    arith.cmpi(arith.CmpIPredicate.ult, row_idx, fx.Index(m)),
+                    row_idx,
+                    fx.Index(0),
+                )
             )
             global_offset = (
                 safe_row_idx * k
@@ -1675,7 +1712,7 @@ def compile_hgemm_ht_kernel(
             return b_frags
 
         def consume(m_part, n_part, a_frags, b_frags, c_frags_in, emit_sched_barrier):
-            c_frags_new = [cx for cx in c_frags_in]
+            c_frags_out = [cx for cx in c_frags_in]
             # rocdl.sched_barrier(0)
             # rocdl.s_setprio(1)
             # rocdl.sched_barrier(0)
@@ -1685,16 +1722,16 @@ def compile_hgemm_ht_kernel(
                         c_idx = (
                             (m_part * 2 + n_part) * C_FRAGS_LEN + mi * WARP_N_STEPS + ni
                         )
-                        c_frags_new[c_idx] = WMMA_IMPL(
+                        c_frags_out[c_idx] = WMMA_IMPL(
                             a_frags[ki * WARP_M_STEPS + mi],
                             b_frags[ki * WARP_N_STEPS + ni],
-                            c_frags_new[c_idx],
+                            c_frags_out[c_idx],
                         )
             # rocdl.sched_barrier(0)
             # rocdl.s_setprio(0)
             if const_expr(emit_sched_barrier):
                 rocdl.sched_barrier(0)
-            return c_frags_new
+            return c_frags_out
 
         if const_expr(IS_SPLIT_K):
             zero_c()
@@ -1763,8 +1800,8 @@ def compile_hgemm_ht_kernel(
             for _, state in range(0, BLOCK_K_LOOPS - 2, 2, init=init_state):
                 k_offset = state[0]
                 c_frags = state[1:]
-                c_frags_new = compute_double_tile(k_offset, c_frags, True)
-                results = yield [k_offset + fx.Int32(2 * BLOCK_K)] + c_frags_new
+                c_frags = compute_double_tile(k_offset, c_frags, True)
+                results = yield [k_offset + fx.Int32(2 * BLOCK_K)] + c_frags
             k_offset = results[0]
             c_frags = results[1:]
         else:
@@ -1773,11 +1810,15 @@ def compile_hgemm_ht_kernel(
         __barrier(1 * LDG_REG_B_COUNT_AS + 1 * LDG_REG_A_COUNT_AS)
         c_frags = compute_double_tile(k_offset, c_frags, False)
 
-        def write_c_mi_to_lds(m_part, n_part, mi):
+        def c_quad_for(m_part, n_part):
+            c_base = (m_part * 2 + n_part) * C_FRAGS_LEN
+            return c_frags[c_base : c_base + C_FRAGS_LEN]
+
+        def write_c_mi_to_lds(m_part, n_part, mi, c_quad):
             warp_atom_m_idx = warp_m_idx + mi * WARP_ATOM_M
             for ni in range_constexpr(WARP_N_STEPS):
                 warp_atom_n_idx = warp_n_idx + ni * WARP_ATOM_N
-                c_idx = (m_part * 2 + n_part) * C_FRAGS_LEN + mi * WARP_N_STEPS + ni
+                c_idx = mi * WARP_N_STEPS + ni
                 if const_expr(IS_FP8_PTPC):
                     lds_n_idx_common = fx.Index(
                         n_part * HALF_BLOCK_N + warp_atom_n_idx + stmatrix_c_n_idx
@@ -1793,15 +1834,23 @@ def compile_hgemm_ht_kernel(
                         m_part * HALF_BLOCK_M + warp_atom_m_idx + stmatrix_c_m_vec_idx
                     )
                     row_global_base = m_offset + lds_m_base
-                    full_scale_rows = arith.cmpi(
-                        arith.CmpIPredicate.ule,
-                        row_global_base + fx.Index(WMMA_C_FRAG_VALUES),
-                        fx.Index(m),
+                    full_scale_rows = (
+                        None
+                        if const_expr(ASSUME_FULL_M)
+                        else arith.cmpi(
+                            arith.CmpIPredicate.ule,
+                            row_global_base + fx.Index(WMMA_C_FRAG_VALUES),
+                            fx.Index(m),
+                        )
                     )
-                    scale_a_vec_base = arith.select(
-                        full_scale_rows,
-                        row_global_base,
-                        fx.Index(0),
+                    scale_a_vec_base = (
+                        row_global_base
+                        if const_expr(ASSUME_FULL_M)
+                        else arith.select(
+                            full_scale_rows,
+                            row_global_base,
+                            fx.Index(0),
+                        )
                     )
                     scale_a_vec = SCALE_A_.vec_load(
                         (scale_a_vec_base,), WMMA_C_FRAG_VALUES
@@ -1817,29 +1866,36 @@ def compile_hgemm_ht_kernel(
                         n_part * HALF_BLOCK_N + warp_atom_n_idx + stmatrix_c_n_idx
                     )
                     val = vector.extract(
-                        c_frags[c_idx],
+                        c_quad[c_idx],
                         static_position=[kk],
                         dynamic_position=[],
                     )
                     if const_expr(IS_FP8_PTPC):
-                        row_global = m_offset + lds_m_idx
-                        safe_row_global = arith.select(
-                            arith.cmpi(
-                                arith.CmpIPredicate.ult, row_global, fx.Index(m)
-                            ),
-                            row_global,
-                            fx.Index(0),
-                        )
                         scale_a_fast = vector.extract(
                             scale_a_vec,
                             static_position=[kk],
                             dynamic_position=[],
                         )
-                        scale_a_safe = SCALE_A_[safe_row_global]
-                        scale_a = arith.select(
-                            full_scale_rows, scale_a_fast, scale_a_safe
-                        )
-                        val = val * scale_a * scale_b_common
+                        if const_expr(ASSUME_FULL_M):
+                            val = val * (scale_a_fast * scale_b_common)
+                        else:
+                            row_global = m_offset + lds_m_idx
+                            scale_a = arith.select(
+                                full_scale_rows,
+                                scale_a_fast,
+                                SCALE_A_[
+                                    arith.select(
+                                        arith.cmpi(
+                                            arith.CmpIPredicate.ult,
+                                            row_global,
+                                            fx.Index(m),
+                                        ),
+                                        row_global,
+                                        fx.Index(0),
+                                    )
+                                ],
+                            )
+                            val = val * scale_a * scale_b_common
                         if const_expr(HAS_BIAS):
                             val = val + bias_common
                     cs_[lds_m_idx, lds_n_idx] = val.truncf(out_dtype_)
@@ -1865,23 +1921,33 @@ def compile_hgemm_ht_kernel(
                 )
                 n_tile_idx = fx.Index(n_part * HALF_BLOCK_N) + n_local_idx
                 m_global_idx = m_offset + m_tile_idx
-                cond_boundary = arith.cmpi(
-                    arith.CmpIPredicate.ult, m_global_idx, fx.Index(m)
-                )
-                cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
-                with ir.InsertionPoint(cond_boundary_if.then_block):
+                if const_expr(ASSUME_FULL_M):
                     vec = cs_.vec_load((m_tile_idx, n_tile_idx), STG_VEC_SIZE)
                     C_.vec_store(
                         (m_global_idx, n_offset + n_tile_idx), vec, STG_VEC_SIZE
                     )
-                    scf.YieldOp([])
+                else:
+                    cond_boundary = arith.cmpi(
+                        arith.CmpIPredicate.ult, m_global_idx, fx.Index(m)
+                    )
+                    cond_boundary_if = scf.IfOp(
+                        cond_boundary, results_=[], has_else=False
+                    )
+                    with ir.InsertionPoint(cond_boundary_if.then_block):
+                        vec = cs_.vec_load((m_tile_idx, n_tile_idx), STG_VEC_SIZE)
+                        C_.vec_store(
+                            (m_global_idx, n_offset + n_tile_idx), vec, STG_VEC_SIZE
+                        )
+                        scf.YieldOp([])
 
         if const_expr(IS_SPLIT_K):
             gpu.barrier()
             for m_part in range_constexpr(2):
                 for n_part in range_constexpr(2):
                     for mi in range_constexpr(WARP_M_STEPS):
-                        write_c_mi_to_lds(m_part, n_part, mi)
+                        write_c_mi_to_lds(
+                            m_part, n_part, mi, c_quad_for(m_part, n_part)
+                        )
             split_k_barrier()
             for i in range_constexpr(STG_REG_C_COUNT):
                 global_tid = BLOCK_THREADS * i + tid
@@ -1928,7 +1994,9 @@ def compile_hgemm_ht_kernel(
                 for m_part in range_constexpr(2):
                     for n_part in range_constexpr(2):
                         for mi in range_constexpr(WARP_M_STEPS):
-                            write_c_mi_to_lds(m_part, n_part, mi)
+                            write_c_mi_to_lds(
+                                m_part, n_part, mi, c_quad_for(m_part, n_part)
+                            )
                 hip_s_barrier()
                 for m_part in range_constexpr(2):
                     for n_part in range_constexpr(2):
@@ -1938,7 +2006,9 @@ def compile_hgemm_ht_kernel(
                 for m_part in range_constexpr(2):
                     for n_part in range_constexpr(2):
                         for mi in range_constexpr(WARP_M_STEPS):
-                            write_c_mi_to_lds(m_part, n_part, mi)
+                            write_c_mi_to_lds(
+                                m_part, n_part, mi, c_quad_for(m_part, n_part)
+                            )
                             # gpu.barrier()
                             hip_s_barrier()
                             store_c_mi(m_part, n_part, mi)
@@ -1965,11 +2035,381 @@ def compile_hgemm_ht_kernel(
         bm = (m + BLOCK_M - 1) // BLOCK_M
         bn = n // BLOCK_N
         hgemm_ht_kernel._func.__name__ = KERNEL_NAME
-        hgemm_ht_kernel(C, A, B, SCALE_A, SCALE_B, BIAS, m, semaphore, signal).launch(
-            grid=(bm * bn, SPLIT_K, 1), block=(BLOCK_THREADS, 1, 1), stream=stream
-        )
+        value_attrs = {
+            "rocdl.waves_per_eu": 2,
+            "rocdl.flat_work_group_size": f"{BLOCK_THREADS},{BLOCK_THREADS}",
+        }
+        if const_expr(USE_AGPR):
+            value_attrs["passthrough"] = [["amdgpu-agpr-alloc", "128,128"]]
+        hgemm_ht_kernel(
+            C,
+            A,
+            B,
+            SCALE_A,
+            SCALE_B,
+            BIAS,
+            m,
+            semaphore,
+            signal,
+            value_attrs=value_attrs,
+        ).launch(grid=(bm * bn, SPLIT_K, 1), block=(BLOCK_THREADS, 1, 1), stream=stream)
 
     return launch_hgemm_ht_kernel
+
+
+class Fp8PtpcStoreCBias:
+    def __init__(
+        self, A_scale, B_scale, Bias, C, c_rows, c_cols, c_idx_fn, n_tiles_a, n_tiles_b
+    ):
+        self.c_rows = c_rows
+        self.c_cols = c_cols
+        self.lane_id = fx.thread_idx.x % 64
+        self.c_idx_fn = c_idx_fn
+        self.n_tiles_a = n_tiles_a
+        self.n_tiles_b = n_tiles_b
+
+        c_nbytes = c_rows * c_cols * 2  # BFloat16 C output.
+        sa_nbytes = c_rows * 4
+        sb_nbytes = c_cols * 4
+        bias_nbytes = c_cols * 2
+        gC = fx.rocdl.make_buffer_tensor(C, max_size=False, num_records_bytes=c_nbytes)
+        gSA = fx.rocdl.make_buffer_tensor(
+            A_scale, max_size=False, num_records_bytes=sa_nbytes
+        )
+        gSB = fx.rocdl.make_buffer_tensor(
+            B_scale, max_size=False, num_records_bytes=sb_nbytes
+        )
+        gBias = fx.rocdl.make_buffer_tensor(
+            Bias, max_size=False, num_records_bytes=bias_nbytes
+        )
+        self.c_div = fx.logical_divide(gC, fx.make_layout(1, 1))
+        self.sa_div = fx.logical_divide(gSA, fx.make_layout(1, 1))
+        self.sb_div = fx.logical_divide(gSB, fx.make_layout(1, 1))
+        self.bias_div = fx.logical_divide(gBias, fx.make_layout(1, 1))
+
+        self.scale_atom_4 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float32)
+        self.scale_atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+        self.bias_atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16)
+        self.out_atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16)
+        self.reg_f32_4 = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32)
+        self.reg_f32_1 = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Float32)
+        self.reg_bf16_1 = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.BFloat16)
+
+    def _load_scale_vec4(self, row):
+        fx.copy(
+            self.scale_atom_4,
+            fx.slice(self.sa_div, (None, fx.Int32(row))),
+            self.reg_f32_4,
+        )
+        return Vec(fx.memref_load_vec(self.reg_f32_4))
+
+    def _load_scale_scalar(self, col):
+        fx.copy(
+            self.scale_atom_1,
+            fx.slice(self.sb_div, (None, fx.Int32(col))),
+            self.reg_f32_1,
+        )
+        return Vec(fx.memref_load_vec(self.reg_f32_1))[0]
+
+    def _load_bias_scalar(self, col):
+        fx.copy(
+            self.bias_atom_1,
+            fx.slice(self.bias_div, (None, fx.Int32(col))),
+            self.reg_bf16_1,
+        )
+        return Vec(fx.memref_load_vec(self.reg_bf16_1))[0].to(fx.Float32)
+
+    def _store_bf16(self, value_bf16, c_index):
+        fx.memref_store_vec(Vec.filled(1, value_bf16, fx.BFloat16), self.reg_bf16_1)
+        fx.copy(
+            self.out_atom_1,
+            self.reg_bf16_1,
+            fx.slice(self.c_div, (None, fx.Int32(c_index))),
+        )
+
+    def store(self, c_frag, base_row, base_col):
+        a_scales = [
+            self._load_scale_vec4(base_row + i * 16 + (self.lane_id // 16) * 4)
+            for i in range_constexpr(self.n_tiles_a)
+        ]
+        b_scales = [
+            self._load_scale_scalar(base_col + i * 16 + self.lane_id % 16)
+            for i in range_constexpr(self.n_tiles_b)
+        ]
+        biases = [
+            self._load_bias_scalar(base_col + i * 16 + self.lane_id % 16)
+            for i in range_constexpr(self.n_tiles_b)
+        ]
+        for ti in range_constexpr(self.n_tiles_a):
+            row = base_row + ti * 16 + (self.lane_id // 16) * 4
+            for tj in range_constexpr(self.n_tiles_b):
+                col = base_col + tj * 16 + self.lane_id % 16
+                vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
+                for i in range_constexpr(4):
+                    scaled = (
+                        vec_f32[i] * (a_scales[ti][i] * b_scales[tj]) + biases[tj]
+                    ).to(fx.BFloat16)
+                    c_index = (row + i) * self.c_cols + col
+                    self._store_bf16(scaled, c_index)
+
+
+@functools.lru_cache(maxsize=512)
+def compile_fp8_ptpc_8wave_kernel(
+    *, n: int, k: int, BLOCK_M: int = 256, BLOCK_N: int = 256
+):
+    BLOCK_K = 128
+    assert BLOCK_M >= 128 and BLOCK_N >= 256
+    assert BLOCK_M % 128 == 0 and BLOCK_N % 256 == 0
+    assert k % BLOCK_K == 0 and k >= 2 * BLOCK_K
+    assert n % BLOCK_N == 0
+
+    K_ITERS = k // BLOCK_K
+    N_TILES_A = BLOCK_M // 64
+    N_TILES_B = BLOCK_N // 128
+    N_ACCUMS = N_TILES_A * N_TILES_B
+
+    LDS_BLOCK_M = BLOCK_M // 2
+    LDS_BLOCK_N = BLOCK_N // 2
+    N_LDS_STEPS_A = LDS_BLOCK_M // 64
+    N_LDS_STEPS_B = LDS_BLOCK_N // 64
+    N_LDS_ROUNDS = max(N_LDS_STEPS_A, N_LDS_STEPS_B)
+
+    a_lds_size = LDS_BLOCK_M * BLOCK_K
+    b_lds_size = LDS_BLOCK_N * BLOCK_K
+
+    @fx.struct
+    class SharedStorage:
+        A_lds_cur_0: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
+        A_lds_cur_1: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
+        A_lds_next_0: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
+        A_lds_next_1: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
+        B_lds_cur_0: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
+        B_lds_cur_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
+        B_lds_next_0: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
+        B_lds_next_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
+
+    @flyc.kernel(known_block_size=[512, 1, 1])
+    def fp8_ptpc_8wave_kernel(
+        A: fx.Tensor,
+        B_T: fx.Tensor,
+        C: fx.Tensor,
+        A_scale: fx.Tensor,
+        B_scale: fx.Tensor,
+        Bias: fx.Tensor,
+        c_m: fx.Int32,
+        c_n: fx.Int32,
+    ):
+        F8_IR_t = fx.Float8E4M3FN.ir_type
+        n_blocks = c_n // BLOCK_N
+
+        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+        a_cur0 = lds.A_lds_cur_0
+        a_cur1 = lds.A_lds_cur_1
+        a_next0 = lds.A_lds_next_0
+        a_next1 = lds.A_lds_next_1
+        b_cur0 = lds.B_lds_cur_0
+        b_cur1 = lds.B_lds_cur_1
+        b_next0 = lds.B_lds_next_0
+        b_next1 = lds.B_lds_next_1
+
+        lane_id = fx.thread_idx.x % 64
+        wave_id = fx.thread_idx.x // 64
+        wave_m = wave_id // 4
+        wave_n = wave_id % 4
+        block_m, block_n = divmod(fx.block_idx.x, n_blocks)
+
+        A0_gl_offset = (block_m * BLOCK_M) * k
+        A1_gl_offset = (block_m * BLOCK_M + LDS_BLOCK_M) * k
+        B0_gl_offset = (block_n * BLOCK_N) * k
+        B1_gl_offset = (block_n * BLOCK_N + LDS_BLOCK_N) * k
+
+        gA = make_fp8_buffer_tensor(A, F8_IR_t)
+        gB = make_fp8_buffer_tensor(B_T, F8_IR_t)
+        a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
+        b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
+
+        gl_off_a = compute_global_swizzle(
+            lane_id, wave_id, k, N_LDS_ROUNDS, preshuffled=False
+        )
+        gl_off_b = compute_global_swizzle(
+            lane_id, wave_id, k, N_LDS_ROUNDS, preshuffled=False
+        )
+
+        mfma = Mfma16x16x128(N_TILES_A, N_TILES_B)
+        a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id)
+        b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
+        a_s2r = S2RLoader(wave_m, N_TILES_A)
+        b_s2r = S2RLoader(wave_n, N_TILES_B)
+        store_c = Fp8PtpcStoreCBias(
+            A_scale, B_scale, Bias, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B
+        )
+
+        c00_frag = [mfma.zero_value] * N_ACCUMS
+        c01_frag = [mfma.zero_value] * N_ACCUMS
+        c10_frag = [mfma.zero_value] * N_ACCUMS
+        c11_frag = [mfma.zero_value] * N_ACCUMS
+
+        b_g2s.load(b_cur0, B0_gl_offset + 0 * BLOCK_K)
+        a_g2s.load(a_cur0, A0_gl_offset + 0 * BLOCK_K)
+        b_g2s.load(b_cur1, B1_gl_offset + 0 * BLOCK_K)
+        a_g2s.load(a_cur1, A1_gl_offset + 0 * BLOCK_K)
+
+        if wave_m == 1:
+            rocdl.s_barrier()
+
+        wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B)
+
+        b_g2s.load(b_next0, B0_gl_offset + 1 * BLOCK_K)
+        a_g2s.load(a_next0, A0_gl_offset + 1 * BLOCK_K)
+        b_g2s.load(b_next1, B1_gl_offset + 1 * BLOCK_K)
+
+        wait_barrier(N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
+
+        for kk in range_constexpr(K_ITERS - 2):
+            b0_frag = b_s2r.load(b_cur0, preshuffled=False)
+            a0_frag = a_s2r.load(a_cur0)
+            a_g2s.load(a_next1, A1_gl_offset + (kk + 1) * BLOCK_K)
+            rocdl.s_barrier()
+
+            rocdl.s_setprio(1)
+            c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
+            rocdl.s_setprio(0)
+            rocdl.s_barrier()
+
+            b1_frag = b_s2r.load(b_cur1, preshuffled=False)
+            b_g2s.load(b_cur0, B0_gl_offset + (kk + 2) * BLOCK_K)
+            rocdl.s_barrier()
+
+            rocdl.s_setprio(1)
+            c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
+            rocdl.s_setprio(0)
+            rocdl.s_barrier()
+
+            a1_frag = a_s2r.load(a_cur1)
+            a_g2s.load(a_cur0, A0_gl_offset + (kk + 2) * BLOCK_K)
+            rocdl.s_barrier()
+
+            rocdl.s_setprio(1)
+            c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
+            rocdl.s_setprio(0)
+            rocdl.s_barrier()
+
+            b_g2s.load(b_cur1, B1_gl_offset + (kk + 2) * BLOCK_K)
+            wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
+
+            rocdl.s_setprio(1)
+            c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
+            rocdl.s_setprio(0)
+            rocdl.s_barrier()
+
+            a_cur0, a_next0 = a_next0, a_cur0
+            a_cur1, a_next1 = a_next1, a_cur1
+            b_cur0, b_next0 = b_next0, b_cur0
+            b_cur1, b_next1 = b_next1, b_cur1
+
+        b0_frag = b_s2r.load(b_cur0, preshuffled=False)
+        a0_frag = a_s2r.load(a_cur0)
+        rocdl.s_barrier()
+
+        rocdl.s_setprio(1)
+        c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
+        rocdl.s_setprio(0)
+        rocdl.s_barrier()
+
+        b1_frag = b_s2r.load(b_cur1, preshuffled=False)
+        rocdl.s_barrier()
+
+        rocdl.s_setprio(1)
+        c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
+        rocdl.s_setprio(0)
+        rocdl.s_barrier()
+
+        a1_frag = a_s2r.load(a_cur1)
+        a_g2s.load(a_next1, A1_gl_offset + (K_ITERS - 1) * BLOCK_K)
+        rocdl.s_barrier()
+
+        rocdl.s_setprio(1)
+        c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
+        rocdl.s_setprio(0)
+        rocdl.s_barrier()
+
+        b0_frag = b_s2r.load(b_next0, preshuffled=False)
+        rocdl.s_barrier()
+
+        rocdl.s_setprio(1)
+        c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
+        rocdl.s_setprio(0)
+        rocdl.s_barrier()
+
+        a_cur0, a_next0 = a_next0, a_cur0
+        a_cur1, a_next1 = a_next1, a_cur1
+        b_cur0, b_next0 = b_next0, b_cur0
+        b_cur1, b_next1 = b_next1, b_cur1
+
+        a0_frag = a_s2r.load(a_cur0)
+        wait_barrier(0)
+
+        rocdl.s_setprio(1)
+        c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
+        rocdl.s_setprio(0)
+        rocdl.s_barrier()
+
+        b1_frag = b_s2r.load(b_cur1, preshuffled=False)
+        rocdl.s_barrier()
+
+        rocdl.s_setprio(1)
+        c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
+        rocdl.s_setprio(0)
+        rocdl.s_barrier()
+
+        a1_frag = a_s2r.load(a_cur1)
+        rocdl.s_barrier()
+
+        rocdl.s_setprio(1)
+        c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
+        c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
+        rocdl.s_setprio(0)
+        rocdl.s_barrier()
+
+        wave_n_offset = wave_n * (N_TILES_B * 16)
+        wave_m_offset = wave_m * (N_TILES_A * 16)
+        base_row = block_m * BLOCK_M + wave_m_offset
+        base_col = block_n * BLOCK_N + wave_n_offset
+
+        store_c.store(c00_frag, base_row + 0, base_col + 0)
+        store_c.store(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
+        store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
+        store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
+
+    @flyc.jit
+    def launch_fp8_ptpc_8wave_kernel(
+        A: fx.Tensor,
+        B_T: fx.Tensor,
+        C: fx.Tensor,
+        A_scale: fx.Tensor,
+        B_scale: fx.Tensor,
+        Bias: fx.Tensor,
+        c_m: fx.Int32,
+        c_n: fx.Int32,
+        stream: fx.Stream,
+    ):
+        grid_x = (c_m // BLOCK_M) * (c_n // BLOCK_N)
+        fp8_ptpc_8wave_kernel(
+            A,
+            B_T,
+            C,
+            A_scale,
+            B_scale,
+            Bias,
+            c_m,
+            c_n,
+            value_attrs={
+                "rocdl.waves_per_eu": 2,
+                "rocdl.flat_work_group_size": "512,512",
+            },
+        ).launch(grid=(grid_x, 1, 1), block=(512, 1, 1), stream=stream)
+
+    return launch_fp8_ptpc_8wave_kernel
 
 
 def compile_hgemm_kernel(
@@ -1988,6 +2428,8 @@ def compile_hgemm_kernel(
     HAS_BIAS: bool = False,
     USE_HT: bool = False,
     XCD_SWIZZLE: int = 0,
+    ASSUME_FULL_M: bool = False,
+    USE_AGPR: bool = False,
 ):
     assert n % 8 == 0
     if USE_HT:
@@ -2006,6 +2448,8 @@ def compile_hgemm_kernel(
             BLOCK_N_WARPS=BLOCK_N_WARPS,
             HAS_BIAS=HAS_BIAS,
             XCD_SWIZZLE=XCD_SWIZZLE,
+            ASSUME_FULL_M=ASSUME_FULL_M,
+            USE_AGPR=USE_AGPR,
         )
     else:
         return compile_hgemm_ft_kernel(
@@ -2231,12 +2675,44 @@ def hgemm_splitk_(
             "USE_HT": True,
             "HAS_BIAS": True,
             "XCD_SWIZZLE": 4,
+            "USE_AGPR": False,
+            "USE_FP8PTPC_8W": False,
         }
         kwargs.update(hgemm_kwargs)
+        use_fp8ptpc_8w = kwargs.pop("USE_FP8PTPC_8W", True)
+        if use_fp8ptpc_8w:
+            assert kwargs["SPLIT_K"] == 1
+            assert kwargs["TILE_M"] >= 128 and kwargs["TILE_N"] >= 256
+            assert kwargs["TILE_M"] % 128 == 0 and kwargs["TILE_N"] % 256 == 0
+            assert m % kwargs["TILE_M"] == 0
+            assert n % kwargs["TILE_N"] == 0
+            assert k % 128 == 0
+            exe = compile_fp8_ptpc_8wave_kernel(
+                n=n,
+                k=k,
+                BLOCK_M=kwargs["TILE_M"],
+                BLOCK_N=kwargs["TILE_N"],
+            )
+            _run_compiled(
+                exe,
+                a.contiguous().view(-1),
+                b.contiguous().view(-1),
+                c.contiguous().view(-1),
+                scale_a.contiguous().view(-1),
+                scale_b.contiguous().view(-1),
+                bias.contiguous().view(-1),
+                m,
+                n,
+                stream,
+            )
+            return
+        kwargs["ASSUME_FULL_M"] = kwargs.get("ASSUME_FULL_M", m % kwargs["TILE_M"] == 0)
         assert kwargs["USE_HT"] is True
         assert kwargs["B_TO_LDS"] is True
         assert kwargs["SPLIT_K"] == 1
         assert n % kwargs["TILE_N"] == 0
+        if kwargs["ASSUME_FULL_M"]:
+            assert m % kwargs["TILE_M"] == 0
         assert k % (2 * kwargs["TILE_K"]) == 0
         exe = compile_hgemm_kernel("fp8_ptpc", n, k, **kwargs)
         _run_compiled(
