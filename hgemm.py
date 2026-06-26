@@ -2196,8 +2196,10 @@ def hgemm_splitk_(
     b: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
     hgemm_kwargs: dict = {},
-    stream: torch.cuda.Stream = torch.cuda.current_stream(),
+    scale_a: Optional[torch.Tensor] = None,
+    scale_b: Optional[torch.Tensor] = None,
 ):
+    stream = torch.cuda.current_stream()
     global SPLIT_K_SEMAPHORE_MAX_LEN
     device = a.device
     semaphore, signal = get_semaphore(stream, device)
@@ -2208,6 +2210,40 @@ def hgemm_splitk_(
     assert b.shape[1] == k
     c = c.view(-1, n)
     assert c.shape[0] == m
+    is_fp8_ptpc = scale_a is not None or scale_b is not None
+    if is_fp8_ptpc:
+        assert scale_a is not None and scale_b is not None
+        assert bias is not None
+        assert scale_a.shape[0] == m
+        assert scale_b.shape[0] == n
+        assert bias.shape[0] == n
+        assert c.dtype == torch.bfloat16
+        kwargs = {
+            "TILE_M": 256,
+            "TILE_N": 256,
+            "TILE_K": 128,
+            "STAGES": 2,
+            "SPLIT_K": 1,
+            "BLOCK_M_WARPS": 2,
+            "BLOCK_N_WARPS": 4,
+            "BLOCK_K_WARPS": 1,
+            "B_TO_LDS": True,
+            "USE_HT": True,
+            "HAS_BIAS": True,
+            "XCD_SWIZZLE": 4,
+        }
+        kwargs.update(hgemm_kwargs)
+        assert kwargs["USE_HT"] is True
+        assert kwargs["B_TO_LDS"] is True
+        assert kwargs["SPLIT_K"] == 1
+        assert n % kwargs["TILE_N"] == 0
+        assert k % (2 * kwargs["TILE_K"]) == 0
+        exe = compile_hgemm_kernel("fp8_ptpc", n, k, **kwargs)
+        _run_compiled(
+            exe, c, a, b, scale_a, scale_b, bias, m, semaphore, signal, stream
+        )
+        return
+
     kwargs = get_default_kwargs(m, n, k)
     kwargs.update(hgemm_kwargs)
     kwargs["HAS_BIAS"] = False if bias is None else True
@@ -2228,58 +2264,10 @@ def hgemm_splitk_(
         _run_compiled(exe, c, a, b, bias_tensor, m, semaphore, signal, stream)
 
 
-def fp8_ptpc_gemm_(
-    c: torch.Tensor,
-    a: torch.Tensor,
-    b: torch.Tensor,
-    scale_a: torch.Tensor,
-    scale_b: torch.Tensor,
-    bias: torch.Tensor,
-    hgemm_kwargs: dict = {},
-    stream: torch.cuda.Stream = torch.cuda.current_stream(),
-):
-    global SPLIT_K_SEMAPHORE_MAX_LEN
-    device = a.device
-    semaphore, signal = get_semaphore(stream, device)
-    k = a.shape[-1]
-    a = a.view(-1, k)
-    m = a.shape[0]
-    n = b.shape[0]
-    assert b.shape[1] == k
-    assert scale_a.shape[0] == m
-    assert scale_b.shape[0] == n
-    assert bias.shape[0] == n
-    c = c.view(-1, n)
-    assert c.shape[0] == m
-    assert c.dtype == torch.bfloat16
-    kwargs = {
-        "TILE_M": 256,
-        "TILE_N": 256,
-        "TILE_K": 128,
-        "STAGES": 2,
-        "SPLIT_K": 1,
-        "BLOCK_M_WARPS": 2,
-        "BLOCK_N_WARPS": 4,
-        "BLOCK_K_WARPS": 1,
-        "B_TO_LDS": True,
-        "USE_HT": True,
-        "HAS_BIAS": True,
-        "XCD_SWIZZLE": 4,
-    }
-    kwargs.update(hgemm_kwargs)
-    assert kwargs["USE_HT"] is True
-    assert kwargs["B_TO_LDS"] is True
-    assert kwargs["SPLIT_K"] == 1
-    assert n % kwargs["TILE_N"] == 0
-    assert k % (2 * kwargs["TILE_K"]) == 0
-    exe = compile_hgemm_kernel("fp8_ptpc", n, k, **kwargs)
-    _run_compiled(exe, c, a, b, scale_a, scale_b, bias, m, semaphore, signal, stream)
-
-
 def func(*args):
     if len(args) == 6:
         a, b, scale_a, scale_b, bias, c = args
-        fp8_ptpc_gemm_(c, a, b, scale_a, scale_b, bias)
+        hgemm_splitk_(c, a, b, bias=bias, scale_a=scale_a, scale_b=scale_b)
     else:
         a, b, bias, c = args
         hgemm_splitk_(c, a, b, bias=bias)
