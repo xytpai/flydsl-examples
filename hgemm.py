@@ -1983,13 +1983,24 @@ def compile_hgemm_ht_kernel(
                     scf.YieldOp([])
         else:
             gpu.barrier()
-            for m_part in range_constexpr(2):
-                for n_part in range_constexpr(2):
-                    for mi in range_constexpr(WARP_M_STEPS):
-                        write_c_mi_to_lds(m_part, n_part, mi)
-                        # gpu.barrier()
-                        hip_s_barrier()
-                        store_c_mi(m_part, n_part, mi)
+            if const_expr(IS_FP8_PTPC):
+                for m_part in range_constexpr(2):
+                    for n_part in range_constexpr(2):
+                        for mi in range_constexpr(WARP_M_STEPS):
+                            write_c_mi_to_lds(m_part, n_part, mi)
+                hip_s_barrier()
+                for m_part in range_constexpr(2):
+                    for n_part in range_constexpr(2):
+                        for mi in range_constexpr(WARP_M_STEPS):
+                            store_c_mi(m_part, n_part, mi)
+            else:
+                for m_part in range_constexpr(2):
+                    for n_part in range_constexpr(2):
+                        for mi in range_constexpr(WARP_M_STEPS):
+                            write_c_mi_to_lds(m_part, n_part, mi)
+                            # gpu.barrier()
+                            hip_s_barrier()
+                            store_c_mi(m_part, n_part, mi)
         return
 
     @flyc.jit
