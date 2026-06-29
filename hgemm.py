@@ -1760,6 +1760,9 @@ def compile_hgemm_ht_kernel(
                 ldg_sts_b_async(0, 0, next_k_offset)
             c_frags_out = consume(0, 1, a0_frags, b1_frags, c_frags_out, False)
 
+            if const_expr(not do_prefetch):
+                __barrier(1 * LDG_REG_B_COUNT_AS + 1 * LDG_REG_A_COUNT_AS)
+
             a1_frags = ldmatrix_a(1, 0)
             if const_expr(do_prefetch):
                 ldg_sts_a_async(0, 0, next_k_offset)
@@ -1808,15 +1811,81 @@ def compile_hgemm_ht_kernel(
         else:
             k_offset = ks_begin
 
-        __barrier(1 * LDG_REG_B_COUNT_AS + 1 * LDG_REG_A_COUNT_AS)
+        # __barrier(1 * LDG_REG_B_COUNT_AS + 1 * LDG_REG_A_COUNT_AS)
         c_frags = compute_double_tile(k_offset, c_frags, False)
 
         def c_quad_for(m_part, n_part):
             c_base = (m_part * 2 + n_part) * C_FRAGS_LEN
             return c_frags[c_base : c_base + C_FRAGS_LEN]
 
-        def write_c_mi_to_lds(m_part, n_part, mi, c_quad):
+        def load_scale_a(m_part):
+            lds_m_bases = [fx.Index(0)] * WARP_M_STEPS
+            row_global_bases = [fx.Index(0)] * WARP_M_STEPS
+            full_scale_rows_list = [None] * WARP_M_STEPS
+            scale_a_vecs = [acc_init] * WARP_M_STEPS
+            for mi in range_constexpr(WARP_M_STEPS):
+                warp_atom_m_idx = warp_m_idx + mi * WARP_ATOM_M
+                lds_m_base = fx.Index(
+                    m_part * HALF_BLOCK_M + warp_atom_m_idx + stmatrix_c_m_vec_idx
+                )
+                row_global_base = m_offset + lds_m_base
+                full_scale_rows = (
+                    None
+                    if const_expr(ASSUME_FULL_M)
+                    else arith.cmpi(
+                        arith.CmpIPredicate.ule,
+                        row_global_base + fx.Index(WMMA_C_FRAG_VALUES),
+                        fx.Index(m),
+                    )
+                )
+                scale_a_vec_base = (
+                    row_global_base
+                    if const_expr(ASSUME_FULL_M)
+                    else arith.select(
+                        full_scale_rows,
+                        row_global_base,
+                        fx.Index(0),
+                    )
+                )
+                lds_m_bases[mi] = lds_m_base
+                row_global_bases[mi] = row_global_base
+                full_scale_rows_list[mi] = full_scale_rows
+                scale_a_vecs[mi] = SCALE_A_.vec_load(
+                    (scale_a_vec_base,), WMMA_C_FRAG_VALUES
+                )
+            return lds_m_bases, row_global_bases, full_scale_rows_list, scale_a_vecs
+
+        def load_scale_b(n_part):
+            scale_b_frags = [fx.Float32(0.0)] * WARP_N_STEPS
+            for ni in range_constexpr(WARP_N_STEPS):
+                warp_atom_n_idx = warp_n_idx + ni * WARP_ATOM_N
+                lds_n_idx_common = fx.Index(
+                    n_part * HALF_BLOCK_N + warp_atom_n_idx + stmatrix_c_n_idx
+                )
+                col_global = n_offset + lds_n_idx_common
+                scale_b_frags[ni] = SCALE_B_[col_global]
+            return scale_b_frags
+
+        def write_c_mi_to_lds(
+            m_part,
+            n_part,
+            mi,
+            c_quad,
+            scale_b_frags=None,
+            scale_a_state=None,
+        ):
             warp_atom_m_idx = warp_m_idx + mi * WARP_ATOM_M
+            lds_m_base = fx.Index(
+                m_part * HALF_BLOCK_M + warp_atom_m_idx + stmatrix_c_m_vec_idx
+            )
+            if const_expr(IS_FP8_PTPC):
+                lds_m_bases, row_global_bases, full_scale_rows_list, scale_a_vecs = (
+                    scale_a_state
+                )
+                lds_m_base = lds_m_bases[mi]
+                row_global_base = row_global_bases[mi]
+                full_scale_rows = full_scale_rows_list[mi]
+                scale_a_vec = scale_a_vecs[mi]
             for ni in range_constexpr(WARP_N_STEPS):
                 warp_atom_n_idx = warp_n_idx + ni * WARP_ATOM_N
                 c_idx = mi * WARP_N_STEPS + ni
@@ -1825,44 +1894,14 @@ def compile_hgemm_ht_kernel(
                         n_part * HALF_BLOCK_N + warp_atom_n_idx + stmatrix_c_n_idx
                     )
                     col_global = n_offset + lds_n_idx_common
-                    scale_b_common = SCALE_B_[col_global]
+                    scale_b_common = scale_b_frags[ni]
                     bias_common = (
                         BIAS_[col_global].extf(T.f32)
                         if const_expr(HAS_BIAS)
                         else fx.Float32(0.0)
                     )
-                    lds_m_base = fx.Index(
-                        m_part * HALF_BLOCK_M + warp_atom_m_idx + stmatrix_c_m_vec_idx
-                    )
-                    row_global_base = m_offset + lds_m_base
-                    full_scale_rows = (
-                        None
-                        if const_expr(ASSUME_FULL_M)
-                        else arith.cmpi(
-                            arith.CmpIPredicate.ule,
-                            row_global_base + fx.Index(WMMA_C_FRAG_VALUES),
-                            fx.Index(m),
-                        )
-                    )
-                    scale_a_vec_base = (
-                        row_global_base
-                        if const_expr(ASSUME_FULL_M)
-                        else arith.select(
-                            full_scale_rows,
-                            row_global_base,
-                            fx.Index(0),
-                        )
-                    )
-                    scale_a_vec = SCALE_A_.vec_load(
-                        (scale_a_vec_base,), WMMA_C_FRAG_VALUES
-                    )
                 for kk in range_constexpr(WMMA_C_FRAG_VALUES):
-                    lds_m_idx = fx.Index(
-                        m_part * HALF_BLOCK_M
-                        + warp_atom_m_idx
-                        + stmatrix_c_m_vec_idx
-                        + kk
-                    )
+                    lds_m_idx = lds_m_base + fx.Index(kk)
                     lds_n_idx = fx.Index(
                         n_part * HALF_BLOCK_N + warp_atom_n_idx + stmatrix_c_n_idx
                     )
@@ -1880,7 +1919,7 @@ def compile_hgemm_ht_kernel(
                         if const_expr(ASSUME_FULL_M):
                             val = val * (scale_a_fast * scale_b_common)
                         else:
-                            row_global = m_offset + lds_m_idx
+                            row_global = row_global_base + fx.Index(kk)
                             scale_a = arith.select(
                                 full_scale_rows,
                                 scale_a_fast,
@@ -1992,14 +2031,21 @@ def compile_hgemm_ht_kernel(
         else:
             if const_expr(IS_FP8_PTPC):
                 for m_part in range_constexpr(2):
+                    scale_a_state = load_scale_a(m_part)
                     for n_part in range_constexpr(2):
+                        scale_b_frags = load_scale_b(n_part)
                         for mi in range_constexpr(WARP_M_STEPS):
                             write_c_mi_to_lds(
-                                m_part, n_part, mi, c_quad_for(m_part, n_part)
+                                m_part,
+                                n_part,
+                                mi,
+                                c_quad_for(m_part, n_part),
+                                scale_b_frags,
+                                scale_a_state,
                             )
-                hip_s_barrier()
-                for m_part in range_constexpr(2):
-                    for n_part in range_constexpr(2):
+                        hip_s_barrier()
+                        # for m_part in range_constexpr(2):
+                        # for n_part in range_constexpr(2):
                         for mi in range_constexpr(WARP_M_STEPS):
                             store_c_mi(m_part, n_part, mi)
             else:
