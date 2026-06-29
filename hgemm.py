@@ -1740,6 +1740,7 @@ def compile_hgemm_ht_kernel(
         ldg_sts_a_async(0, 0, ks_begin)
         ldg_sts_b_async(1, 0, ks_begin)
         ldg_sts_a_async(1, 0, ks_begin)
+        hip_s_barrier()
         ldg_sts_b_async(0, 1, ks_begin)
         ldg_sts_a_async(0, 1, ks_begin)
         ldg_sts_b_async(1, 1, ks_begin)
@@ -1940,8 +1941,8 @@ def compile_hgemm_ht_kernel(
                         )
                         scf.YieldOp([])
 
+        # NOTE: Assume no barrier need
         if const_expr(IS_SPLIT_K):
-            gpu.barrier()
             for m_part in range_constexpr(2):
                 for n_part in range_constexpr(2):
                     for mi in range_constexpr(WARP_M_STEPS):
@@ -1989,7 +1990,6 @@ def compile_hgemm_ht_kernel(
                         )
                     scf.YieldOp([])
         else:
-            gpu.barrier()
             if const_expr(IS_FP8_PTPC):
                 for m_part in range_constexpr(2):
                     for n_part in range_constexpr(2):
@@ -2481,7 +2481,7 @@ def get_default_kwargs(m, n, k):
         "BLOCK_K_WARPS": 1,
         "B_TO_LDS": True,
         "USE_HT": True,
-        "XCD_SWIZZLE": 4,
+        "XCD_SWIZZLE": -1,
     }
     if m == 2048 and n == 2048 and k == 2048:
         kwargs["TILE_M"] = 128
@@ -2674,7 +2674,7 @@ def hgemm_splitk_(
             "B_TO_LDS": True,
             "USE_HT": True,
             "HAS_BIAS": True,
-            "XCD_SWIZZLE": 4,
+            "XCD_SWIZZLE": -1,
             "USE_AGPR": False,
             "USE_FP8PTPC_8W": False,
         }
@@ -2706,7 +2706,8 @@ def hgemm_splitk_(
                 stream,
             )
             return
-        kwargs["ASSUME_FULL_M"] = kwargs.get("ASSUME_FULL_M", m % kwargs["TILE_M"] == 0)
+        if "ASSUME_FULL_M" not in hgemm_kwargs:
+            kwargs["ASSUME_FULL_M"] = m % kwargs["TILE_M"] == 0
         assert kwargs["USE_HT"] is True
         assert kwargs["B_TO_LDS"] is True
         assert kwargs["SPLIT_K"] == 1
@@ -2723,6 +2724,10 @@ def hgemm_splitk_(
     kwargs = get_default_kwargs(m, n, k)
     kwargs.update(hgemm_kwargs)
     kwargs["HAS_BIAS"] = False if bias is None else True
+    if "ASSUME_FULL_M" not in hgemm_kwargs:
+        kwargs["ASSUME_FULL_M"] = m % kwargs["TILE_M"] == 0
+    if kwargs["ASSUME_FULL_M"]:
+        assert m % kwargs["TILE_M"] == 0
     if a.dtype == torch.half:
         exe = compile_hgemm_kernel("f16", n, k, **kwargs)
     elif a.dtype == torch.bfloat16:
@@ -2840,4 +2845,5 @@ if __name__ == "__main__":
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8 --n=5120 --k=2880 --dtype=bf16
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=32 --n=2880 --k=2048 --dtype=bf16
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=800 --n=384 --k=7168 --dtype=bf16
+    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=4096 --n=4096 --k=4096 --dtype=fp8_ptpc
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8192 --n=8192 --k=8192 --dtype=fp8_ptpc
