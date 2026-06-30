@@ -1185,6 +1185,11 @@ def compile_hgemm_ht_kernel(
     if XCD_SWIZZLE > 0:
         KERNEL_NAME += f"_XCD{XCD_SWIZZLE}"
 
+    HT_KERNEL_VALUE_ATTRS = {
+        "rocdl.waves_per_eu": 2,
+        "rocdl.flat_work_group_size": f"{BLOCK_THREADS},{BLOCK_THREADS}",
+    }
+
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
     def hgemm_ht_kernel(
         C: fx.Pointer,
@@ -1351,36 +1356,6 @@ def compile_hgemm_ht_kernel(
                     n_local_idx, k_local_idx * DTYPE_BYTES, fx.Int32(k_blocks16)
                 )
             swizzle_cache_b[i] = n_local_idx * k + col_in_bytes // DTYPE_BYTES
-
-        ldmatrix_a_row_cache = [0] * WARP_M_STEPS
-        ldmatrix_a_col_cache = [0] * (A_FRAGS_LEN * 2)
-        ldmatrix_b_row_cache = [0] * WARP_N_STEPS
-        ldmatrix_b_col_cache = [0] * (B_FRAGS_LEN * 2)
-        if const_expr(IS_FP8_PTPC):
-            for mi in range_constexpr(WARP_M_STEPS):
-                row = warp_m_idx + mi * WARP_ATOM_M + ldmatrix_a_m_idx
-                ldmatrix_a_row_cache[mi] = row
-                for ki in range_constexpr(WARP_K_STEPS):
-                    col_base = ki * WMMA_K + (w_tid // WMMA_M) * 16
-                    frag_idx = ki * WARP_M_STEPS + mi
-                    ldmatrix_a_col_cache[frag_idx * 2 + 0] = swizzle_fp8_128(
-                        row, col_base
-                    )
-                    ldmatrix_a_col_cache[frag_idx * 2 + 1] = swizzle_fp8_128(
-                        row, col_base + 64
-                    )
-            for ni in range_constexpr(WARP_N_STEPS):
-                row = warp_n_idx + ni * WARP_ATOM_N + ldmatrix_b_n_idx
-                ldmatrix_b_row_cache[ni] = row
-                for ki in range_constexpr(WARP_K_STEPS):
-                    col_base = ki * WMMA_K + (w_tid // WMMA_N) * 16
-                    frag_idx = ki * WARP_N_STEPS + ni
-                    ldmatrix_b_col_cache[frag_idx * 2 + 0] = swizzle_fp8_128(
-                        row, col_base
-                    )
-                    ldmatrix_b_col_cache[frag_idx * 2 + 1] = swizzle_fp8_128(
-                        row, col_base + 64
-                    )
 
         def __barrier(vmcnt=0):
             llvm.InlineAsmOp(
@@ -1619,8 +1594,7 @@ def compile_hgemm_ht_kernel(
                 warp_atom_m_idx = warp_m_idx + mi * WARP_ATOM_M
                 for ki in range_constexpr(WARP_K_STEPS):
                     if const_expr(IS_FP8_PTPC):
-                        row = ldmatrix_a_row_cache[mi]
-                        frag_idx = ki * WARP_M_STEPS + mi
+                        row = warp_atom_m_idx + ldmatrix_a_m_idx
                     else:
                         row = warp_atom_m_idx + ldmatrix_a_m_idx
                         warp_atom_k_idx = ki * WARP_ATOM_K
@@ -1629,8 +1603,9 @@ def compile_hgemm_ht_kernel(
                         ) * DTYPE_BYTES
                     if const_expr(IS_FP8_PTPC):
 
-                        def load_i32x4_at(cache_idx):
-                            col_swz = ldmatrix_a_col_cache[cache_idx]
+                        def load_i32x4_at(col_delta):
+                            col_base = ki * WMMA_K + (w_tid // WMMA_M) * 16
+                            col_swz = swizzle_fp8_128(row, col_base + col_delta)
                             v16 = as_.vec_load(
                                 (
                                     fx.Index(k_buf),
@@ -1642,8 +1617,8 @@ def compile_hgemm_ht_kernel(
                             )
                             return fx.Vector(v16).bitcast(fx.Int32)
 
-                        lo = load_i32x4_at(frag_idx * 2 + 0)
-                        hi = load_i32x4_at(frag_idx * 2 + 1)
+                        lo = load_i32x4_at(0)
+                        hi = load_i32x4_at(64)
                         a_frags[ki * WARP_M_STEPS + mi] = fx.Vector(lo).shuffle(
                             hi, list(range(8))
                         )
@@ -1668,8 +1643,7 @@ def compile_hgemm_ht_kernel(
                 warp_atom_n_idx = warp_n_idx + ni * WARP_ATOM_N
                 for ki in range_constexpr(WARP_K_STEPS):
                     if const_expr(IS_FP8_PTPC):
-                        row = ldmatrix_b_row_cache[ni]
-                        frag_idx = ki * WARP_N_STEPS + ni
+                        row = warp_atom_n_idx + ldmatrix_b_n_idx
                     else:
                         row = warp_atom_n_idx + ldmatrix_b_n_idx
                         warp_atom_k_idx = ki * WARP_ATOM_K
@@ -1678,8 +1652,9 @@ def compile_hgemm_ht_kernel(
                         ) * DTYPE_BYTES
                     if const_expr(IS_FP8_PTPC):
 
-                        def load_i32x4_at(cache_idx):
-                            col_swz = ldmatrix_b_col_cache[cache_idx]
+                        def load_i32x4_at(col_delta):
+                            col_base = ki * WMMA_K + (w_tid // WMMA_N) * 16
+                            col_swz = swizzle_fp8_128(row, col_base + col_delta)
                             v16 = bs_.vec_load(
                                 (
                                     fx.Index(k_buf),
@@ -1691,8 +1666,8 @@ def compile_hgemm_ht_kernel(
                             )
                             return fx.Vector(v16).bitcast(fx.Int32)
 
-                        lo = load_i32x4_at(frag_idx * 2 + 0)
-                        hi = load_i32x4_at(frag_idx * 2 + 1)
+                        lo = load_i32x4_at(0)
+                        hi = load_i32x4_at(64)
                         b_frags[ki * WARP_N_STEPS + ni] = fx.Vector(lo).shuffle(
                             hi, list(range(8))
                         )
@@ -1713,9 +1688,7 @@ def compile_hgemm_ht_kernel(
 
         def consume(m_part, n_part, a_frags, b_frags, c_frags_in, emit_sched_barrier):
             c_frags_out = [cx for cx in c_frags_in]
-            # rocdl.sched_barrier(0)
-            # rocdl.s_setprio(1)
-            # rocdl.sched_barrier(0)
+            rocdl.sched_barrier(0)
             for mi in range_constexpr(WARP_M_STEPS):
                 for ni in range_constexpr(WARP_N_STEPS):
                     for ki in range_constexpr(WARP_K_STEPS):
@@ -1727,8 +1700,8 @@ def compile_hgemm_ht_kernel(
                             b_frags[ki * WARP_N_STEPS + ni],
                             c_frags_out[c_idx],
                         )
-            # rocdl.sched_barrier(0)
-            # rocdl.s_setprio(0)
+            rocdl.sched_barrier(0)
+            hip_s_barrier()
             if const_expr(emit_sched_barrier):
                 rocdl.sched_barrier(0)
             return c_frags_out
@@ -1740,11 +1713,13 @@ def compile_hgemm_ht_kernel(
         ldg_sts_a_async(0, 0, ks_begin)
         ldg_sts_b_async(1, 0, ks_begin)
         ldg_sts_a_async(1, 0, ks_begin)
+        if wid // 4 == 1:
+            hip_s_barrier()
         hip_s_barrier()
         ldg_sts_b_async(0, 1, ks_begin)
         ldg_sts_a_async(0, 1, ks_begin)
         ldg_sts_b_async(1, 1, ks_begin)
-        __barrier(2 * LDG_REG_B_COUNT_AS + 2 * LDG_REG_A_COUNT_AS)
+        __barrier(1 * LDG_REG_B_COUNT_AS + 1 * LDG_REG_A_COUNT_AS)
 
         def compute_double_tile(k_offset, c_frags_in, do_prefetch):
             next_k_offset = k_offset + fx.Int32(2 * BLOCK_K)
@@ -1752,12 +1727,13 @@ def compile_hgemm_ht_kernel(
             b0_frags = ldmatrix_b(0, 0)
             a0_frags = ldmatrix_a(0, 0)
             ldg_sts_a_async(1, 1, k_offset)
+            hip_s_barrier()
             c_frags_out = consume(0, 0, a0_frags, b0_frags, c_frags_in, True)
 
             b1_frags = ldmatrix_b(1, 0)
             if const_expr(do_prefetch):
-                __barrier(1 * LDG_REG_B_COUNT_AS + 2 * LDG_REG_A_COUNT_AS)
                 ldg_sts_b_async(0, 0, next_k_offset)
+            hip_s_barrier()
             c_frags_out = consume(0, 1, a0_frags, b1_frags, c_frags_out, False)
 
             if const_expr(not do_prefetch):
@@ -1766,6 +1742,7 @@ def compile_hgemm_ht_kernel(
             a1_frags = ldmatrix_a(1, 0)
             if const_expr(do_prefetch):
                 ldg_sts_a_async(0, 0, next_k_offset)
+            hip_s_barrier()
             c_frags_out = consume(1, 0, a1_frags, b0_frags, c_frags_out, True)
 
             b0_frags = ldmatrix_b(0, 1)
@@ -1780,22 +1757,24 @@ def compile_hgemm_ht_kernel(
             a0_frags = ldmatrix_a(0, 1)
             if const_expr(do_prefetch):
                 ldg_sts_a_async(1, 0, next_k_offset)
+            hip_s_barrier()
             c_frags_out = consume(0, 0, a0_frags, b0_frags, c_frags_out, True)
 
             b1_frags = ldmatrix_b(1, 1)
             if const_expr(do_prefetch):
                 ldg_sts_b_async(0, 1, next_k_offset)
+            hip_s_barrier()
             c_frags_out = consume(0, 1, a0_frags, b1_frags, c_frags_out, False)
 
             a1_frags = ldmatrix_a(1, 1)
             if const_expr(do_prefetch):
-                hip_s_barrier()
                 ldg_sts_a_async(0, 1, next_k_offset)
+            hip_s_barrier()
             c_frags_out = consume(1, 0, a1_frags, b0_frags, c_frags_out, True)
 
             if const_expr(do_prefetch):
                 ldg_sts_b_async(1, 1, next_k_offset)
-                __barrier(2 * LDG_REG_B_COUNT_AS + 2 * LDG_REG_A_COUNT_AS)
+                __barrier(1 * LDG_REG_B_COUNT_AS + 1 * LDG_REG_A_COUNT_AS)
             c_frags_out = consume(1, 1, a1_frags, b1_frags, c_frags_out, False)
             return c_frags_out
 
@@ -1810,9 +1789,6 @@ def compile_hgemm_ht_kernel(
             c_frags = results[1:]
         else:
             k_offset = ks_begin
-
-        # __barrier(1 * LDG_REG_B_COUNT_AS + 1 * LDG_REG_A_COUNT_AS)
-        c_frags = compute_double_tile(k_offset, c_frags, False)
 
         def c_quad_for(m_part, n_part):
             c_base = (m_part * 2 + n_part) * C_FRAGS_LEN
@@ -1980,8 +1956,68 @@ def compile_hgemm_ht_kernel(
                         )
                         scf.YieldOp([])
 
+        def compute_final_tile_and_epilogue_non_fp8(k_offset, c_frags_in):
+            b0_frags = ldmatrix_b(0, 0)
+            a0_frags = ldmatrix_a(0, 0)
+            ldg_sts_a_async(1, 1, k_offset)
+            hip_s_barrier()
+            c_frags_out = consume(0, 0, a0_frags, b0_frags, c_frags_in, True)
+
+            b1_frags = ldmatrix_b(1, 0)
+            hip_s_barrier()
+            c_frags_out = consume(0, 1, a0_frags, b1_frags, c_frags_out, False)
+
+            a1_frags = ldmatrix_a(1, 0)
+            hip_s_barrier()
+            c_frags_out = consume(1, 0, a1_frags, b0_frags, c_frags_out, True)
+
+            b0_frags = ldmatrix_b(0, 1)
+            hip_s_barrier()
+            c_frags_out = consume(1, 1, a1_frags, b1_frags, c_frags_out, False)
+
+            __barrier(0)
+            a0_frags = ldmatrix_a(0, 1)
+            hip_s_barrier()
+            c_frags_out = consume(0, 0, a0_frags, b0_frags, c_frags_out, False)
+
+            b1_frags = ldmatrix_b(1, 1)
+            hip_s_barrier()
+            c_frags_out = consume(0, 1, a0_frags, b1_frags, c_frags_out, False)
+
+            a1_frags = ldmatrix_a(1, 1)
+            hip_s_barrier()
+            c_frags_out = consume(1, 0, a1_frags, b0_frags, c_frags_out, False)
+
+            def local_c_quad_for(m_part, n_part):
+                c_base = (m_part * 2 + n_part) * C_FRAGS_LEN
+                return c_frags_out[c_base : c_base + C_FRAGS_LEN]
+
+            for mi in range_constexpr(WARP_M_STEPS):
+                write_c_mi_to_lds(0, 0, mi, local_c_quad_for(0, 0))
+            for mi in range_constexpr(WARP_M_STEPS):
+                write_c_mi_to_lds(0, 1, mi, local_c_quad_for(0, 1))
+            hip_s_barrier()
+            for mi in range_constexpr(WARP_M_STEPS):
+                store_c_mi(0, 0, mi)
+            for mi in range_constexpr(WARP_M_STEPS):
+                store_c_mi(0, 1, mi)
+
+            c_frags_out = consume(1, 1, a1_frags, b1_frags, c_frags_out, False)
+
+            for mi in range_constexpr(WARP_M_STEPS):
+                write_c_mi_to_lds(1, 0, mi, local_c_quad_for(1, 0))
+            for mi in range_constexpr(WARP_M_STEPS):
+                write_c_mi_to_lds(1, 1, mi, local_c_quad_for(1, 1))
+            hip_s_barrier()
+            for mi in range_constexpr(WARP_M_STEPS):
+                store_c_mi(1, 0, mi)
+            for mi in range_constexpr(WARP_M_STEPS):
+                store_c_mi(1, 1, mi)
+            return c_frags_out
+
         # NOTE: Assume no barrier need
         if const_expr(IS_SPLIT_K):
+            c_frags = compute_double_tile(k_offset, c_frags, False)
             for m_part in range_constexpr(2):
                 for n_part in range_constexpr(2):
                     for mi in range_constexpr(WARP_M_STEPS):
@@ -2030,6 +2066,7 @@ def compile_hgemm_ht_kernel(
                     scf.YieldOp([])
         else:
             if const_expr(IS_FP8_PTPC):
+                c_frags = compute_double_tile(k_offset, c_frags, False)
                 for m_part in range_constexpr(2):
                     scale_a_state = load_scale_a(m_part)
                     for n_part in range_constexpr(2):
@@ -2049,15 +2086,7 @@ def compile_hgemm_ht_kernel(
                         for mi in range_constexpr(WARP_M_STEPS):
                             store_c_mi(m_part, n_part, mi)
             else:
-                for m_part in range_constexpr(2):
-                    for n_part in range_constexpr(2):
-                        for mi in range_constexpr(WARP_M_STEPS):
-                            write_c_mi_to_lds(
-                                m_part, n_part, mi, c_quad_for(m_part, n_part)
-                            )
-                            # gpu.barrier()
-                            hip_s_barrier()
-                            store_c_mi(m_part, n_part, mi)
+                c_frags = compute_final_tile_and_epilogue_non_fp8(k_offset, c_frags)
         return
 
     @flyc.jit
@@ -2081,10 +2110,7 @@ def compile_hgemm_ht_kernel(
         bm = (m + BLOCK_M - 1) // BLOCK_M
         bn = n // BLOCK_N
         hgemm_ht_kernel._func.__name__ = KERNEL_NAME
-        value_attrs = {
-            "rocdl.waves_per_eu": 2,
-            "rocdl.flat_work_group_size": f"{BLOCK_THREADS},{BLOCK_THREADS}",
-        }
+        value_attrs = dict(HT_KERNEL_VALUE_ATTRS)
         if const_expr(USE_AGPR):
             value_attrs["passthrough"] = [["amdgpu-agpr-alloc", "128,128"]]
         hgemm_ht_kernel(
