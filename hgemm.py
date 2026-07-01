@@ -1713,9 +1713,11 @@ def compile_hgemm_ht_kernel(
         ldg_sts_a_async(0, 0, ks_begin)
         ldg_sts_b_async(1, 0, ks_begin)
         ldg_sts_a_async(1, 0, ks_begin)
+        rocdl.sched_barrier(0)
         if wid // 4 == 1:
             hip_s_barrier()
         hip_s_barrier()
+        rocdl.sched_barrier(0)
         ldg_sts_b_async(0, 1, ks_begin)
         ldg_sts_a_async(0, 1, ks_begin)
         ldg_sts_b_async(1, 1, ks_begin)
@@ -1736,9 +1738,6 @@ def compile_hgemm_ht_kernel(
             hip_s_barrier()
             c_frags_out = consume(0, 1, a0_frags, b1_frags, c_frags_out, False)
 
-            if const_expr(not do_prefetch):
-                __barrier(1 * LDG_REG_B_COUNT_AS + 1 * LDG_REG_A_COUNT_AS)
-
             a1_frags = ldmatrix_a(1, 0)
             if const_expr(do_prefetch):
                 ldg_sts_a_async(0, 0, next_k_offset)
@@ -1749,6 +1748,8 @@ def compile_hgemm_ht_kernel(
             if const_expr(do_prefetch):
                 ldg_sts_b_async(1, 0, next_k_offset)
                 __barrier(2 * LDG_REG_B_COUNT_AS + 1 * LDG_REG_A_COUNT_AS)
+            else:
+                hip_s_barrier()
             c_frags_out = consume(1, 1, a1_frags, b1_frags, c_frags_out, False)
 
             if const_expr(not do_prefetch):
@@ -1956,6 +1957,71 @@ def compile_hgemm_ht_kernel(
                         )
                         scf.YieldOp([])
 
+        def store_matrix_to_lds(m_, n_, c_frags):
+            c_base = (m_ * 2 + n_) * C_FRAGS_LEN
+            for mi in range_constexpr(WARP_M_STEPS):
+                warp_atom_m_idx = warp_m_idx + mi * WARP_ATOM_M
+                lds_m_base = fx.Index(
+                    m_ * HALF_BLOCK_M + warp_atom_m_idx + stmatrix_c_m_vec_idx
+                )
+                for ni in range_constexpr(WARP_N_STEPS):
+                    warp_atom_n_idx = warp_n_idx + ni * WARP_ATOM_N
+                    c_idx = c_base + mi * WARP_N_STEPS + ni
+                    for kk in range_constexpr(WMMA_C_FRAG_VALUES):
+                        lds_m_idx = lds_m_base + fx.Index(kk)
+                        lds_n_idx = fx.Index(
+                            n_ * HALF_BLOCK_N + warp_atom_n_idx + stmatrix_c_n_idx
+                        )
+                        val = vector.extract(
+                            c_frags[c_idx],
+                            static_position=[kk],
+                            dynamic_position=[],
+                        )
+                        cs_[lds_m_idx, lds_n_idx] = val.truncf(out_dtype_)
+
+        def store_matrix_from_lds(m_, n_):
+            for mi in range_constexpr(WARP_M_STEPS):
+                for i in range_constexpr(
+                    BLOCK_M_WARPS
+                    * WARP_ATOM_M
+                    * HALF_BLOCK_N
+                    // BLOCK_THREADS
+                    // STG_VEC_SIZE
+                ):
+                    global_tid = BLOCK_THREADS * i + tid
+                    m_band_idx = fx.Index(global_tid // STG_C_QUAD_X_THREADS)
+                    n_local_idx = fx.Index(
+                        global_tid % STG_C_QUAD_X_THREADS * STG_VEC_SIZE
+                    )
+                    warp_m_band = m_band_idx // fx.Index(WARP_ATOM_M)
+                    atom_m_idx = m_band_idx % fx.Index(WARP_ATOM_M)
+                    m_tile_idx = (
+                        fx.Index(m_ * HALF_BLOCK_M)
+                        + warp_m_band * fx.Index(WARP_M)
+                        + fx.Index(mi * WARP_ATOM_M)
+                        + atom_m_idx
+                    )
+                    n_tile_idx = fx.Index(n_ * HALF_BLOCK_N) + n_local_idx
+                    m_global_idx = m_offset + m_tile_idx
+                    if const_expr(ASSUME_FULL_M):
+                        vec = cs_.vec_load((m_tile_idx, n_tile_idx), STG_VEC_SIZE)
+                        C_.vec_store(
+                            (m_global_idx, n_offset + n_tile_idx), vec, STG_VEC_SIZE
+                        )
+                    else:
+                        cond = arith.cmpi(
+                            arith.CmpIPredicate.ult, m_global_idx, fx.Index(m)
+                        )
+                        cond_if = scf.IfOp(cond, results_=[], has_else=False)
+                        with ir.InsertionPoint(cond_if.then_block):
+                            vec = cs_.vec_load((m_tile_idx, n_tile_idx), STG_VEC_SIZE)
+                            C_.vec_store(
+                                (m_global_idx, n_offset + n_tile_idx),
+                                vec,
+                                STG_VEC_SIZE,
+                            )
+                            scf.YieldOp([])
+
         def compute_final_tile_and_epilogue_non_fp8(k_offset, c_frags_in):
             b0_frags = ldmatrix_b(0, 0)
             a0_frags = ldmatrix_a(0, 0)
@@ -1988,31 +2054,20 @@ def compile_hgemm_ht_kernel(
             hip_s_barrier()
             c_frags_out = consume(1, 0, a1_frags, b0_frags, c_frags_out, False)
 
-            def local_c_quad_for(m_part, n_part):
-                c_base = (m_part * 2 + n_part) * C_FRAGS_LEN
-                return c_frags_out[c_base : c_base + C_FRAGS_LEN]
-
-            for mi in range_constexpr(WARP_M_STEPS):
-                write_c_mi_to_lds(0, 0, mi, local_c_quad_for(0, 0))
-            for mi in range_constexpr(WARP_M_STEPS):
-                write_c_mi_to_lds(0, 1, mi, local_c_quad_for(0, 1))
+            store_matrix_to_lds(0, 0, c_frags_out)
+            store_matrix_to_lds(0, 1, c_frags_out)
             hip_s_barrier()
-            for mi in range_constexpr(WARP_M_STEPS):
-                store_c_mi(0, 0, mi)
-            for mi in range_constexpr(WARP_M_STEPS):
-                store_c_mi(0, 1, mi)
+            store_matrix_from_lds(0, 0)
+            store_matrix_from_lds(0, 1)
 
             c_frags_out = consume(1, 1, a1_frags, b1_frags, c_frags_out, False)
 
-            for mi in range_constexpr(WARP_M_STEPS):
-                write_c_mi_to_lds(1, 0, mi, local_c_quad_for(1, 0))
-            for mi in range_constexpr(WARP_M_STEPS):
-                write_c_mi_to_lds(1, 1, mi, local_c_quad_for(1, 1))
+            store_matrix_to_lds(1, 0, c_frags_out)
+            store_matrix_to_lds(1, 1, c_frags_out)
             hip_s_barrier()
-            for mi in range_constexpr(WARP_M_STEPS):
-                store_c_mi(1, 0, mi)
-            for mi in range_constexpr(WARP_M_STEPS):
-                store_c_mi(1, 1, mi)
+            store_matrix_from_lds(1, 0)
+            store_matrix_from_lds(1, 1)
+
             return c_frags_out
 
         # NOTE: Assume no barrier need
