@@ -2043,7 +2043,6 @@ def compile_hgemm_ht_kernel(
             b0_frags = ldmatrix_b(0, 1)
             hip_s_barrier()
             c_frags_out = consume(1, 1, a1_frags, b1_frags, c_frags_out, True)
-            hip_s_barrier()
             # 1
             __barrier(0)
             a0_frags = ldmatrix_a(0, 1)
