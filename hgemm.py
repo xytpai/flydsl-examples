@@ -2056,7 +2056,6 @@ def compile_hgemm_ht_kernel(
             a1_frags = ldmatrix_a(1, 1)
             hip_s_barrier()
             rocdl.sched_barrier(0)
-
             if const_expr(IS_FP8_PTPC):
                 scale_b0 = load_scale_b(0)
                 scale_a0 = load_scale_a(0)
@@ -2067,20 +2066,25 @@ def compile_hgemm_ht_kernel(
                 store_matrix_to_lds(0, 0, c_frags_out)
                 store_matrix_to_lds(0, 1, c_frags_out)
             c_frags_out = consume(1, 0, a1_frags, b0_frags, c_frags_out, False)
+            rocdl.sched_barrier(0)
             hip_s_barrier()
+            rocdl.sched_barrier(0)
             store_matrix_from_lds(0, 0)
             store_matrix_from_lds(0, 1)
-            hip_s_barrier()
-            c_frags_out = consume(1, 1, a1_frags, b1_frags, c_frags_out, False)
             if const_expr(IS_FP8_PTPC):
                 scale_a1 = load_scale_a(1)
                 store_matrix_to_lds(1, 0, c_frags_out, scale_a1, scale_b0)
-                store_matrix_to_lds(1, 1, c_frags_out, scale_a1, scale_b1)
             else:
                 store_matrix_to_lds(1, 0, c_frags_out)
-                store_matrix_to_lds(1, 1, c_frags_out)
+            c_frags_out = consume(1, 1, a1_frags, b1_frags, c_frags_out, False)
+            rocdl.sched_barrier(0)
             hip_s_barrier()
             store_matrix_from_lds(1, 0)
+            if const_expr(IS_FP8_PTPC):
+                store_matrix_to_lds(1, 1, c_frags_out, scale_a1, scale_b1)
+            else:
+                store_matrix_to_lds(1, 1, c_frags_out)
+            hip_s_barrier()
             store_matrix_from_lds(1, 1)
             return c_frags_out
 
