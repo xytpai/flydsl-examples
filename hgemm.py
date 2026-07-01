@@ -1098,7 +1098,6 @@ def compile_hgemm_ht_kernel(
     OUT_DTYPE_BYTES = 2
     DMA_BYTES = 16
     LDG_VEC_SIZE = 16 if IS_FP8_PTPC else 8
-    STG_VEC_SIZE = 8
     LDG_ASYNC_VEC_SIZE = DMA_BYTES // DTYPE_BYTES
     MFMA_PER_WARP_K = 1
 
@@ -1126,10 +1125,21 @@ def compile_hgemm_ht_kernel(
     assert WARP_M_STEPS >= 1 and WARP_N_STEPS >= 1
     assert HALF_BLOCK_M % (BLOCK_M_WARPS * WARP_ATOM_M) == 0
     assert HALF_BLOCK_N % (BLOCK_N_WARPS * WARP_ATOM_N) == 0
-
     WARP_M = WARP_M_STEPS * WARP_ATOM_M
     WARP_N = WARP_N_STEPS * WARP_ATOM_N
     BLOCK_THREADS = BLOCK_M_WARPS * BLOCK_N_WARPS * WARP_SIZE
+
+    STG_SIZE_PER_M_STEP = BLOCK_M_WARPS * WARP_ATOM_M * HALF_BLOCK_N
+    STG_WORK_SIZE_PER_M_STEP = STG_SIZE_PER_M_STEP // BLOCK_THREADS
+    assert (STG_SIZE_PER_M_STEP % BLOCK_THREADS == 0) and (
+        STG_WORK_SIZE_PER_M_STEP >= 1
+    )
+    STG_VEC_SIZE = 8 if STG_WORK_SIZE_PER_M_STEP >= 8 else STG_WORK_SIZE_PER_M_STEP
+    assert STG_VEC_SIZE in [8, 4]
+    assert (STG_WORK_SIZE_PER_M_STEP % STG_VEC_SIZE == 0) and (
+        STG_WORK_SIZE_PER_M_STEP // STG_VEC_SIZE >= 1
+    )
+
     LDG_X_THREADS_AS = BLOCK_K // LDG_ASYNC_VEC_SIZE
     LDG_REG_A_COUNT = HALF_BLOCK_M * BLOCK_K // BLOCK_THREADS // LDG_VEC_SIZE
     LDG_REG_B_COUNT = HALF_BLOCK_N * BLOCK_K // BLOCK_THREADS // LDG_VEC_SIZE
@@ -1983,13 +1993,7 @@ def compile_hgemm_ht_kernel(
 
         def store_matrix_from_lds(m_, n_):
             for mi in range_constexpr(WARP_M_STEPS):
-                for i in range_constexpr(
-                    BLOCK_M_WARPS
-                    * WARP_ATOM_M
-                    * HALF_BLOCK_N
-                    // BLOCK_THREADS
-                    // STG_VEC_SIZE
-                ):
+                for i in range_constexpr(STG_WORK_SIZE_PER_M_STEP // STG_VEC_SIZE):
                     global_tid = BLOCK_THREADS * i + tid
                     m_band_idx = fx.Index(global_tid // STG_C_QUAD_X_THREADS)
                     n_local_idx = fx.Index(
