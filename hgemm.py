@@ -49,6 +49,7 @@ from hgemm_utils import (
     __barrier,
     __s_barrier,
     buffer_load_lds_inline,
+    SplitKProtocol,
 )
 
 SPLIT_K_SEMAPHORE_MAX_LEN = 256
@@ -241,6 +242,10 @@ def compile_hgemm_ft_kernel(
     if HAS_BIAS:
         KERNEL_NAME += "_BIAS"
 
+    splitk_protocol = SplitKProtocol(
+        SPLIT_K, BLOCK_M, BLOCK_N, LDG_VEC_SIZE, DTYPE_BYTES, BLOCK_THREADS, HAS_BIAS
+    )
+
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
     def hgemm_ft_kernel(
         C: fx.Pointer,
@@ -260,6 +265,8 @@ def compile_hgemm_ft_kernel(
         C_ = GTensor(C, dtype=dtype_, shape=(-1, n))
         if const_expr(HAS_BIAS):
             BIAS_ = GTensor(BIAS, dtype=dtype_, shape=(n,))
+        else:
+            BIAS_ = None
         base_ptr = allocator.get_base()
         smem_a_ptr = SmemPtr(
             base_ptr, smem_a_offset, dtype_, shape=(STAGES * BLOCK_M * BLOCK_K,)
@@ -273,10 +280,6 @@ def compile_hgemm_ft_kernel(
             base_ptr, smem_a_offset, dtype_, shape=(BLOCK_K_WARPS * BLOCK_M * BLOCK_N,)
         )
         cs_ = STensor(smem_c_ptr, dtype_, shape=(BLOCK_K_WARPS, BLOCK_M, BLOCK_N))
-        if const_expr(IS_SPLIT_K):
-            semaphore_ = GTensor(semaphore, dtype=T.i32, shape=(-1,))
-            signal_ = GTensor(signal, dtype=T.i32, shape=(-1,))
-            signal_idx = fx.Int32(fx.block_idx.x)
 
         tid = fx.thread_idx.x
         wid = tid // WARP_SIZE
@@ -328,121 +331,20 @@ def compile_hgemm_ft_kernel(
                 for jj in range_constexpr(WARP_N_STEPS):
                     c_frags[ii * WARP_N_STEPS + jj] = bias_frags[jj]
 
-        def zero_c():
-            # zero c if current block is the first block
-            is_t0_cond = arith.cmpi(arith.CmpIPredicate.eq, fx.Index(tid), fx.Index(0))
-            cond_ks0 = arith.cmpi(arith.CmpIPredicate.eq, ks_idx, fx.Index(0))
-            cond_ks0_if = scf.IfOp(cond_ks0, results_=[], has_else=False)
-            with ir.InsertionPoint(cond_ks0_if.then_block):
-                zero_vec = vector.broadcast(T.vec(LDG_VEC_SIZE, dtype_), c_zero_d)
-                for i in range_constexpr(LDG_REG_C_COUNT):
-                    global_tid = BLOCK_THREADS * i + tid
-                    m_local_idx = global_tid // LDG_C_X_THREADS
-                    n_local_idx = global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE
-                    row_idx = m_offset + fx.Index(m_local_idx)
-                    init_vec = zero_vec
-                    if const_expr(HAS_BIAS):
-                        init_vec = BIAS_.vec_load(
-                            (n_offset + n_local_idx,), LDG_VEC_SIZE
-                        )
-                    cond_boundary = arith.cmpi(
-                        arith.CmpIPredicate.ult, row_idx, fx.Index(m)
-                    )
-                    cond_boundary_if = scf.IfOp(
-                        cond_boundary, results_=[], has_else=False
-                    )
-                    with ir.InsertionPoint(cond_boundary_if.then_block):
-                        bytes_offset = C_.linear_offset(
-                            (row_idx, n_offset + n_local_idx)
-                        )
-                        bytes_offset_i32 = arith.index_cast(T.i32, bytes_offset)
-                        c_ptr = get_llvm_ptr(
-                            C,
-                            bytes_offset_i32,
-                            DTYPE_BYTES,
-                            ir.Type.parse("!llvm.ptr<1>"),
-                        )
-                        llvm.InlineAsmOp(
-                            None,
-                            [c_ptr, init_vec],
-                            "global_store_dwordx4 $0, $1, off sc0 sc1",
-                            "v,v",
-                            has_side_effects=True,
-                        )
-                        scf.YieldOp([])
-                gpu.barrier()
-                # trigger signal when zeroc is done by the first arrived block
-                is_t0_cond_if = scf.IfOp(is_t0_cond, results_=[], has_else=False)
-                with ir.InsertionPoint(is_t0_cond_if.then_block):
-                    signal_ptr = get_llvm_ptr(
-                        signal, signal_idx, 4, ir.Type.parse("!llvm.ptr<1>")
-                    )
-                    llvm.InlineAsmOp(
-                        None,
-                        [signal_ptr, arith.constant(1, type=T.i32)],
-                        "global_store_dword $0, $1, off sc0 sc1",
-                        "v,v",
-                        has_side_effects=True,
-                    )
-                    scf.YieldOp([])
-                gpu.barrier()
-                scf.YieldOp([])
-
-        def split_k_barrier():
-            # spin-wait until signal triggered
-            is_t0_cond = arith.cmpi(arith.CmpIPredicate.eq, fx.Index(tid), fx.Index(0))
-            is_t0_cond_if = scf.IfOp(is_t0_cond, results_=[], has_else=False)
-            with ir.InsertionPoint(is_t0_cond_if.then_block):
-                init_cur = arith.constant(0, type=T.i32)
-                w = scf.WhileOp([T.i32], [init_cur])
-                before = ir.Block.create_at_start(w.before, [T.i32])
-                after = ir.Block.create_at_start(w.after, [T.i32])
-                with ir.InsertionPoint(before):
-                    cur = before.arguments[0]
-                    need_wait = arith.CmpIOp(
-                        arith.CmpIPredicate.eq, cur, arith.constant(0, type=T.i32)
-                    ).result
-                    scf.ConditionOp(need_wait, [cur])
-                with ir.InsertionPoint(after):
-                    signal_ptr = get_llvm_ptr(
-                        signal, signal_idx, 4, ir.Type.parse("!llvm.ptr<1>")
-                    )
-                    data = llvm.InlineAsmOp(
-                        T.i32,
-                        [signal_ptr],
-                        "global_load_dword $0, $1, off sc1",
-                        "=v,v",
-                        has_side_effects=True,
-                    ).result
-                    rocdl.s_waitcnt(0)
-                    scf.YieldOp([data])
-                scf.YieldOp([])
-            rocdl.sched_barrier(0)
-            gpu.barrier()
-            # clean semaphore and signal if this is the last block within split-k group
-            is_t0_cond_if = scf.IfOp(is_t0_cond, results_=[], has_else=False)
-            with ir.InsertionPoint(is_t0_cond_if.then_block):
-                semaphore_ptr = get_llvm_ptr(
-                    semaphore, signal_idx, 4, ir.Type.parse("!llvm.ptr<1>")
-                )
-                arrive_idx = llvm.AtomicRMWOp(
-                    llvm.AtomicBinOp.add,
-                    semaphore_ptr,
-                    arith.constant(1, type=T.i32),
-                    llvm.AtomicOrdering.monotonic,
-                    syncscope="agent",
-                    alignment=4,
-                ).result
-                cond_ksl = arith.cmpi(
-                    arith.CmpIPredicate.eq, fx.Index(arrive_idx), fx.Index(SPLIT_K - 1)
-                )
-                cond_ksl_if = scf.IfOp(cond_ksl, results_=[], has_else=False)
-                with ir.InsertionPoint(cond_ksl_if.then_block):
-                    semaphore_[signal_idx] = arith.constant(0, type=T.i32)
-                    signal_[signal_idx] = arith.constant(0, type=T.i32)
-                    scf.YieldOp([])
-                scf.YieldOp([])
-            gpu.barrier()
+        if const_expr(IS_SPLIT_K):
+            signal_idx = fx.Int32(fx.block_idx.x)
+            splitk_protocol.init(
+                tid,
+                ks_idx,
+                m,
+                m_offset,
+                n_offset,
+                dtype_,
+                dtype_,
+                signal,
+                signal_idx,
+                semaphore,
+            )
 
         def get_dma_copy_warp_offset():
             warp_offset = rocdl.readfirstlane(
@@ -626,7 +528,7 @@ def compile_hgemm_ft_kernel(
         warp_offset = get_dma_copy_warp_offset()
 
         if const_expr(IS_SPLIT_K):
-            zero_c()
+            splitk_protocol.zero_c(C, C_, BIAS_)
 
         for s in range_constexpr(STAGES - 1):
             ldg_sts_b_async(ks_begin + s * BLOCK_K, s)
@@ -693,7 +595,7 @@ def compile_hgemm_ft_kernel(
 
         # write back to global
         if const_expr(IS_SPLIT_K):
-            split_k_barrier()
+            splitk_protocol.split_k_barrier()
             for i in range_constexpr(LDG_REG_C_COUNT):
                 global_tid = BLOCK_THREADS * i + tid
                 m_local_idx = fx.Index(global_tid // LDG_C_X_THREADS)
@@ -925,6 +827,10 @@ def compile_hgemm_ht_kernel(
         "rocdl.flat_work_group_size": f"{BLOCK_THREADS},{BLOCK_THREADS}",
     }
 
+    splitk_protocol = SplitKProtocol(
+        SPLIT_K, BLOCK_M, BLOCK_N, LDG_VEC_SIZE, DTYPE_BYTES, BLOCK_THREADS, HAS_BIAS
+    )
+
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
     def hgemm_ht_kernel(
         C: fx.Pointer,
@@ -961,10 +867,6 @@ def compile_hgemm_ht_kernel(
             SCALE_B_ = GTensor(SCALE_B, dtype=T.f32, shape=(n,))
         if const_expr(HAS_BIAS):
             BIAS_ = GTensor(BIAS, dtype=out_dtype_, shape=(n,))
-        if const_expr(IS_SPLIT_K):
-            semaphore_ = GTensor(semaphore, dtype=T.i32, shape=(-1,))
-            signal_ = GTensor(signal, dtype=T.i32, shape=(-1,))
-            signal_idx = fx.Int32(fx.block_idx.x)
 
         base_ptr = allocator.get_base()
         smem_a_ptr = SmemPtr(
@@ -1092,117 +994,20 @@ def compile_hgemm_ht_kernel(
                 )
             swizzle_cache_b[i] = n_local_idx * k + col_in_bytes // DTYPE_BYTES
 
-        def zero_c():
-            is_t0_cond = arith.cmpi(arith.CmpIPredicate.eq, fx.Index(tid), fx.Index(0))
-            cond_ks0 = arith.cmpi(arith.CmpIPredicate.eq, ks_idx, fx.Index(0))
-            cond_ks0_if = scf.IfOp(cond_ks0, results_=[], has_else=False)
-            with ir.InsertionPoint(cond_ks0_if.then_block):
-                zero_vec = vector.broadcast(T.vec(STG_VEC_SIZE, out_dtype_), c_zero_d)
-                for i in range_constexpr(STG_REG_C_COUNT):
-                    global_tid = BLOCK_THREADS * i + tid
-                    m_local_idx = global_tid // STG_C_X_THREADS
-                    n_local_idx = global_tid % STG_C_X_THREADS * STG_VEC_SIZE
-                    row_idx = m_offset + fx.Index(m_local_idx)
-                    init_vec = zero_vec
-                    if const_expr(HAS_BIAS):
-                        init_vec = BIAS_.vec_load(
-                            (n_offset + n_local_idx,), STG_VEC_SIZE
-                        )
-                    cond_boundary = arith.cmpi(
-                        arith.CmpIPredicate.ult, row_idx, fx.Index(m)
-                    )
-                    cond_boundary_if = scf.IfOp(
-                        cond_boundary, results_=[], has_else=False
-                    )
-                    with ir.InsertionPoint(cond_boundary_if.then_block):
-                        bytes_offset = C_.linear_offset(
-                            (row_idx, n_offset + n_local_idx)
-                        )
-                        bytes_offset_i32 = arith.index_cast(T.i32, bytes_offset)
-                        c_ptr = get_llvm_ptr(
-                            C,
-                            bytes_offset_i32,
-                            OUT_DTYPE_BYTES,
-                            ir.Type.parse("!llvm.ptr<1>"),
-                        )
-                        llvm.InlineAsmOp(
-                            None,
-                            [c_ptr, init_vec],
-                            "global_store_dwordx4 $0, $1, off sc0 sc1",
-                            "v,v",
-                            has_side_effects=True,
-                        )
-                        scf.YieldOp([])
-                gpu.barrier()
-                is_t0_cond_if = scf.IfOp(is_t0_cond, results_=[], has_else=False)
-                with ir.InsertionPoint(is_t0_cond_if.then_block):
-                    signal_ptr = get_llvm_ptr(
-                        signal, signal_idx, 4, ir.Type.parse("!llvm.ptr<1>")
-                    )
-                    llvm.InlineAsmOp(
-                        None,
-                        [signal_ptr, arith.constant(1, type=T.i32)],
-                        "global_store_dword $0, $1, off sc0 sc1",
-                        "v,v",
-                        has_side_effects=True,
-                    )
-                    scf.YieldOp([])
-                gpu.barrier()
-                scf.YieldOp([])
-
-        def split_k_barrier():
-            is_t0_cond = arith.cmpi(arith.CmpIPredicate.eq, fx.Index(tid), fx.Index(0))
-            is_t0_cond_if = scf.IfOp(is_t0_cond, results_=[], has_else=False)
-            with ir.InsertionPoint(is_t0_cond_if.then_block):
-                init_cur = arith.constant(0, type=T.i32)
-                w = scf.WhileOp([T.i32], [init_cur])
-                before = ir.Block.create_at_start(w.before, [T.i32])
-                after = ir.Block.create_at_start(w.after, [T.i32])
-                with ir.InsertionPoint(before):
-                    cur = before.arguments[0]
-                    need_wait = arith.CmpIOp(
-                        arith.CmpIPredicate.eq, cur, arith.constant(0, type=T.i32)
-                    ).result
-                    scf.ConditionOp(need_wait, [cur])
-                with ir.InsertionPoint(after):
-                    signal_ptr = get_llvm_ptr(
-                        signal, signal_idx, 4, ir.Type.parse("!llvm.ptr<1>")
-                    )
-                    data = llvm.InlineAsmOp(
-                        T.i32,
-                        [signal_ptr],
-                        "global_load_dword $0, $1, off sc1",
-                        "=v,v",
-                        has_side_effects=True,
-                    ).result
-                    rocdl.s_waitcnt(0)
-                    scf.YieldOp([data])
-                scf.YieldOp([])
-            rocdl.sched_barrier(0)
-            gpu.barrier()
-            is_t0_cond_if = scf.IfOp(is_t0_cond, results_=[], has_else=False)
-            with ir.InsertionPoint(is_t0_cond_if.then_block):
-                semaphore_ptr = get_llvm_ptr(
-                    semaphore, signal_idx, 4, ir.Type.parse("!llvm.ptr<1>")
-                )
-                arrive_idx = llvm.AtomicRMWOp(
-                    llvm.AtomicBinOp.add,
-                    semaphore_ptr,
-                    arith.constant(1, type=T.i32),
-                    llvm.AtomicOrdering.monotonic,
-                    syncscope="agent",
-                    alignment=4,
-                ).result
-                cond_ksl = arith.cmpi(
-                    arith.CmpIPredicate.eq, fx.Index(arrive_idx), fx.Index(SPLIT_K - 1)
-                )
-                cond_ksl_if = scf.IfOp(cond_ksl, results_=[], has_else=False)
-                with ir.InsertionPoint(cond_ksl_if.then_block):
-                    semaphore_[signal_idx] = arith.constant(0, type=T.i32)
-                    signal_[signal_idx] = arith.constant(0, type=T.i32)
-                    scf.YieldOp([])
-                scf.YieldOp([])
-            gpu.barrier()
+        if const_expr(IS_SPLIT_K):
+            signal_idx = fx.Int32(fx.block_idx.x)
+            splitk_protocol.init(
+                tid,
+                ks_idx,
+                m,
+                m_offset,
+                n_offset,
+                input_dtype_,
+                out_dtype_,
+                signal,
+                signal_idx,
+                semaphore,
+            )
 
         def get_dma_copy_warp_offset():
             return rocdl.readfirstlane(
@@ -1406,7 +1211,7 @@ def compile_hgemm_ht_kernel(
             return c_frags_out
 
         if const_expr(IS_SPLIT_K):
-            zero_c()
+            splitk_protocol.zero_c(C, C_, BIAS_)
 
         ldg_sts_b_async(0, 0, ks_begin)
         ldg_sts_a_async(0, 0, ks_begin)
@@ -1791,7 +1596,7 @@ def compile_hgemm_ht_kernel(
                         write_c_mi_to_lds(
                             m_part, n_part, mi, c_quad_for(m_part, n_part)
                         )
-            split_k_barrier()
+            splitk_protocol.split_k_barrier()
             for i in range_constexpr(STG_REG_C_COUNT):
                 global_tid = BLOCK_THREADS * i + tid
                 m_local_idx = fx.Index(global_tid // STG_C_X_THREADS)
