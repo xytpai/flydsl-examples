@@ -50,6 +50,7 @@ from hgemm_utils import (
     __s_barrier,
     buffer_load_lds_inline,
     SplitKProtocol,
+    BlockSwizzle,
 )
 
 SPLIT_K_SEMAPHORE_MAX_LEN = 256
@@ -245,6 +246,9 @@ def compile_hgemm_ft_kernel(
     splitk_protocol = SplitKProtocol(
         SPLIT_K, BLOCK_M, BLOCK_N, LDG_VEC_SIZE, DTYPE_BYTES, BLOCK_THREADS, HAS_BIAS
     )
+    block_swizzle = BlockSwizzle(
+        NUM_XCDS=8, NUM_CUS=256, GROUP_M=-1, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, N=n
+    )
 
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
     def hgemm_ft_kernel(
@@ -287,11 +291,7 @@ def compile_hgemm_ft_kernel(
         wid_k = wid // BLOCK_MN_WARPS
         w_tid = tid % WARP_SIZE
 
-        def swizzle_for_cache_reuse(pid):
-            # Do nothing currently
-            return pid // N_BLOCKS, pid % N_BLOCKS
-
-        block_m_idx, block_n_idx = swizzle_for_cache_reuse(fx.block_idx.x)
+        block_m_idx, block_n_idx = block_swizzle.swizzle(m, fx.block_idx.x)
         ks_idx = fx.Index(fx.block_idx.y)
         ks_begin = arith.index_cast(T.i32, ks_idx * ks)
 
@@ -703,7 +703,7 @@ def compile_hgemm_ht_kernel(
     BLOCK_M_WARPS: int = 2,
     BLOCK_N_WARPS: int = 2,
     HAS_BIAS: bool = False,
-    XCD_SWIZZLE: int = 0,
+    GROUP_M: int = 0,
     ASSUME_FULL_M: bool = False,
 ):
     assert n % TILE_N == 0
@@ -819,8 +819,8 @@ def compile_hgemm_ht_kernel(
         KERNEL_NAME += "_BIAS"
     if ASSUME_FULL_M:
         KERNEL_NAME += "_FM"
-    if XCD_SWIZZLE > 0:
-        KERNEL_NAME += f"_XCD{XCD_SWIZZLE}"
+    if GROUP_M > 0:
+        KERNEL_NAME += f"_XCD{GROUP_M}"
 
     HT_KERNEL_VALUE_ATTRS = {
         "rocdl.waves_per_eu": 2,
@@ -829,6 +829,9 @@ def compile_hgemm_ht_kernel(
 
     splitk_protocol = SplitKProtocol(
         SPLIT_K, BLOCK_M, BLOCK_N, LDG_VEC_SIZE, DTYPE_BYTES, BLOCK_THREADS, HAS_BIAS
+    )
+    block_swizzle = BlockSwizzle(
+        NUM_XCDS=8, NUM_CUS=256, GROUP_M=GROUP_M, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, N=n
     )
 
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
@@ -891,46 +894,7 @@ def compile_hgemm_ht_kernel(
         wid = tid // WARP_SIZE
         w_tid = tid % WARP_SIZE
 
-        def swizzle_for_xcd(pid):
-            simple_m = fx.Index(pid // N_BLOCKS)
-            simple_n = fx.Index(pid % N_BLOCKS)
-            if const_expr(XCD_SWIZZLE <= 0):
-                return simple_m, simple_n
-
-            num_xcds = fx.Index(8)
-            num_cus = fx.Index(32 * 8)
-            swizzle_threshold = fx.Index(4) * num_cus
-            num_pid_n = fx.Index(N_BLOCKS)
-            num_pid_m = (fx.Index(m) + fx.Index(BLOCK_M - 1)) // fx.Index(BLOCK_M)
-            num_wg = num_pid_m * num_pid_n
-
-            linear_id = fx.Index(pid)
-            intra_xcd = linear_id // num_xcds
-            xcd = linear_id % num_xcds
-            wgid = xcd * (num_wg // num_xcds) + intra_xcd
-
-            group_m = fx.Index(XCD_SWIZZLE)
-            wgid_per_group = group_m * num_pid_n
-            group_id = wgid // wgid_per_group
-            intra_group = wgid % wgid_per_group
-            first_pid_m = group_id * group_m
-            remaining_m = num_pid_m - first_pid_m
-            group_size_m = arith.select(
-                arith.cmpi(arith.CmpIPredicate.ult, remaining_m, group_m),
-                remaining_m,
-                group_m,
-            )
-            swizzled_n = intra_group // group_size_m
-            swizzled_m = first_pid_m + (intra_group % group_size_m)
-            use_simple = arith.cmpi(
-                arith.CmpIPredicate.ult, num_wg, swizzle_threshold
-            ) | arith.cmpi(arith.CmpIPredicate.ne, num_wg % num_xcds, fx.Index(0))
-            return (
-                arith.select(use_simple, simple_m, swizzled_m),
-                arith.select(use_simple, simple_n, swizzled_n),
-            )
-
-        block_m_idx, block_n_idx = swizzle_for_xcd(fx.block_idx.x)
+        block_m_idx, block_n_idx = block_swizzle.swizzle(m, fx.block_idx.x)
         ks_idx = fx.Index(fx.block_idx.y)
         ks_begin = arith.index_cast(T.i32, ks_idx * ks)
         m_offset = fx.Index(block_m_idx * BLOCK_M)
@@ -1695,7 +1659,7 @@ def compile_hgemm_kernel(
     BLOCK_K_WARPS: int = 1,
     HAS_BIAS: bool = False,
     USE_HT: bool = False,
-    XCD_SWIZZLE: int = 0,
+    GROUP_M: int = 0,
     ASSUME_FULL_M: bool = False,
 ):
     assert n % 8 == 0
@@ -1713,7 +1677,7 @@ def compile_hgemm_kernel(
             BLOCK_M_WARPS=BLOCK_M_WARPS,
             BLOCK_N_WARPS=BLOCK_N_WARPS,
             HAS_BIAS=HAS_BIAS,
-            XCD_SWIZZLE=XCD_SWIZZLE,
+            GROUP_M=GROUP_M,
             ASSUME_FULL_M=ASSUME_FULL_M,
         )
     else:
@@ -1744,7 +1708,7 @@ def get_default_b16_kwargs(m, n, k):
         "BLOCK_N_WARPS": 4,
         "BLOCK_K_WARPS": 1,
         "USE_HT": True,
-        "XCD_SWIZZLE": -1,
+        "GROUP_M": 4,
     }
     if m == 2048 and n == 2048 and k == 2048:
         kwargs["TILE_M"] = 128
@@ -1830,7 +1794,7 @@ def get_default_b8_kwargs(m, n, k):
         "BLOCK_N_WARPS": 4,
         "BLOCK_K_WARPS": 1,
         "USE_HT": True,
-        "XCD_SWIZZLE": -1,
+        "GROUP_M": -1,
     }
     return kwargs
 

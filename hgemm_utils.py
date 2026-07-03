@@ -330,5 +330,48 @@ class SplitKProtocol:
         gpu.barrier()
 
 
-# class BlockSwizzle:
-#     def __init__():
+class BlockSwizzle:
+    def __init__(self, NUM_XCDS, NUM_CUS, GROUP_M, BLOCK_M, BLOCK_N, N):
+        self.NUM_XCDS = NUM_XCDS
+        self.NUM_CUS = NUM_CUS
+        self.GROUP_M = GROUP_M
+        self.BLOCK_M = BLOCK_M
+        self.BLOCK_N = BLOCK_N
+        self.N = N
+        self.N_BLOCKS = N // BLOCK_N
+
+    def swizzle(self, m, pid):
+        simple_m = fx.Index(pid // self.N_BLOCKS)
+        simple_n = fx.Index(pid % self.N_BLOCKS)
+        if const_expr(self.GROUP_M <= 0):
+            return simple_m, simple_n
+        num_xcds = fx.Index(self.NUM_XCDS)
+        num_cus = fx.Index(self.NUM_CUS)
+        swizzle_threshold = num_cus
+        num_pid_n = fx.Index(self.N_BLOCKS)
+        num_pid_m = (fx.Index(m) + fx.Index(self.BLOCK_M - 1)) // fx.Index(self.BLOCK_M)
+        num_wg = num_pid_m * num_pid_n
+        linear_id = fx.Index(pid)
+        intra_xcd = linear_id // num_xcds
+        xcd = linear_id % num_xcds
+        wgid = xcd * (num_wg // num_xcds) + intra_xcd
+        group_m = fx.Index(self.GROUP_M)
+        wgid_per_group = group_m * num_pid_n
+        group_id = wgid // wgid_per_group
+        intra_group = wgid % wgid_per_group
+        first_pid_m = group_id * group_m
+        remaining_m = num_pid_m - first_pid_m
+        group_size_m = arith.select(
+            arith.cmpi(arith.CmpIPredicate.ult, remaining_m, group_m),
+            remaining_m,
+            group_m,
+        )
+        swizzled_n = intra_group // group_size_m
+        swizzled_m = first_pid_m + (intra_group % group_size_m)
+        use_simple = arith.cmpi(
+            arith.CmpIPredicate.ult, num_wg, swizzle_threshold
+        ) | arith.cmpi(arith.CmpIPredicate.ne, num_wg % num_xcds, fx.Index(0))
+        return (
+            arith.select(use_simple, simple_m, swizzled_m),
+            arith.select(use_simple, simple_n, swizzled_n),
+        )
