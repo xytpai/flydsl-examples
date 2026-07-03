@@ -1366,43 +1366,6 @@ def compile_hgemm_ht_kernel(
                                 val = val + bias_common
                         cs_[lds_m_idx, lds_n_idx] = val.truncf(out_dtype_)
 
-        def store_matrix_from_lds(m_, n_):
-            for mi in range_constexpr(WARP_M_STEPS):
-                for i in range_constexpr(STG_WORK_SIZE_PER_M_STEP // STG_VEC_SIZE):
-                    global_tid = BLOCK_THREADS * i + tid
-                    m_band_idx = fx.Index(global_tid // STG_C_QUAD_X_THREADS)
-                    n_local_idx = fx.Index(
-                        global_tid % STG_C_QUAD_X_THREADS * STG_VEC_SIZE
-                    )
-                    warp_m_band = m_band_idx // fx.Index(WARP_ATOM_M)
-                    atom_m_idx = m_band_idx % fx.Index(WARP_ATOM_M)
-                    m_tile_idx = (
-                        fx.Index(m_ * HALF_BLOCK_M)
-                        + warp_m_band * fx.Index(WARP_M)
-                        + fx.Index(mi * WARP_ATOM_M)
-                        + atom_m_idx
-                    )
-                    n_tile_idx = fx.Index(n_ * HALF_BLOCK_N) + n_local_idx
-                    m_global_idx = m_offset + m_tile_idx
-                    if const_expr(ASSUME_FULL_M):
-                        vec = cs_.vec_load((m_tile_idx, n_tile_idx), STG_VEC_SIZE)
-                        C_.vec_store(
-                            (m_global_idx, n_offset + n_tile_idx), vec, STG_VEC_SIZE
-                        )
-                    else:
-                        cond = arith.cmpi(
-                            arith.CmpIPredicate.ult, m_global_idx, fx.Index(m)
-                        )
-                        cond_if = scf.IfOp(cond, results_=[], has_else=False)
-                        with ir.InsertionPoint(cond_if.then_block):
-                            vec = cs_.vec_load((m_tile_idx, n_tile_idx), STG_VEC_SIZE)
-                            C_.vec_store(
-                                (m_global_idx, n_offset + n_tile_idx),
-                                vec,
-                                STG_VEC_SIZE,
-                            )
-                            scf.YieldOp([])
-
         def atomic_add_vec_to_c(m_global_idx, n_global_idx, vec):
             linear_offset_c = C_.linear_offset((m_global_idx, n_global_idx))
             vec2_ty = T.vec(2, out_dtype_)
@@ -1432,7 +1395,13 @@ def compile_hgemm_ht_kernel(
                     alignment=4,
                 )
 
-        def atomic_add_matrix_from_lds(m_, n_):
+        def store_vec_to_c(m_global_idx, n_global_idx, vec):
+            if const_expr(IS_SPLIT_K):
+                atomic_add_vec_to_c(m_global_idx, n_global_idx, vec)
+            else:
+                C_.vec_store((m_global_idx, n_global_idx), vec, STG_VEC_SIZE)
+
+        def store_matrix_from_lds(m_, n_):
             for mi in range_constexpr(WARP_M_STEPS):
                 for i in range_constexpr(STG_WORK_SIZE_PER_M_STEP // STG_VEC_SIZE):
                     global_tid = BLOCK_THREADS * i + tid
@@ -1452,7 +1421,7 @@ def compile_hgemm_ht_kernel(
                     m_global_idx = m_offset + m_tile_idx
                     if const_expr(ASSUME_FULL_M):
                         vec = cs_.vec_load((m_tile_idx, n_tile_idx), STG_VEC_SIZE)
-                        atomic_add_vec_to_c(m_global_idx, n_offset + n_tile_idx, vec)
+                        store_vec_to_c(m_global_idx, n_offset + n_tile_idx, vec)
                     else:
                         cond = arith.cmpi(
                             arith.CmpIPredicate.ult, m_global_idx, fx.Index(m)
@@ -1460,16 +1429,12 @@ def compile_hgemm_ht_kernel(
                         cond_if = scf.IfOp(cond, results_=[], has_else=False)
                         with ir.InsertionPoint(cond_if.then_block):
                             vec = cs_.vec_load((m_tile_idx, n_tile_idx), STG_VEC_SIZE)
-                            atomic_add_vec_to_c(
-                                m_global_idx, n_offset + n_tile_idx, vec
+                            store_vec_to_c(
+                                m_global_idx,
+                                n_offset + n_tile_idx,
+                                vec,
                             )
                             scf.YieldOp([])
-
-        def epilogue_matrix_from_lds(m_, n_):
-            if const_expr(IS_SPLIT_K):
-                atomic_add_matrix_from_lds(m_, n_)
-            else:
-                store_matrix_from_lds(m_, n_)
 
         def compute_final_tile_and_epilogue(k_offset, c_frags_in):
             # 0
@@ -1518,8 +1483,8 @@ def compile_hgemm_ht_kernel(
             rocdl.sched_barrier(0)
             if const_expr(IS_SPLIT_K):
                 splitk_protocol.split_k_barrier()
-            epilogue_matrix_from_lds(0, 0)
-            epilogue_matrix_from_lds(0, 1)
+            store_matrix_from_lds(0, 0)
+            store_matrix_from_lds(0, 1)
             if const_expr(IS_FP8_PTPC):
                 scale_a1 = load_scale_a(1)
                 store_matrix_to_lds(1, 0, c_frags_out, scale_a1, scale_b0)
@@ -1528,13 +1493,13 @@ def compile_hgemm_ht_kernel(
             c_frags_out = consume(1, 1, a1_frags, b1_frags, c_frags_out, False)
             rocdl.sched_barrier(0)
             __s_barrier()
-            epilogue_matrix_from_lds(1, 0)
+            store_matrix_from_lds(1, 0)
             if const_expr(IS_FP8_PTPC):
                 store_matrix_to_lds(1, 1, c_frags_out, scale_a1, scale_b1)
             else:
                 store_matrix_to_lds(1, 1, c_frags_out)
             __s_barrier()
-            epilogue_matrix_from_lds(1, 1)
+            store_matrix_from_lds(1, 1)
             return c_frags_out
 
         c_frags = compute_final_tile_and_epilogue(k_offset, c_frags)
