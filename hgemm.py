@@ -261,7 +261,6 @@ def compile_hgemm_ft_kernel(
         signal: fx.Pointer,
     ):
         dtype_ = get_dtype_in_kernel(dtype)
-        c_zero_d = arith.constant(0.0, type=dtype_)
         acc_init = arith.constant_vector(0.0, T.vec(WMMA_C_FRAG_VALUES, T.f32))
 
         A_ = GTensor(A, dtype=dtype_, shape=(-1, k))
@@ -712,6 +711,7 @@ def compile_hgemm_ht_kernel(
     ks = k // SPLIT_K
     assert ks % (2 * TILE_K) == 0 and ks >= 2 * TILE_K
     assert BLOCK_M_WARPS * BLOCK_N_WARPS <= 16
+    assert BLOCK_M_WARPS == 2
 
     GPU_ARCH = get_rocm_arch()
     IS_FP8_PTPC = dtype == "fp8_ptpc"
@@ -822,11 +822,6 @@ def compile_hgemm_ht_kernel(
     if GROUP_M > 0:
         KERNEL_NAME += f"_XCD{GROUP_M}"
 
-    HT_KERNEL_VALUE_ATTRS = {
-        "rocdl.waves_per_eu": 2,
-        "rocdl.flat_work_group_size": f"{BLOCK_THREADS},{BLOCK_THREADS}",
-    }
-
     splitk_protocol = SplitKProtocol(
         SPLIT_K, BLOCK_M, BLOCK_N, LDG_VEC_SIZE, DTYPE_BYTES, BLOCK_THREADS, HAS_BIAS
     )
@@ -859,7 +854,6 @@ def compile_hgemm_ht_kernel(
             )
         )
         out_dtype_ = T.bf16 if const_expr(IS_FP8_PTPC) else input_dtype_
-        c_zero_d = arith.constant(0.0, type=out_dtype_)
         acc_init = arith.constant_vector(0.0, T.vec(WMMA_C_FRAG_VALUES, T.f32))
 
         A_ = GTensor(A, dtype=input_dtype_, shape=(-1, k))
@@ -1250,10 +1244,6 @@ def compile_hgemm_ht_kernel(
         else:
             k_offset = ks_begin
 
-        def c_quad_for(m_part, n_part):
-            c_base = (m_part * 2 + n_part) * C_FRAGS_LEN
-            return c_frags[c_base : c_base + C_FRAGS_LEN]
-
         def load_scale_a(m_part):
             lds_m_bases = [fx.Index(0)] * WARP_M_STEPS
             row_global_bases = [fx.Index(0)] * WARP_M_STEPS
@@ -1301,80 +1291,6 @@ def compile_hgemm_ht_kernel(
                 col_global = n_offset + lds_n_idx_common
                 scale_b_frags[ni] = SCALE_B_[col_global]
             return scale_b_frags
-
-        def write_c_mi_to_lds(
-            m_part,
-            n_part,
-            mi,
-            c_quad,
-            scale_b_frags=None,
-            scale_a_state=None,
-        ):
-            warp_atom_m_idx = warp_m_idx + mi * WARP_ATOM_M
-            lds_m_base = fx.Index(
-                m_part * HALF_BLOCK_M + warp_atom_m_idx + stmatrix_c_m_vec_idx
-            )
-            if const_expr(IS_FP8_PTPC):
-                lds_m_bases, row_global_bases, full_scale_rows_list, scale_a_vecs = (
-                    scale_a_state
-                )
-                lds_m_base = lds_m_bases[mi]
-                row_global_base = row_global_bases[mi]
-                full_scale_rows = full_scale_rows_list[mi]
-                scale_a_vec = scale_a_vecs[mi]
-            for ni in range_constexpr(WARP_N_STEPS):
-                warp_atom_n_idx = warp_n_idx + ni * WARP_ATOM_N
-                c_idx = mi * WARP_N_STEPS + ni
-                if const_expr(IS_FP8_PTPC):
-                    lds_n_idx_common = fx.Index(
-                        n_part * HALF_BLOCK_N + warp_atom_n_idx + stmatrix_c_n_idx
-                    )
-                    col_global = n_offset + lds_n_idx_common
-                    scale_b_common = scale_b_frags[ni]
-                    bias_common = (
-                        BIAS_[col_global].extf(T.f32)
-                        if const_expr(HAS_BIAS)
-                        else fx.Float32(0.0)
-                    )
-                for kk in range_constexpr(WMMA_C_FRAG_VALUES):
-                    lds_m_idx = lds_m_base + fx.Index(kk)
-                    lds_n_idx = fx.Index(
-                        n_part * HALF_BLOCK_N + warp_atom_n_idx + stmatrix_c_n_idx
-                    )
-                    val = vector.extract(
-                        c_quad[c_idx],
-                        static_position=[kk],
-                        dynamic_position=[],
-                    )
-                    if const_expr(IS_FP8_PTPC):
-                        scale_a_fast = vector.extract(
-                            scale_a_vec,
-                            static_position=[kk],
-                            dynamic_position=[],
-                        )
-                        if const_expr(ASSUME_FULL_M):
-                            val = val * (scale_a_fast * scale_b_common)
-                        else:
-                            row_global = row_global_base + fx.Index(kk)
-                            scale_a = arith.select(
-                                full_scale_rows,
-                                scale_a_fast,
-                                SCALE_A_[
-                                    arith.select(
-                                        arith.cmpi(
-                                            arith.CmpIPredicate.ult,
-                                            row_global,
-                                            fx.Index(m),
-                                        ),
-                                        row_global,
-                                        fx.Index(0),
-                                    )
-                                ],
-                            )
-                            val = val * scale_a * scale_b_common
-                        if const_expr(HAS_BIAS):
-                            val = val + bias_common
-                    cs_[lds_m_idx, lds_n_idx] = val.truncf(out_dtype_)
 
         def store_matrix_to_lds(
             m_, n_, c_frags, scale_a_state=None, scale_b_frags=None
@@ -1487,6 +1403,74 @@ def compile_hgemm_ht_kernel(
                             )
                             scf.YieldOp([])
 
+        def atomic_add_vec_to_c(m_global_idx, n_global_idx, vec):
+            linear_offset_c = C_.linear_offset((m_global_idx, n_global_idx))
+            vec2_ty = T.vec(2, out_dtype_)
+            for vec_idx in range_constexpr(STG_VEC_SIZE // 2):
+                e0 = vector.extract(
+                    vec, static_position=[vec_idx * 2], dynamic_position=[]
+                )
+                e1 = vector.extract(
+                    vec,
+                    static_position=[vec_idx * 2 + 1],
+                    dynamic_position=[],
+                )
+                pair = vector.from_elements(vec2_ty, [e0, e1])
+                pair_v = pair._value if const_expr(hasattr(pair, "_value")) else pair
+                pair_ptr_v = get_llvm_ptr(
+                    C,
+                    fx.Int32(linear_offset_c + vec_idx * 2),
+                    OUT_DTYPE_BYTES,
+                    ir.Type.parse("!llvm.ptr<1>"),
+                )
+                llvm.AtomicRMWOp(
+                    llvm.AtomicBinOp.fadd,
+                    pair_ptr_v,
+                    pair_v,
+                    llvm.AtomicOrdering.monotonic,
+                    syncscope="agent",
+                    alignment=4,
+                )
+
+        def atomic_add_matrix_from_lds(m_, n_):
+            for mi in range_constexpr(WARP_M_STEPS):
+                for i in range_constexpr(STG_WORK_SIZE_PER_M_STEP // STG_VEC_SIZE):
+                    global_tid = BLOCK_THREADS * i + tid
+                    m_band_idx = fx.Index(global_tid // STG_C_QUAD_X_THREADS)
+                    n_local_idx = fx.Index(
+                        global_tid % STG_C_QUAD_X_THREADS * STG_VEC_SIZE
+                    )
+                    warp_m_band = m_band_idx // fx.Index(WARP_ATOM_M)
+                    atom_m_idx = m_band_idx % fx.Index(WARP_ATOM_M)
+                    m_tile_idx = (
+                        fx.Index(m_ * HALF_BLOCK_M)
+                        + warp_m_band * fx.Index(WARP_M)
+                        + fx.Index(mi * WARP_ATOM_M)
+                        + atom_m_idx
+                    )
+                    n_tile_idx = fx.Index(n_ * HALF_BLOCK_N) + n_local_idx
+                    m_global_idx = m_offset + m_tile_idx
+                    if const_expr(ASSUME_FULL_M):
+                        vec = cs_.vec_load((m_tile_idx, n_tile_idx), STG_VEC_SIZE)
+                        atomic_add_vec_to_c(m_global_idx, n_offset + n_tile_idx, vec)
+                    else:
+                        cond = arith.cmpi(
+                            arith.CmpIPredicate.ult, m_global_idx, fx.Index(m)
+                        )
+                        cond_if = scf.IfOp(cond, results_=[], has_else=False)
+                        with ir.InsertionPoint(cond_if.then_block):
+                            vec = cs_.vec_load((m_tile_idx, n_tile_idx), STG_VEC_SIZE)
+                            atomic_add_vec_to_c(
+                                m_global_idx, n_offset + n_tile_idx, vec
+                            )
+                            scf.YieldOp([])
+
+        def epilogue_matrix_from_lds(m_, n_):
+            if const_expr(IS_SPLIT_K):
+                atomic_add_matrix_from_lds(m_, n_)
+            else:
+                store_matrix_from_lds(m_, n_)
+
         def compute_final_tile_and_epilogue(k_offset, c_frags_in):
             # 0
             b0_frags = ldmatrix_b(0, 0)
@@ -1532,8 +1516,10 @@ def compile_hgemm_ht_kernel(
             rocdl.sched_barrier(0)
             __s_barrier()
             rocdl.sched_barrier(0)
-            store_matrix_from_lds(0, 0)
-            store_matrix_from_lds(0, 1)
+            if const_expr(IS_SPLIT_K):
+                splitk_protocol.split_k_barrier()
+            epilogue_matrix_from_lds(0, 0)
+            epilogue_matrix_from_lds(0, 1)
             if const_expr(IS_FP8_PTPC):
                 scale_a1 = load_scale_a(1)
                 store_matrix_to_lds(1, 0, c_frags_out, scale_a1, scale_b0)
@@ -1542,69 +1528,16 @@ def compile_hgemm_ht_kernel(
             c_frags_out = consume(1, 1, a1_frags, b1_frags, c_frags_out, False)
             rocdl.sched_barrier(0)
             __s_barrier()
-            store_matrix_from_lds(1, 0)
+            epilogue_matrix_from_lds(1, 0)
             if const_expr(IS_FP8_PTPC):
                 store_matrix_to_lds(1, 1, c_frags_out, scale_a1, scale_b1)
             else:
                 store_matrix_to_lds(1, 1, c_frags_out)
             __s_barrier()
-            store_matrix_from_lds(1, 1)
+            epilogue_matrix_from_lds(1, 1)
             return c_frags_out
 
-        # NOTE: Assume no barrier need
-        if const_expr(IS_SPLIT_K):
-            c_frags = compute_double_tile(k_offset, c_frags)
-            for m_part in range_constexpr(2):
-                for n_part in range_constexpr(2):
-                    for mi in range_constexpr(WARP_M_STEPS):
-                        write_c_mi_to_lds(
-                            m_part, n_part, mi, c_quad_for(m_part, n_part)
-                        )
-            splitk_protocol.split_k_barrier()
-            for i in range_constexpr(STG_REG_C_COUNT):
-                global_tid = BLOCK_THREADS * i + tid
-                m_local_idx = fx.Index(global_tid // STG_C_X_THREADS)
-                n_local_idx = fx.Index(global_tid % STG_C_X_THREADS * LDG_VEC_SIZE)
-                m_global_idx = m_offset + m_local_idx
-                n_global_idx = n_offset + n_local_idx
-                cond_boundary = arith.cmpi(
-                    arith.CmpIPredicate.ult, m_global_idx, fx.Index(m)
-                )
-                cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
-                with ir.InsertionPoint(cond_boundary_if.then_block):
-                    pk_val = cs_.vec_load((m_local_idx, n_local_idx), STG_VEC_SIZE)
-                    linear_offset_c = C_.linear_offset((m_global_idx, n_global_idx))
-                    vec2_ty = T.vec(2, out_dtype_)
-                    for vec_idx in range_constexpr(STG_VEC_SIZE // 2):
-                        e0 = vector.extract(
-                            pk_val, static_position=[vec_idx * 2], dynamic_position=[]
-                        )
-                        e1 = vector.extract(
-                            pk_val,
-                            static_position=[vec_idx * 2 + 1],
-                            dynamic_position=[],
-                        )
-                        pair = vector.from_elements(vec2_ty, [e0, e1])
-                        pair_v = (
-                            pair._value if const_expr(hasattr(pair, "_value")) else pair
-                        )
-                        pair_ptr_v = get_llvm_ptr(
-                            C,
-                            fx.Int32(linear_offset_c + vec_idx * 2),
-                            OUT_DTYPE_BYTES,
-                            ir.Type.parse("!llvm.ptr<1>"),
-                        )
-                        llvm.AtomicRMWOp(
-                            llvm.AtomicBinOp.fadd,
-                            pair_ptr_v,
-                            pair_v,
-                            llvm.AtomicOrdering.monotonic,
-                            syncscope="agent",
-                            alignment=4,
-                        )
-                    scf.YieldOp([])
-        else:
-            c_frags = compute_final_tile_and_epilogue(k_offset, c_frags)
+        c_frags = compute_final_tile_and_epilogue(k_offset, c_frags)
         return
 
     @flyc.jit
@@ -1628,7 +1561,6 @@ def compile_hgemm_ht_kernel(
         bm = (m + BLOCK_M - 1) // BLOCK_M
         bn = n // BLOCK_N
         hgemm_ht_kernel._func.__name__ = KERNEL_NAME
-        value_attrs = dict(HT_KERNEL_VALUE_ATTRS)
         hgemm_ht_kernel(
             C,
             A,
@@ -1639,7 +1571,6 @@ def compile_hgemm_ht_kernel(
             m,
             semaphore,
             signal,
-            value_attrs=value_attrs,
         ).launch(grid=(bm * bn, SPLIT_K, 1), block=(BLOCK_THREADS, 1, 1), stream=stream)
 
     return launch_hgemm_ht_kernel
