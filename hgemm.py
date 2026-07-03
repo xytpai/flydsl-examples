@@ -156,7 +156,7 @@ def compile_hgemm_ft_kernel(
     GPU_ARCH = get_rocm_arch()
     IS_FP8_PTPC = dtype == "fp8_ptpc"
     if IS_FP8_PTPC:
-        assert k % 32 == 0
+        assert k % 128 == 0
         if (TILE_M == 256) and (TILE_N == 256):
             assert (TILE_K == 128) and (SPLIT_K == 1) and (STAGES == 2)
     else:
