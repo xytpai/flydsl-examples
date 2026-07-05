@@ -148,6 +148,8 @@ def compile_hgemm_wmma_kernel(
     BLOCK_M = TILE_M
     BLOCK_N = TILE_N
     BLOCK_K = TILE_K
+    HALF_BLOCK_M = BLOCK_M // 2
+    HALF_BLOCK_N = BLOCK_N // 2
     IS_FP8 = "fp8" in DTYPE
     IS_FP8_PTPC = DTYPE == "fp8_ptpc"
     WARP_SIZE = 64
@@ -173,6 +175,13 @@ def compile_hgemm_wmma_kernel(
         DMA_BYTES = 16
         MFMA_PER_WARP_K = 1
 
+    if IS_HT:
+        assert STAGES == 2
+        assert BLOCK_M_WARPS == 2
+        assert BLOCK_K_WARPS == 1
+        assert HALF_BLOCK_M * 2 == BLOCK_M
+        assert HALF_BLOCK_N * 2 == BLOCK_N
+
     WMMA_M = WMMA_IMPL.WMMA_M
     WMMA_N = WMMA_IMPL.WMMA_N
     WMMA_K = WMMA_IMPL.WMMA_K
@@ -193,37 +202,67 @@ def compile_hgemm_wmma_kernel(
 
     BLOCK_THREADS = BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS * WARP_SIZE
     BLOCK_MN_WARPS = BLOCK_M_WARPS * BLOCK_N_WARPS
-    WARP_M_STEPS = TILE_M // BLOCK_M_WARPS // WARP_ATOM_M
-    WARP_N_STEPS = TILE_N // BLOCK_N_WARPS // WARP_ATOM_N
-    assert (WARP_M_STEPS >= 1) and (WARP_N_STEPS >= 1)
-    assert TILE_M % (BLOCK_M_WARPS * WARP_ATOM_M) == 0
-    assert TILE_N % (BLOCK_N_WARPS * WARP_ATOM_N) == 0
+    if IS_HT:
+        WARP_M_STEPS = HALF_BLOCK_M // BLOCK_M_WARPS // WARP_ATOM_M
+        WARP_N_STEPS = HALF_BLOCK_N // BLOCK_N_WARPS // WARP_ATOM_N
+        assert (WARP_M_STEPS >= 1) and (WARP_N_STEPS >= 1)
+        assert HALF_BLOCK_M % (BLOCK_M_WARPS * WARP_ATOM_M) == 0
+        assert HALF_BLOCK_N % (BLOCK_N_WARPS * WARP_ATOM_N) == 0
+    else:
+        WARP_M_STEPS = BLOCK_M // BLOCK_M_WARPS // WARP_ATOM_M
+        WARP_N_STEPS = BLOCK_N // BLOCK_N_WARPS // WARP_ATOM_N
+        assert (WARP_M_STEPS >= 1) and (WARP_N_STEPS >= 1)
+        assert BLOCK_M % (BLOCK_M_WARPS * WARP_ATOM_M) == 0
+        assert BLOCK_N % (BLOCK_N_WARPS * WARP_ATOM_N) == 0
     WARP_M = WARP_M_STEPS * WARP_ATOM_M
     WARP_N = WARP_N_STEPS * WARP_ATOM_N
-    assert BLOCK_M == BLOCK_M_WARPS * WARP_M
-    assert BLOCK_N == BLOCK_N_WARPS * WARP_N
+    if IS_HT:
+        assert HALF_BLOCK_M == BLOCK_M_WARPS * WARP_M
+        assert HALF_BLOCK_N == BLOCK_N_WARPS * WARP_N
+    else:
+        assert BLOCK_M == BLOCK_M_WARPS * WARP_M
+        assert BLOCK_N == BLOCK_N_WARPS * WARP_N
     BLOCK_MK_SIZE = BLOCK_M * BLOCK_K
     BLOCK_NK_SIZE = BLOCK_N * BLOCK_K
     BLOCK_MN_SIZE = BLOCK_M * BLOCK_N
     BLOCK_VECS_STG = STG_VEC_SIZE * BLOCK_THREADS
     STG_C_X_THREADS = BLOCK_N // STG_VEC_SIZE
+    STG_C_QUAD_X_THREADS = HALF_BLOCK_N // STG_VEC_SIZE
     assert STG_C_X_THREADS * STG_VEC_SIZE == BLOCK_N
     STG_C_ITERS = BLOCK_MN_SIZE // BLOCK_VECS_STG
     assert STG_C_ITERS * BLOCK_VECS_STG == BLOCK_MN_SIZE
     BLOCK_K_BYTES = BLOCK_K * IN_DTYPE_BYTES
-
     LDG_ASYNC_VEC_SIZE = DMA_BYTES // IN_DTYPE_BYTES
     assert LDG_ASYNC_VEC_SIZE * IN_DTYPE_BYTES == DMA_BYTES
     LDG_A_X_THREADS_AS = BLOCK_K // LDG_ASYNC_VEC_SIZE
     assert LDG_A_X_THREADS_AS * LDG_ASYNC_VEC_SIZE == BLOCK_K
-    LDG_A_ITERS_AS = BLOCK_MK_SIZE // LDG_ASYNC_VEC_SIZE // BLOCK_THREADS
-    assert LDG_A_ITERS_AS * LDG_ASYNC_VEC_SIZE * BLOCK_THREADS == BLOCK_MK_SIZE
     LDG_B_X_THREADS_AS = BLOCK_K // LDG_ASYNC_VEC_SIZE
     assert LDG_B_X_THREADS_AS * LDG_ASYNC_VEC_SIZE == BLOCK_K
-    LDG_B_ITERS_AS = BLOCK_NK_SIZE // LDG_ASYNC_VEC_SIZE // BLOCK_THREADS
-    assert LDG_B_ITERS_AS * LDG_ASYNC_VEC_SIZE * BLOCK_THREADS == BLOCK_NK_SIZE
-    LDG_WAIT_COUNT = LDG_B_ITERS_AS + LDG_A_ITERS_AS
-    assert ((STAGES - 2) * LDG_WAIT_COUNT) < 63
+    assert (BLOCK_M * BLOCK_N) % (BLOCK_THREADS * STG_VEC_SIZE) == 0
+
+    if IS_HT:
+        LDG_A_ITERS_AS = HALF_BLOCK_M * BLOCK_K // LDG_ASYNC_VEC_SIZE // BLOCK_THREADS
+        assert (
+            LDG_A_ITERS_AS * LDG_ASYNC_VEC_SIZE * BLOCK_THREADS
+            == HALF_BLOCK_M * BLOCK_K
+        )
+        LDG_B_ITERS_AS = HALF_BLOCK_N * BLOCK_K // LDG_ASYNC_VEC_SIZE // BLOCK_THREADS
+        assert (
+            LDG_B_ITERS_AS * LDG_ASYNC_VEC_SIZE * BLOCK_THREADS
+            == HALF_BLOCK_N * BLOCK_K
+        )
+        assert (2 * LDG_B_ITERS_AS + 2 * LDG_A_ITERS_AS) < 63
+        assert HALF_BLOCK_N % STG_VEC_SIZE == 0
+        A_FRAGS_LEN = WARP_K_STEPS * WARP_M_STEPS
+        B_FRAGS_LEN = WARP_K_STEPS * WARP_N_STEPS
+        C_FRAGS_LEN = WARP_M_STEPS * WARP_N_STEPS
+    else:
+        LDG_A_ITERS_AS = BLOCK_MK_SIZE // LDG_ASYNC_VEC_SIZE // BLOCK_THREADS
+        assert LDG_A_ITERS_AS * LDG_ASYNC_VEC_SIZE * BLOCK_THREADS == BLOCK_MK_SIZE
+        LDG_B_ITERS_AS = BLOCK_NK_SIZE // LDG_ASYNC_VEC_SIZE // BLOCK_THREADS
+        assert LDG_B_ITERS_AS * LDG_ASYNC_VEC_SIZE * BLOCK_THREADS == BLOCK_NK_SIZE
+        LDG_WAIT_COUNT = LDG_B_ITERS_AS + LDG_A_ITERS_AS
+        assert ((STAGES - 2) * LDG_WAIT_COUNT) < 63
 
     # LDS parameters:
     allocator = SmemAllocator(None, arch=GPU_ARCH, global_sym_name="smem")
@@ -239,10 +278,12 @@ def compile_hgemm_wmma_kernel(
     allocator.ptr += SMEM_USE_ - SMEM_USE
     assert SMEM_USE_ <= SMEM_CAPACITY_MAP[GPU_ARCH]
 
-    KERNEL_NAME = f"HGEMM_{DTYPE}_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}x{STAGES}_SPK{SPLIT_K}_W{BLOCK_M_WARPS}x{BLOCK_N_WARPS}x{BLOCK_K_WARPS}_TN_FT"
+    KERNEL_NAME = f"HGEMM_{DTYPE}_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}x{STAGES}_SPK{SPLIT_K}_W{BLOCK_M_WARPS}x{BLOCK_N_WARPS}x{BLOCK_K_WARPS}_TN"
+    KERNEL_NAME += "_HT" if IS_HT else "_FT"
     KERNEL_NAME += f"_GM{max(GROUP_M, 0)}"
     if HAS_BIAS:
         KERNEL_NAME += "_BIAS"
+    KERNEL_NAME = KERNEL_NAME.upper()
 
     splitk_protocol = SplitKProtocol(
         SPLIT_K,
@@ -343,7 +384,7 @@ def compile_hgemm_wmma_kernel(
         c_frags = [acc_init] * C_FRAGS_LEN
         stmatrix_c_n_idx = w_tid % WMMA_N
 
-        if const_expr(HAS_BIAS and not IS_SPLIT_K):
+        if const_expr(HAS_BIAS and not IS_SPLIT_K and not IS_FP8_PTPC):
             bias_frags = [acc_init] * WARP_N_STEPS
             for jj in range_constexpr(WARP_N_STEPS):
                 warp_atom_n_idx = warp_n_idx + jj * WARP_ATOM_N
@@ -378,7 +419,6 @@ def compile_hgemm_wmma_kernel(
                 n,
                 block_m_offset,
                 block_n_offset,
-                output_dtype_,
                 output_dtype_,
                 signal_idx,
                 c_stride,

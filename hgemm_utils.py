@@ -221,7 +221,6 @@ class SplitKProtocol:
         n,
         block_m_offset,
         block_n_offset,
-        bias_dtype_,
         out_dtype_,
         signal_idx,
         c_stride,
@@ -236,7 +235,6 @@ class SplitKProtocol:
         self.n = n
         self.block_m_offset = block_m_offset
         self.block_n_offset = block_n_offset
-        self.bias_dtype_ = bias_dtype_
         self.out_dtype_ = out_dtype_
         self.signal_idx = signal_idx
         self.c_stride = c_stride
@@ -269,7 +267,7 @@ class SplitKProtocol:
                         self.bias_rsrc,
                         safe_global_n_idx,
                         vec_width=self.STG_VEC_SIZE,
-                        dtype=self.bias_dtype_,
+                        dtype=self.out_dtype_,
                     )
                 else:
                     init_vec = zero_vec
