@@ -1273,26 +1273,6 @@ def compile_hgemm_wmma_kernel(
         k_offset = results[0]
         c_frags = results[1:]
 
-        def load_scale_a(m_part):
-            scale_a_frags = [fx.Float32(0.0)] * WARP_M_STEPS
-            for mi in range_constexpr(WARP_M_STEPS):
-                warp_atom_m_idx = warp_m_idx + mi * WARP_ATOM_M
-                local_m_vec_idx = fx.Index(
-                    m_part * HALF_BLOCK_M + warp_atom_m_idx + stmatrix_c_m_vec_idx
-                )
-                global_m_vec_idx = block_m_offset + local_m_vec_idx
-                full_scale_rows = global_m_vec_idx + fx.Index(
-                    WMMA_C_FRAG_VALUES
-                ) <= fx.Index(m)
-                scale_a_vec_base = full_scale_rows.select(global_m_vec_idx, fx.Index(0))
-                scale_a_frags[mi] = buffer_ops.buffer_load(
-                    scale_a_rsrc,
-                    scale_a_vec_base,
-                    vec_width=WMMA_C_FRAG_VALUES,
-                    dtype=T.f32,
-                )
-            return scale_a_frags
-
         def load_scale_b(n_part):
             scale_b_frags = [fx.Float32(0.0)] * WARP_N_STEPS
             for ni in range_constexpr(WARP_N_STEPS):
@@ -1310,17 +1290,13 @@ def compile_hgemm_wmma_kernel(
                 scale_b_frags[ni] = scale_b
             return scale_b_frags
 
-        def store_matrix_to_lds(
-            m_, n_, c_frags, scale_a_frags=None, scale_b_frags=None
-        ):
+        def store_matrix_to_lds(m_, n_, c_frags, scale_b_frags=None):
             c_base = (m_ * 2 + n_) * C_FRAGS_LEN
             for mi in range_constexpr(WARP_M_STEPS):
                 warp_atom_m_idx = warp_m_idx + mi * WARP_ATOM_M
                 lds_m_base = fx.Index(
                     m_ * HALF_BLOCK_M + warp_atom_m_idx + stmatrix_c_m_vec_idx
                 )
-                if const_expr(IS_FP8_PTPC):
-                    scale_a_vec = scale_a_frags[mi]
                 for ni in range_constexpr(WARP_N_STEPS):
                     warp_atom_n_idx = warp_n_idx + ni * WARP_ATOM_N
                     c_idx = c_base + mi * WARP_N_STEPS + ni
@@ -1348,10 +1324,15 @@ def compile_hgemm_wmma_kernel(
                             dynamic_position=[],
                         )
                         if const_expr(IS_FP8_PTPC):
-                            scale_a = vector.extract(
-                                scale_a_vec,
-                                static_position=[kk],
-                                dynamic_position=[],
+                            row_global = block_m_offset + lds_m_idx
+                            scale_a_offset = (
+                                fx.Index(row_global) < fx.Index(m)
+                            ).select(row_global, fx.Index(0))
+                            scale_a = buffer_ops.buffer_load(
+                                scale_a_rsrc,
+                                scale_a_offset,
+                                vec_width=1,
+                                dtype=T.f32,
                             )
                             val = val * scale_a * scale_b
                             if const_expr(HAS_BIAS and not IS_SPLIT_K):
@@ -1472,10 +1453,9 @@ def compile_hgemm_wmma_kernel(
             rocdl.sched_barrier(0)
             if const_expr(IS_FP8_PTPC):
                 scale_b0 = load_scale_b(0)
-                scale_a0 = load_scale_a(0)
-                store_matrix_to_lds(0, 0, c_frags_out, scale_a0, scale_b0)
+                store_matrix_to_lds(0, 0, c_frags_out, scale_b0)
                 scale_b1 = load_scale_b(0)
-                store_matrix_to_lds(0, 1, c_frags_out, scale_a0, scale_b1)
+                store_matrix_to_lds(0, 1, c_frags_out, scale_b1)
             else:
                 store_matrix_to_lds(0, 0, c_frags_out)
                 store_matrix_to_lds(0, 1, c_frags_out)
@@ -1488,8 +1468,7 @@ def compile_hgemm_wmma_kernel(
             store_matrix_from_lds(0, 0)
             store_matrix_from_lds(0, 1)
             if const_expr(IS_FP8_PTPC):
-                scale_a1 = load_scale_a(1)
-                store_matrix_to_lds(1, 0, c_frags_out, scale_a1, scale_b0)
+                store_matrix_to_lds(1, 0, c_frags_out, scale_b0)
             else:
                 store_matrix_to_lds(1, 0, c_frags_out)
             c_frags_out = consume(1, 1, a1_frags, b1_frags, c_frags_out, False)
@@ -1497,7 +1476,7 @@ def compile_hgemm_wmma_kernel(
             __s_barrier()
             store_matrix_from_lds(1, 0)
             if const_expr(IS_FP8_PTPC):
-                store_matrix_to_lds(1, 1, c_frags_out, scale_a1, scale_b1)
+                store_matrix_to_lds(1, 1, c_frags_out, scale_b1)
             else:
                 store_matrix_to_lds(1, 1, c_frags_out)
             __s_barrier()
@@ -1573,7 +1552,7 @@ def get_default_b16_kwargs(m, n, k):
         "BLOCK_N_WARPS": 4,
         "BLOCK_K_WARPS": 1,
         "USE_HALF_TILE_INTERLEAVED": True,
-        "GROUP_M": 4,
+        "GROUP_M": 0,
     }
     if m == 2048 and n == 2048 and k == 2048:
         kwargs["TILE_M"] = 128
@@ -1659,7 +1638,7 @@ def get_default_b8_kwargs(m, n, k):
         "BLOCK_N_WARPS": 4,
         "BLOCK_K_WARPS": 1,
         "USE_HALF_TILE_INTERLEAVED": True,
-        "GROUP_M": -1,
+        "GROUP_M": 0,
     }
     if m == 2048 and n == 2048 and k == 2048:
         kwargs["TILE_M"] = 128
