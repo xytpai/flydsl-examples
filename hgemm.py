@@ -705,7 +705,7 @@ def compile_hgemm_wmma_kernel(
             # ================ Reordered ================
             rocdl.sched_barrier(0)
 
-        BLOCK_K_LOOPS = ks // BLOCK_K
+        BLOCK_K_LOOPS = (ks + BLOCK_K - 1) // BLOCK_K
         init_state = [ks_begin, arith.constant(0, index=True)] + c_frags
         for _, state in range(0, BLOCK_K_LOOPS - (STAGES - 1), 1, init=init_state):
             k_offset = state[0]
@@ -1203,7 +1203,7 @@ def compile_hgemm_wmma_kernel(
         ldg_sts_b_async(1, 0, ks_begin)
         ldg_sts_a_async(1, 0, ks_begin)
         rocdl.sched_barrier(0)
-        if wid // 4 == 1:
+        if wid // BLOCK_N_WARPS == 1:
             __s_barrier()
         rocdl.sched_barrier(0)
         __s_barrier()
@@ -1777,7 +1777,6 @@ def hgemm_splitk_(
             assert bm * bn <= SPLIT_K_SEMAPHORE_MAX_LEN
         # if "ASSUME_FULL_M" not in hgemm_kwargs:
         #     kwargs["ASSUME_FULL_M"] = m % kwargs["TILE_M"] == 0
-        assert n % kwargs["TILE_N"] == 0
         # if kwargs["ASSUME_FULL_M"]:
         #     assert m % kwargs["TILE_M"] == 0
         assert k % (2 * kwargs["TILE_K"]) == 0
@@ -1902,6 +1901,7 @@ if __name__ == "__main__":
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=4096 --n=4096 --k=4096 --dtype=bf16
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=4096 --n=4096 --k=8192 --dtype=bf16
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8192 --n=8192 --k=8192 --dtype=bf16
+    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8160 --n=8160 --k=8192 --dtype=bf16
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=32 --n=384 --k=7168 --dtype=bf16
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=32 --n=7168 --k=2048 --dtype=bf16
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=32 --n=384 --k=16384 --dtype=bf16
@@ -1912,4 +1912,5 @@ if __name__ == "__main__":
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=2048 --n=2048 --k=2048 --dtype=fp8_ptpc
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=4096 --n=4096 --k=4096 --dtype=fp8_ptpc
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8192 --n=8192 --k=8192 --dtype=fp8_ptpc
+    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8160 --n=8160 --k=8192 --dtype=fp8_ptpc
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=32 --n=384 --k=7168 --dtype=fp8_ptpc

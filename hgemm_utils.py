@@ -209,6 +209,7 @@ class SplitKProtocol:
         self.STG_C_ITERS = BLOCK_M * BLOCK_N // BLOCK_THREADS // STG_VEC_SIZE
         assert self.STG_C_ITERS * BLOCK_THREADS * STG_VEC_SIZE == BLOCK_M * BLOCK_N
 
+    @flyc.jit
     def init(
         self,
         semaphore_ptr,
@@ -244,12 +245,10 @@ class SplitKProtocol:
         )
         self.signal_rsrc = buffer_ops.create_buffer_resource(signal_ptr, max_size=True)
 
+    @flyc.jit
     def zero_c(self):
         # zero c if current block is the first block
-        is_t0_cond = arith.cmpi(arith.CmpIPredicate.eq, fx.Index(self.tid), fx.Index(0))
-        cond_ks0 = arith.cmpi(arith.CmpIPredicate.eq, self.ks_idx, fx.Index(0))
-        cond_ks0_if = scf.IfOp(cond_ks0, results_=[], has_else=False)
-        with ir.InsertionPoint(cond_ks0_if.then_block):
+        if self.ks_idx == 0:
             zero_vec = vector.broadcast(
                 T.vec(self.STG_VEC_SIZE, self.out_dtype_), self.c_zero_out
             )
@@ -257,11 +256,9 @@ class SplitKProtocol:
                 global_tid = self.BLOCK_THREADS * i + self.tid
                 m_local_idx = global_tid // self.STG_C_X_THREADS
                 n_local_idx = global_tid % self.STG_C_X_THREADS * self.STG_VEC_SIZE
-                global_m_idx = self.block_m_offset + fx.Index(m_local_idx)
-                global_n_idx = self.block_n_offset + fx.Index(n_local_idx)
-                safe_global_n_idx = (fx.Index(global_n_idx) < fx.Index(self.n)).select(
-                    global_n_idx, fx.Index(0)
-                )
+                global_m_idx = self.block_m_offset + m_local_idx
+                global_n_idx = self.block_n_offset + n_local_idx
+                safe_global_n_idx = (global_n_idx < self.n).select(global_n_idx, 0)
                 if const_expr(self.HAS_BIAS):
                     init_vec = buffer_ops.buffer_load(
                         self.bias_rsrc,
@@ -271,17 +268,11 @@ class SplitKProtocol:
                     )
                 else:
                     init_vec = zero_vec
-                cond = (fx.Index(global_m_idx) < fx.Index(self.m)) & (
-                    fx.Index(global_n_idx) < fx.Index(self.n)
-                )
-                cond_v = cond.ir_value() if hasattr(cond, "ir_value") else cond
-                cond_if = scf.IfOp(cond_v, results_=[], has_else=False)
-                with ir.InsertionPoint(cond_if.then_block):
+                if global_m_idx < self.m and global_n_idx < self.n:
                     c_offset = global_m_idx * self.c_stride + global_n_idx
-                    c_offset_i32 = arith.index_cast(T.i32, c_offset)
                     c_ptr = get_llvm_ptr(
                         self.c_ptr,
-                        c_offset_i32,
+                        c_offset,
                         self.C_DTYPE_BYTES,
                         ir.Type.parse("!llvm.ptr<1>"),
                     )
@@ -292,11 +283,9 @@ class SplitKProtocol:
                         "v,v",
                         has_side_effects=True,
                     )
-                    scf.YieldOp([])
             gpu.barrier()
             # trigger signal when zeroc is done by the first arrived block
-            is_t0_cond_if = scf.IfOp(is_t0_cond, results_=[], has_else=False)
-            with ir.InsertionPoint(is_t0_cond_if.then_block):
+            if self.tid == 0:
                 signal_ptr = get_llvm_ptr(
                     self.signal_ptr, self.signal_idx, 4, ir.Type.parse("!llvm.ptr<1>")
                 )
@@ -307,15 +296,12 @@ class SplitKProtocol:
                     "v,v",
                     has_side_effects=True,
                 )
-                scf.YieldOp([])
             gpu.barrier()
-            scf.YieldOp([])
 
+    @flyc.jit
     def split_k_barrier(self):
         # spin-wait until signal triggered
-        is_t0_cond = arith.cmpi(arith.CmpIPredicate.eq, fx.Index(self.tid), fx.Index(0))
-        is_t0_cond_if = scf.IfOp(is_t0_cond, results_=[], has_else=False)
-        with ir.InsertionPoint(is_t0_cond_if.then_block):
+        if self.tid == 0:
             init_cur = arith.constant(0, type=T.i32)
             w = scf.WhileOp([T.i32], [init_cur])
             before = ir.Block.create_at_start(w.before, [T.i32])
@@ -339,12 +325,10 @@ class SplitKProtocol:
                 ).result
                 rocdl.s_waitcnt(0)
                 scf.YieldOp([data])
-            scf.YieldOp([])
         rocdl.sched_barrier(0)
         gpu.barrier()
         # clean semaphore and signal if this is the last block within split-k group
-        is_t0_cond_if = scf.IfOp(is_t0_cond, results_=[], has_else=False)
-        with ir.InsertionPoint(is_t0_cond_if.then_block):
+        if self.tid == 0:
             semaphore_ptr = get_llvm_ptr(
                 self.semaphore_ptr, self.signal_idx, 4, ir.Type.parse("!llvm.ptr<1>")
             )
@@ -356,16 +340,10 @@ class SplitKProtocol:
                 syncscope="agent",
                 alignment=4,
             ).result
-            cond_ksl = arith.cmpi(
-                arith.CmpIPredicate.eq, fx.Index(arrive_idx), fx.Index(self.SPLIT_K - 1)
-            )
-            cond_ksl_if = scf.IfOp(cond_ksl, results_=[], has_else=False)
-            with ir.InsertionPoint(cond_ksl_if.then_block):
+            if arrive_idx == self.SPLIT_K - 1:
                 zero_i32 = arith.constant(0, type=T.i32)
                 buffer_ops.buffer_store(zero_i32, self.semaphore_rsrc, self.signal_idx)
                 buffer_ops.buffer_store(zero_i32, self.signal_rsrc, self.signal_idx)
-                scf.YieldOp([])
-            scf.YieldOp([])
         gpu.barrier()
 
 
@@ -375,6 +353,7 @@ class BlockSwizzle:
         self.NUM_PIDS_THRESHOLD = NUM_PIDS_THRESHOLD
         self.GROUP_M = GROUP_M
 
+    @flyc.jit
     def swizzle(self, num_pid_m, num_pid_n, pid):
         simple_m = fx.Index(pid // num_pid_n)
         simple_n = fx.Index(pid % num_pid_n)
