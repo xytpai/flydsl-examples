@@ -1792,6 +1792,10 @@ def hgemm_splitk_(
         kwargs = get_default_b8_kwargs(m, n, k)
         kwargs.update(hgemm_kwargs)
         kwargs["HAS_BIAS"] = True
+        if kwargs["SPLIT_K"] > 1:
+            bm = (m + kwargs["TILE_M"] - 1) // kwargs["TILE_M"]
+            bn = (n + kwargs["TILE_N"] - 1) // kwargs["TILE_N"]
+            assert bm * bn <= SPLIT_K_SEMAPHORE_MAX_LEN
         # if "ASSUME_FULL_M" not in hgemm_kwargs:
         #     kwargs["ASSUME_FULL_M"] = m % kwargs["TILE_M"] == 0
         assert n % kwargs["TILE_N"] == 0
