@@ -1273,56 +1273,89 @@ def compile_hgemm_wmma_kernel(
         k_offset = results[0]
         c_frags = results[1:]
 
-        def safe_idx(idx, limit):
-            return (fx.Index(idx) < fx.Index(limit)).select(idx, fx.Index(0))
+        def load_scale_a(m_part):
+            scale_a_frags = [fx.Float32(0.0)] * WARP_M_STEPS
+            for mi in range_constexpr(WARP_M_STEPS):
+                warp_atom_m_idx = warp_m_idx + mi * WARP_ATOM_M
+                local_m_vec_idx = fx.Index(
+                    m_part * HALF_BLOCK_M + warp_atom_m_idx + stmatrix_c_m_vec_idx
+                )
+                global_m_vec_idx = block_m_offset + local_m_vec_idx
+                full_scale_rows = global_m_vec_idx + fx.Index(
+                    WMMA_C_FRAG_VALUES
+                ) <= fx.Index(m)
+                scale_a_vec_base = full_scale_rows.select(global_m_vec_idx, fx.Index(0))
+                scale_a_frags[mi] = buffer_ops.buffer_load(
+                    scale_a_rsrc,
+                    scale_a_vec_base,
+                    vec_width=WMMA_C_FRAG_VALUES,
+                    dtype=T.f32,
+                )
+            return scale_a_frags
 
-        def load_bias_f32(col_global):
-            bias_i16 = buffer_ops.buffer_load(
-                bias_rsrc, safe_idx(col_global, n), vec_width=1, dtype=T.i16
-            )
-            bias_i32 = arith.ExtUIOp(T.i32, _to_raw(bias_i16)).result
-            return arith.BitcastOp(
-                T.f32, arith.shli(bias_i32, arith.constant(16, type=T.i32))
-            ).result
+        def load_scale_b(n_part):
+            scale_b_frags = [fx.Float32(0.0)] * WARP_N_STEPS
+            for ni in range_constexpr(WARP_N_STEPS):
+                warp_atom_n_idx = warp_n_idx + ni * WARP_ATOM_N
+                local_n_idx = fx.Index(
+                    n_part * HALF_BLOCK_N + warp_atom_n_idx + stmatrix_c_n_idx
+                )
+                global_n_offset = block_n_offset + local_n_idx
+                scale_b_offset = (fx.Index(global_n_offset) < fx.Index(n)).select(
+                    global_n_offset, fx.Index(0)
+                )
+                scale_b = buffer_ops.buffer_load(
+                    scale_b_rsrc, scale_b_offset, vec_width=1, dtype=T.f32
+                )
+                scale_b_frags[ni] = scale_b
+            return scale_b_frags
 
-        def store_matrix_to_lds(m_, n_, c_frags):
+        def store_matrix_to_lds(
+            m_, n_, c_frags, scale_a_frags=None, scale_b_frags=None
+        ):
             c_base = (m_ * 2 + n_) * C_FRAGS_LEN
             for mi in range_constexpr(WARP_M_STEPS):
                 warp_atom_m_idx = warp_m_idx + mi * WARP_ATOM_M
                 lds_m_base = fx.Index(
                     m_ * HALF_BLOCK_M + warp_atom_m_idx + stmatrix_c_m_vec_idx
                 )
+                if const_expr(IS_FP8_PTPC):
+                    scale_a_vec = scale_a_frags[mi]
                 for ni in range_constexpr(WARP_N_STEPS):
                     warp_atom_n_idx = warp_n_idx + ni * WARP_ATOM_N
                     c_idx = c_base + mi * WARP_N_STEPS + ni
+                    lds_n_idx = fx.Index(
+                        n_ * HALF_BLOCK_N + warp_atom_n_idx + stmatrix_c_n_idx
+                    )
+                    col_global = block_n_offset + lds_n_idx
+                    safe_col_global = (fx.Index(col_global) < fx.Index(n)).select(
+                        col_global, fx.Index(0)
+                    )
+                    if const_expr(HAS_BIAS and IS_FP8_PTPC and not IS_SPLIT_K):
+                        bias = buffer_ops.buffer_load(
+                            bias_rsrc,
+                            safe_col_global,
+                            vec_width=1,
+                            dtype=output_dtype_,
+                        ).extf(T.f32)
+                    if const_expr(IS_FP8_PTPC):
+                        scale_b = scale_b_frags[ni]
                     for kk in range_constexpr(WMMA_C_FRAG_VALUES):
                         lds_m_idx = lds_m_base + fx.Index(kk)
-                        lds_n_idx = fx.Index(
-                            n_ * HALF_BLOCK_N + warp_atom_n_idx + stmatrix_c_n_idx
-                        )
                         val = vector.extract(
                             c_frags[c_idx],
                             static_position=[kk],
                             dynamic_position=[],
                         )
                         if const_expr(IS_FP8_PTPC):
-                            row_global = block_m_offset + lds_m_idx
-                            col_global = block_n_offset + lds_n_idx
-                            scale_a = buffer_ops.buffer_load(
-                                scale_a_rsrc,
-                                safe_idx(row_global, m),
-                                vec_width=1,
-                                dtype=T.f32,
-                            )
-                            scale_b = buffer_ops.buffer_load(
-                                scale_b_rsrc,
-                                safe_idx(col_global, n),
-                                vec_width=1,
-                                dtype=T.f32,
+                            scale_a = vector.extract(
+                                scale_a_vec,
+                                static_position=[kk],
+                                dynamic_position=[],
                             )
                             val = val * scale_a * scale_b
                             if const_expr(HAS_BIAS and not IS_SPLIT_K):
-                                val = val + load_bias_f32(col_global)
+                                val = val + bias
                         val = val.truncf(output_dtype_)
                         val = vector.from_elements(T.vec(1, output_dtype_), [val])
                         flat_offset = lds_m_idx * BLOCK_N + lds_n_idx
@@ -1438,8 +1471,11 @@ def compile_hgemm_wmma_kernel(
             __s_barrier()
             rocdl.sched_barrier(0)
             if const_expr(IS_FP8_PTPC):
-                store_matrix_to_lds(0, 0, c_frags_out)
-                store_matrix_to_lds(0, 1, c_frags_out)
+                scale_b0 = load_scale_b(0)
+                scale_a0 = load_scale_a(0)
+                store_matrix_to_lds(0, 0, c_frags_out, scale_a0, scale_b0)
+                scale_b1 = load_scale_b(0)
+                store_matrix_to_lds(0, 1, c_frags_out, scale_a0, scale_b1)
             else:
                 store_matrix_to_lds(0, 0, c_frags_out)
                 store_matrix_to_lds(0, 1, c_frags_out)
@@ -1452,14 +1488,18 @@ def compile_hgemm_wmma_kernel(
             store_matrix_from_lds(0, 0)
             store_matrix_from_lds(0, 1)
             if const_expr(IS_FP8_PTPC):
-                store_matrix_to_lds(1, 0, c_frags_out)
+                scale_a1 = load_scale_a(1)
+                store_matrix_to_lds(1, 0, c_frags_out, scale_a1, scale_b0)
             else:
                 store_matrix_to_lds(1, 0, c_frags_out)
             c_frags_out = consume(1, 1, a1_frags, b1_frags, c_frags_out, False)
             rocdl.sched_barrier(0)
             __s_barrier()
             store_matrix_from_lds(1, 0)
-            store_matrix_to_lds(1, 1, c_frags_out)
+            if const_expr(IS_FP8_PTPC):
+                store_matrix_to_lds(1, 1, c_frags_out, scale_a1, scale_b1)
+            else:
+                store_matrix_to_lds(1, 1, c_frags_out)
             __s_barrier()
             store_matrix_from_lds(1, 1)
             return c_frags_out
