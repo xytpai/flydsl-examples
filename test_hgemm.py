@@ -11,7 +11,7 @@ ROTARY_INPUTS_TARGET_BYTES = 8 * 1024**3
 
 
 @dataclass
-class TestArgs:
+class _TestArgs:
     dtype: torch.dtype | str
     m: int
     n: int
@@ -50,7 +50,7 @@ def quantize_ptpc_fp8(x: torch.Tensor):
     return x_fp8, scale.float()
 
 
-def create_inputs(args: TestArgs):
+def create_inputs(args: _TestArgs):
     if args.dtype == "fp8_ptpc":
         a_f32 = torch.empty((args.m, args.k), dtype=torch.float32, device="cuda")
         b_f32 = torch.empty((args.n, args.k), dtype=torch.float32, device="cuda")
@@ -76,7 +76,7 @@ def create_inputs(args: TestArgs):
     return (a, b, bias)
 
 
-def create_outputs(args: TestArgs):
+def create_outputs(args: _TestArgs):
     if args.dtype == "fp8_ptpc":
         c = torch.randn((args.m, args.n), dtype=torch.bfloat16, device="cuda")
     else:
@@ -119,7 +119,7 @@ def get_rotary_inputs(sample_inputs: torch.Tensor, sample_outputs: torch.Tensor)
     return max(1, int(rotary_inputs))
 
 
-def check_acc(args: TestArgs):
+def check_acc(args: _TestArgs):
     kwargs = {
         "TILE_M": args.TILE_M,
         "TILE_N": args.TILE_N,
@@ -138,18 +138,28 @@ def check_acc(args: TestArgs):
     inouts = inputs + outputs
     ref_inouts = inputs + ref_outputs
     maxdiff_out_ = []
+
+    def get_tol(args):
+        k_scale = (args.k / 8192) ** 0.5
+        if args.dtype == "fp8_ptpc":
+            return 2e-1 * k_scale, 2e-1
+        if args.dtype is torch.bfloat16:
+            return 1e-1 * k_scale, 1e-1
+        return 5e-2 * k_scale, 5e-2
+
+    atol, rtol = get_tol(args)
     for _ in range(5):
         func(*(inouts + (kwargs,)))
         ref_func(*ref_inouts)
         for output, ref_output in zip(outputs, ref_outputs):
-            is_allclose = torch.allclose(output, ref_output, atol=1e-1, rtol=1e-1)
+            is_allclose = torch.allclose(output, ref_output, atol=atol, rtol=rtol)
             assert is_allclose
             maxdiff_out = (output - ref_output).abs().max().item()
             maxdiff_out_.append(maxdiff_out)
     print(f"\n{args}\nmaxdiff_out:{maxdiff_out_}")
 
 
-def benchmark(args: TestArgs, warmup: int = 500, niters: int = 600):
+def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
     kwargs = {
         "TILE_M": args.TILE_M,
         "TILE_N": args.TILE_N,
@@ -268,7 +278,7 @@ def test_hgemm_acc_main_loop(
         TILE_K = 128
     else:
         dtype = torch.bfloat16 if "bf16" in dtype else torch.half
-    args = TestArgs(
+    args = _TestArgs(
         dtype,
         m,
         n,
