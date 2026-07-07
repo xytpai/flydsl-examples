@@ -1,14 +1,15 @@
 # FlyDSL-Examples
 
-This is an unofficial FlyDSL kernel example repository.
-If you are using AMD GPUs, we hope to provide a step-by-step guide to help you get familiar with writing operators using FlyDSL.
-Empowered by https://github.com/rocm/flydsl we are now able to develop high-performance GPU kernels in Python on AMD GPU, similar to CUDA/CuteDSL.
-This repository will provide the following examples from scratch:
+This is an unofficial collection of FlyDSL GEMM kernel examples.
+For AMD GPU users, the goal is to build peak-performance GEMM kernels from scratch while showing how to write FlyDSL operators step by step.
+With https://github.com/rocm/flydsl, high-performance GPU kernels can be developed in Python for AMD GPUs, in a style similar to CUDA/CuteDSL.
+
+This repository currently includes:
 
 - [x] B/F16-GEMM-WMMA (for MI350)
 - [x] FP8-PTPC-GEMM-WMMA (for MI350)
 
-For IR study: https://mlir.llvm.org/docs/
+![HGEMM BF16 benchmark](images/hgemm_benchmark.svg)
 
 ## How to build install FlyDSL on AMD GPUs
 
@@ -29,10 +30,6 @@ pip install -e .
 rm -rf ~/.flydsl/ ; pytest -sv test_hgemm.py
 ```
 
-### HGEMM BF16 Benchmark
-
-![HGEMM BF16 benchmark](images/hgemm_benchmark.svg)
-
----
+> Documents for IR study: https://mlir.llvm.org/docs/
 
 > Contact: xytpai@gmail.com
