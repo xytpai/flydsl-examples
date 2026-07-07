@@ -1803,6 +1803,16 @@ def hgemm_splitk_(
     kwargs["HAS_K_TAIL"] = (working_k % kwargs["TILE_K"] != 0) or (
         last_working_k % kwargs["TILE_K"] != 0
     )
+    if kwargs["USE_HALF_TILE_INTERLEAVED"]:
+        working_k_tiles = (working_k + kwargs["TILE_K"] - 1) // kwargs["TILE_K"]
+        last_working_k_tiles = (last_working_k + kwargs["TILE_K"] - 1) // kwargs[
+            "TILE_K"
+        ]
+        kwargs["HAS_K_TAIL"] = (
+            kwargs["HAS_K_TAIL"]
+            or (working_k_tiles % 2 != 0)
+            or (last_working_k_tiles % 2 != 0)
+        )
 
     if is_fp8_ptpc:
         assert scale_a is not None and scale_b is not None
@@ -1955,6 +1965,19 @@ if __name__ == "__main__":
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=32 --n=384 --k=7168 --dtype=fp8_ptpc
 
     # unit test
+    # bf16
+    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8192 --n=8192 --k=8192 --dtype=bf16
+    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8192 --n=8192 --k=8224 --dtype=bf16
+    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8192 --n=8192 --k=8256 --dtype=bf16
+    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8192 --n=8192 --k=8288 --dtype=bf16
+    # fp8ptpc
+    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8192 --n=8192 --k=8192 --dtype=fp8_ptpc
+    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8192 --n=8192 --k=8224 --dtype=fp8_ptpc
+    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8192 --n=8192 --k=8256 --dtype=fp8_ptpc
+    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8192 --n=8192 --k=8288 --dtype=fp8_ptpc
+
+    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8160 --n=8160 --k=8160 --dtype=bf16
+    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8192 --n=8192 --k=8192 --dtype=bf16
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=2048 --n=2048 --k=2048 --dtype=bf16
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8192 --n=8192 --k=8192 --dtype=bf16
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8160 --n=8160 --k=8160 --dtype=bf16
