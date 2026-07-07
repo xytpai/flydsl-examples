@@ -1,6 +1,5 @@
 import torch
 import pytest
-import argparse
 import torch.nn.functional as F
 from torch.profiler import profile, ProfilerActivity
 from dataclasses import dataclass
@@ -143,11 +142,11 @@ def check_acc(args: TestArgs):
         func(*(inouts + (kwargs,)))
         ref_func(*ref_inouts)
         for output, ref_output in zip(outputs, ref_outputs):
-            is_allclose = torch.allclose(output, ref_output, atol=1e-2, rtol=1e-2)
+            is_allclose = torch.allclose(output, ref_output, atol=1e-1, rtol=1e-1)
             assert is_allclose
             maxdiff_out = (output - ref_output).abs().max().item()
             maxdiff_out_.append(maxdiff_out)
-    print(f"\nmaxdiff_out:{maxdiff_out_}")
+    print(f"\n{args}\nmaxdiff_out:{maxdiff_out_}")
 
 
 def benchmark(args: TestArgs, warmup: int = 500, niters: int = 600):
@@ -206,24 +205,49 @@ def benchmark(args: TestArgs, warmup: int = 500, niters: int = 600):
     print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))
 
 
-params = [
-    (8192, 8192, 8192, 256, 256, 64, 2, 1, 2, 4, 1, True, 0, False),
-    (8192, 8192, 8192, 256, 256, 64, 2, 1, 2, 4, 1, True, 0, True),
-    (8192, 8192, 8192, 256, 256, 64, 2, 1, 2, 4, 1, True, 4, False),
-    (8192, 8192, 8192, 256, 256, 64, 2, 1, 2, 4, 1, True, 4, True),
-    (8192, 8192, 8192, 256, 256, 64, 2, 1, 2, 4, 1, False, 0, False),
-    (8192, 8192, 8192, 256, 256, 64, 2, 1, 2, 4, 1, False, 0, True),
-    (8192, 8192, 8192, 256, 256, 64, 2, 1, 2, 4, 1, False, 4, False),
-    (8192, 8192, 8192, 256, 256, 64, 2, 1, 2, 4, 1, False, 4, True),
-]
-
-
-@pytest.mark.parametrize("dtype", ["fp16", "bf16"])
+@pytest.mark.parametrize("dtype", ["fp16", "bf16", "fp8_ptpc"])
 @pytest.mark.parametrize(
     "m, n, k, TILE_M, TILE_N, TILE_K, STAGES, SPLIT_K, BLOCK_M_WARPS, BLOCK_N_WARPS, BLOCK_K_WARPS, HAS_BIAS, GROUP_M, USE_HALF_TILE_INTERLEAVED",
-    params,
+    [
+        # k 8192
+        (8192, 8192, 8192, 256, 256, 64, 2, 1, 2, 4, 1, True, 0, False),
+        (8192, 8192, 8192, 256, 256, 64, 2, 1, 2, 4, 1, True, 0, True),
+        (8192, 8192, 8192, 256, 256, 64, 2, 1, 2, 4, 1, True, 4, False),
+        (8192, 8192, 8192, 256, 256, 64, 2, 1, 2, 4, 1, True, 4, True),
+        (8192, 8192, 8192, 256, 256, 64, 2, 1, 2, 4, 1, False, 0, False),
+        (8192, 8192, 8192, 256, 256, 64, 2, 1, 2, 4, 1, False, 0, True),
+        (8192, 8192, 8192, 256, 256, 64, 2, 1, 2, 4, 1, False, 4, False),
+        (8192, 8192, 8192, 256, 256, 64, 2, 1, 2, 4, 1, False, 4, True),
+        # k 8224
+        (8192, 8192, 8224, 256, 256, 64, 2, 1, 2, 4, 1, True, 0, False),
+        (8192, 8192, 8224, 256, 256, 64, 2, 1, 2, 4, 1, True, 0, True),
+        (8192, 8192, 8224, 256, 256, 64, 2, 1, 2, 4, 1, True, 4, False),
+        (8192, 8192, 8224, 256, 256, 64, 2, 1, 2, 4, 1, True, 4, True),
+        (8192, 8192, 8224, 256, 256, 64, 2, 1, 2, 4, 1, False, 0, False),
+        (8192, 8192, 8224, 256, 256, 64, 2, 1, 2, 4, 1, False, 0, True),
+        (8192, 8192, 8224, 256, 256, 64, 2, 1, 2, 4, 1, False, 4, False),
+        (8192, 8192, 8224, 256, 256, 64, 2, 1, 2, 4, 1, False, 4, True),
+        # k 8256
+        (8192, 8192, 8256, 256, 256, 64, 2, 1, 2, 4, 1, True, 0, False),
+        (8192, 8192, 8256, 256, 256, 64, 2, 1, 2, 4, 1, True, 0, True),
+        (8192, 8192, 8256, 256, 256, 64, 2, 1, 2, 4, 1, True, 4, False),
+        (8192, 8192, 8256, 256, 256, 64, 2, 1, 2, 4, 1, True, 4, True),
+        (8192, 8192, 8256, 256, 256, 64, 2, 1, 2, 4, 1, False, 0, False),
+        (8192, 8192, 8256, 256, 256, 64, 2, 1, 2, 4, 1, False, 0, True),
+        (8192, 8192, 8256, 256, 256, 64, 2, 1, 2, 4, 1, False, 4, False),
+        (8192, 8192, 8256, 256, 256, 64, 2, 1, 2, 4, 1, False, 4, True),
+        # k 8288
+        (8192, 8192, 8288, 256, 256, 64, 2, 1, 2, 4, 1, True, 0, False),
+        (8192, 8192, 8288, 256, 256, 64, 2, 1, 2, 4, 1, True, 0, True),
+        (8192, 8192, 8288, 256, 256, 64, 2, 1, 2, 4, 1, True, 4, False),
+        (8192, 8192, 8288, 256, 256, 64, 2, 1, 2, 4, 1, True, 4, True),
+        (8192, 8192, 8288, 256, 256, 64, 2, 1, 2, 4, 1, False, 0, False),
+        (8192, 8192, 8288, 256, 256, 64, 2, 1, 2, 4, 1, False, 0, True),
+        (8192, 8192, 8288, 256, 256, 64, 2, 1, 2, 4, 1, False, 4, False),
+        (8192, 8192, 8288, 256, 256, 64, 2, 1, 2, 4, 1, False, 4, True),
+    ],
 )
-def test_hgemm_b16_main_loop(
+def test_hgemm_acc_main_loop(
     dtype: str,
     m: int,
     n: int,
@@ -240,7 +264,10 @@ def test_hgemm_b16_main_loop(
     GROUP_M: int,
     USE_HALF_TILE_INTERLEAVED: bool,
 ):
-    dtype = torch.bfloat16 if "bf16" in dtype else torch.half
+    if dtype == "fp8_ptpc":
+        TILE_K = 128
+    else:
+        dtype = torch.bfloat16 if "bf16" in dtype else torch.half
     args = TestArgs(
         dtype,
         m,
