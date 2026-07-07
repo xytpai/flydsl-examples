@@ -138,6 +138,7 @@ def compile_hgemm_wmma_kernel(
     BLOCK_N_WARPS: int = 2,
     BLOCK_K_WARPS: int = 1,
     HAS_BIAS: bool = False,
+    HAS_K_TAIL: bool = False,
     GROUP_M: int = 0,
     USE_HALF_TILE_INTERLEAVED: bool = False,
 ):
@@ -296,8 +297,8 @@ def compile_hgemm_wmma_kernel(
     KERNEL_NAME = f"HGEMM_{DTYPE}_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}x{STAGES}_SPK{SPLIT_K}_W{BLOCK_M_WARPS}x{BLOCK_N_WARPS}x{BLOCK_K_WARPS}_TN"
     KERNEL_NAME += "_HT" if IS_HT else "_FT"
     KERNEL_NAME += f"_GM{max(GROUP_M, 0)}"
-    if HAS_BIAS:
-        KERNEL_NAME += "_BIAS"
+    KERNEL_NAME += "_BIAS" if HAS_BIAS else ""
+    KERNEL_NAME += "_KTAIL" if HAS_K_TAIL else ""
     KERNEL_NAME = KERNEL_NAME.upper()
 
     splitk_protocol = SplitKProtocol(
@@ -475,7 +476,10 @@ def compile_hgemm_wmma_kernel(
             global_m_idx = block_m_offset + m_local_idx
             safe_global_m_idx = (global_m_idx < m).select(global_m_idx, 0)
             global_k_idx = k_offset + col_in_bytes // IN_DTYPE_BYTES
-            safe_global_k_idx = (global_k_idx < k).select(global_k_idx, 0)
+            if const_expr(HAS_K_TAIL):
+                safe_global_k_idx = (global_k_idx < ks_end).select(global_k_idx, 0)
+            else:
+                safe_global_k_idx = global_k_idx
             global_offset_in_bytes = (
                 safe_global_m_idx * a_stride + safe_global_k_idx
             ) * IN_DTYPE_BYTES
@@ -497,7 +501,10 @@ def compile_hgemm_wmma_kernel(
             global_n_idx = block_n_offset + fx.Index(n_local_idx)
             safe_global_n_idx = (global_n_idx < n).select(global_n_idx, 0)
             global_k_idx = k_offset + col_in_bytes // IN_DTYPE_BYTES
-            safe_global_k_idx = (global_k_idx < k).select(global_k_idx, 0)
+            if const_expr(HAS_K_TAIL):
+                safe_global_k_idx = (global_k_idx < ks_end).select(global_k_idx, 0)
+            else:
+                safe_global_k_idx = global_k_idx
             global_offset_in_bytes = (
                 safe_global_n_idx * b_stride + safe_global_k_idx
             ) * IN_DTYPE_BYTES
@@ -733,7 +740,7 @@ def compile_hgemm_wmma_kernel(
         c_frags = results[2:]
         for s in range_constexpr(0, STAGES - 1):
             __barrier((STAGES - 2 - s) * LDG_WAIT_COUNT)
-            mask_k_tail = s == STAGES - 2
+            mask_k_tail = HAS_K_TAIL and s == STAGES - 2
             c_frags = ldmatrix_compute_tile_streaming(
                 current_stage, k_offset, c_frags, mask_k_tail
             )
@@ -912,6 +919,8 @@ def compile_hgemm_wmma_kernel(
         )
         ks_idx = fx.block_idx.y
         ks_begin = ks_idx * working_k
+        ks_end = ks_begin + working_k
+        ks_end = (ks_end < k).select(ks_end, k)
         block_m_offset = block_m_idx * BLOCK_M
         block_n_offset = block_n_idx * BLOCK_N
         k_blocks16 = BLOCK_K_BYTES // 16
@@ -1026,11 +1035,13 @@ def compile_hgemm_wmma_kernel(
             m_local_idx = global_tid // LDG_A_X_THREADS_AS
             global_m_idx = block_m_offset + m_part * HALF_BLOCK_M + m_local_idx
             safe_global_m_idx = (global_m_idx < m).select(global_m_idx, 0)
+            global_k_idx = k_offset + k_buf * BLOCK_K + swizzle_cache_a[ii]
+            if const_expr(HAS_K_TAIL):
+                safe_global_k_idx = (global_k_idx < ks_end).select(global_k_idx, 0)
+            else:
+                safe_global_k_idx = global_k_idx
             global_offset = (
-                safe_global_m_idx * a_stride
-                + k_offset
-                + k_buf * BLOCK_K
-                + swizzle_cache_a[ii]
+                safe_global_m_idx * a_stride + safe_global_k_idx
             ) * IN_DTYPE_BYTES
             global_offset = arith.index_cast(T.i32, global_offset)
             static_bytes_offset = (
@@ -1045,11 +1056,13 @@ def compile_hgemm_wmma_kernel(
             n_local_idx = global_tid // LDG_B_X_THREADS_AS
             global_n_idx = block_n_offset + n_part * HALF_BLOCK_N + n_local_idx
             safe_global_n_idx = (global_n_idx < n).select(global_n_idx, 0)
+            global_k_idx = k_offset + k_buf * BLOCK_K + swizzle_cache_b[ii]
+            if const_expr(HAS_K_TAIL):
+                safe_global_k_idx = (global_k_idx < ks_end).select(global_k_idx, 0)
+            else:
+                safe_global_k_idx = global_k_idx
             global_offset = (
-                safe_global_n_idx * b_stride
-                + k_offset
-                + k_buf * BLOCK_K
-                + swizzle_cache_b[ii]
+                safe_global_n_idx * b_stride + safe_global_k_idx
             ) * IN_DTYPE_BYTES
             global_offset = arith.index_cast(T.i32, global_offset)
             static_bytes_offset = (
@@ -1073,7 +1086,18 @@ def compile_hgemm_wmma_kernel(
                     n_part, k_buf, k_offset, i, lds_ptr if i > 0 else None
                 )
 
-        def ldmatrix_a(m_part, k_buf):
+        def mask_tail_k_frag(frag, k_base, frag_values):
+            elems = [0] * frag_values
+            for vi in range_constexpr(frag_values):
+                global_k_idx = k_base + vi
+                valid_k = global_k_idx < ks_end
+                elem = vector.extract(frag, static_position=[vi], dynamic_position=[])
+                elems[vi] = arith.select(
+                    valid_k, elem, arith.constant(0, type=smem_input_dtype_)
+                )
+            return vector.from_elements(T.vec(frag_values, smem_input_dtype_), elems)
+
+        def ldmatrix_a(m_part, k_buf, k_tile_offset, mask_k_tail=False):
             a_frags = [0] * A_FRAGS_LEN
             for mi in range_constexpr(WARP_M_STEPS):
                 warp_atom_m_idx = warp_m_idx + mi * WARP_ATOM_M
@@ -1099,6 +1123,12 @@ def compile_hgemm_wmma_kernel(
                                 smem_a_ptr.get(),
                                 [fx.Index(flat_offset)],
                             )
+                            if const_expr(mask_k_tail):
+                                v16 = mask_tail_k_frag(
+                                    v16,
+                                    k_tile_offset + col_base + col_delta,
+                                    LDG_VEC_SIZE,
+                                )
                             return fx.Vector(v16).bitcast(fx.Int32)
 
                         lo = load_i32x4_at(0)
@@ -1111,16 +1141,24 @@ def compile_hgemm_wmma_kernel(
                         flat_offset = (
                             (k_buf * 2 + m_part) * HALF_BLOCK_M + row
                         ) * BLOCK_K + col_in_bytes // IN_DTYPE_BYTES
-                        a_frags[ki * WARP_M_STEPS + mi] = vector.load_op(
+                        vec = vector.load_op(
                             T.vec(
                                 WMMA_A_FRAG_VALUES * MFMA_PER_WARP_K, smem_input_dtype_
                             ),
                             smem_a_ptr.get(),
                             [fx.Index(flat_offset)],
                         )
+                        if const_expr(mask_k_tail):
+                            a_frags[ki * WARP_M_STEPS + mi] = mask_tail_k_frag(
+                                vec,
+                                k_tile_offset + warp_atom_k_idx + ldmatrix_a_k_vec_idx,
+                                WMMA_A_FRAG_VALUES * MFMA_PER_WARP_K,
+                            )
+                        else:
+                            a_frags[ki * WARP_M_STEPS + mi] = vec
             return a_frags
 
-        def ldmatrix_b(n_part, k_buf):
+        def ldmatrix_b(n_part, k_buf, k_tile_offset, mask_k_tail=False):
             b_frags = [0] * B_FRAGS_LEN
             for ni in range_constexpr(WARP_N_STEPS):
                 warp_atom_n_idx = warp_n_idx + ni * WARP_ATOM_N
@@ -1146,6 +1184,12 @@ def compile_hgemm_wmma_kernel(
                                 smem_b_ptr.get(),
                                 [fx.Index(flat_offset)],
                             )
+                            if const_expr(mask_k_tail):
+                                v16 = mask_tail_k_frag(
+                                    v16,
+                                    k_tile_offset + col_base + col_delta,
+                                    LDG_VEC_SIZE,
+                                )
                             return fx.Vector(v16).bitcast(fx.Int32)
 
                         lo = load_i32x4_at(0)
@@ -1160,13 +1204,21 @@ def compile_hgemm_wmma_kernel(
                         flat_offset = (
                             (k_buf * 2 + n_part) * HALF_BLOCK_N + row
                         ) * BLOCK_K + col_in_bytes // IN_DTYPE_BYTES
-                        b_frags[ki * WARP_N_STEPS + ni] = vector.load_op(
+                        vec = vector.load_op(
                             T.vec(
                                 WMMA_B_FRAG_VALUES * MFMA_PER_WARP_K, smem_input_dtype_
                             ),
                             smem_b_ptr.get(),
                             [fx.Index(flat_offset)],
                         )
+                        if const_expr(mask_k_tail):
+                            b_frags[ki * WARP_N_STEPS + ni] = mask_tail_k_frag(
+                                vec,
+                                k_tile_offset + warp_atom_k_idx + ldmatrix_b_k_vec_idx,
+                                WMMA_B_FRAG_VALUES * MFMA_PER_WARP_K,
+                            )
+                        else:
+                            b_frags[ki * WARP_N_STEPS + ni] = vec
             return b_frags
 
         def consume(m_part, n_part, a_frags, b_frags, c_frags_in, emit_sched_barrier):
@@ -1209,39 +1261,39 @@ def compile_hgemm_wmma_kernel(
         def compute_double_tile(k_offset, c_frags_in):
             next_k_offset = k_offset + 2 * BLOCK_K
             # 0
-            b0_frags = ldmatrix_b(0, 0)
-            a0_frags = ldmatrix_a(0, 0)
+            b0_frags = ldmatrix_b(0, 0, k_offset)
+            a0_frags = ldmatrix_a(0, 0, k_offset)
             ldg_sts_a_async(1, 1, k_offset)
             __s_barrier()
             c_frags_out = consume(0, 0, a0_frags, b0_frags, c_frags_in, True)
             __s_barrier()
-            b1_frags = ldmatrix_b(1, 0)
+            b1_frags = ldmatrix_b(1, 0, k_offset)
             ldg_sts_b_async(0, 0, next_k_offset)
             __s_barrier()
             c_frags_out = consume(0, 1, a0_frags, b1_frags, c_frags_out, True)
             __s_barrier()
-            a1_frags = ldmatrix_a(1, 0)
+            a1_frags = ldmatrix_a(1, 0, k_offset)
             ldg_sts_a_async(0, 0, next_k_offset)
             __s_barrier()
             c_frags_out = consume(1, 0, a1_frags, b0_frags, c_frags_out, True)
             __s_barrier()
-            b0_frags = ldmatrix_b(0, 1)
+            b0_frags = ldmatrix_b(0, 1, k_offset + BLOCK_K)
             ldg_sts_b_async(1, 0, next_k_offset)
             __barrier(2 * LDG_B_ITERS_AS + 1 * LDG_A_ITERS_AS)
             c_frags_out = consume(1, 1, a1_frags, b1_frags, c_frags_out, True)
             __s_barrier()
             # 1
-            a0_frags = ldmatrix_a(0, 1)
+            a0_frags = ldmatrix_a(0, 1, k_offset + BLOCK_K)
             ldg_sts_a_async(1, 0, next_k_offset)
             __s_barrier()
             c_frags_out = consume(0, 0, a0_frags, b0_frags, c_frags_out, True)
             __s_barrier()
-            b1_frags = ldmatrix_b(1, 1)
+            b1_frags = ldmatrix_b(1, 1, k_offset + BLOCK_K)
             ldg_sts_b_async(0, 1, next_k_offset)
             __s_barrier()
             c_frags_out = consume(0, 1, a0_frags, b1_frags, c_frags_out, True)
             __s_barrier()
-            a1_frags = ldmatrix_a(1, 1)
+            a1_frags = ldmatrix_a(1, 1, k_offset + BLOCK_K)
             ldg_sts_a_async(0, 1, next_k_offset)
             __s_barrier()
             c_frags_out = consume(1, 0, a1_frags, b0_frags, c_frags_out, True)
@@ -1252,7 +1304,7 @@ def compile_hgemm_wmma_kernel(
             __s_barrier()
             return c_frags_out
 
-        BLOCK_K_LOOPS = working_k // BLOCK_K
+        BLOCK_K_LOOPS = (working_k + BLOCK_K - 1) // BLOCK_K
         loop_end = (BLOCK_K_LOOPS > 2).select(BLOCK_K_LOOPS - 2, 0)
         init_state = [ks_begin] + c_frags
         for _, state in range(0, loop_end, 2, init=init_state):
@@ -1399,34 +1451,34 @@ def compile_hgemm_wmma_kernel(
 
         def compute_final_tile_and_epilogue(k_offset, c_frags_in):
             # 0
-            b0_frags = ldmatrix_b(0, 0)
-            a0_frags = ldmatrix_a(0, 0)
+            b0_frags = ldmatrix_b(0, 0, k_offset, HAS_K_TAIL)
+            a0_frags = ldmatrix_a(0, 0, k_offset, HAS_K_TAIL)
             ldg_sts_a_async(1, 1, k_offset)
             __s_barrier()
             c_frags_out = consume(0, 0, a0_frags, b0_frags, c_frags_in, True)
             __s_barrier()
-            b1_frags = ldmatrix_b(1, 0)
+            b1_frags = ldmatrix_b(1, 0, k_offset, HAS_K_TAIL)
             __s_barrier()
             c_frags_out = consume(0, 1, a0_frags, b1_frags, c_frags_out, True)
             __s_barrier()
-            a1_frags = ldmatrix_a(1, 0)
+            a1_frags = ldmatrix_a(1, 0, k_offset, HAS_K_TAIL)
             __s_barrier()
             c_frags_out = consume(1, 0, a1_frags, b0_frags, c_frags_out, True)
             __s_barrier()
-            b0_frags = ldmatrix_b(0, 1)
+            b0_frags = ldmatrix_b(0, 1, k_offset + BLOCK_K, HAS_K_TAIL)
             __s_barrier()
             c_frags_out = consume(1, 1, a1_frags, b1_frags, c_frags_out, True)
             # 1
             __barrier(0)
-            a0_frags = ldmatrix_a(0, 1)
+            a0_frags = ldmatrix_a(0, 1, k_offset + BLOCK_K, HAS_K_TAIL)
             __s_barrier()
             c_frags_out = consume(0, 0, a0_frags, b0_frags, c_frags_out, True)
             __s_barrier()
-            b1_frags = ldmatrix_b(1, 1)
+            b1_frags = ldmatrix_b(1, 1, k_offset + BLOCK_K, HAS_K_TAIL)
             __s_barrier()
             c_frags_out = consume(0, 1, a0_frags, b1_frags, c_frags_out, True)
             __s_barrier()
-            a1_frags = ldmatrix_a(1, 1)
+            a1_frags = ldmatrix_a(1, 1, k_offset + BLOCK_K, HAS_K_TAIL)
             __s_barrier()
             rocdl.sched_barrier(0)
             if const_expr(IS_FP8_PTPC):
@@ -1739,6 +1791,19 @@ def hgemm_splitk_(
     assert c.shape[0] == m
     assert (n % 16 == 0) and (k % 16 == 0)
     is_fp8_ptpc = scale_a is not None or scale_b is not None
+
+    kwargs = (
+        get_default_b8_kwargs(m, n, k)
+        if is_fp8_ptpc
+        else get_default_b16_kwargs(m, n, k)
+    )
+    kwargs.update(hgemm_kwargs)
+    working_k = (k + kwargs["SPLIT_K"] - 1) // kwargs["SPLIT_K"]
+    last_working_k = k - (kwargs["SPLIT_K"] - 1) * working_k
+    kwargs["HAS_K_TAIL"] = (working_k % kwargs["TILE_K"] != 0) or (
+        last_working_k % kwargs["TILE_K"] != 0
+    )
+
     if is_fp8_ptpc:
         assert scale_a is not None and scale_b is not None
         assert bias is not None
@@ -1746,8 +1811,6 @@ def hgemm_splitk_(
         assert scale_b.shape[0] == n
         assert bias.shape[0] == n
         assert c.dtype == torch.bfloat16
-        kwargs = get_default_b8_kwargs(m, n, k)
-        kwargs.update(hgemm_kwargs)
         kwargs["HAS_BIAS"] = True
         if kwargs["SPLIT_K"] > 1:
             bm = (m + kwargs["TILE_M"] - 1) // kwargs["TILE_M"]
@@ -1764,8 +1827,6 @@ def hgemm_splitk_(
         )
         return
 
-    kwargs = get_default_b16_kwargs(m, n, k)
-    kwargs.update(hgemm_kwargs)
     kwargs["HAS_BIAS"] = False if bias is None else True
     # if "ASSUME_FULL_M" not in hgemm_kwargs:
     #     kwargs["ASSUME_FULL_M"] = m % kwargs["TILE_M"] == 0
@@ -1879,7 +1940,7 @@ if __name__ == "__main__":
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=4096 --n=4096 --k=4096 --dtype=bf16
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=4096 --n=4096 --k=8192 --dtype=bf16
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8192 --n=8192 --k=8192 --dtype=bf16
-    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8160 --n=8160 --k=8192 --dtype=bf16
+    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8160 --n=8160 --k=8160 --dtype=bf16
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=32 --n=384 --k=7168 --dtype=bf16
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=32 --n=7168 --k=2048 --dtype=bf16
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=32 --n=384 --k=16384 --dtype=bf16
@@ -1890,7 +1951,7 @@ if __name__ == "__main__":
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=2048 --n=2048 --k=2048 --dtype=fp8_ptpc
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=4096 --n=4096 --k=4096 --dtype=fp8_ptpc
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8192 --n=8192 --k=8192 --dtype=fp8_ptpc
-    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8160 --n=8160 --k=8192 --dtype=fp8_ptpc
+    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8160 --n=8160 --k=8160 --dtype=fp8_ptpc
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=32 --n=384 --k=7168 --dtype=fp8_ptpc
 
     # unit test
