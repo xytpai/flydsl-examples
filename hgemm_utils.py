@@ -9,16 +9,40 @@ from flydsl.expr import (
     buffer_ops,
 )
 import flydsl.expr as fx
-from utils.tensor_shim import (
-    get_dtype_in_kernel,
-    GTensor,
-    STensor,
-    _to_raw,
-    _run_compiled,
-)
+import flydsl.compiler as flyc
 from flydsl.expr.typing import T, Vector as Vec
 from flydsl._mlir.dialects import llvm, fly, memref, scf
 from flydsl._mlir import ir
+
+
+def _to_raw(v):
+    """Convert ArithValue / Numeric (Int32, Boolean, …) to raw ir.Value."""
+    if isinstance(v, ir.Value):
+        return v
+    if hasattr(v, "ir_value"):
+        return _to_raw(v.ir_value())
+    return ir.Value._CAPICreate(v._CAPIPtr)
+
+
+def get_dtype_in_kernel(dtype: str):
+    if dtype == "f32":
+        return T.f32
+    elif dtype == "f16":
+        return T.f16
+    elif dtype == "bf16":
+        return T.bf16
+
+
+def _run_compiled(exe, *args):
+    """First call: ``flyc.compile(exe, *args)`` compiles **and** executes the kernel.
+    Subsequent calls: fast dispatch via the cached ``CompiledFunction``.
+    """
+    cf = getattr(exe, "_cf", None)
+    if cf is None:
+        cf = flyc.compile(exe, *args)
+        exe._cf = cf
+    else:
+        cf(*args)
 
 
 class WmmaHalfBase(ABC):
@@ -155,7 +179,7 @@ def buffer_load_lds_inline(rsrc, lds_ptr, global_offset, DMA_BYTES):
         raise NotImplementedError(f"DMA_BYTES={DMA_BYTES} not supported")
     llvm.InlineAsmOp(
         None,
-        [lds_ptr, global_offset, rsrc],
+        [_to_raw(lds_ptr), _to_raw(global_offset), _to_raw(rsrc)],
         asm,
         "s,v,s",
         has_side_effects=True,
@@ -169,7 +193,7 @@ class SplitKProtocol:
         BLOCK_M,
         BLOCK_N,
         STG_VEC_SIZE,
-        DTYPE_BYTES,
+        C_DTYPE_BYTES,
         BLOCK_THREADS,
         HAS_BIAS,
     ):
@@ -177,74 +201,79 @@ class SplitKProtocol:
         self.BLOCK_M = BLOCK_M
         self.BLOCK_N = BLOCK_N
         self.STG_VEC_SIZE = STG_VEC_SIZE
-        self.DTYPE_BYTES = DTYPE_BYTES
+        self.C_DTYPE_BYTES = C_DTYPE_BYTES
         self.BLOCK_THREADS = BLOCK_THREADS
         self.HAS_BIAS = HAS_BIAS
         self.STG_C_X_THREADS = BLOCK_N // STG_VEC_SIZE
-        assert (self.STG_C_X_THREADS >= 1) and (BLOCK_N % STG_VEC_SIZE == 0)
-        self.STG_REG_C_COUNT = BLOCK_M * BLOCK_N // BLOCK_THREADS // STG_VEC_SIZE
-        assert (self.STG_REG_C_COUNT >= 1) and (
-            (BLOCK_M * BLOCK_N) % (BLOCK_THREADS * STG_VEC_SIZE) == 0
-        )
+        assert self.STG_C_X_THREADS * STG_VEC_SIZE == BLOCK_N
+        self.STG_C_ITERS = BLOCK_M * BLOCK_N // BLOCK_THREADS // STG_VEC_SIZE
+        assert self.STG_C_ITERS * BLOCK_THREADS * STG_VEC_SIZE == BLOCK_M * BLOCK_N
 
+    @flyc.jit
     def init(
         self,
+        semaphore_ptr,
+        signal_ptr,
+        c_ptr,
+        bias_rsrc,
         tid,
         ks_idx,
         m,
-        m_offset,
-        n_offset,
-        in_dtype_,
+        n,
+        block_m_offset,
+        block_n_offset,
         out_dtype_,
-        signal,
         signal_idx,
-        semaphore,
+        c_stride,
     ):
+        self.semaphore_ptr = semaphore_ptr
+        self.signal_ptr = signal_ptr
+        self.c_ptr = c_ptr
+        self.bias_rsrc = bias_rsrc
         self.tid = tid
         self.ks_idx = ks_idx
         self.m = m
-        self.m_offset = m_offset
-        self.n_offset = n_offset
-        self.in_dtype_ = in_dtype_
-        self.c_zero_d = arith.constant(0.0, type=out_dtype_)
-        self.signal = signal
+        self.n = n
+        self.block_m_offset = block_m_offset
+        self.block_n_offset = block_n_offset
+        self.out_dtype_ = out_dtype_
         self.signal_idx = signal_idx
-        self.semaphore = semaphore
-        self.semaphore_ = GTensor(semaphore, dtype=T.i32, shape=(-1,))
-        self.signal_ = GTensor(signal, dtype=T.i32, shape=(-1,))
+        self.c_stride = c_stride
+        self.c_zero_out = arith.constant(0.0, type=out_dtype_)
+        self.semaphore_rsrc = buffer_ops.create_buffer_resource(
+            semaphore_ptr, max_size=True
+        )
+        self.signal_rsrc = buffer_ops.create_buffer_resource(signal_ptr, max_size=True)
 
-    def zero_c(self, C, C_, BIAS_=None):
+    @flyc.jit
+    def zero_c(self):
         # zero c if current block is the first block
-        is_t0_cond = arith.cmpi(arith.CmpIPredicate.eq, fx.Index(self.tid), fx.Index(0))
-        cond_ks0 = arith.cmpi(arith.CmpIPredicate.eq, self.ks_idx, fx.Index(0))
-        cond_ks0_if = scf.IfOp(cond_ks0, results_=[], has_else=False)
-        with ir.InsertionPoint(cond_ks0_if.then_block):
+        if self.ks_idx == 0:
             zero_vec = vector.broadcast(
-                T.vec(self.STG_VEC_SIZE, self.in_dtype_), self.c_zero_d
+                T.vec(self.STG_VEC_SIZE, self.out_dtype_), self.c_zero_out
             )
-            for i in range_constexpr(self.STG_REG_C_COUNT):
+            for i in range_constexpr(self.STG_C_ITERS):
                 global_tid = self.BLOCK_THREADS * i + self.tid
                 m_local_idx = global_tid // self.STG_C_X_THREADS
                 n_local_idx = global_tid % self.STG_C_X_THREADS * self.STG_VEC_SIZE
-                row_idx = self.m_offset + fx.Index(m_local_idx)
-                init_vec = zero_vec
+                global_m_idx = self.block_m_offset + m_local_idx
+                global_n_idx = self.block_n_offset + n_local_idx
+                safe_global_n_idx = (global_n_idx < self.n).select(global_n_idx, 0)
                 if const_expr(self.HAS_BIAS):
-                    init_vec = BIAS_.vec_load(
-                        (self.n_offset + n_local_idx,), self.STG_VEC_SIZE
+                    init_vec = buffer_ops.buffer_load(
+                        self.bias_rsrc,
+                        safe_global_n_idx,
+                        vec_width=self.STG_VEC_SIZE,
+                        dtype=self.out_dtype_,
                     )
-                cond_boundary = arith.cmpi(
-                    arith.CmpIPredicate.ult, row_idx, fx.Index(self.m)
-                )
-                cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
-                with ir.InsertionPoint(cond_boundary_if.then_block):
-                    bytes_offset = C_.linear_offset(
-                        (row_idx, self.n_offset + n_local_idx)
-                    )
-                    bytes_offset_i32 = arith.index_cast(T.i32, bytes_offset)
+                else:
+                    init_vec = zero_vec
+                if global_m_idx < self.m and global_n_idx < self.n:
+                    c_offset = global_m_idx * self.c_stride + global_n_idx
                     c_ptr = get_llvm_ptr(
-                        C,
-                        bytes_offset_i32,
-                        self.DTYPE_BYTES,
+                        self.c_ptr,
+                        c_offset,
+                        self.C_DTYPE_BYTES,
                         ir.Type.parse("!llvm.ptr<1>"),
                     )
                     llvm.InlineAsmOp(
@@ -254,13 +283,11 @@ class SplitKProtocol:
                         "v,v",
                         has_side_effects=True,
                     )
-                    scf.YieldOp([])
             gpu.barrier()
             # trigger signal when zeroc is done by the first arrived block
-            is_t0_cond_if = scf.IfOp(is_t0_cond, results_=[], has_else=False)
-            with ir.InsertionPoint(is_t0_cond_if.then_block):
+            if self.tid == 0:
                 signal_ptr = get_llvm_ptr(
-                    self.signal, self.signal_idx, 4, ir.Type.parse("!llvm.ptr<1>")
+                    self.signal_ptr, self.signal_idx, 4, ir.Type.parse("!llvm.ptr<1>")
                 )
                 llvm.InlineAsmOp(
                     None,
@@ -269,15 +296,12 @@ class SplitKProtocol:
                     "v,v",
                     has_side_effects=True,
                 )
-                scf.YieldOp([])
             gpu.barrier()
-            scf.YieldOp([])
 
+    @flyc.jit
     def split_k_barrier(self):
         # spin-wait until signal triggered
-        is_t0_cond = arith.cmpi(arith.CmpIPredicate.eq, fx.Index(self.tid), fx.Index(0))
-        is_t0_cond_if = scf.IfOp(is_t0_cond, results_=[], has_else=False)
-        with ir.InsertionPoint(is_t0_cond_if.then_block):
+        if self.tid == 0:
             init_cur = arith.constant(0, type=T.i32)
             w = scf.WhileOp([T.i32], [init_cur])
             before = ir.Block.create_at_start(w.before, [T.i32])
@@ -290,7 +314,7 @@ class SplitKProtocol:
                 scf.ConditionOp(need_wait, [cur])
             with ir.InsertionPoint(after):
                 signal_ptr = get_llvm_ptr(
-                    self.signal, self.signal_idx, 4, ir.Type.parse("!llvm.ptr<1>")
+                    self.signal_ptr, self.signal_idx, 4, ir.Type.parse("!llvm.ptr<1>")
                 )
                 data = llvm.InlineAsmOp(
                     T.i32,
@@ -301,14 +325,12 @@ class SplitKProtocol:
                 ).result
                 rocdl.s_waitcnt(0)
                 scf.YieldOp([data])
-            scf.YieldOp([])
         rocdl.sched_barrier(0)
         gpu.barrier()
         # clean semaphore and signal if this is the last block within split-k group
-        is_t0_cond_if = scf.IfOp(is_t0_cond, results_=[], has_else=False)
-        with ir.InsertionPoint(is_t0_cond_if.then_block):
+        if self.tid == 0:
             semaphore_ptr = get_llvm_ptr(
-                self.semaphore, self.signal_idx, 4, ir.Type.parse("!llvm.ptr<1>")
+                self.semaphore_ptr, self.signal_idx, 4, ir.Type.parse("!llvm.ptr<1>")
             )
             arrive_idx = llvm.AtomicRMWOp(
                 llvm.AtomicBinOp.add,
@@ -318,60 +340,43 @@ class SplitKProtocol:
                 syncscope="agent",
                 alignment=4,
             ).result
-            cond_ksl = arith.cmpi(
-                arith.CmpIPredicate.eq, fx.Index(arrive_idx), fx.Index(self.SPLIT_K - 1)
-            )
-            cond_ksl_if = scf.IfOp(cond_ksl, results_=[], has_else=False)
-            with ir.InsertionPoint(cond_ksl_if.then_block):
-                self.semaphore_[self.signal_idx] = arith.constant(0, type=T.i32)
-                self.signal_[self.signal_idx] = arith.constant(0, type=T.i32)
-                scf.YieldOp([])
-            scf.YieldOp([])
+            if arrive_idx == self.SPLIT_K - 1:
+                zero_i32 = arith.constant(0, type=T.i32)
+                buffer_ops.buffer_store(zero_i32, self.semaphore_rsrc, self.signal_idx)
+                buffer_ops.buffer_store(zero_i32, self.signal_rsrc, self.signal_idx)
         gpu.barrier()
 
 
 class BlockSwizzle:
-    def __init__(self, NUM_XCDS, NUM_CUS, GROUP_M, BLOCK_M, BLOCK_N, N):
+    def __init__(self, NUM_XCDS, NUM_PIDS_THRESHOLD, GROUP_M):
         self.NUM_XCDS = NUM_XCDS
-        self.NUM_CUS = NUM_CUS
+        self.NUM_PIDS_THRESHOLD = NUM_PIDS_THRESHOLD
         self.GROUP_M = GROUP_M
-        self.BLOCK_M = BLOCK_M
-        self.BLOCK_N = BLOCK_N
-        self.N = N
-        self.N_BLOCKS = N // BLOCK_N
 
-    def swizzle(self, m, pid):
-        simple_m = fx.Index(pid // self.N_BLOCKS)
-        simple_n = fx.Index(pid % self.N_BLOCKS)
+    @flyc.jit
+    def swizzle(self, num_pid_m, num_pid_n, pid):
+        simple_m = pid // num_pid_n
+        simple_n = pid % num_pid_n
         if const_expr(self.GROUP_M <= 0):
             return simple_m, simple_n
-        num_xcds = fx.Index(self.NUM_XCDS)
-        num_cus = fx.Index(self.NUM_CUS)
-        swizzle_threshold = num_cus
-        num_pid_n = fx.Index(self.N_BLOCKS)
-        num_pid_m = (fx.Index(m) + fx.Index(self.BLOCK_M - 1)) // fx.Index(self.BLOCK_M)
+        num_xcds = self.NUM_XCDS
+        swizzle_threshold = self.NUM_PIDS_THRESHOLD
         num_wg = num_pid_m * num_pid_n
-        linear_id = fx.Index(pid)
+        linear_id = pid
         intra_xcd = linear_id // num_xcds
         xcd = linear_id % num_xcds
         wgid = xcd * (num_wg // num_xcds) + intra_xcd
-        group_m = fx.Index(self.GROUP_M)
+        group_m = self.GROUP_M
         wgid_per_group = group_m * num_pid_n
         group_id = wgid // wgid_per_group
         intra_group = wgid % wgid_per_group
         first_pid_m = group_id * group_m
         remaining_m = num_pid_m - first_pid_m
-        group_size_m = arith.select(
-            arith.cmpi(arith.CmpIPredicate.ult, remaining_m, group_m),
-            remaining_m,
-            group_m,
-        )
+        group_size_m = (remaining_m < group_m).select(remaining_m, group_m)
         swizzled_n = intra_group // group_size_m
         swizzled_m = first_pid_m + (intra_group % group_size_m)
-        use_simple = arith.cmpi(
-            arith.CmpIPredicate.ult, num_wg, swizzle_threshold
-        ) | arith.cmpi(arith.CmpIPredicate.ne, num_wg % num_xcds, fx.Index(0))
+        use_simple = (num_wg < swizzle_threshold) | ((num_wg % num_xcds) != 0)
         return (
-            arith.select(use_simple, simple_m, swizzled_m),
-            arith.select(use_simple, simple_n, swizzled_n),
+            use_simple.select(simple_m, swizzled_m),
+            use_simple.select(simple_n, swizzled_n),
         )
