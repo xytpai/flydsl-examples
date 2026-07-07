@@ -745,7 +745,9 @@ def compile_hgemm_wmma_kernel(
                     val = val.truncf(output_dtype_)
                     val = vector.from_elements(T.vec(1, output_dtype_), [val])
                     flat_offset = (wid_k * BLOCK_M + lds_m_idx) * BLOCK_N + lds_n_idx
-                    vector.store(val, smem_c_ptr.get(), [flat_offset], alignment=16)
+                    vector.store(
+                        val, smem_c_ptr.get(), [fx.Index(flat_offset)], alignment=16
+                    )
 
         # write back to global
         if const_expr(IS_SPLIT_K):
@@ -770,7 +772,7 @@ def compile_hgemm_wmma_kernel(
                     peer_c_vec = vector.load_op(
                         T.vec(STG_VEC_SIZE, output_dtype_),
                         smem_c_ptr_,
-                        [flat_offset + ksi * BLOCK_M * BLOCK_N],
+                        [fx.Index(flat_offset + ksi * BLOCK_M * BLOCK_N)],
                     )
                     c_vec += peer_c_vec
                 global_offset = global_m_idx * c_stride + global_n_idx
