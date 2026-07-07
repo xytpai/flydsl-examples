@@ -442,6 +442,25 @@ def compile_hgemm_wmma_kernel(
 
         warp_offset = get_dma_copy_warp_offset()
 
+        def get_smem_warp_ptr(memptr):
+            lds_base = memref.extract_aligned_pointer_as_index(memptr)
+            lds_ptr_base = buffer_ops.create_llvm_ptr(
+                arith.index_cast(T.i64, lds_base), address_space=3
+            )
+            return buffer_ops.get_element_ptr(lds_ptr_base, warp_offset)
+
+        as_warp_ptr = get_smem_warp_ptr(smem_a_ptr.get())
+        bs_warp_ptr = get_smem_warp_ptr(smem_b_ptr.get())
+
+        def get_lds_ptr(base_ptr, static_bytes_offset, lds_ptr=None):
+            if const_expr(lds_ptr is None):
+                return buffer_ops.get_element_ptr(
+                    base_ptr, byte_offset=static_bytes_offset
+                )
+            return buffer_ops.get_element_ptr(
+                lds_ptr, static_byte_offset=BLOCK_THREADS * DMA_BYTES
+            )
+
         def ldg_sts_a_async_one(ii, k_offset, write_stage, lds_ptr=None):
             global_tid = BLOCK_THREADS * ii + tid
             m_local_idx = global_tid // LDG_A_X_THREADS_AS
@@ -459,22 +478,8 @@ def compile_hgemm_wmma_kernel(
                 safe_global_m_idx * a_stride + safe_global_k_idx
             ) * IN_DTYPE_BYTES
             global_offset_in_bytes = arith.index_cast(T.i32, global_offset_in_bytes)
-            if const_expr(lds_ptr is None):
-                lds_offset_in_bytes = fx.Index(
-                    write_stage * BLOCK_M * BLOCK_K * IN_DTYPE_BYTES
-                )
-                lds_base = (
-                    memref.extract_aligned_pointer_as_index(smem_a_ptr.get())
-                    + lds_offset_in_bytes
-                )
-                lds_ptr_base = buffer_ops.create_llvm_ptr(
-                    arith.index_cast(T.i64, lds_base), address_space=3
-                )
-                lds_ptr = buffer_ops.get_element_ptr(lds_ptr_base, warp_offset)
-            else:
-                lds_ptr = buffer_ops.get_element_ptr(
-                    lds_ptr, static_byte_offset=BLOCK_THREADS * DMA_BYTES
-                )
+            dynamic_bytes_offset = write_stage * BLOCK_M * BLOCK_K * IN_DTYPE_BYTES
+            lds_ptr = get_lds_ptr(as_warp_ptr, dynamic_bytes_offset, lds_ptr)
             buffer_load_lds_inline(a_rsrc, lds_ptr, global_offset_in_bytes, DMA_BYTES)
             return lds_ptr
 
@@ -495,22 +500,8 @@ def compile_hgemm_wmma_kernel(
                 safe_global_n_idx * b_stride + safe_global_k_idx
             ) * IN_DTYPE_BYTES
             global_offset_in_bytes = arith.index_cast(T.i32, global_offset_in_bytes)
-            if const_expr(lds_ptr is None):
-                lds_offset_in_bytes = fx.Index(
-                    write_stage * BLOCK_N * BLOCK_K * IN_DTYPE_BYTES
-                )
-                lds_base = (
-                    memref.extract_aligned_pointer_as_index(smem_b_ptr.get())
-                    + lds_offset_in_bytes
-                )
-                lds_ptr_base = buffer_ops.create_llvm_ptr(
-                    arith.index_cast(T.i64, lds_base), address_space=3
-                )
-                lds_ptr = buffer_ops.get_element_ptr(lds_ptr_base, warp_offset)
-            else:
-                lds_ptr = buffer_ops.get_element_ptr(
-                    lds_ptr, static_byte_offset=BLOCK_THREADS * DMA_BYTES
-                )
+            dynamic_bytes_offset = write_stage * BLOCK_N * BLOCK_K * IN_DTYPE_BYTES
+            lds_ptr = get_lds_ptr(bs_warp_ptr, dynamic_bytes_offset, lds_ptr)
             buffer_load_lds_inline(b_rsrc, lds_ptr, global_offset_in_bytes, DMA_BYTES)
             return lds_ptr
 
