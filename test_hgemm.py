@@ -1,0 +1,261 @@
+import torch
+import pytest
+import argparse
+import torch.nn.functional as F
+from torch.profiler import profile, ProfilerActivity
+from dataclasses import dataclass
+from flydsl.runtime.device import get_rocm_arch
+
+from kernels.hgemm_wmma_gfx950 import hgemm
+
+ROTARY_INPUTS_TARGET_BYTES = 8 * 1024**3
+
+
+@dataclass
+class TestArgs:
+    dtype: torch.dtype | str
+    m: int
+    n: int
+    k: int
+    TILE_M: int
+    TILE_N: int
+    TILE_K: int
+    STAGES: int
+    SPLIT_K: int
+    BLOCK_M_WARPS: int
+    BLOCK_N_WARPS: int
+    BLOCK_K_WARPS: int
+    HAS_BIAS: bool
+    GROUP_M: int
+    USE_HALF_TILE_INTERLEAVED: bool
+
+
+def get_torch_fp8_dtype():
+    arch = str(get_rocm_arch())
+    if ("gfx95" in arch or "gfx12" in arch) and hasattr(torch, "float8_e4m3fn"):
+        return torch.float8_e4m3fn
+    if hasattr(torch, "float8_e4m3fnuz"):
+        return torch.float8_e4m3fnuz
+    if hasattr(torch, "float8_e4m3fn"):
+        return torch.float8_e4m3fn
+    raise RuntimeError("This PyTorch build does not expose an E4M3 FP8 dtype")
+
+
+def quantize_ptpc_fp8(x: torch.Tensor):
+    fp8_dtype = get_torch_fp8_dtype()
+    fp8_max = float(torch.finfo(fp8_dtype).max)
+    scale = x.float().abs().amax(dim=1, keepdim=True) / fp8_max
+    scale[scale == 0] = 1
+    x_fp8 = (x.float() / scale).to(fp8_dtype)
+    scale = torch.nan_to_num(scale, nan=1.0, posinf=1.0, neginf=1.0).squeeze(1)
+    return x_fp8, scale.float()
+
+
+def create_inputs(args: TestArgs):
+    if args.dtype == "fp8_ptpc":
+        a_f32 = torch.empty((args.m, args.k), dtype=torch.float32, device="cuda")
+        b_f32 = torch.empty((args.n, args.k), dtype=torch.float32, device="cuda")
+        a_f32.uniform_(-1, 1)
+        b_f32.uniform_(-1, 1)
+        a, scale_a = quantize_ptpc_fp8(a_f32)
+        b, scale_b = quantize_ptpc_fp8(b_f32)
+        if args.HAS_BIAS:
+            bias = torch.empty((args.n,), dtype=torch.bfloat16, device="cuda")
+            bias.uniform_(10, 20)
+        else:
+            bias = None
+        return (a, b, scale_a, scale_b, bias)
+    a = torch.empty((args.m, args.k), dtype=args.dtype, device="cuda")
+    a.uniform_(-1, 1)
+    b = torch.empty((args.n, args.k), dtype=args.dtype, device="cuda")
+    b.uniform_(-1, 1)
+    if args.HAS_BIAS:
+        bias = torch.empty((args.n,), dtype=args.dtype, device="cuda")
+        bias.uniform_(10, 20)
+    else:
+        bias = None
+    return (a, b, bias)
+
+
+def create_outputs(args: TestArgs):
+    if args.dtype == "fp8_ptpc":
+        c = torch.randn((args.m, args.n), dtype=torch.bfloat16, device="cuda")
+    else:
+        c = torch.randn((args.m, args.n), dtype=args.dtype, device="cuda")
+    return (c,)
+
+
+def ref_func(*args):
+    if len(args) == 6:
+        a, b, scale_a, scale_b, bias, c = args
+        a_f32 = a.float() * scale_a[:, None]
+        b_f32 = b.float() * scale_b[:, None]
+        if bias is not None:
+            ref = torch.addmm(bias.float(), a_f32, b_f32.t())
+        else:
+            ref = torch.mm(a_f32, b_f32.t())
+        c.copy_(ref.to(c.dtype))
+    else:
+        a, b, bias, c = args
+        F.linear(a, b, out=c, bias=bias)
+
+
+def func(*args):
+    if len(args) == 7:
+        a, b, scale_a, scale_b, bias, c, kwargs = args
+        hgemm(c, a, b, bias=bias, scale_a=scale_a, scale_b=scale_b, user_kwargs=kwargs)
+    else:
+        a, b, bias, c, kwargs = args
+        hgemm(c, a, b, bias=bias, user_kwargs=kwargs)
+
+
+def tensor_nbytes(tensors: torch.Tensor):
+    return sum(t.numel() * t.element_size() for t in tensors)
+
+
+def get_rotary_inputs(sample_inputs: torch.Tensor, sample_outputs: torch.Tensor):
+    global ROTARY_INPUTS_TARGET_BYTES
+    slot_bytes = 2 * (tensor_nbytes(sample_inputs) + tensor_nbytes(sample_outputs))
+    rotary_inputs = ROTARY_INPUTS_TARGET_BYTES // slot_bytes
+    return max(1, int(rotary_inputs))
+
+
+def check_acc(args: TestArgs):
+    kwargs = {
+        "TILE_M": args.TILE_M,
+        "TILE_N": args.TILE_N,
+        "TILE_K": args.TILE_K,
+        "STAGES": args.STAGES,
+        "SPLIT_K": args.SPLIT_K,
+        "BLOCK_M_WARPS": args.BLOCK_M_WARPS,
+        "BLOCK_N_WARPS": args.BLOCK_N_WARPS,
+        "BLOCK_K_WARPS": args.BLOCK_K_WARPS,
+        "GROUP_M": args.GROUP_M,
+        "USE_HALF_TILE_INTERLEAVED": args.USE_HALF_TILE_INTERLEAVED,
+    }
+    inputs = create_inputs(args)
+    outputs = create_outputs(args)
+    ref_outputs = create_outputs(args)
+    inouts = inputs + outputs
+    ref_inouts = inputs + ref_outputs
+    maxdiff_out_ = []
+    for _ in range(5):
+        func(*(inouts + (kwargs,)))
+        ref_func(*ref_inouts)
+        for output, ref_output in zip(outputs, ref_outputs):
+            is_allclose = torch.allclose(output, ref_output, atol=1e-2, rtol=1e-2)
+            assert is_allclose
+            maxdiff_out = (output - ref_output).abs().max().item()
+            maxdiff_out_.append(maxdiff_out)
+    print(f"\nmaxdiff_out:{maxdiff_out_}")
+
+
+def benchmark(args: TestArgs, warmup: int = 500, niters: int = 600):
+    kwargs = {
+        "TILE_M": args.TILE_M,
+        "TILE_N": args.TILE_N,
+        "TILE_K": args.TILE_K,
+        "STAGES": args.STAGES,
+        "SPLIT_K": args.SPLIT_K,
+        "BLOCK_M_WARPS": args.BLOCK_M_WARPS,
+        "BLOCK_N_WARPS": args.BLOCK_N_WARPS,
+        "BLOCK_K_WARPS": args.BLOCK_K_WARPS,
+        "GROUP_M": args.GROUP_M,
+        "USE_HALF_TILE_INTERLEAVED": args.USE_HALF_TILE_INTERLEAVED,
+    }
+    rotary_inputs = get_rotary_inputs(inputs, outputs)
+    inputs = [create_inputs(args) for _ in range(rotary_inputs)]
+    ref_inputs = [create_inputs(args) for _ in range(rotary_inputs)]
+    outputs = [create_outputs(args) for _ in range(rotary_inputs)]
+    ref_outputs = [create_outputs(args) for _ in range(rotary_inputs)]
+    global ROTARY_INPUTS_TARGET_BYTES
+    print(
+        f"rotary_inputs:{rotary_inputs}, target_bytes:{ROTARY_INPUTS_TARGET_BYTES}, "
+        f"warmup:{warmup}, niters:{niters}"
+    )
+
+    def run_ref(idx):
+        ref_func(*(ref_inputs[idx] + ref_outputs[idx]))
+
+    def run_flydsl(idx):
+        func(*(inputs[idx] + outputs[idx] + (kwargs,)))
+
+    print("===================== [INTERLEAVED] =====================")
+    for i in range(warmup):
+        idx = i % rotary_inputs
+        if i % 2 == 0:
+            run_ref(idx)
+            run_flydsl(idx)
+        else:
+            run_flydsl(idx)
+            run_ref(idx)
+        torch.cuda.synchronize()
+
+    with profile(
+        activities=[ProfilerActivity.CUDA],
+    ) as prof:
+        for i in range(warmup, niters):
+            idx = i % rotary_inputs
+            if i % 2 == 0:
+                run_ref(idx)
+                run_flydsl(idx)
+            else:
+                run_flydsl(idx)
+                run_ref(idx)
+            torch.cuda.synchronize()
+    print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))
+
+
+params = [
+    (8192, 8192, 8192, 256, 256, 64, 2, 1, 2, 4, 1, True, 0, False),
+    (8192, 8192, 8192, 256, 256, 64, 2, 1, 2, 4, 1, True, 0, True),
+    (8192, 8192, 8192, 256, 256, 64, 2, 1, 2, 4, 1, True, 4, False),
+    (8192, 8192, 8192, 256, 256, 64, 2, 1, 2, 4, 1, True, 4, True),
+    (8192, 8192, 8192, 256, 256, 64, 2, 1, 2, 4, 1, False, 0, False),
+    (8192, 8192, 8192, 256, 256, 64, 2, 1, 2, 4, 1, False, 0, True),
+    (8192, 8192, 8192, 256, 256, 64, 2, 1, 2, 4, 1, False, 4, False),
+    (8192, 8192, 8192, 256, 256, 64, 2, 1, 2, 4, 1, False, 4, True),
+]
+
+
+@pytest.mark.parametrize("dtype", ["fp16", "bf16"])
+@pytest.mark.parametrize(
+    "m, n, k, TILE_M, TILE_N, TILE_K, STAGES, SPLIT_K, BLOCK_M_WARPS, BLOCK_N_WARPS, BLOCK_K_WARPS, HAS_BIAS, GROUP_M, USE_HALF_TILE_INTERLEAVED",
+    params,
+)
+def test_hgemm_b16_main_loop(
+    dtype: str,
+    m: int,
+    n: int,
+    k: int,
+    TILE_M: int,
+    TILE_N: int,
+    TILE_K: int,
+    STAGES: int,
+    SPLIT_K: int,
+    BLOCK_M_WARPS: int,
+    BLOCK_N_WARPS: int,
+    BLOCK_K_WARPS: int,
+    HAS_BIAS: bool,
+    GROUP_M: int,
+    USE_HALF_TILE_INTERLEAVED: bool,
+):
+    dtype = torch.bfloat16 if "bf16" in dtype else torch.half
+    args = TestArgs(
+        dtype,
+        m,
+        n,
+        k,
+        TILE_M,
+        TILE_N,
+        TILE_K,
+        STAGES,
+        SPLIT_K,
+        BLOCK_M_WARPS,
+        BLOCK_N_WARPS,
+        BLOCK_K_WARPS,
+        HAS_BIAS,
+        GROUP_M,
+        USE_HALF_TILE_INTERLEAVED,
+    )
+    check_acc(args)

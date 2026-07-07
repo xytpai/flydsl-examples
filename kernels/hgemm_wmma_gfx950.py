@@ -1,10 +1,6 @@
 import torch
-import argparse
 import functools
 import itertools
-import torch.nn.functional as F
-from torch.profiler import profile, ProfilerActivity
-from dataclasses import dataclass
 from typing import Optional
 
 import flydsl.compiler as flyc
@@ -25,7 +21,7 @@ from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr, SMEM_CAPACITY_MA
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl._mlir.dialects import llvm, memref
 
-from hgemm_utils import (
+from .hgemm_wmma_gfx950_utils import (
     get_dtype_in_kernel,
     _run_compiled,
     WmmaHalf_m16n16k16,
@@ -42,76 +38,6 @@ from hgemm_utils import (
 )
 
 SPLIT_K_SEMAPHORE_MAX_LEN = 256
-ROTARY_INPUTS_TARGET_BYTES = 8 * 1024**3
-
-
-@dataclass
-class Args:
-    dtype: torch.dtype | str
-    m: int
-    n: int
-    k: int
-
-
-def get_torch_fp8_dtype():
-    arch = str(get_rocm_arch())
-    if ("gfx95" in arch or "gfx12" in arch) and hasattr(torch, "float8_e4m3fn"):
-        return torch.float8_e4m3fn
-    if hasattr(torch, "float8_e4m3fnuz"):
-        return torch.float8_e4m3fnuz
-    if hasattr(torch, "float8_e4m3fn"):
-        return torch.float8_e4m3fn
-    raise RuntimeError("This PyTorch build does not expose an E4M3 FP8 dtype")
-
-
-def quantize_ptpc_fp8(x: torch.Tensor):
-    fp8_dtype = get_torch_fp8_dtype()
-    fp8_max = float(torch.finfo(fp8_dtype).max)
-    scale = x.float().abs().amax(dim=1, keepdim=True) / fp8_max
-    scale[scale == 0] = 1
-    x_fp8 = (x.float() / scale).to(fp8_dtype)
-    scale = torch.nan_to_num(scale, nan=1.0, posinf=1.0, neginf=1.0).squeeze(1)
-    return x_fp8, scale.float()
-
-
-def create_inputs(args):
-    if args.dtype == "fp8_ptpc":
-        a_f32 = torch.empty((args.m, args.k), dtype=torch.float32, device="cuda")
-        b_f32 = torch.empty((args.n, args.k), dtype=torch.float32, device="cuda")
-        a_f32.uniform_(-1, 1)
-        b_f32.uniform_(-1, 1)
-        a, scale_a = quantize_ptpc_fp8(a_f32)
-        b, scale_b = quantize_ptpc_fp8(b_f32)
-        bias = torch.empty((args.n,), dtype=torch.bfloat16, device="cuda")
-        bias.uniform_(10, 20)
-        return (a, b, scale_a, scale_b, bias)
-    a = torch.empty((args.m, args.k), dtype=args.dtype, device="cuda")
-    a.uniform_(-1, 1)
-    b = torch.empty((args.n, args.k), dtype=args.dtype, device="cuda")
-    b.uniform_(-1, 1)
-    bias = torch.empty((args.n,), dtype=args.dtype, device="cuda")
-    bias.uniform_(10, 20)
-    return (a, b, bias)
-
-
-def create_outputs(args):
-    if args.dtype == "fp8_ptpc":
-        c = torch.randn((args.m, args.n), dtype=torch.bfloat16, device="cuda")
-    else:
-        c = torch.randn((args.m, args.n), dtype=args.dtype, device="cuda")
-    return (c,)
-
-
-def ref_func(*args):
-    if len(args) == 6:
-        a, b, scale_a, scale_b, bias, c = args
-        a_f32 = a.float() * scale_a[:, None]
-        b_f32 = b.float() * scale_b[:, None]
-        ref = torch.addmm(bias.float(), a_f32, b_f32.t())
-        c.copy_(ref.to(c.dtype))
-    else:
-        a, b, bias, c = args
-        F.linear(a, b, out=c, bias=bias)
 
 
 @functools.lru_cache(maxsize=16384)
@@ -1681,20 +1607,7 @@ def get_default_b8_kwargs(m, n, k):
     return kwargs
 
 
-selections = {
-    "TILE_M": [16, 32, 48, 64, 80, 96, 128, 256],
-    "TILE_N": [64, 80, 96, 128, 256],
-    "TILE_K": [64, 128, 256],
-    "STAGES": [i for i in range(2, 9)],
-    "SPLIT_K": [i for i in range(1, 14)],
-    "BLOCK_M_WARPS": [1, 2, 4],
-    "BLOCK_N_WARPS": [1, 2, 4],
-    "BLOCK_K_WARPS": [1, 2, 4],
-    "USE_HT": [False, True],
-}
-
-
-def selection_filter(m, n, k, kwargs):
+def hgemm_validate(dtype_str, m, n, k, kwargs):
     TILE_M = kwargs["TILE_M"]
     TILE_N = kwargs["TILE_N"]
     TILE_K = kwargs["TILE_K"]
@@ -1703,12 +1616,13 @@ def selection_filter(m, n, k, kwargs):
     BLOCK_M_WARPS = kwargs["BLOCK_M_WARPS"]
     BLOCK_N_WARPS = kwargs["BLOCK_N_WARPS"]
     BLOCK_K_WARPS = kwargs["BLOCK_K_WARPS"]
-    USE_HT = kwargs.get("USE_HT", False)
+    USE_HALF_TILE_INTERLEAVED = kwargs.get("USE_HALF_TILE_INTERLEAVED", False)
     GPU_ARCH = get_rocm_arch()
-    DTYPE_BYTES = 2
+    IS_FP8 = "fp8" in dtype_str
+    DTYPE_BYTES = 1 if IS_FP8 else 2
 
-    if USE_HT:
-        if not (STAGES == 2 and BLOCK_K_WARPS == 1):
+    if USE_HALF_TILE_INTERLEAVED:
+        if not (STAGES == 2 and BLOCK_K_WARPS == 1 and BLOCK_M_WARPS == 2):
             return False
 
     def get_stage_smem_use(stages_):
@@ -1724,9 +1638,9 @@ def selection_filter(m, n, k, kwargs):
         return False
     if m >= 4096 and n >= 4096 and k >= 4096:
         if not (
-            TILE_M == 256
-            and TILE_N == 256
-            and TILE_K == 64
+            TILE_M == 256 and TILE_N == 256 and TILE_K == 128
+            if IS_FP8
+            else 64
             and STAGES == 2
             and SPLIT_K == 1
             and BLOCK_M_WARPS == 2
@@ -1734,17 +1648,34 @@ def selection_filter(m, n, k, kwargs):
             and BLOCK_K_WARPS == 1
         ):
             return False
-    if not ((k % SPLIT_K == 0) and (k // SPLIT_K >= 1)):
+    if kwargs["SPLIT_K"] > 1:
+        global SPLIT_K_SEMAPHORE_MAX_LEN
+        bm = (m + TILE_M - 1) // TILE_M
+        bn = (n + TILE_N - 1) // TILE_N
+        if not (bm * bn <= SPLIT_K_SEMAPHORE_MAX_LEN):
+            return False
+    if not ((n % 16 == 0) and (k % 16 == 0)):
         return False
     return True
 
 
 def hgemm_get_configs(m, n, k):
-    global selections
+    selections = {
+        "TILE_M": [16, 32, 48, 64, 80, 96, 128, 256],
+        "TILE_N": [64, 80, 96, 128, 256],
+        "TILE_K": [64, 128, 256],
+        "STAGES": [i for i in range(2, 9)],
+        "SPLIT_K": [i for i in range(1, 14)],
+        "BLOCK_M_WARPS": [1, 2, 4],
+        "BLOCK_N_WARPS": [1, 2, 4],
+        "BLOCK_K_WARPS": [1, 2, 4],
+        "GROUP_M": [0, 4],
+        "USE_HALF_TILE_INTERLEAVED": [False, True],
+    }
     keys = selections.keys()
     values = selections.values()
     configs = [dict(zip(keys, combo)) for combo in itertools.product(*values)]
-    configs = [config for config in configs if selection_filter(m, n, k, config)]
+    configs = [config for config in configs if hgemm_validate(m, n, k, config)]
     return configs
 
 
@@ -1757,12 +1688,12 @@ def get_semaphore(stream, device):
     return semaphore, signal
 
 
-def hgemm_splitk_(
+def hgemm(
     c: torch.Tensor,
     a: torch.Tensor,
     b: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
-    hgemm_kwargs: dict = {},
+    user_kwargs: dict = {},
     scale_a: Optional[torch.Tensor] = None,
     scale_b: Optional[torch.Tensor] = None,
 ):
@@ -1775,9 +1706,9 @@ def hgemm_splitk_(
     m = a.shape[0]
     n = b.shape[0]
     assert b.shape[1] == k
+    assert b.numel() == n * k
     c = c.view(-1, n)
     assert c.shape[0] == m
-    assert (n % 16 == 0) and (k % 16 == 0)
     is_fp8_ptpc = scale_a is not None or scale_b is not None
 
     kwargs = (
@@ -1785,7 +1716,8 @@ def hgemm_splitk_(
         if is_fp8_ptpc
         else get_default_b16_kwargs(m, n, k)
     )
-    kwargs.update(hgemm_kwargs)
+    kwargs.update(user_kwargs)
+
     working_k = (k + kwargs["SPLIT_K"] - 1) // kwargs["SPLIT_K"]
     last_working_k = k - (kwargs["SPLIT_K"] - 1) * working_k
     kwargs["HAS_K_TAIL"] = (working_k % kwargs["TILE_K"] != 0) or (
@@ -1802,175 +1734,45 @@ def hgemm_splitk_(
             or (last_working_k_tiles % 2 != 0)
         )
 
+    kwargs["HAS_BIAS"] = False if bias is None else True
+
+    bias_tensor = a if bias is None else bias
+    if bias is not None:
+        assert bias.shape[0] == n
+
     if is_fp8_ptpc:
         assert scale_a is not None and scale_b is not None
-        assert bias is not None
         assert scale_a.shape[0] == m
         assert scale_b.shape[0] == n
-        assert bias.shape[0] == n
         assert c.dtype == torch.bfloat16
-        kwargs["HAS_BIAS"] = True
-        if kwargs["SPLIT_K"] > 1:
-            bm = (m + kwargs["TILE_M"] - 1) // kwargs["TILE_M"]
-            bn = (n + kwargs["TILE_N"] - 1) // kwargs["TILE_N"]
-            assert bm * bn <= SPLIT_K_SEMAPHORE_MAX_LEN
-        # if "ASSUME_FULL_M" not in hgemm_kwargs:
-        #     kwargs["ASSUME_FULL_M"] = m % kwargs["TILE_M"] == 0
-        # if kwargs["ASSUME_FULL_M"]:
-        #     assert m % kwargs["TILE_M"] == 0
-        # assert k % (2 * kwargs["TILE_K"]) == 0
+        assert hgemm_validate("fp8_ptpc", m, n, k, kwargs)
         exe = compile_hgemm_wmma_kernel("fp8_ptpc", **kwargs)
         _run_compiled(
-            exe, c, a, b, scale_a, scale_b, bias, semaphore, signal, m, n, k, stream
+            exe,
+            c,
+            a,
+            b,
+            scale_a,
+            scale_b,
+            bias_tensor,
+            semaphore,
+            signal,
+            m,
+            n,
+            k,
+            stream,
         )
-        return
-
-    kwargs["HAS_BIAS"] = False if bias is None else True
-    # if "ASSUME_FULL_M" not in hgemm_kwargs:
-    #     kwargs["ASSUME_FULL_M"] = m % kwargs["TILE_M"] == 0
-    # if kwargs["ASSUME_FULL_M"]:
-    #     assert m % kwargs["TILE_M"] == 0
-    if a.dtype == torch.half:
-        exe = compile_hgemm_wmma_kernel("f16", **kwargs)
-    elif a.dtype == torch.bfloat16:
-        exe = compile_hgemm_wmma_kernel("bf16", **kwargs)
     else:
-        raise NotImplementedError()
-    if kwargs["SPLIT_K"] > 1:
-        bm = (m + kwargs["TILE_M"] - 1) // kwargs["TILE_M"]
-        bn = (n + kwargs["TILE_N"] - 1) // kwargs["TILE_N"]
-        assert bm * bn <= SPLIT_K_SEMAPHORE_MAX_LEN
-    bias_tensor = a if bias is None else bias
-    _run_compiled(exe, c, a, b, a, b, bias_tensor, semaphore, signal, m, n, k, stream)
-
-
-def func(*args):
-    if len(args) == 6:
-        a, b, scale_a, scale_b, bias, c = args
-        hgemm_splitk_(c, a, b, bias=bias, scale_a=scale_a, scale_b=scale_b)
-    else:
-        a, b, bias, c = args
-        hgemm_splitk_(c, a, b, bias=bias)
-
-
-def tensor_nbytes(tensors):
-    return sum(t.numel() * t.element_size() for t in tensors)
-
-
-def get_rotary_inputs(sample_inputs, sample_outputs):
-    slot_bytes = 2 * (tensor_nbytes(sample_inputs) + tensor_nbytes(sample_outputs))
-    rotary_inputs = ROTARY_INPUTS_TARGET_BYTES // slot_bytes
-    return max(1, int(rotary_inputs))
-
-
-def benchmark(args, func, ref_func, warmup=500, niters=600):
-    inputs = create_inputs(args)
-    outputs = create_outputs(args)
-    ref_outputs = create_outputs(args)
-    inouts = inputs + outputs
-    ref_inouts = inputs + ref_outputs
-    for i in range(5):
-        func(*inouts)
-        ref_func(*ref_inouts)
-        for output, ref_output in zip(outputs, ref_outputs):
-            is_allclose = torch.allclose(output, ref_output, atol=1e-2, rtol=1e-2)
-            # print(output)
-            # print(ref_output)
-            maxdiff_out = (output - ref_output).abs().max()
-            print(f"maxdiff_out:{maxdiff_out}")
-            # assert is_allclose == True
-
-    rotary_inputs = get_rotary_inputs(inputs, outputs)
-    inputs = [create_inputs(args) for _ in range(rotary_inputs)]
-    ref_inputs = [create_inputs(args) for _ in range(rotary_inputs)]
-    outputs = [create_outputs(args) for _ in range(rotary_inputs)]
-    ref_outputs = [create_outputs(args) for _ in range(rotary_inputs)]
-    print(
-        f"rotary_inputs:{rotary_inputs}, target_bytes:{ROTARY_INPUTS_TARGET_BYTES}, "
-        f"warmup:{warmup}, niters:{niters}"
-    )
-
-    def run_ref(idx):
-        ref_func(*(ref_inputs[idx] + ref_outputs[idx]))
-
-    def run_flydsl(idx):
-        func(*(inputs[idx] + outputs[idx]))
-
-    print("===================== [INTERLEAVED] =====================")
-    for i in range(warmup):
-        idx = i % rotary_inputs
-        if i % 2 == 0:
-            run_ref(idx)
-            run_flydsl(idx)
+        if a.dtype == torch.half:
+            assert c.dtype == torch.half
+            assert hgemm_validate("fp16", m, n, k, kwargs)
+            exe = compile_hgemm_wmma_kernel("f16", **kwargs)
+        elif a.dtype == torch.bfloat16:
+            assert c.dtype == torch.bfloat16
+            assert hgemm_validate("bf16", m, n, k, kwargs)
+            exe = compile_hgemm_wmma_kernel("bf16", **kwargs)
         else:
-            run_flydsl(idx)
-            run_ref(idx)
-        torch.cuda.synchronize()
-
-    with profile(
-        activities=[ProfilerActivity.CUDA],
-    ) as prof:
-        for i in range(warmup, niters):
-            idx = i % rotary_inputs
-            if i % 2 == 0:
-                run_ref(idx)
-                run_flydsl(idx)
-            else:
-                run_flydsl(idx)
-                run_ref(idx)
-            torch.cuda.synchronize()
-    print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Examples")
-    parser.add_argument("--m", type=int, required=True)
-    parser.add_argument("--n", type=int, required=True)
-    parser.add_argument("--k", type=int, required=True)
-    parser.add_argument("--dtype", type=str, required=True)
-    args = parser.parse_args()
-    print(f"run: {__file__}, args: {args}")
-    dtype_convert = {"f16": torch.half, "bf16": torch.bfloat16, "fp8_ptpc": "fp8_ptpc"}
-    args.dtype = dtype_convert[args.dtype]
-    args = Args(**vars(args))
-    benchmark(args, func, ref_func)
-    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=2048 --n=2048 --k=2048 --dtype=bf16
-    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=4096 --n=4096 --k=4096 --dtype=bf16
-    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=4096 --n=4096 --k=8192 --dtype=bf16
-    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8192 --n=8192 --k=8192 --dtype=bf16
-    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8160 --n=8160 --k=8160 --dtype=bf16
-    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=32 --n=384 --k=7168 --dtype=bf16
-    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=32 --n=7168 --k=2048 --dtype=bf16
-    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=32 --n=384 --k=16384 --dtype=bf16
-    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8 --n=5120 --k=2880 --dtype=bf16
-    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=32 --n=2880 --k=2048 --dtype=bf16
-    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=800 --n=384 --k=7168 --dtype=bf16
-
-    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=2048 --n=2048 --k=2048 --dtype=fp8_ptpc
-    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=4096 --n=4096 --k=4096 --dtype=fp8_ptpc
-    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8192 --n=8192 --k=8192 --dtype=fp8_ptpc
-    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8160 --n=8160 --k=8160 --dtype=fp8_ptpc
-    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=32 --n=384 --k=7168 --dtype=fp8_ptpc
-
-    # unit test
-    # bf16
-    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8192 --n=8192 --k=8192 --dtype=bf16
-    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8192 --n=8192 --k=8224 --dtype=bf16
-    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8192 --n=8192 --k=8256 --dtype=bf16
-    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8192 --n=8192 --k=8288 --dtype=bf16
-    # fp8ptpc
-    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8192 --n=8192 --k=8192 --dtype=fp8_ptpc
-    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8192 --n=8192 --k=8224 --dtype=fp8_ptpc
-    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8192 --n=8192 --k=8256 --dtype=fp8_ptpc
-    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8192 --n=8192 --k=8288 --dtype=fp8_ptpc
-
-    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8160 --n=8160 --k=8160 --dtype=bf16
-    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8192 --n=8192 --k=8192 --dtype=bf16
-    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=2048 --n=2048 --k=2048 --dtype=bf16
-    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8192 --n=8192 --k=8192 --dtype=bf16
-    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8160 --n=8160 --k=8160 --dtype=bf16
-    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=32 --n=384 --k=7168 --dtype=bf16
-    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=2048 --n=2048 --k=2048 --dtype=fp8_ptpc
-    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8192 --n=8192 --k=8192 --dtype=fp8_ptpc
-    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8160 --n=8160 --k=8160 --dtype=fp8_ptpc
-    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=32 --n=384 --k=7168 --dtype=fp8_ptpc
+            raise NotImplementedError()
+        _run_compiled(
+            exe, c, a, b, a, b, bias_tensor, semaphore, signal, m, n, k, stream
+        )
