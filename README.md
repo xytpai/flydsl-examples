@@ -10,7 +10,7 @@ This repository will provide the following examples from scratch:
 
 For IR study: https://mlir.llvm.org/docs/
 
-## 0. How to build install FlyDSL on AMD GPUs
+## How to build install FlyDSL on AMD GPUs
 
 Check the ROCm version using `amd-smi`. My version is `7.0.1`.
 
@@ -26,11 +26,12 @@ pip install -e .
 ## GEMM-WMMA Test
 
 ```bash
-pytest -sv test_hgemm.py
+rm -rf ~/.flydsl/ ; pytest -sv test_hgemm.py
 ```
 
-```txt
-```
+### HGEMM BF16 Benchmark
+
+![HGEMM BF16 benchmark](images/hgemm_benchmark.svg)
 
 ---
 
