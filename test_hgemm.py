@@ -141,7 +141,7 @@ def check_acc(args: _TestArgs):
 
     def get_tol(args):
         k_scale = (args.k / 8192) ** 0.5
-        k_scale *= args.SPLIT_K
+        k_scale *= args.SPLIT_K * args.BLOCK_K_WARPS
         if args.dtype == "fp8_ptpc":
             return 2e-1 * k_scale, 2e-1
         if args.dtype is torch.bfloat16:
@@ -179,10 +179,14 @@ def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
         "GROUP_M": args.GROUP_M,
         "USE_HALF_TILE_INTERLEAVED": args.USE_HALF_TILE_INTERLEAVED,
     }
-    rotary_inputs = get_rotary_inputs(inputs, outputs)
-    inputs = [create_inputs(args) for _ in range(rotary_inputs)]
+    sample_inputs = create_inputs(args)
+    sample_outputs = create_outputs(args)
+    rotary_inputs = get_rotary_inputs(sample_inputs, sample_outputs)
+    inputs = [sample_inputs] + [create_inputs(args) for _ in range(rotary_inputs - 1)]
     ref_inputs = [create_inputs(args) for _ in range(rotary_inputs)]
-    outputs = [create_outputs(args) for _ in range(rotary_inputs)]
+    outputs = [sample_outputs] + [
+        create_outputs(args) for _ in range(rotary_inputs - 1)
+    ]
     ref_outputs = [create_outputs(args) for _ in range(rotary_inputs)]
     global ROTARY_INPUTS_TARGET_BYTES
     print(
@@ -470,3 +474,106 @@ def test_hgemm_acc_small_m(
         USE_HALF_TILE_INTERLEAVED,
     )
     check_acc(args)
+
+
+@pytest.mark.parametrize("dtype", ["fp16", "bf16"])
+@pytest.mark.parametrize(
+    "m, n, k, TILE_M, TILE_N, TILE_K, STAGES, SPLIT_K, BLOCK_M_WARPS, BLOCK_N_WARPS, BLOCK_K_WARPS, HAS_BIAS, GROUP_M, USE_HALF_TILE_INTERLEAVED",
+    [
+        (800, 384, 7168, 32, 64, 128, 6, 1, 1, 2, 2, True, 0, False),
+        (800, 384, 7168, 32, 64, 128, 6, 2, 1, 2, 2, True, 0, False),
+        (800, 384, 7168, 32, 64, 128, 6, 1, 1, 2, 2, False, 0, False),
+        (800, 384, 7168, 32, 64, 128, 6, 2, 1, 2, 2, False, 0, False),
+        (800, 384, 7168, 32, 64, 128, 6, 2, 1, 2, 2, False, 4, False),
+    ],
+)
+def test_hgemm_acc_ft_slice_k(
+    dtype: str,
+    m: int,
+    n: int,
+    k: int,
+    TILE_M: int,
+    TILE_N: int,
+    TILE_K: int,
+    STAGES: int,
+    SPLIT_K: int,
+    BLOCK_M_WARPS: int,
+    BLOCK_N_WARPS: int,
+    BLOCK_K_WARPS: int,
+    HAS_BIAS: bool,
+    GROUP_M: int,
+    USE_HALF_TILE_INTERLEAVED: bool,
+):
+    if dtype == "fp8_ptpc":
+        TILE_K = 128
+    else:
+        dtype = torch.bfloat16 if "bf16" in dtype else torch.half
+    args = _TestArgs(
+        dtype,
+        m,
+        n,
+        k,
+        TILE_M,
+        TILE_N,
+        TILE_K,
+        STAGES,
+        SPLIT_K,
+        BLOCK_M_WARPS,
+        BLOCK_N_WARPS,
+        BLOCK_K_WARPS,
+        HAS_BIAS,
+        GROUP_M,
+        USE_HALF_TILE_INTERLEAVED,
+    )
+    check_acc(args)
+
+
+# =========================================== benchmark ===========================================
+
+
+@pytest.mark.parametrize("dtype", ["bf16"])
+@pytest.mark.parametrize(
+    "m, n, k, TILE_M, TILE_N, TILE_K, STAGES, SPLIT_K, BLOCK_M_WARPS, BLOCK_N_WARPS, BLOCK_K_WARPS, HAS_BIAS, GROUP_M, USE_HALF_TILE_INTERLEAVED",
+    [
+        (8192, 8192, 8192, 256, 256, 64, 2, 1, 2, 4, 1, True, 0, True),
+        (4096, 4096, 8192, 256, 256, 64, 2, 1, 2, 4, 1, True, 0, True),
+        (4096, 4096, 4096, 256, 256, 64, 2, 1, 2, 4, 1, True, 0, True),
+        (2048, 2048, 2048, 128, 128, 64, 5, 1, 4, 4, 1, True, 0, False),
+    ],
+)
+def test_hgemm_benchmark_smoke(
+    dtype: str,
+    m: int,
+    n: int,
+    k: int,
+    TILE_M: int,
+    TILE_N: int,
+    TILE_K: int,
+    STAGES: int,
+    SPLIT_K: int,
+    BLOCK_M_WARPS: int,
+    BLOCK_N_WARPS: int,
+    BLOCK_K_WARPS: int,
+    HAS_BIAS: bool,
+    GROUP_M: int,
+    USE_HALF_TILE_INTERLEAVED: bool,
+):
+    dtype = torch.bfloat16 if "bf16" in dtype else torch.half
+    args = _TestArgs(
+        dtype,
+        m,
+        n,
+        k,
+        TILE_M,
+        TILE_N,
+        TILE_K,
+        STAGES,
+        SPLIT_K,
+        BLOCK_M_WARPS,
+        BLOCK_N_WARPS,
+        BLOCK_K_WARPS,
+        HAS_BIAS,
+        GROUP_M,
+        USE_HALF_TILE_INTERLEAVED,
+    )
+    benchmark(args)

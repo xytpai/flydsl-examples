@@ -330,7 +330,7 @@ def compile_hgemm_wmma_kernel(
                     is_first_k_slice = wid_k == 0
                     bias_val = is_first_k_slice.select(bias_val, fx.Float32(0.0))
                 bias_frags[jj] = vector.broadcast(
-                    T.vec(WMMA_C_FRAG_VALUES, T.f32), bias_val
+                    T.vec(WMMA_C_FRAG_VALUES, T.f32), arith.unwrap(bias_val)
                 )
             for ii in range_constexpr(WARP_M_STEPS):
                 for jj in range_constexpr(WARP_N_STEPS):
