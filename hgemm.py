@@ -324,7 +324,7 @@ def compile_hgemm_wmma_kernel(
         m: fx.Int32,
         n: fx.Int32,
         k: fx.Int32,
-        ks: fx.Int32,
+        working_k: fx.Int32,
         num_pid_m: fx.Int32,
         num_pid_n: fx.Int32,
         c_stride: fx.Int32,
@@ -380,7 +380,9 @@ def compile_hgemm_wmma_kernel(
             num_pid_m, num_pid_n, fx.block_idx.x
         )
         ks_idx = fx.block_idx.y
-        ks_begin = ks_idx * ks
+        ks_begin = ks_idx * working_k
+        ks_end = ks_begin + working_k
+        ks_end = (ks_end < k).select(ks_end, k)
 
         block_m_offset = block_m_idx * BLOCK_M
         block_n_offset = block_n_idx * BLOCK_N
@@ -519,7 +521,20 @@ def compile_hgemm_wmma_kernel(
                     ii, k_offset, lds_stage, lds_ptr if ii > 0 else None
                 )
 
-        def ldmatrix_compute_tile_streaming(lds_stage, c_frags):
+        def mask_tail_k_frag(frag, k_base, frag_values):
+            elems = [0] * frag_values
+            for vi in range_constexpr(frag_values):
+                global_k_idx = k_base + vi
+                valid_k = global_k_idx < ks_end
+                elem = vector.extract(frag, static_position=[vi], dynamic_position=[])
+                elems[vi] = arith.select(
+                    valid_k, elem, arith.constant(0, type=smem_input_dtype_)
+                )
+            return vector.from_elements(T.vec(frag_values, smem_input_dtype_), elems)
+
+        def ldmatrix_compute_tile_streaming(
+            lds_stage, k_offset, c_frags, mask_k_tail=False
+        ):
             s = lds_stage
             c_frags_new = [cx for cx in c_frags]
             for kk in range_constexpr(WARP_K_STEPS):
@@ -542,15 +557,18 @@ def compile_hgemm_wmma_kernel(
                                 smem_b_ptr.get(),
                                 [fx.Index(flat_offset)],
                             )
+                            if const_expr(mask_k_tail):
+                                v16 = mask_tail_k_frag(
+                                    v16, k_offset + col_base, LDG_VEC_SIZE
+                                )
                             return fx.Vector(v16).bitcast(fx.Int32)
 
                         lo = load_i32x4_at_b(0)
                         hi = load_i32x4_at_b(64)
                         b_frags[ii] = fx.Vector(lo).shuffle(hi, list(range(8)))
                     else:
-                        col_in_bytes = (
-                            warp_atom_k_idx + ldmatrix_b_k_vec_idx
-                        ) * IN_DTYPE_BYTES
+                        frag_k_base = warp_atom_k_idx + ldmatrix_b_k_vec_idx
+                        col_in_bytes = frag_k_base * IN_DTYPE_BYTES
                         col_in_bytes = swizzle_xor16(row, col_in_bytes, k_blocks16)
                         flat_offset = (
                             s * BLOCK_N + row
@@ -562,7 +580,14 @@ def compile_hgemm_wmma_kernel(
                             smem_b_ptr.get(),
                             [fx.Index(flat_offset)],
                         )
-                        b_frags[ii] = vec
+                        if const_expr(mask_k_tail):
+                            b_frags[ii] = mask_tail_k_frag(
+                                vec,
+                                k_offset + frag_k_base,
+                                WMMA_B_FRAG_VALUES * MFMA_PER_WARP_K,
+                            )
+                        else:
+                            b_frags[ii] = vec
                 a_frags = [0] * WARP_M_STEPS
                 for ii in range_constexpr(WARP_M_STEPS):
                     # ldmatrix a
@@ -581,15 +606,18 @@ def compile_hgemm_wmma_kernel(
                                 smem_a_ptr.get(),
                                 [fx.Index(flat_offset)],
                             )
+                            if const_expr(mask_k_tail):
+                                v16 = mask_tail_k_frag(
+                                    v16, k_offset + col_base, LDG_VEC_SIZE
+                                )
                             return fx.Vector(v16).bitcast(fx.Int32)
 
                         lo = load_i32x4_at_a(0)
                         hi = load_i32x4_at_a(64)
                         a_frags[ii] = fx.Vector(lo).shuffle(hi, list(range(8)))
                     else:
-                        col_in_bytes = (
-                            warp_atom_k_idx + ldmatrix_a_k_vec_idx
-                        ) * IN_DTYPE_BYTES
+                        frag_k_base = warp_atom_k_idx + ldmatrix_a_k_vec_idx
+                        col_in_bytes = frag_k_base * IN_DTYPE_BYTES
                         col_in_bytes = swizzle_xor16(row, col_in_bytes, k_blocks16)
                         flat_offset = (
                             s * BLOCK_M + row
@@ -601,7 +629,14 @@ def compile_hgemm_wmma_kernel(
                             smem_a_ptr.get(),
                             [fx.Index(flat_offset)],
                         )
-                        a_frags[ii] = vec
+                        if const_expr(mask_k_tail):
+                            a_frags[ii] = mask_tail_k_frag(
+                                vec,
+                                k_offset + frag_k_base,
+                                WMMA_A_FRAG_VALUES * MFMA_PER_WARP_K,
+                            )
+                        else:
+                            a_frags[ii] = vec
                 rocdl.sched_barrier(0)
                 for ii in range_constexpr(WARP_M_STEPS):
                     a_frag = a_frags[ii]
@@ -676,7 +711,7 @@ def compile_hgemm_wmma_kernel(
             # ================ Reordered ================
             rocdl.sched_barrier(0)
 
-        BLOCK_K_LOOPS = (ks + BLOCK_K - 1) // BLOCK_K
+        BLOCK_K_LOOPS = (working_k + BLOCK_K - 1) // BLOCK_K
         init_state = [ks_begin, fx.Int32(0)] + c_frags
         for _, state in range(0, BLOCK_K_LOOPS - (STAGES - 1), 1, init=init_state):
             k_offset = state[0]
@@ -687,15 +722,22 @@ def compile_hgemm_wmma_kernel(
             __barrier((STAGES - 2) * LDG_WAIT_COUNT)
             ldg_sts_b_async(k_offset + (STAGES - 1) * BLOCK_K, write_stage)
             ldg_sts_a_async(k_offset + (STAGES - 1) * BLOCK_K, write_stage)
-            c_frags_new = ldmatrix_compute_tile_streaming(current_stage, c_frags)
+            c_frags_new = ldmatrix_compute_tile_streaming(
+                current_stage, k_offset, c_frags
+            )
             k_offset_next = k_offset + BLOCK_K
             hot_loop_scheduler()
             results = yield [k_offset_next, next_stage] + c_frags_new
         current_stage = results[1]
+        k_offset = results[0]
         c_frags = results[2:]
         for s in range_constexpr(0, STAGES - 1):
             __barrier((STAGES - 2 - s) * LDG_WAIT_COUNT)
-            c_frags = ldmatrix_compute_tile_streaming(current_stage, c_frags)
+            mask_k_tail = s == STAGES - 2
+            c_frags = ldmatrix_compute_tile_streaming(
+                current_stage, k_offset, c_frags, mask_k_tail
+            )
+            k_offset = k_offset + BLOCK_K
             current_stage = (current_stage + 1) % STAGES
 
         # write to lds
@@ -814,7 +856,7 @@ def compile_hgemm_wmma_kernel(
         m: fx.Int32,
         n: fx.Int32,
         k: fx.Int32,
-        ks: fx.Int32,
+        working_k: fx.Int32,
         num_pid_m: fx.Int32,
         num_pid_n: fx.Int32,
         c_stride: fx.Int32,
@@ -869,7 +911,7 @@ def compile_hgemm_wmma_kernel(
             num_pid_m, num_pid_n, fx.block_idx.x
         )
         ks_idx = fx.block_idx.y
-        ks_begin = ks_idx * ks
+        ks_begin = ks_idx * working_k
         block_m_offset = block_m_idx * BLOCK_M
         block_n_offset = block_n_idx * BLOCK_N
         k_blocks16 = BLOCK_K_BYTES // 16
@@ -1210,7 +1252,7 @@ def compile_hgemm_wmma_kernel(
             __s_barrier()
             return c_frags_out
 
-        BLOCK_K_LOOPS = ks // BLOCK_K
+        BLOCK_K_LOOPS = working_k // BLOCK_K
         loop_end = (BLOCK_K_LOOPS > 2).select(BLOCK_K_LOOPS - 2, 0)
         init_state = [ks_begin] + c_frags
         for _, state in range(0, loop_end, 2, init=init_state):
@@ -1442,7 +1484,7 @@ def compile_hgemm_wmma_kernel(
         with ir.InsertionPoint(ctx.gpu_module_body):
             allocator.finalize()
 
-        ks = (k + SPLIT_K - 1) // SPLIT_K
+        working_k = (k + SPLIT_K - 1) // SPLIT_K
         num_pid_m = (m + BLOCK_M - 1) // BLOCK_M
         num_pid_n = (n + BLOCK_N - 1) // BLOCK_N
         c_stride = n
@@ -1462,7 +1504,7 @@ def compile_hgemm_wmma_kernel(
             m,
             n,
             k,
-            ks,
+            working_k,
             num_pid_m,
             num_pid_n,
             c_stride,
@@ -1715,7 +1757,7 @@ def hgemm_splitk_(
         #     kwargs["ASSUME_FULL_M"] = m % kwargs["TILE_M"] == 0
         # if kwargs["ASSUME_FULL_M"]:
         #     assert m % kwargs["TILE_M"] == 0
-        assert k % (2 * kwargs["TILE_K"]) == 0
+        # assert k % (2 * kwargs["TILE_K"]) == 0
         exe = compile_hgemm_wmma_kernel("fp8_ptpc", **kwargs)
         _run_compiled(
             exe, c, a, b, scale_a, scale_b, bias, semaphore, signal, m, n, k, stream
@@ -1854,9 +1896,9 @@ if __name__ == "__main__":
     # unit test
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=2048 --n=2048 --k=2048 --dtype=bf16
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8192 --n=8192 --k=8192 --dtype=bf16
-    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8160 --n=8160 --k=8192 --dtype=bf16
+    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8160 --n=8160 --k=8160 --dtype=bf16
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=32 --n=384 --k=7168 --dtype=bf16
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=2048 --n=2048 --k=2048 --dtype=fp8_ptpc
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8192 --n=8192 --k=8192 --dtype=fp8_ptpc
-    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8160 --n=8160 --k=8192 --dtype=fp8_ptpc
+    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8160 --n=8160 --k=8160 --dtype=fp8_ptpc
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=32 --n=384 --k=7168 --dtype=fp8_ptpc

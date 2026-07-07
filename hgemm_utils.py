@@ -179,7 +179,7 @@ def buffer_load_lds_inline(rsrc, lds_ptr, global_offset, DMA_BYTES):
         raise NotImplementedError(f"DMA_BYTES={DMA_BYTES} not supported")
     llvm.InlineAsmOp(
         None,
-        [lds_ptr, global_offset, rsrc],
+        [_to_raw(lds_ptr), _to_raw(global_offset), _to_raw(rsrc)],
         asm,
         "s,v,s",
         has_side_effects=True,
