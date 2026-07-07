@@ -11,7 +11,7 @@ from flydsl.expr import (
 import flydsl.expr as fx
 import flydsl.compiler as flyc
 from flydsl.expr.typing import T, Vector as Vec
-from flydsl._mlir.dialects import llvm, fly, memref, scf
+from flydsl._mlir.dialects import llvm, fly, scf
 from flydsl._mlir import ir
 
 
@@ -249,6 +249,12 @@ class SplitKProtocol:
     def zero_c(self):
         # zero c if current block is the first block
         if self.ks_idx == 0:
+            if const_expr(self.STG_VEC_SIZE == 4):
+                store_asm = "global_store_dwordx2 $0, $1, off sc0 sc1"
+            elif const_expr(self.STG_VEC_SIZE == 8):
+                store_asm = "global_store_dwordx4 $0, $1, off sc0 sc1"
+            else:
+                raise NotImplementedError(f"STG_VEC_SIZE={self.STG_VEC_SIZE}")
             zero_vec = vector.broadcast(
                 T.vec(self.STG_VEC_SIZE, self.out_dtype_), self.c_zero_out
             )
@@ -279,7 +285,7 @@ class SplitKProtocol:
                     llvm.InlineAsmOp(
                         None,
                         [c_ptr, init_vec],
-                        "global_store_dwordx4 $0, $1, off sc0 sc1",
+                        store_asm,
                         "v,v",
                         has_side_effects=True,
                     )
