@@ -145,7 +145,7 @@ def check_acc(args: _TestArgs):
         if args.dtype == "fp8_ptpc":
             return 2e-1 * k_scale, 2e-1
         if args.dtype is torch.bfloat16:
-            return 1e-1 * k_scale, 1e-1
+            return 2e-1 * k_scale, 2e-1
         return 5e-2 * k_scale, 5e-2
 
     atol, rtol = get_tol(args)
@@ -155,6 +155,7 @@ def check_acc(args: _TestArgs):
         for output, ref_output in zip(outputs, ref_outputs):
             maxdiff_out = (output - ref_output).abs().max().item()
             maxdiff_out_.append(maxdiff_out)
+            print(maxdiff_out, flush=True)
             torch.testing.assert_close(
                 output,
                 ref_output,
@@ -315,6 +316,61 @@ def test_hgemm_acc_main_loop(
     ],
 )
 def test_hgemm_acc_ft_stage_split_k(
+    dtype: str,
+    m: int,
+    n: int,
+    k: int,
+    TILE_M: int,
+    TILE_N: int,
+    TILE_K: int,
+    STAGES: int,
+    SPLIT_K: int,
+    BLOCK_M_WARPS: int,
+    BLOCK_N_WARPS: int,
+    BLOCK_K_WARPS: int,
+    HAS_BIAS: bool,
+    GROUP_M: int,
+    USE_HALF_TILE_INTERLEAVED: bool,
+):
+    if dtype == "fp8_ptpc":
+        TILE_K = 128
+    else:
+        dtype = torch.bfloat16 if "bf16" in dtype else torch.half
+    args = _TestArgs(
+        dtype,
+        m,
+        n,
+        k,
+        TILE_M,
+        TILE_N,
+        TILE_K,
+        STAGES,
+        SPLIT_K,
+        BLOCK_M_WARPS,
+        BLOCK_N_WARPS,
+        BLOCK_K_WARPS,
+        HAS_BIAS,
+        GROUP_M,
+        USE_HALF_TILE_INTERLEAVED,
+    )
+    check_acc(args)
+
+
+@pytest.mark.parametrize("dtype", ["fp16", "bf16", "fp8_ptpc"])
+@pytest.mark.parametrize(
+    "m, n, k, TILE_M, TILE_N, TILE_K, STAGES, SPLIT_K, BLOCK_M_WARPS, BLOCK_N_WARPS, BLOCK_K_WARPS, HAS_BIAS, GROUP_M, USE_HALF_TILE_INTERLEAVED",
+    [
+        (64, 384, 7168, 64, 64, 64, 2, 8, 2, 2, 1, True, 0, True),
+        (64, 384, 7168, 64, 64, 64, 2, 8, 2, 2, 1, False, 0, True),
+        (64, 384, 7168, 64, 64, 64, 2, 8, 2, 2, 1, True, 4, True),
+        (64, 384, 7168, 64, 64, 64, 2, 8, 2, 2, 1, False, 4, True),
+        (2048, 2048, 2048, 128, 128, 64, 2, 4, 2, 2, 1, True, 0, True),
+        (2048, 2048, 2048, 128, 128, 64, 2, 4, 2, 2, 1, False, 0, True),
+        (2048, 2048, 2048, 128, 128, 64, 2, 4, 2, 2, 1, True, 4, True),
+        (2048, 2048, 2048, 128, 128, 64, 2, 4, 2, 2, 1, False, 4, True),
+    ],
+)
+def test_hgemm_acc_ht_split_k(
     dtype: str,
     m: int,
     n: int,

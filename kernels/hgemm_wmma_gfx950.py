@@ -1398,7 +1398,7 @@ def compile_hgemm_wmma_kernel(
             if const_expr(IS_FP8_PTPC):
                 scale_b0 = load_scale_b(0)
                 store_matrix_to_lds(0, 0, c_frags_out, scale_b0)
-                scale_b1 = load_scale_b(0)
+                scale_b1 = load_scale_b(1)
                 store_matrix_to_lds(0, 1, c_frags_out, scale_b1)
             else:
                 store_matrix_to_lds(0, 0, c_frags_out)
