@@ -379,12 +379,12 @@ def compile_hgemm_wmma_kernel(
         block_m_idx, block_n_idx = block_swizzle.swizzle(
             num_pid_m, num_pid_n, fx.block_idx.x
         )
-        ks_idx = fx.Index(fx.block_idx.y)
-        ks_begin = arith.index_cast(T.i32, ks_idx * ks)
+        ks_idx = fx.block_idx.y
+        ks_begin = ks_idx * ks
 
-        block_m_offset = fx.Index(block_m_idx * BLOCK_M)
-        block_n_offset = fx.Index(block_n_idx * BLOCK_N)
-        k_blocks16 = fx.Int32(BLOCK_K_BYTES // 16)
+        block_m_offset = block_m_idx * BLOCK_M
+        block_n_offset = block_n_idx * BLOCK_N
+        k_blocks16 = BLOCK_K_BYTES // 16
 
         warp_m_idx = wid_mn // BLOCK_N_WARPS * WARP_M
         warp_n_idx = wid_mn % BLOCK_N_WARPS * WARP_N
@@ -403,16 +403,14 @@ def compile_hgemm_wmma_kernel(
             bias_frags = [acc_init] * WARP_N_STEPS
             for jj in range_constexpr(WARP_N_STEPS):
                 warp_atom_n_idx = warp_n_idx + jj * WARP_ATOM_N
-                lds_n_idx = fx.Index(warp_atom_n_idx + stmatrix_c_n_idx)
+                lds_n_idx = warp_atom_n_idx + stmatrix_c_n_idx
                 global_n_idx = block_n_offset + lds_n_idx
-                safe_global_n_idx = (fx.Index(global_n_idx) < fx.Index(n)).select(
-                    global_n_idx, fx.Index(0)
-                )
+                safe_global_n_idx = (global_n_idx < n).select(global_n_idx, 0)
                 bias_val = buffer_ops.buffer_load(
                     bias_rsrc, safe_global_n_idx, vec_width=1, dtype=output_dtype_
                 ).extf(T.f32)
                 if const_expr(IS_SLICE_K):
-                    is_first_k_slice = fx.Index(wid_k) == fx.Index(0)
+                    is_first_k_slice = wid_k == 0
                     bias_val = is_first_k_slice.select(bias_val, fx.Float32(0.0))
                 bias_frags[jj] = vector.broadcast(
                     T.vec(WMMA_C_FRAG_VALUES, T.f32), bias_val
@@ -422,7 +420,7 @@ def compile_hgemm_wmma_kernel(
                     c_frags[ii * WARP_N_STEPS + jj] = bias_frags[jj]
 
         if const_expr(IS_SPLIT_K):
-            signal_idx = fx.Int32(fx.block_idx.x)
+            signal_idx = fx.block_idx.x
             splitk_protocol.init(
                 semaphore_ptr,
                 signal_ptr,
@@ -440,13 +438,7 @@ def compile_hgemm_wmma_kernel(
             )
 
         def get_dma_copy_warp_offset():
-            return rocdl.readfirstlane(
-                T.i64,
-                arith.index_cast(
-                    T.i64,
-                    fx.Index(wid) * arith.constant(WARP_SIZE * DMA_BYTES, index=True),
-                ),
-            )
+            return rocdl.readfirstlane(T.i64, fx.Int64(wid * WARP_SIZE * DMA_BYTES))
 
         warp_offset = get_dma_copy_warp_offset()
 
@@ -459,21 +451,17 @@ def compile_hgemm_wmma_kernel(
             else:
                 col_in_bytes = k_local_idx * IN_DTYPE_BYTES
                 col_in_bytes = swizzle_xor16(m_local_idx, col_in_bytes, k_blocks16)
-            global_m_idx = block_m_offset + fx.Index(m_local_idx)
-            safe_global_m_idx = (fx.Index(global_m_idx) < fx.Index(m)).select(
-                global_m_idx, fx.Index(0)
-            )
-            global_k_idx = fx.Index(k_offset + col_in_bytes // IN_DTYPE_BYTES)
-            safe_global_k_idx = (fx.Index(global_k_idx) < fx.Index(k)).select(
-                global_k_idx, fx.Index(0)
-            )
+            global_m_idx = block_m_offset + m_local_idx
+            safe_global_m_idx = (global_m_idx < m).select(global_m_idx, 0)
+            global_k_idx = k_offset + col_in_bytes // IN_DTYPE_BYTES
+            safe_global_k_idx = (global_k_idx < k).select(global_k_idx, 0)
             global_offset_in_bytes = (
                 safe_global_m_idx * a_stride + safe_global_k_idx
             ) * IN_DTYPE_BYTES
             global_offset_in_bytes = arith.index_cast(T.i32, global_offset_in_bytes)
             if const_expr(lds_ptr is None):
-                lds_offset_in_bytes = (
-                    fx.Index(write_stage) * BLOCK_M * BLOCK_K * IN_DTYPE_BYTES
+                lds_offset_in_bytes = fx.Index(
+                    write_stage * BLOCK_M * BLOCK_K * IN_DTYPE_BYTES
                 )
                 lds_base = (
                     memref.extract_aligned_pointer_as_index(smem_a_ptr.get())
@@ -500,20 +488,16 @@ def compile_hgemm_wmma_kernel(
                 col_in_bytes = k_local_idx * IN_DTYPE_BYTES
                 col_in_bytes = swizzle_xor16(n_local_idx, col_in_bytes, k_blocks16)
             global_n_idx = block_n_offset + fx.Index(n_local_idx)
-            safe_global_n_idx = (fx.Index(global_n_idx) < fx.Index(n)).select(
-                global_n_idx, fx.Index(0)
-            )
-            global_k_idx = fx.Index(k_offset + col_in_bytes // IN_DTYPE_BYTES)
-            safe_global_k_idx = (fx.Index(global_k_idx) < fx.Index(k)).select(
-                global_k_idx, fx.Index(0)
-            )
+            safe_global_n_idx = (global_n_idx < n).select(global_n_idx, 0)
+            global_k_idx = k_offset + col_in_bytes // IN_DTYPE_BYTES
+            safe_global_k_idx = (global_k_idx < k).select(global_k_idx, 0)
             global_offset_in_bytes = (
                 safe_global_n_idx * b_stride + safe_global_k_idx
             ) * IN_DTYPE_BYTES
             global_offset_in_bytes = arith.index_cast(T.i32, global_offset_in_bytes)
             if const_expr(lds_ptr is None):
-                lds_offset_in_bytes = (
-                    fx.Index(write_stage) * BLOCK_N * BLOCK_K * IN_DTYPE_BYTES
+                lds_offset_in_bytes = fx.Index(
+                    write_stage * BLOCK_N * BLOCK_K * IN_DTYPE_BYTES
                 )
                 lds_base = (
                     memref.extract_aligned_pointer_as_index(smem_b_ptr.get())
@@ -545,7 +529,7 @@ def compile_hgemm_wmma_kernel(
                 )
 
         def ldmatrix_compute_tile_streaming(lds_stage, c_frags):
-            s = fx.Index(lds_stage)
+            s = lds_stage
             c_frags_new = [cx for cx in c_frags]
             for kk in range_constexpr(WARP_K_STEPS):
                 warp_atom_k_idx = warp_k_slice_base + kk * WARP_ATOM_K
@@ -561,13 +545,11 @@ def compile_hgemm_wmma_kernel(
                                 warp_atom_k_idx + (w_tid // WMMA_N) * 16 + col_delta
                             )
                             col_swz = swizzle_fp8_128(row, col_base)
-                            flat_offset = (s * BLOCK_N + row) * BLOCK_K + fx.Index(
-                                col_swz
-                            )
+                            flat_offset = (s * BLOCK_N + row) * BLOCK_K + col_swz
                             v16 = vector.load_op(
                                 T.vec(LDG_VEC_SIZE, smem_input_dtype_),
                                 smem_b_ptr.get(),
-                                [flat_offset],
+                                [fx.Index(flat_offset)],
                             )
                             return fx.Vector(v16).bitcast(fx.Int32)
 
@@ -587,7 +569,7 @@ def compile_hgemm_wmma_kernel(
                                 WMMA_B_FRAG_VALUES * MFMA_PER_WARP_K, smem_input_dtype_
                             ),
                             smem_b_ptr.get(),
-                            [flat_offset],
+                            [fx.Index(flat_offset)],
                         )
                         b_frags[ii] = vec
                 a_frags = [0] * WARP_M_STEPS
@@ -602,13 +584,11 @@ def compile_hgemm_wmma_kernel(
                                 warp_atom_k_idx + (w_tid // WMMA_M) * 16 + col_delta
                             )
                             col_swz = swizzle_fp8_128(row, col_base)
-                            flat_offset = (s * BLOCK_M + row) * BLOCK_K + fx.Index(
-                                col_swz
-                            )
+                            flat_offset = (s * BLOCK_M + row) * BLOCK_K + col_swz
                             v16 = vector.load_op(
                                 T.vec(LDG_VEC_SIZE, smem_input_dtype_),
                                 smem_a_ptr.get(),
-                                [flat_offset],
+                                [fx.Index(flat_offset)],
                             )
                             return fx.Vector(v16).bitcast(fx.Int32)
 
@@ -628,7 +608,7 @@ def compile_hgemm_wmma_kernel(
                                 WMMA_A_FRAG_VALUES * MFMA_PER_WARP_K, smem_input_dtype_
                             ),
                             smem_a_ptr.get(),
-                            [flat_offset],
+                            [fx.Index(flat_offset)],
                         )
                         a_frags[ii] = vec
                 rocdl.sched_barrier(0)
@@ -706,10 +686,10 @@ def compile_hgemm_wmma_kernel(
             rocdl.sched_barrier(0)
 
         BLOCK_K_LOOPS = (ks + BLOCK_K - 1) // BLOCK_K
-        init_state = [ks_begin, arith.constant(0, index=True)] + c_frags
+        init_state = [ks_begin, fx.Int32(0)] + c_frags
         for _, state in range(0, BLOCK_K_LOOPS - (STAGES - 1), 1, init=init_state):
             k_offset = state[0]
-            current_stage = fx.Index(state[1])
+            current_stage = state[1]
             c_frags = state[2:]
             next_stage = (current_stage + 1) % STAGES
             write_stage = (current_stage + STAGES - 1) % STAGES
@@ -717,10 +697,10 @@ def compile_hgemm_wmma_kernel(
             ldg_sts_b_async(k_offset + (STAGES - 1) * BLOCK_K, write_stage)
             ldg_sts_a_async(k_offset + (STAGES - 1) * BLOCK_K, write_stage)
             c_frags_new = ldmatrix_compute_tile_streaming(current_stage, c_frags)
-            k_offset_next = k_offset + fx.Int32(BLOCK_K)
+            k_offset_next = k_offset + BLOCK_K
             hot_loop_scheduler()
             results = yield [k_offset_next, next_stage] + c_frags_new
-        current_stage = fx.Index(results[1])
+        current_stage = results[1]
         c_frags = results[2:]
         for s in range_constexpr(0, STAGES - 1):
             __barrier((STAGES - 2 - s) * LDG_WAIT_COUNT)
@@ -745,15 +725,11 @@ def compile_hgemm_wmma_kernel(
                     if const_expr(IS_FP8_PTPC):
                         row_global = block_m_offset + lds_m_idx
                         col_global = block_n_offset + lds_n_idx
-                        scale_a_offset = (fx.Index(row_global) < fx.Index(m)).select(
-                            row_global, fx.Index(0)
-                        )
+                        scale_a_offset = (row_global < m).select(row_global, 0)
                         scale_a = buffer_ops.buffer_load(
                             scale_a_rsrc, scale_a_offset, vec_width=1, dtype=T.f32
                         )
-                        scale_b_offset = (fx.Index(col_global) < fx.Index(n)).select(
-                            col_global, fx.Index(0)
-                        )
+                        scale_b_offset = (col_global < n).select(col_global, 0)
                         scale_b = buffer_ops.buffer_load(
                             scale_b_rsrc, scale_b_offset, vec_width=1, dtype=T.f32
                         )
@@ -779,18 +755,16 @@ def compile_hgemm_wmma_kernel(
         smem_c_ptr_ = smem_c_ptr.get()
         for i in range_constexpr(STG_C_ITERS):
             global_tid = BLOCK_THREADS * i + tid
-            m_local_idx = fx.Index(global_tid // STG_C_X_THREADS)
-            n_local_idx = fx.Index(global_tid % STG_C_X_THREADS * STG_VEC_SIZE)
+            m_local_idx = global_tid // STG_C_X_THREADS
+            n_local_idx = global_tid % STG_C_X_THREADS * STG_VEC_SIZE
             global_m_idx = block_m_offset + m_local_idx
             global_n_idx = block_n_offset + n_local_idx
-            if (fx.Index(global_m_idx) < fx.Index(m)) & (
-                fx.Index(global_n_idx) < fx.Index(n)
-            ):
+            if (global_m_idx < m) and (global_n_idx < n):
                 flat_offset = m_local_idx * BLOCK_N + n_local_idx
                 c_vec = vector.load_op(
                     T.vec(STG_VEC_SIZE, output_dtype_),
                     smem_c_ptr_,
-                    [flat_offset],
+                    [fx.Index(flat_offset)],
                 )
                 for ksi in range_constexpr(1, BLOCK_K_WARPS):
                     peer_c_vec = vector.load_op(
@@ -818,7 +792,7 @@ def compile_hgemm_wmma_kernel(
                         )
                         pair_ptr_v = get_llvm_ptr(
                             c_ptr,
-                            fx.Int32(global_offset + vec_idx * 2),
+                            global_offset + vec_idx * 2,
                             OUT_DTYPE_BYTES,
                             ir.Type.parse("!llvm.ptr<1>"),
                         )
@@ -901,11 +875,11 @@ def compile_hgemm_wmma_kernel(
         block_m_idx, block_n_idx = block_swizzle.swizzle(
             num_pid_m, num_pid_n, fx.block_idx.x
         )
-        ks_idx = fx.Index(fx.block_idx.y)
-        ks_begin = arith.index_cast(T.i32, ks_idx * ks)
-        block_m_offset = fx.Index(block_m_idx * BLOCK_M)
-        block_n_offset = fx.Index(block_n_idx * BLOCK_N)
-        k_blocks16 = fx.Int32(BLOCK_K_BYTES // 16)
+        ks_idx = fx.block_idx.y
+        ks_begin = ks_idx * ks
+        block_m_offset = block_m_idx * BLOCK_M
+        block_n_offset = block_n_idx * BLOCK_N
+        k_blocks16 = BLOCK_K_BYTES // 16
 
         warp_m_idx = wid // BLOCK_N_WARPS * WARP_M
         warp_n_idx = wid % BLOCK_N_WARPS * WARP_N
@@ -923,13 +897,11 @@ def compile_hgemm_wmma_kernel(
             for n_part in range_constexpr(2):
                 for ni in range_constexpr(WARP_N_STEPS):
                     warp_atom_n_idx = warp_n_idx + ni * WARP_ATOM_N
-                    lds_n_idx = fx.Index(
+                    lds_n_idx = (
                         n_part * HALF_BLOCK_N + warp_atom_n_idx + stmatrix_c_n_idx
                     )
                     global_n_idx = block_n_offset + lds_n_idx
-                    safe_global_n_idx = (fx.Index(global_n_idx) < fx.Index(n)).select(
-                        global_n_idx, fx.Index(0)
-                    )
+                    safe_global_n_idx = (global_n_idx < n).select(global_n_idx, 0)
                     bias_val = buffer_ops.buffer_load(
                         bias_rsrc, safe_global_n_idx, vec_width=1, dtype=output_dtype_
                     ).extf(T.f32)
@@ -955,7 +927,7 @@ def compile_hgemm_wmma_kernel(
                 col_in_bytes = swizzle_fp8_128(m_local_idx, k_local_idx)
             else:
                 col_in_bytes = swizzle_xor16(
-                    m_local_idx, k_local_idx * IN_DTYPE_BYTES, fx.Int32(k_blocks16)
+                    m_local_idx, k_local_idx * IN_DTYPE_BYTES, k_blocks16
                 )
             swizzle_cache_a[i] = col_in_bytes // IN_DTYPE_BYTES
 
@@ -968,12 +940,12 @@ def compile_hgemm_wmma_kernel(
                 col_in_bytes = swizzle_fp8_128(n_local_idx, k_local_idx)
             else:
                 col_in_bytes = swizzle_xor16(
-                    n_local_idx, k_local_idx * IN_DTYPE_BYTES, fx.Int32(k_blocks16)
+                    n_local_idx, k_local_idx * IN_DTYPE_BYTES, k_blocks16
                 )
             swizzle_cache_b[i] = col_in_bytes // IN_DTYPE_BYTES
 
         if const_expr(IS_SPLIT_K):
-            signal_idx = fx.Int32(fx.block_idx.x)
+            signal_idx = fx.block_idx.x
             splitk_protocol.init(
                 semaphore_ptr,
                 signal_ptr,
@@ -991,13 +963,7 @@ def compile_hgemm_wmma_kernel(
             )
 
         def get_dma_copy_warp_offset():
-            return rocdl.readfirstlane(
-                T.i64,
-                arith.index_cast(
-                    T.i64,
-                    fx.Index(wid) * arith.constant(WARP_SIZE * DMA_BYTES, index=True),
-                ),
-            )
+            return rocdl.readfirstlane(T.i64, fx.Int64(wid * WARP_SIZE * DMA_BYTES))
 
         warp_offset = get_dma_copy_warp_offset()
 
@@ -1023,16 +989,13 @@ def compile_hgemm_wmma_kernel(
         def ldg_sts_a_async_one(m_part, k_buf, k_offset, ii, lds_ptr=None):
             global_tid = BLOCK_THREADS * ii + tid
             m_local_idx = global_tid // LDG_A_X_THREADS_AS
-            global_m_idx = block_m_offset + fx.Index(
-                m_part * HALF_BLOCK_M + m_local_idx
-            )
-            safe_global_m_idx = (fx.Index(global_m_idx) < fx.Index(m)).select(
-                global_m_idx, fx.Index(0)
-            )
+            global_m_idx = block_m_offset + m_part * HALF_BLOCK_M + m_local_idx
+            safe_global_m_idx = (global_m_idx < m).select(global_m_idx, 0)
             global_offset = (
                 safe_global_m_idx * a_stride
-                + fx.Index(k_offset + k_buf * BLOCK_K)
-                + fx.Index(swizzle_cache_a[ii])
+                + k_offset
+                + k_buf * BLOCK_K
+                + swizzle_cache_a[ii]
             ) * IN_DTYPE_BYTES
             global_offset = arith.index_cast(T.i32, global_offset)
             static_bytes_offset = (
@@ -1045,16 +1008,13 @@ def compile_hgemm_wmma_kernel(
         def ldg_sts_b_async_one(n_part, k_buf, k_offset, ii, lds_ptr=None):
             global_tid = BLOCK_THREADS * ii + tid
             n_local_idx = global_tid // LDG_B_X_THREADS_AS
-            global_n_idx = block_n_offset + fx.Index(
-                n_part * HALF_BLOCK_N + n_local_idx
-            )
-            safe_global_n_idx = (fx.Index(global_n_idx) < fx.Index(n)).select(
-                global_n_idx, fx.Index(0)
-            )
+            global_n_idx = block_n_offset + n_part * HALF_BLOCK_N + n_local_idx
+            safe_global_n_idx = (global_n_idx < n).select(global_n_idx, 0)
             global_offset = (
                 safe_global_n_idx * b_stride
-                + fx.Index(k_offset + k_buf * BLOCK_K)
-                + fx.Index(swizzle_cache_b[ii])
+                + k_offset
+                + k_buf * BLOCK_K
+                + swizzle_cache_b[ii]
             ) * IN_DTYPE_BYTES
             global_offset = arith.index_cast(T.i32, global_offset)
             static_bytes_offset = (
@@ -1097,12 +1057,12 @@ def compile_hgemm_wmma_kernel(
                             col_base = ki * WMMA_K + (w_tid // WMMA_M) * 16
                             col_swz = swizzle_fp8_128(row, col_base + col_delta)
                             flat_offset = (
-                                (fx.Index(k_buf) * 2 + m_part) * HALF_BLOCK_M + row
-                            ) * BLOCK_K + fx.Index(col_swz)
+                                (k_buf * 2 + m_part) * HALF_BLOCK_M + row
+                            ) * BLOCK_K + col_swz
                             v16 = vector.load_op(
                                 T.vec(LDG_VEC_SIZE, smem_input_dtype_),
                                 smem_a_ptr.get(),
-                                [flat_offset],
+                                [fx.Index(flat_offset)],
                             )
                             return fx.Vector(v16).bitcast(fx.Int32)
 
@@ -1112,18 +1072,16 @@ def compile_hgemm_wmma_kernel(
                             hi, list(range(8))
                         )
                     else:
-                        col_in_bytes = swizzle_xor16(
-                            row, col_in_bytes, fx.Int32(k_blocks16)
-                        )
+                        col_in_bytes = swizzle_xor16(row, col_in_bytes, k_blocks16)
                         flat_offset = (
-                            (fx.Index(k_buf) * 2 + m_part) * HALF_BLOCK_M + row
+                            (k_buf * 2 + m_part) * HALF_BLOCK_M + row
                         ) * BLOCK_K + col_in_bytes // IN_DTYPE_BYTES
                         a_frags[ki * WARP_M_STEPS + mi] = vector.load_op(
                             T.vec(
                                 WMMA_A_FRAG_VALUES * MFMA_PER_WARP_K, smem_input_dtype_
                             ),
                             smem_a_ptr.get(),
-                            [flat_offset],
+                            [fx.Index(flat_offset)],
                         )
             return a_frags
 
@@ -1146,12 +1104,12 @@ def compile_hgemm_wmma_kernel(
                             col_base = ki * WMMA_K + (w_tid // WMMA_N) * 16
                             col_swz = swizzle_fp8_128(row, col_base + col_delta)
                             flat_offset = (
-                                (fx.Index(k_buf) * 2 + n_part) * HALF_BLOCK_N + row
-                            ) * BLOCK_K + fx.Index(col_swz)
+                                (k_buf * 2 + n_part) * HALF_BLOCK_N + row
+                            ) * BLOCK_K + col_swz
                             v16 = vector.load_op(
                                 T.vec(LDG_VEC_SIZE, smem_input_dtype_),
                                 smem_b_ptr.get(),
-                                [flat_offset],
+                                [fx.Index(flat_offset)],
                             )
                             return fx.Vector(v16).bitcast(fx.Int32)
 
@@ -1165,14 +1123,14 @@ def compile_hgemm_wmma_kernel(
                             row, col_in_bytes, fx.Int32(k_blocks16)
                         )
                         flat_offset = (
-                            (fx.Index(k_buf) * 2 + n_part) * HALF_BLOCK_N + row
+                            (k_buf * 2 + n_part) * HALF_BLOCK_N + row
                         ) * BLOCK_K + col_in_bytes // IN_DTYPE_BYTES
                         b_frags[ki * WARP_N_STEPS + ni] = vector.load_op(
                             T.vec(
                                 WMMA_B_FRAG_VALUES * MFMA_PER_WARP_K, smem_input_dtype_
                             ),
                             smem_b_ptr.get(),
-                            [flat_offset],
+                            [fx.Index(flat_offset)],
                         )
             return b_frags
 
@@ -1214,7 +1172,7 @@ def compile_hgemm_wmma_kernel(
         __barrier(1 * LDG_B_ITERS_AS + 1 * LDG_A_ITERS_AS)
 
         def compute_double_tile(k_offset, c_frags_in):
-            next_k_offset = k_offset + fx.Int32(2 * BLOCK_K)
+            next_k_offset = k_offset + 2 * BLOCK_K
             # 0
             b0_frags = ldmatrix_b(0, 0)
             a0_frags = ldmatrix_a(0, 0)
@@ -1260,16 +1218,13 @@ def compile_hgemm_wmma_kernel(
             return c_frags_out
 
         BLOCK_K_LOOPS = ks // BLOCK_K
-        loop_end = (BLOCK_K_LOOPS > fx.Int32(2)).select(
-            BLOCK_K_LOOPS - fx.Int32(2),
-            fx.Int32(0),
-        )
+        loop_end = (BLOCK_K_LOOPS > 2).select(BLOCK_K_LOOPS - 2, 0)
         init_state = [ks_begin] + c_frags
         for _, state in range(0, loop_end, 2, init=init_state):
             k_offset = state[0]
             c_frags = state[1:]
             c_frags = compute_double_tile(k_offset, c_frags)
-            results = yield [k_offset + fx.Int32(2 * BLOCK_K)] + c_frags
+            results = yield [k_offset + 2 * BLOCK_K] + c_frags
         k_offset = results[0]
         c_frags = results[1:]
 
@@ -1281,9 +1236,7 @@ def compile_hgemm_wmma_kernel(
                     n_part * HALF_BLOCK_N + warp_atom_n_idx + stmatrix_c_n_idx
                 )
                 global_n_offset = block_n_offset + local_n_idx
-                scale_b_offset = (fx.Index(global_n_offset) < fx.Index(n)).select(
-                    global_n_offset, fx.Index(0)
-                )
+                scale_b_offset = (global_n_offset < n).select(global_n_offset, 0)
                 scale_b = buffer_ops.buffer_load(
                     scale_b_rsrc, scale_b_offset, vec_width=1, dtype=T.f32
                 )
@@ -1294,19 +1247,13 @@ def compile_hgemm_wmma_kernel(
             c_base = (m_ * 2 + n_) * C_FRAGS_LEN
             for mi in range_constexpr(WARP_M_STEPS):
                 warp_atom_m_idx = warp_m_idx + mi * WARP_ATOM_M
-                lds_m_base = fx.Index(
-                    m_ * HALF_BLOCK_M + warp_atom_m_idx + stmatrix_c_m_vec_idx
-                )
+                lds_m_base = m_ * HALF_BLOCK_M + warp_atom_m_idx + stmatrix_c_m_vec_idx
                 for ni in range_constexpr(WARP_N_STEPS):
                     warp_atom_n_idx = warp_n_idx + ni * WARP_ATOM_N
                     c_idx = c_base + mi * WARP_N_STEPS + ni
-                    lds_n_idx = fx.Index(
-                        n_ * HALF_BLOCK_N + warp_atom_n_idx + stmatrix_c_n_idx
-                    )
+                    lds_n_idx = n_ * HALF_BLOCK_N + warp_atom_n_idx + stmatrix_c_n_idx
                     col_global = block_n_offset + lds_n_idx
-                    safe_col_global = (fx.Index(col_global) < fx.Index(n)).select(
-                        col_global, fx.Index(0)
-                    )
+                    safe_col_global = (col_global < n).select(col_global, 0)
                     if const_expr(HAS_BIAS and IS_FP8_PTPC and not IS_SPLIT_K):
                         bias = buffer_ops.buffer_load(
                             bias_rsrc,
@@ -1317,7 +1264,7 @@ def compile_hgemm_wmma_kernel(
                     if const_expr(IS_FP8_PTPC):
                         scale_b = scale_b_frags[ni]
                     for kk in range_constexpr(WMMA_C_FRAG_VALUES):
-                        lds_m_idx = lds_m_base + fx.Index(kk)
+                        lds_m_idx = lds_m_base + kk
                         val = vector.extract(
                             c_frags[c_idx],
                             static_position=[kk],
@@ -1325,9 +1272,7 @@ def compile_hgemm_wmma_kernel(
                         )
                         if const_expr(IS_FP8_PTPC):
                             row_global = block_m_offset + lds_m_idx
-                            scale_a_offset = (
-                                fx.Index(row_global) < fx.Index(m)
-                            ).select(row_global, fx.Index(0))
+                            scale_a_offset = (row_global < m).select(row_global, 0)
                             scale_a = buffer_ops.buffer_load(
                                 scale_a_rsrc,
                                 scale_a_offset,
@@ -1340,7 +1285,9 @@ def compile_hgemm_wmma_kernel(
                         val = val.truncf(output_dtype_)
                         val = vector.from_elements(T.vec(1, output_dtype_), [val])
                         flat_offset = lds_m_idx * BLOCK_N + lds_n_idx
-                        vector.store(val, smem_c_ptr.get(), [flat_offset], alignment=16)
+                        vector.store(
+                            val, smem_c_ptr.get(), [fx.Index(flat_offset)], alignment=16
+                        )
 
         def atomic_add_vec_to_c(global_m_idx, global_n_idx, vec):
             global_offset = global_m_idx * c_stride + global_n_idx
@@ -1358,7 +1305,7 @@ def compile_hgemm_wmma_kernel(
                 pair_v = pair._value if const_expr(hasattr(pair, "_value")) else pair
                 pair_ptr_v = get_llvm_ptr(
                     c_ptr,
-                    fx.Int32(global_offset + vec_idx * 2),
+                    global_offset + vec_idx * 2,
                     OUT_DTYPE_BYTES,
                     ir.Type.parse("!llvm.ptr<1>"),
                 )
@@ -1383,19 +1330,17 @@ def compile_hgemm_wmma_kernel(
             for mi in range_constexpr(WARP_M_STEPS):
                 for i in range_constexpr(STG_WORK_SIZE_PER_M_STEP // STG_VEC_SIZE):
                     global_tid = BLOCK_THREADS * i + tid
-                    m_band_idx = fx.Index(global_tid // STG_C_QUAD_X_THREADS)
-                    n_local_idx = fx.Index(
-                        global_tid % STG_C_QUAD_X_THREADS * STG_VEC_SIZE
-                    )
-                    warp_m_band = m_band_idx // fx.Index(WARP_ATOM_M)
-                    atom_m_idx = m_band_idx % fx.Index(WARP_ATOM_M)
+                    m_band_idx = global_tid // STG_C_QUAD_X_THREADS
+                    n_local_idx = global_tid % STG_C_QUAD_X_THREADS * STG_VEC_SIZE
+                    warp_m_band = m_band_idx // WARP_ATOM_M
+                    atom_m_idx = m_band_idx % WARP_ATOM_M
                     m_tile_idx = (
-                        fx.Index(m_ * HALF_BLOCK_M)
-                        + warp_m_band * fx.Index(WARP_M)
-                        + fx.Index(mi * WARP_ATOM_M)
+                        m_ * HALF_BLOCK_M
+                        + warp_m_band * WARP_M
+                        + mi * WARP_ATOM_M
                         + atom_m_idx
                     )
-                    n_tile_idx = fx.Index(n_ * HALF_BLOCK_N) + n_local_idx
+                    n_tile_idx = n_ * HALF_BLOCK_N + n_local_idx
                     global_m_idx = block_m_offset + m_tile_idx
                     global_n_idx = block_n_offset + n_tile_idx
 
@@ -1404,14 +1349,12 @@ def compile_hgemm_wmma_kernel(
                     #     store_vec_to_c(m_global_idx, n_offset + n_tile_idx, vec)
                     # else:
                     if const_expr(True):
-                        if (fx.Index(global_m_idx) < fx.Index(m)) & (
-                            fx.Index(global_n_idx) < fx.Index(n)
-                        ):
+                        if (global_m_idx < m) and (global_n_idx < n):
                             flat_offset = m_tile_idx * BLOCK_N + n_tile_idx
                             c_vec = vector.load_op(
                                 T.vec(STG_VEC_SIZE, output_dtype_),
                                 smem_c_ptr_,
-                                [flat_offset],
+                                [fx.Index(flat_offset)],
                             )
                             store_vec_to_c(
                                 global_m_idx,
@@ -1911,6 +1854,16 @@ if __name__ == "__main__":
 
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=2048 --n=2048 --k=2048 --dtype=fp8_ptpc
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=4096 --n=4096 --k=4096 --dtype=fp8_ptpc
+    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8192 --n=8192 --k=8192 --dtype=fp8_ptpc
+    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8160 --n=8160 --k=8192 --dtype=fp8_ptpc
+    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=32 --n=384 --k=7168 --dtype=fp8_ptpc
+
+    # unit test
+    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=2048 --n=2048 --k=2048 --dtype=bf16
+    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8192 --n=8192 --k=8192 --dtype=bf16
+    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8160 --n=8160 --k=8192 --dtype=bf16
+    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=32 --n=384 --k=7168 --dtype=bf16
+    # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=2048 --n=2048 --k=2048 --dtype=fp8_ptpc
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8192 --n=8192 --k=8192 --dtype=fp8_ptpc
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=8160 --n=8160 --k=8192 --dtype=fp8_ptpc
     # rm -rf ~/.flydsl/ ; python3 hgemm.py --m=32 --n=384 --k=7168 --dtype=fp8_ptpc

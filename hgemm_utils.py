@@ -355,34 +355,28 @@ class BlockSwizzle:
 
     @flyc.jit
     def swizzle(self, num_pid_m, num_pid_n, pid):
-        simple_m = fx.Index(pid // num_pid_n)
-        simple_n = fx.Index(pid % num_pid_n)
+        simple_m = pid // num_pid_n
+        simple_n = pid % num_pid_n
         if const_expr(self.GROUP_M <= 0):
             return simple_m, simple_n
-        num_xcds = fx.Index(self.NUM_XCDS)
-        swizzle_threshold = fx.Index(self.NUM_PIDS_THRESHOLD)
+        num_xcds = self.NUM_XCDS
+        swizzle_threshold = self.NUM_PIDS_THRESHOLD
         num_wg = num_pid_m * num_pid_n
-        linear_id = fx.Index(pid)
+        linear_id = pid
         intra_xcd = linear_id // num_xcds
         xcd = linear_id % num_xcds
         wgid = xcd * (num_wg // num_xcds) + intra_xcd
-        group_m = fx.Index(self.GROUP_M)
+        group_m = self.GROUP_M
         wgid_per_group = group_m * num_pid_n
         group_id = wgid // wgid_per_group
         intra_group = wgid % wgid_per_group
         first_pid_m = group_id * group_m
         remaining_m = num_pid_m - first_pid_m
-        group_size_m = arith.select(
-            arith.cmpi(arith.CmpIPredicate.ult, remaining_m, group_m),
-            remaining_m,
-            group_m,
-        )
+        group_size_m = (remaining_m < group_m).select(remaining_m, group_m)
         swizzled_n = intra_group // group_size_m
         swizzled_m = first_pid_m + (intra_group % group_size_m)
-        use_simple = arith.cmpi(
-            arith.CmpIPredicate.ult, fx.Index(num_wg), swizzle_threshold
-        ) | arith.cmpi(arith.CmpIPredicate.ne, num_wg % num_xcds, fx.Index(0))
+        use_simple = (num_wg < swizzle_threshold) | ((num_wg % num_xcds) != 0)
         return (
-            arith.select(use_simple, simple_m, swizzled_m),
-            arith.select(use_simple, simple_n, swizzled_n),
+            use_simple.select(simple_m, swizzled_m),
+            use_simple.select(simple_n, swizzled_n),
         )
