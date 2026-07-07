@@ -26,7 +26,7 @@ pip install -e .
 ## GEMM-WMMA Test
 
 ```bash
-pytest -sv test_hgemm.py
+rm -rf ~/.flydsl/ ; pytest -sv test_hgemm.py
 ```
 
 ```txt
