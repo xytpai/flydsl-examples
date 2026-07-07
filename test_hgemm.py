@@ -418,3 +418,55 @@ def test_hgemm_acc_ht_split_k(
         USE_HALF_TILE_INTERLEAVED,
     )
     check_acc(args)
+
+
+@pytest.mark.parametrize("dtype", ["fp16", "bf16", "fp8_ptpc"])
+@pytest.mark.parametrize(
+    "m, n, k, TILE_M, TILE_N, TILE_K, STAGES, SPLIT_K, BLOCK_M_WARPS, BLOCK_N_WARPS, BLOCK_K_WARPS, HAS_BIAS, GROUP_M, USE_HALF_TILE_INTERLEAVED",
+    [
+        (3, 5120, 2880, 64, 64, 64, 5, 3, 2, 2, 1, True, 0, False),
+        (3, 5120, 2880, 64, 64, 64, 5, 3, 2, 2, 1, False, 0, False),
+        (3, 5120, 2880, 64, 64, 64, 2, 3, 2, 2, 1, True, 0, True),
+        (3, 5120, 2880, 64, 64, 64, 2, 3, 2, 2, 1, False, 0, True),
+        (3, 5120, 2880, 64, 64, 64, 2, 3, 2, 2, 1, True, 4, True),
+    ],
+)
+def test_hgemm_acc_small_m(
+    dtype: str,
+    m: int,
+    n: int,
+    k: int,
+    TILE_M: int,
+    TILE_N: int,
+    TILE_K: int,
+    STAGES: int,
+    SPLIT_K: int,
+    BLOCK_M_WARPS: int,
+    BLOCK_N_WARPS: int,
+    BLOCK_K_WARPS: int,
+    HAS_BIAS: bool,
+    GROUP_M: int,
+    USE_HALF_TILE_INTERLEAVED: bool,
+):
+    if dtype == "fp8_ptpc":
+        TILE_K = 128
+    else:
+        dtype = torch.bfloat16 if "bf16" in dtype else torch.half
+    args = _TestArgs(
+        dtype,
+        m,
+        n,
+        k,
+        TILE_M,
+        TILE_N,
+        TILE_K,
+        STAGES,
+        SPLIT_K,
+        BLOCK_M_WARPS,
+        BLOCK_N_WARPS,
+        BLOCK_K_WARPS,
+        HAS_BIAS,
+        GROUP_M,
+        USE_HALF_TILE_INTERLEAVED,
+    )
+    check_acc(args)

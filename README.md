@@ -30,6 +30,7 @@ rm -rf ~/.flydsl/ ; pytest -sv test_hgemm.py
 ```
 
 ```txt
+====== 171 passed in 14.54s ========
 ```
 
 ---
