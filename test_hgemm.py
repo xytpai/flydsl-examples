@@ -141,6 +141,7 @@ def check_acc(args: _TestArgs):
 
     def get_tol(args):
         k_scale = (args.k / 8192) ** 0.5
+        k_scale *= args.SPLIT_K
         if args.dtype == "fp8_ptpc":
             return 2e-1 * k_scale, 2e-1
         if args.dtype is torch.bfloat16:
@@ -152,10 +153,15 @@ def check_acc(args: _TestArgs):
         func(*(inouts + (kwargs,)))
         ref_func(*ref_inouts)
         for output, ref_output in zip(outputs, ref_outputs):
-            is_allclose = torch.allclose(output, ref_output, atol=atol, rtol=rtol)
-            assert is_allclose
             maxdiff_out = (output - ref_output).abs().max().item()
             maxdiff_out_.append(maxdiff_out)
+            torch.testing.assert_close(
+                output,
+                ref_output,
+                atol=atol,
+                rtol=rtol,
+                check_dtype=True,
+            )
     print(f"\n{args}\nmaxdiff_out:{maxdiff_out_}")
 
 
@@ -258,6 +264,57 @@ def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
     ],
 )
 def test_hgemm_acc_main_loop(
+    dtype: str,
+    m: int,
+    n: int,
+    k: int,
+    TILE_M: int,
+    TILE_N: int,
+    TILE_K: int,
+    STAGES: int,
+    SPLIT_K: int,
+    BLOCK_M_WARPS: int,
+    BLOCK_N_WARPS: int,
+    BLOCK_K_WARPS: int,
+    HAS_BIAS: bool,
+    GROUP_M: int,
+    USE_HALF_TILE_INTERLEAVED: bool,
+):
+    if dtype == "fp8_ptpc":
+        TILE_K = 128
+    else:
+        dtype = torch.bfloat16 if "bf16" in dtype else torch.half
+    args = _TestArgs(
+        dtype,
+        m,
+        n,
+        k,
+        TILE_M,
+        TILE_N,
+        TILE_K,
+        STAGES,
+        SPLIT_K,
+        BLOCK_M_WARPS,
+        BLOCK_N_WARPS,
+        BLOCK_K_WARPS,
+        HAS_BIAS,
+        GROUP_M,
+        USE_HALF_TILE_INTERLEAVED,
+    )
+    check_acc(args)
+
+
+@pytest.mark.parametrize("dtype", ["fp16", "bf16", "fp8_ptpc"])
+@pytest.mark.parametrize(
+    "m, n, k, TILE_M, TILE_N, TILE_K, STAGES, SPLIT_K, BLOCK_M_WARPS, BLOCK_N_WARPS, BLOCK_K_WARPS, HAS_BIAS, GROUP_M, USE_HALF_TILE_INTERLEAVED",
+    [
+        (32, 384, 7168, 32, 64, 64, 5, 8, 2, 2, 1, True, 0, False),
+        (32, 384, 7168, 32, 64, 64, 5, 8, 2, 2, 1, False, 0, False),
+        (32, 384, 7168, 32, 64, 64, 5, 8, 2, 2, 1, True, 4, False),
+        (32, 384, 7168, 32, 64, 64, 5, 8, 2, 2, 1, False, 4, False),
+    ],
+)
+def test_hgemm_acc_ft_stage_split_k(
     dtype: str,
     m: int,
     n: int,
