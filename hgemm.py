@@ -1,21 +1,15 @@
-import time
 import torch
 import argparse
 import functools
 import itertools
-import numpy as np
 import torch.nn.functional as F
-import sys
 from torch.profiler import profile, ProfilerActivity
 from dataclasses import dataclass
-from abc import ABC, abstractmethod
-from pathlib import Path
 from typing import Optional
 
-import flydsl
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr.typing import T, Vector as Vec
+from flydsl.expr.typing import T
 from flydsl.expr import (
     range_constexpr,
     const_expr,
@@ -29,16 +23,10 @@ from flydsl._mlir import ir
 from flydsl.runtime.device import get_rocm_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr, SMEM_CAPACITY_MAP
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl._mlir.dialects import llvm, fly, memref, scf
-
-from utils.tensor_shim import (
-    GTensor,
-    STensor,
-)
+from flydsl._mlir.dialects import llvm, memref
 
 from hgemm_utils import (
     get_dtype_in_kernel,
-    _to_raw,
     _run_compiled,
     WmmaHalf_m16n16k16,
     WmmaHalf_m16n16k32,
