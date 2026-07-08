@@ -1867,9 +1867,12 @@ def hgemm_get_configs(dtype_str, m, n, k):
     keys = selections.keys()
     values = selections.values()
     configs = [dict(zip(keys, combo)) for combo in itertools.product(*values)]
-    configs = [
-        config for config in configs if hgemm_validate(dtype_str, m, n, k, config)
-    ]
+    if m is None or n is None or k is None:
+        pass
+    else:
+        configs = [
+            config for config in configs if hgemm_validate(dtype_str, m, n, k, config)
+        ]
     return configs
 
 
