@@ -654,7 +654,7 @@ def compile_hgemm_wmma_kernel(
         c_frags = results[2:]
         for s in range_constexpr(0, STAGES - 1):
             __barrier((STAGES - 2 - s) * LDG_WAIT_COUNT)
-            mask_k_tail = HAS_K_TAIL and s == STAGES - 2
+            mask_k_tail = HAS_K_TAIL
             c_frags = ldmatrix_compute_tile_streaming(
                 current_stage, k_offset, c_frags, mask_k_tail
             )
