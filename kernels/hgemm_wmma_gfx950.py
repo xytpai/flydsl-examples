@@ -1885,13 +1885,18 @@ def get_semaphore(stream, device):
     return semaphore, signal
 
 
-def infer_has_k_tail(k: int, split_k: int, tile_k: int, is_ht: bool):
+def infer_has_k_tail(k: int, split_k: int, tile_k: int, stages: int, is_ht: bool):
     working_k = (k + split_k - 1) // split_k
     last_working_k = k - (split_k - 1) * working_k
+    working_k_tiles = (working_k + tile_k - 1) // tile_k
+    last_working_k_tiles = (last_working_k + tile_k - 1) // tile_k
     has_k_tail = (working_k % tile_k != 0) or (last_working_k % tile_k != 0)
+    has_k_tail = (
+        has_k_tail
+        or (working_k_tiles < stages - 1)
+        or (last_working_k_tiles < stages - 1)
+    )
     if is_ht:
-        working_k_tiles = (working_k + tile_k - 1) // tile_k
-        last_working_k_tiles = (last_working_k + tile_k - 1) // tile_k
         has_k_tail = (
             has_k_tail or (working_k_tiles % 2 != 0) or (last_working_k_tiles % 2 != 0)
         )
@@ -1951,6 +1956,7 @@ def hgemm(
         k=k,
         split_k=kwargs["SPLIT_K"],
         tile_k=kwargs["TILE_K"],
+        stages=kwargs["STAGES"],
         is_ht=kwargs["USE_HALF_TILE_INTERLEAVED"],
     )
 
