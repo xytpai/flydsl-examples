@@ -102,10 +102,10 @@ def ref_func(*args):
 def func(*args):
     if len(args) == 7:
         a, b, scale_a, scale_b, bias, c, kwargs = args
-        hgemm(c, a, b, bias=bias, scale_a=scale_a, scale_b=scale_b, user_kwargs=kwargs)
+        hgemm(a, b, c, bias=bias, scale_a=scale_a, scale_b=scale_b, user_kwargs=kwargs)
     else:
         a, b, bias, c, kwargs = args
-        hgemm(c, a, b, bias=bias, user_kwargs=kwargs)
+        hgemm(a, b, c, bias=bias, user_kwargs=kwargs)
 
 
 def tensor_nbytes(tensors: torch.Tensor):

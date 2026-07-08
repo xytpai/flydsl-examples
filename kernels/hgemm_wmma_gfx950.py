@@ -1345,23 +1345,18 @@ def compile_hgemm_wmma_kernel(
                     global_m_idx = block_m_offset + m_tile_idx
                     global_n_idx = block_n_offset + n_tile_idx
 
-                    # if const_expr(ASSUME_FULL_M):
-                    #     vec = cs_.vec_load((m_tile_idx, n_tile_idx), STG_VEC_SIZE)
-                    #     store_vec_to_c(m_global_idx, n_offset + n_tile_idx, vec)
-                    # else:
-                    if const_expr(True):
-                        if (global_m_idx < m) and (global_n_idx < n):
-                            flat_offset = m_tile_idx * BLOCK_N + n_tile_idx
-                            c_vec = vector.load_op(
-                                T.vec(STG_VEC_SIZE, output_dtype_),
-                                smem_c_ptr_,
-                                [fx.Index(flat_offset)],
-                            )
-                            store_vec_to_c(
-                                global_m_idx,
-                                global_n_idx,
-                                c_vec,
-                            )
+                    if (global_m_idx < m) and (global_n_idx < n):
+                        flat_offset = m_tile_idx * BLOCK_N + n_tile_idx
+                        c_vec = vector.load_op(
+                            T.vec(STG_VEC_SIZE, output_dtype_),
+                            smem_c_ptr_,
+                            [fx.Index(flat_offset)],
+                        )
+                        store_vec_to_c(
+                            global_m_idx,
+                            global_n_idx,
+                            c_vec,
+                        )
 
         def compute_final_tile_and_epilogue(k_offset, c_frags_in):
             # 0
@@ -1688,16 +1683,31 @@ def get_semaphore(stream, device):
     return semaphore, signal
 
 
+def infer_has_k_tail(k: int, split_k: int, tile_k: int, is_ht: bool):
+    working_k = (k + split_k - 1) // split_k
+    last_working_k = k - (split_k - 1) * working_k
+    has_k_tail = (working_k % tile_k != 0) or (last_working_k % tile_k != 0)
+    if is_ht:
+        working_k_tiles = (working_k + tile_k - 1) // tile_k
+        last_working_k_tiles = (last_working_k + tile_k - 1) // tile_k
+        has_k_tail = (
+            has_k_tail or (working_k_tiles % 2 != 0) or (last_working_k_tiles % 2 != 0)
+        )
+    return has_k_tail
+
+
 def hgemm(
-    c: torch.Tensor,
     a: torch.Tensor,
     b: torch.Tensor,
+    c: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
     user_kwargs: dict = {},
     scale_a: Optional[torch.Tensor] = None,
     scale_b: Optional[torch.Tensor] = None,
-):
-    stream = torch.cuda.current_stream()
+    stream: Optional[torch.cuda.Stream] = None,
+) -> torch.Tensor:
+    if stream is None:
+        stream = torch.cuda.current_stream()
     global SPLIT_K_SEMAPHORE_MAX_LEN
     device = a.device
     semaphore, signal = get_semaphore(stream, device)
@@ -1705,11 +1715,28 @@ def hgemm(
     a = a.view(-1, k)
     m = a.shape[0]
     n = b.shape[0]
+    assert a.device == b.device
+    assert a.dtype == b.dtype
     assert b.shape[1] == k
     assert b.numel() == n * k
+
+    is_fp8_ptpc = scale_a is not None or scale_b is not None
+
+    if c is None:
+        if is_fp8_ptpc:
+            c = torch.empty((m, n), dtype=torch.bfloat16, device=a.device)
+        else:
+            c = torch.empty((m, n), dtype=a.dtype, device=a.device)
     c = c.view(-1, n)
     assert c.shape[0] == m
-    is_fp8_ptpc = scale_a is not None or scale_b is not None
+    assert a.device == c.device
+
+    if not a.is_contiguous():
+        a = a.contiguous()
+    if not b.is_contiguous():
+        b = b.contiguous()
+    if bias is not None and not bias.is_contiguous():
+        bias = bias.contiguous()
 
     kwargs = (
         get_default_b8_kwargs(m, n, k)
@@ -1718,21 +1745,12 @@ def hgemm(
     )
     kwargs.update(user_kwargs)
 
-    working_k = (k + kwargs["SPLIT_K"] - 1) // kwargs["SPLIT_K"]
-    last_working_k = k - (kwargs["SPLIT_K"] - 1) * working_k
-    kwargs["HAS_K_TAIL"] = (working_k % kwargs["TILE_K"] != 0) or (
-        last_working_k % kwargs["TILE_K"] != 0
+    kwargs["HAS_K_TAIL"] = infer_has_k_tail(
+        k=k,
+        split_k=kwargs["SPLIT_K"],
+        tile_k=kwargs["TILE_K"],
+        is_ht=kwargs["USE_HALF_TILE_INTERLEAVED"],
     )
-    if kwargs["USE_HALF_TILE_INTERLEAVED"]:
-        working_k_tiles = (working_k + kwargs["TILE_K"] - 1) // kwargs["TILE_K"]
-        last_working_k_tiles = (last_working_k + kwargs["TILE_K"] - 1) // kwargs[
-            "TILE_K"
-        ]
-        kwargs["HAS_K_TAIL"] = (
-            kwargs["HAS_K_TAIL"]
-            or (working_k_tiles % 2 != 0)
-            or (last_working_k_tiles % 2 != 0)
-        )
 
     kwargs["HAS_BIAS"] = False if bias is None else True
 
@@ -1776,3 +1794,4 @@ def hgemm(
         _run_compiled(
             exe, c, a, b, a, b, bias_tensor, semaphore, signal, m, n, k, stream
         )
+    return c
