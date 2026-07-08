@@ -633,6 +633,7 @@ def test_hgemm_acc_ft_slice_k(
 @pytest.mark.parametrize(
     "m, n, k, TILE_M, TILE_N, TILE_K, STAGES, SPLIT_K, BLOCK_M_WARPS, BLOCK_N_WARPS, BLOCK_K_WARPS, HAS_BIAS, GROUP_M, USE_HALF_TILE_INTERLEAVED",
     [
+        (16384, 16384, 16384, 256, 256, 64, 2, 1, 2, 4, 1, True, 4, True),
         (8192, 8192, 8192, 256, 256, 64, 2, 1, 2, 4, 1, True, 0, True),
         (8160, 8160, 8160, 256, 256, 64, 2, 1, 2, 4, 1, True, 0, True),
         (4096, 4096, 8192, 256, 256, 64, 2, 1, 2, 4, 1, True, 4, True),
