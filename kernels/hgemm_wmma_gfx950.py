@@ -88,6 +88,7 @@ def assert_hgemm_wmma_kernel(
     if IS_HT:
         assert STAGES == 2
         assert BLOCK_M_WARPS == 2
+        assert BLOCK_N_WARPS >= 2
         assert BLOCK_K_WARPS == 1
         assert HALF_BLOCK_M * 2 == BLOCK_M
         assert HALF_BLOCK_N * 2 == BLOCK_N
@@ -271,6 +272,7 @@ def compile_hgemm_wmma_kernel(
     if IS_HT:
         assert STAGES == 2
         assert BLOCK_M_WARPS == 2
+        assert BLOCK_N_WARPS >= 2
         assert BLOCK_K_WARPS == 1
         assert HALF_BLOCK_M * 2 == BLOCK_M
         assert HALF_BLOCK_N * 2 == BLOCK_N
@@ -1814,7 +1816,12 @@ def hgemm_validate(dtype_str, m, n, k, kwargs):
         return False
 
     if USE_HALF_TILE_INTERLEAVED:
-        if not (STAGES == 2 and BLOCK_K_WARPS == 1 and BLOCK_M_WARPS == 2):
+        if not (
+            STAGES == 2
+            and BLOCK_K_WARPS == 1
+            and BLOCK_M_WARPS == 2
+            and BLOCK_N_WARPS >= 2
+        ):
             return False
 
     def get_stage_smem_use(stages_):
