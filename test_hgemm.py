@@ -266,6 +266,42 @@ def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
         (8192, 8192, 8288, 256, 256, 64, 2, 1, 2, 4, 1, False, 0, True),
         (8192, 8192, 8288, 256, 256, 64, 2, 1, 2, 4, 1, False, 4, False),
         (8192, 8192, 8288, 256, 256, 64, 2, 1, 2, 4, 1, False, 4, True),
+        # k 8320
+        (8192, 8192, 8320, 256, 256, 64, 2, 1, 2, 4, 1, True, 0, False),
+        (8192, 8192, 8320, 256, 256, 64, 2, 1, 2, 4, 1, True, 0, True),
+        (8192, 8192, 8320, 256, 256, 64, 2, 1, 2, 4, 1, True, 4, False),
+        (8192, 8192, 8320, 256, 256, 64, 2, 1, 2, 4, 1, True, 4, True),
+        (8192, 8192, 8320, 256, 256, 64, 2, 1, 2, 4, 1, False, 0, False),
+        (8192, 8192, 8320, 256, 256, 64, 2, 1, 2, 4, 1, False, 0, True),
+        (8192, 8192, 8320, 256, 256, 64, 2, 1, 2, 4, 1, False, 4, False),
+        (8192, 8192, 8320, 256, 256, 64, 2, 1, 2, 4, 1, False, 4, True),
+        # k 8352
+        (8192, 8192, 8352, 256, 256, 64, 2, 1, 2, 4, 1, True, 0, False),
+        (8192, 8192, 8352, 256, 256, 64, 2, 1, 2, 4, 1, True, 0, True),
+        (8192, 8192, 8352, 256, 256, 64, 2, 1, 2, 4, 1, True, 4, False),
+        (8192, 8192, 8352, 256, 256, 64, 2, 1, 2, 4, 1, True, 4, True),
+        (8192, 8192, 8352, 256, 256, 64, 2, 1, 2, 4, 1, False, 0, False),
+        (8192, 8192, 8352, 256, 256, 64, 2, 1, 2, 4, 1, False, 0, True),
+        (8192, 8192, 8352, 256, 256, 64, 2, 1, 2, 4, 1, False, 4, False),
+        (8192, 8192, 8352, 256, 256, 64, 2, 1, 2, 4, 1, False, 4, True),
+        # k 8384
+        (8192, 8192, 8384, 256, 256, 64, 2, 1, 2, 4, 1, True, 0, False),
+        (8192, 8192, 8384, 256, 256, 64, 2, 1, 2, 4, 1, True, 0, True),
+        (8192, 8192, 8384, 256, 256, 64, 2, 1, 2, 4, 1, True, 4, False),
+        (8192, 8192, 8384, 256, 256, 64, 2, 1, 2, 4, 1, True, 4, True),
+        (8192, 8192, 8384, 256, 256, 64, 2, 1, 2, 4, 1, False, 0, False),
+        (8192, 8192, 8384, 256, 256, 64, 2, 1, 2, 4, 1, False, 0, True),
+        (8192, 8192, 8384, 256, 256, 64, 2, 1, 2, 4, 1, False, 4, False),
+        (8192, 8192, 8384, 256, 256, 64, 2, 1, 2, 4, 1, False, 4, True),
+        # k 8416
+        (8160, 8160, 8416, 256, 256, 64, 2, 1, 2, 4, 1, True, 0, False),
+        (8160, 8160, 8416, 256, 256, 64, 2, 1, 2, 4, 1, True, 0, True),
+        (8160, 8192, 8416, 256, 256, 64, 2, 1, 2, 4, 1, True, 4, False),
+        (8160, 8192, 8416, 256, 256, 64, 2, 1, 2, 4, 1, True, 4, True),
+        (8160, 8192, 8416, 256, 256, 64, 2, 1, 2, 4, 1, False, 0, False),
+        (8160, 8192, 8416, 256, 256, 64, 2, 1, 2, 4, 1, False, 0, True),
+        (8160, 8160, 8416, 256, 256, 64, 2, 1, 2, 4, 1, False, 4, False),
+        (8160, 8160, 8416, 256, 256, 64, 2, 1, 2, 4, 1, False, 4, True),
         # need pad
         (8160, 8160, 8160, 256, 256, 64, 2, 1, 2, 4, 1, True, 0, False),
         (8160, 8160, 8160, 256, 256, 64, 2, 1, 2, 4, 1, True, 0, True),
@@ -476,6 +512,68 @@ def test_hgemm_acc_small_m(
     check_acc(args)
 
 
+@pytest.mark.parametrize("dtype", ["fp16", "bf16", "fp8_ptpc"])
+@pytest.mark.parametrize(
+    "m, n, k, TILE_M, TILE_N, TILE_K, STAGES, SPLIT_K, BLOCK_M_WARPS, BLOCK_N_WARPS, BLOCK_K_WARPS, HAS_BIAS, GROUP_M, USE_HALF_TILE_INTERLEAVED",
+    [
+        # ft
+        (3, 16, 16, 64, 64, 64, 2, 3, 2, 2, 1, False, 0, False),
+        (3, 16, 16, 64, 64, 64, 2, 3, 2, 2, 1, True, 0, False),
+        (3, 16, 48, 64, 64, 64, 2, 3, 2, 2, 1, True, 0, False),
+        (3, 16, 80, 64, 64, 64, 2, 3, 2, 2, 1, True, 0, False),
+        (3, 16, 144, 64, 64, 64, 2, 3, 2, 2, 1, True, 0, False),
+        (3, 16, 144, 64, 64, 64, 3, 3, 2, 2, 1, True, 0, False),
+        (3, 16, 16, 64, 64, 64, 4, 3, 2, 2, 1, True, 0, False),
+        # ht
+        (3, 16, 16, 64, 64, 64, 2, 3, 2, 2, 1, False, 0, True),
+        (3, 16, 16, 64, 64, 64, 2, 3, 2, 2, 1, True, 0, True),
+        (3, 16, 48, 64, 64, 64, 2, 3, 2, 2, 1, True, 0, True),
+        (3, 16, 80, 64, 64, 64, 2, 3, 2, 2, 1, True, 0, True),
+        (3, 16, 144, 64, 64, 64, 2, 3, 2, 2, 1, True, 0, True),
+        (3, 16, 144, 64, 64, 64, 2, 3, 2, 2, 1, False, 4, True),
+    ],
+)
+def test_hgemm_acc_small_mnk(
+    dtype: str,
+    m: int,
+    n: int,
+    k: int,
+    TILE_M: int,
+    TILE_N: int,
+    TILE_K: int,
+    STAGES: int,
+    SPLIT_K: int,
+    BLOCK_M_WARPS: int,
+    BLOCK_N_WARPS: int,
+    BLOCK_K_WARPS: int,
+    HAS_BIAS: bool,
+    GROUP_M: int,
+    USE_HALF_TILE_INTERLEAVED: bool,
+):
+    if dtype == "fp8_ptpc":
+        TILE_K = 128
+    else:
+        dtype = torch.bfloat16 if "bf16" in dtype else torch.half
+    args = _TestArgs(
+        dtype,
+        m,
+        n,
+        k,
+        TILE_M,
+        TILE_N,
+        TILE_K,
+        STAGES,
+        SPLIT_K,
+        BLOCK_M_WARPS,
+        BLOCK_N_WARPS,
+        BLOCK_K_WARPS,
+        HAS_BIAS,
+        GROUP_M,
+        USE_HALF_TILE_INTERLEAVED,
+    )
+    check_acc(args)
+
+
 @pytest.mark.parametrize("dtype", ["fp16", "bf16"])
 @pytest.mark.parametrize(
     "m, n, k, TILE_M, TILE_N, TILE_K, STAGES, SPLIT_K, BLOCK_M_WARPS, BLOCK_N_WARPS, BLOCK_K_WARPS, HAS_BIAS, GROUP_M, USE_HALF_TILE_INTERLEAVED",
@@ -536,6 +634,7 @@ def test_hgemm_acc_ft_slice_k(
     "m, n, k, TILE_M, TILE_N, TILE_K, STAGES, SPLIT_K, BLOCK_M_WARPS, BLOCK_N_WARPS, BLOCK_K_WARPS, HAS_BIAS, GROUP_M, USE_HALF_TILE_INTERLEAVED",
     [
         (8192, 8192, 8192, 256, 256, 64, 2, 1, 2, 4, 1, True, 0, True),
+        (8160, 8160, 8160, 256, 256, 64, 2, 1, 2, 4, 1, True, 0, True),
         (4096, 4096, 8192, 256, 256, 64, 2, 1, 2, 4, 1, True, 0, True),
         (4096, 4096, 4096, 256, 256, 64, 2, 1, 2, 4, 1, True, 0, True),
         (2048, 2048, 2048, 128, 128, 64, 5, 1, 4, 4, 1, True, 0, False),
