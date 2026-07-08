@@ -1,13 +1,13 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="700" viewBox="0 0 1200 700" role="img" aria-labelledby="title desc">
   <title id="title">HGEMM BF16 Benchmark</title>
-  <desc id="desc">Bar chart comparing HGEMM and Torch hipBLAS BF16 throughput in TFLOPS for four GEMM benchmark shapes.</desc>
+  <desc id="desc">Bar chart comparing HGEMM and Torch hipBLAS BF16 throughput in TFLOPS for six GEMM benchmark shapes.</desc>
   <rect width="1200" height="700" fill="#ffffff"/>
   <text x="64" y="46" font-family="Arial, sans-serif" font-size="26" font-weight="700" fill="#111827">HGEMM BF16 Benchmark</text>
-  <text x="64" y="76" font-family="Arial, sans-serif" font-size="14" fill="#4b5563">TFLOPS computed from average CUDA latency over 100 profiled calls, warmup=500, niters=600</text>
+  <text x="64" y="76" font-family="Arial, sans-serif" font-size="14" fill="#4b5563">TFLOPS computed from Self CUDA total / 100 profiled calls, warmup=500, niters=600</text>
 
   <rect x="870" y="112" width="270" height="116" rx="10" fill="#f9fafb" stroke="#e5e7eb"/>
-  <rect x="892" y="140" width="18" height="18" fill="#2563eb"/>
-  <text x="920" y="154" font-family="Arial, sans-serif" font-size="14" fill="#111827">HGEMM</text>
+  <rect x="892" y="140" width="18" height="18" fill="#22d3ee" stroke="#0891b2"/>
+  <text x="920" y="154" font-family="Arial, sans-serif" font-size="14" font-weight="700" fill="#0891b2">HGEMM</text>
   <rect x="892" y="174" width="18" height="18" fill="#f97316"/>
   <text x="920" y="188" font-family="Arial, sans-serif" font-size="14" fill="#111827">Torch hipBLAS</text>
   <text x="892" y="214" font-family="Arial, sans-serif" font-size="13" fill="#4b5563">Speedup = HGEMM / hipBLAS</text>
@@ -30,52 +30,75 @@
   </g>
 
   <g font-family="Arial, sans-serif">
-    <rect x="200" y="208.11" width="34" height="306.89" rx="4" fill="#2563eb"/>
-    <rect x="240" y="203.43" width="34" height="311.57" rx="4" fill="#f97316"/>
-    <text x="217" y="198" text-anchor="middle" font-size="12" fill="#111827">1573.8</text>
-    <text x="257" y="193" text-anchor="middle" font-size="12" fill="#111827">1597.8</text>
-    <text x="237" y="544" text-anchor="middle" font-size="13" fill="#111827">8192x8192x8192</text>
-    <text x="237" y="566" text-anchor="middle" font-size="12" fill="#4b5563">HT, bias</text>
-    <rect x="195" y="586" width="84" height="24" rx="12" fill="#eff6ff" stroke="#bfdbfe"/>
-    <text x="237" y="603" text-anchor="middle" font-size="12" font-weight="700" fill="#1d4ed8">0.986x</text>
+    <rect x="167" y="211.56" width="28" height="303.44" rx="4" fill="#22d3ee" stroke="#0891b2" stroke-width="1"/>
+    <rect x="201" y="214.31" width="28" height="300.69" rx="4" fill="#f97316"/>
+    <text x="195" y="202" text-anchor="end" font-size="12" font-weight="700" fill="#0891b2">1556.1</text>
+    <text x="201" y="204" text-anchor="start" font-size="12" fill="#111827">1542.0</text>
+    <text x="198" y="544" text-anchor="middle" font-size="12" fill="#111827">16384x16384x16384</text>
+    <text x="198" y="566" text-anchor="middle" font-size="12" fill="#4b5563">HT, GM4, bias</text>
+    <rect x="156" y="586" width="84" height="24" rx="12" fill="#ecfdf5" stroke="#bbf7d0"/>
+    <text x="198" y="603" text-anchor="middle" font-size="12" font-weight="700" fill="#047857">1.009x</text>
   </g>
 
   <g font-family="Arial, sans-serif">
-    <rect x="370" y="206.65" width="34" height="308.35" rx="4" fill="#2563eb"/>
-    <rect x="410" y="222.52" width="34" height="292.48" rx="4" fill="#f97316"/>
-    <text x="387" y="197" text-anchor="middle" font-size="12" fill="#111827">1581.3</text>
-    <text x="427" y="213" text-anchor="middle" font-size="12" fill="#111827">1499.9</text>
-    <text x="407" y="544" text-anchor="middle" font-size="13" fill="#111827">4096x4096x8192</text>
-    <text x="407" y="566" text-anchor="middle" font-size="12" fill="#4b5563">HT, bias</text>
-    <rect x="365" y="586" width="84" height="24" rx="12" fill="#ecfdf5" stroke="#bbf7d0"/>
-    <text x="407" y="603" text-anchor="middle" font-size="12" font-weight="700" fill="#047857">1.054x</text>
+    <rect x="275" y="202.92" width="28" height="312.08" rx="4" fill="#22d3ee" stroke="#0891b2" stroke-width="1"/>
+    <rect x="309" y="197.99" width="28" height="317.01" rx="4" fill="#f97316"/>
+    <text x="303" y="193" text-anchor="end" font-size="12" font-weight="700" fill="#0891b2">1600.4</text>
+    <text x="309" y="188" text-anchor="start" font-size="12" fill="#111827">1625.7</text>
+    <text x="306" y="544" text-anchor="middle" font-size="12" fill="#111827">8192x8192x8192</text>
+    <text x="306" y="566" text-anchor="middle" font-size="12" fill="#4b5563">HT, bias</text>
+    <rect x="264" y="586" width="84" height="24" rx="12" fill="#eff6ff" stroke="#bfdbfe"/>
+    <text x="306" y="603" text-anchor="middle" font-size="12" font-weight="700" fill="#1d4ed8">0.984x</text>
   </g>
 
   <g font-family="Arial, sans-serif">
-    <rect x="540" y="228.51" width="34" height="286.49" rx="4" fill="#2563eb"/>
-    <rect x="580" y="225.13" width="34" height="289.87" rx="4" fill="#f97316"/>
-    <text x="557" y="219" text-anchor="middle" font-size="12" fill="#111827">1469.2</text>
-    <text x="597" y="215" text-anchor="middle" font-size="12" fill="#111827">1486.5</text>
-    <text x="577" y="544" text-anchor="middle" font-size="13" fill="#111827">4096x4096x4096</text>
-    <text x="577" y="566" text-anchor="middle" font-size="12" fill="#4b5563">HT, bias</text>
-    <rect x="535" y="586" width="84" height="24" rx="12" fill="#eff6ff" stroke="#bfdbfe"/>
-    <text x="577" y="603" text-anchor="middle" font-size="12" font-weight="700" fill="#1d4ed8">0.988x</text>
+    <rect x="383" y="230.53" width="28" height="284.47" rx="4" fill="#22d3ee" stroke="#0891b2" stroke-width="1"/>
+    <rect x="417" y="251.98" width="28" height="263.02" rx="4" fill="#f97316"/>
+    <text x="411" y="221" text-anchor="end" font-size="12" font-weight="700" fill="#0891b2">1458.8</text>
+    <text x="417" y="242" text-anchor="start" font-size="12" fill="#111827">1348.8</text>
+    <text x="414" y="544" text-anchor="middle" font-size="12" fill="#111827">8160x8160x8160</text>
+    <text x="414" y="566" text-anchor="middle" font-size="12" fill="#4b5563">HT, bias, tail</text>
+    <rect x="372" y="586" width="84" height="24" rx="12" fill="#ecfdf5" stroke="#bbf7d0"/>
+    <text x="414" y="603" text-anchor="middle" font-size="12" font-weight="700" fill="#047857">1.082x</text>
   </g>
 
   <g font-family="Arial, sans-serif">
-    <rect x="710" y="373.61" width="34" height="141.39" rx="4" fill="#2563eb"/>
-    <rect x="750" y="394.59" width="34" height="120.41" rx="4" fill="#f97316"/>
-    <text x="727" y="364" text-anchor="middle" font-size="12" fill="#111827">725.1</text>
-    <text x="767" y="385" text-anchor="middle" font-size="12" fill="#111827">617.5</text>
-    <text x="747" y="544" text-anchor="middle" font-size="13" fill="#111827">2048x2048x2048</text>
-    <text x="747" y="566" text-anchor="middle" font-size="12" fill="#4b5563">FT, bias</text>
-    <rect x="705" y="586" width="84" height="24" rx="12" fill="#ecfdf5" stroke="#bbf7d0"/>
-    <text x="747" y="603" text-anchor="middle" font-size="12" font-weight="700" fill="#047857">1.174x</text>
+    <rect x="491" y="206.69" width="28" height="308.31" rx="4" fill="#22d3ee" stroke="#0891b2" stroke-width="1"/>
+    <rect x="525" y="222.05" width="28" height="292.95" rx="4" fill="#f97316"/>
+    <text x="519" y="197" text-anchor="end" font-size="12" font-weight="700" fill="#0891b2">1581.1</text>
+    <text x="525" y="212" text-anchor="start" font-size="12" fill="#111827">1497.2</text>
+    <text x="522" y="544" text-anchor="middle" font-size="12" fill="#111827">4096x4096x8192</text>
+    <text x="522" y="566" text-anchor="middle" font-size="12" fill="#4b5563">HT, GM4, bias</text>
+    <rect x="480" y="586" width="84" height="24" rx="12" fill="#ecfdf5" stroke="#bbf7d0"/>
+    <text x="522" y="603" text-anchor="middle" font-size="12" font-weight="700" fill="#047857">1.056x</text>
+  </g>
+
+  <g font-family="Arial, sans-serif">
+    <rect x="599" y="226.48" width="28" height="288.52" rx="4" fill="#22d3ee" stroke="#0891b2" stroke-width="1"/>
+    <rect x="633" y="223.48" width="28" height="291.52" rx="4" fill="#f97316"/>
+    <text x="627" y="216" text-anchor="end" font-size="12" font-weight="700" fill="#0891b2">1479.6</text>
+    <text x="633" y="213" text-anchor="start" font-size="12" fill="#111827">1495.0</text>
+    <text x="630" y="544" text-anchor="middle" font-size="12" fill="#111827">4096x4096x4096</text>
+    <text x="630" y="566" text-anchor="middle" font-size="12" fill="#4b5563">HT, bias</text>
+    <rect x="588" y="586" width="84" height="24" rx="12" fill="#eff6ff" stroke="#bfdbfe"/>
+    <text x="630" y="603" text-anchor="middle" font-size="12" font-weight="700" fill="#1d4ed8">0.990x</text>
+  </g>
+
+  <g font-family="Arial, sans-serif">
+    <rect x="707" y="374.31" width="28" height="140.69" rx="4" fill="#22d3ee" stroke="#0891b2" stroke-width="1"/>
+    <rect x="741" y="395.02" width="28" height="119.98" rx="4" fill="#f97316"/>
+    <text x="735" y="364" text-anchor="end" font-size="12" font-weight="700" fill="#0891b2">721.5</text>
+    <text x="741" y="385" text-anchor="start" font-size="12" fill="#111827">615.3</text>
+    <text x="738" y="544" text-anchor="middle" font-size="12" fill="#111827">2048x2048x2048</text>
+    <text x="738" y="566" text-anchor="middle" font-size="12" fill="#4b5563">FT, bias</text>
+    <rect x="696" y="586" width="84" height="24" rx="12" fill="#ecfdf5" stroke="#bbf7d0"/>
+    <text x="738" y="603" text-anchor="middle" font-size="12" font-weight="700" fill="#047857">1.173x</text>
   </g>
 
   <text x="870" y="286" font-family="Arial, sans-serif" font-size="15" font-weight="700" fill="#111827">Summary</text>
-  <text x="870" y="314" font-family="Arial, sans-serif" font-size="13" fill="#374151">Best speedup: 2048x2048x2048, 1.174x</text>
+  <text x="870" y="314" font-family="Arial, sans-serif" font-size="13" fill="#374151">Best speedup: 2048x2048x2048, 1.173x</text>
   <text x="870" y="338" font-family="Arial, sans-serif" font-size="13" fill="#374151">Peak HGEMM:</text>
-  <text x="870" y="362" font-family="Arial, sans-serif" font-size="13" fill="#374151">4096x4096x8192, 1581.3 TFLOPS</text>
+  <text x="870" y="362" font-family="Arial, sans-serif" font-size="13" fill="#374151">8192x8192x8192, 1600.4 TFLOPS</text>
   <text x="870" y="386" font-family="Arial, sans-serif" font-size="13" fill="#374151">Profiler calls: 100 per kernel</text>
+  <text x="870" y="410" font-family="Arial, sans-serif" font-size="13" fill="#374151">Shapes: 6 BF16 benchmark cases</text>
 </svg>
