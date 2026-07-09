@@ -102,10 +102,10 @@ def ref_func(*args):
 def func(*args):
     if len(args) == 7:
         a, b, scale_a, scale_b, bias, c, kwargs = args
-        hgemm(c, a, b, bias=bias, scale_a=scale_a, scale_b=scale_b, user_kwargs=kwargs)
+        hgemm(a, b, c, bias=bias, scale_a=scale_a, scale_b=scale_b, user_kwargs=kwargs)
     else:
         a, b, bias, c, kwargs = args
-        hgemm(c, a, b, bias=bias, user_kwargs=kwargs)
+        hgemm(a, b, c, bias=bias, user_kwargs=kwargs)
 
 
 def tensor_nbytes(tensors: torch.Tensor):
@@ -586,6 +586,56 @@ def test_hgemm_acc_small_mnk(
     ],
 )
 def test_hgemm_acc_ft_slice_k(
+    dtype: str,
+    m: int,
+    n: int,
+    k: int,
+    TILE_M: int,
+    TILE_N: int,
+    TILE_K: int,
+    STAGES: int,
+    SPLIT_K: int,
+    BLOCK_M_WARPS: int,
+    BLOCK_N_WARPS: int,
+    BLOCK_K_WARPS: int,
+    HAS_BIAS: bool,
+    GROUP_M: int,
+    USE_HALF_TILE_INTERLEAVED: bool,
+):
+    if dtype == "fp8_ptpc":
+        TILE_K = 128
+    else:
+        dtype = torch.bfloat16 if "bf16" in dtype else torch.half
+    args = _TestArgs(
+        dtype,
+        m,
+        n,
+        k,
+        TILE_M,
+        TILE_N,
+        TILE_K,
+        STAGES,
+        SPLIT_K,
+        BLOCK_M_WARPS,
+        BLOCK_N_WARPS,
+        BLOCK_K_WARPS,
+        HAS_BIAS,
+        GROUP_M,
+        USE_HALF_TILE_INTERLEAVED,
+    )
+    check_acc(args)
+
+
+@pytest.mark.parametrize("dtype", ["bf16", "fp16"])
+@pytest.mark.parametrize(
+    "m, n, k, TILE_M, TILE_N, TILE_K, STAGES, SPLIT_K, BLOCK_M_WARPS, BLOCK_N_WARPS, BLOCK_K_WARPS, HAS_BIAS, GROUP_M, USE_HALF_TILE_INTERLEAVED",
+    [
+        (16, 2880, 512, 16, 128, 128, 4, 2, 1, 1, 4, True, 0, False),
+        (48, 128, 2880, 80, 64, 64, 4, 12, 1, 1, 2, True, 0, False),
+        (48, 640, 2880, 96, 64, 64, 5, 2, 1, 1, 1, True, 0, False),
+    ],
+)
+def test_hgemm_acc_ft_special(
     dtype: str,
     m: int,
     n: int,
