@@ -1,7 +1,7 @@
 import torch
 import functools
 import itertools
-from typing import Optional
+from typing import Optional, Tuple
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -38,6 +38,8 @@ from .hgemm_wmma_gfx950_utils import (
 )
 
 SPLIT_K_SEMAPHORE_MAX_LEN = 256
+
+
 
 
 def assert_hgemm_wmma_kernel(
@@ -226,22 +228,44 @@ def assert_hgemm_wmma_kernel(
     return
 
 
-@functools.lru_cache(maxsize=16384)
-def compile_hgemm_wmma_kernel(
-    DTYPE: str,
-    TILE_M: int = 128,
-    TILE_N: int = 128,
-    TILE_K: int = 64,
-    STAGES: int = 2,
-    SPLIT_K: int = 1,
-    BLOCK_M_WARPS: int = 2,
-    BLOCK_N_WARPS: int = 2,
-    BLOCK_K_WARPS: int = 1,
-    HAS_BIAS: bool = False,
-    HAS_K_TAIL: bool = False,
-    GROUP_M: int = 0,
-    USE_HALF_TILE_INTERLEAVED: bool = False,
+@fx.struct
+class HGemmWmmaConstexprParam:
+    DTYPE: fx.Constexpr[str]
+    TILE_SHAPE: fx.Constexpr[Tuple[int, int, int]]
+    STAGES: fx.Constexpr[int]
+    SPLIT_K: fx.Constexpr[int]
+    BLOCK_WARPS: fx.Constexpr[Tuple[int, int, int]]
+    HAS_BIAS: fx.Constexpr[bool]
+    HAS_K_TAIL: fx.Constexpr[bool]
+    GROUP_M: fx.Constexpr[int]
+    USE_HALF_TILE_INTERLEAVED: fx.Constexpr[bool]
+
+@flyc.jit
+def hgemm_wmma(
+    c_ptr: fx.Tensor,
+    a_ptr: fx.Tensor,
+    b_ptr: fx.Tensor,
+    scale_a_ptr: fx.Tensor,
+    scale_b_ptr: fx.Tensor,
+    bias_ptr: fx.Tensor,
+    semaphore_ptr: fx.Tensor,
+    signal_ptr: fx.Tensor,
+    m: fx.Int32,
+    n: fx.Int32,
+    k: fx.Int32,
+    stream: fx.Stream,
+    param: HGemmWmmaConstexprParam,
 ):
+    DTYPE = param.DTYPE
+    TILE_M, TILE_N, TILE_K = param.TILE_SHAPE
+    STAGES = param.STAGES
+    SPLIT_K = param.SPLIT_K
+    BLOCK_M_WARPS, BLOCK_N_WARPS, BLOCK_K_WARPS = param.BLOCK_WARPS
+    HAS_BIAS = param.HAS_BIAS
+    HAS_K_TAIL = param.HAS_K_TAIL
+    GROUP_M = param.GROUP_M
+    USE_HALF_TILE_INTERLEAVED = param.USE_HALF_TILE_INTERLEAVED
+
     assert BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS <= 16
     assert STAGES >= 2
     IS_SPLIT_K = SPLIT_K > 1
@@ -260,12 +284,12 @@ def compile_hgemm_wmma_kernel(
     LDG_VEC_SIZE = 16 if IS_FP8 else 8
     GPU_ARCH = get_rocm_arch()
 
-    if IS_FP8:
+    if const_expr(IS_FP8):
         assert BLOCK_K >= 128
         WMMA_IMPL = WmmaFp8_m16n16k128()
         DMA_BYTES = 16
         MFMA_PER_WARP_K = 1
-    elif GPU_ARCH == "gfx942":
+    elif const_expr(GPU_ARCH == "gfx942"):
         assert BLOCK_K >= 16
         WMMA_IMPL = WmmaHalf_m16n16k16(DTYPE)
         DMA_BYTES = 4
@@ -276,7 +300,7 @@ def compile_hgemm_wmma_kernel(
         DMA_BYTES = 16
         MFMA_PER_WARP_K = 1
 
-    if IS_HT:
+    if const_expr(IS_HT):
         assert STAGES == 2
         assert BLOCK_M_WARPS == 2
         assert BLOCK_N_WARPS >= 2
@@ -304,7 +328,7 @@ def compile_hgemm_wmma_kernel(
 
     BLOCK_THREADS = BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS * WARP_SIZE
     BLOCK_MN_WARPS = BLOCK_M_WARPS * BLOCK_N_WARPS
-    if IS_HT:
+    if const_expr(IS_HT):
         WARP_M_STEPS = HALF_BLOCK_M // BLOCK_M_WARPS // WARP_ATOM_M
         WARP_N_STEPS = HALF_BLOCK_N // BLOCK_N_WARPS // WARP_ATOM_N
         assert (WARP_M_STEPS >= 1) and (WARP_N_STEPS >= 1)
@@ -318,7 +342,7 @@ def compile_hgemm_wmma_kernel(
         assert BLOCK_N % (BLOCK_N_WARPS * WARP_ATOM_N) == 0
     WARP_M = WARP_M_STEPS * WARP_ATOM_M
     WARP_N = WARP_N_STEPS * WARP_ATOM_N
-    if IS_HT:
+    if const_expr(IS_HT):
         assert HALF_BLOCK_M == BLOCK_M_WARPS * WARP_M
         assert HALF_BLOCK_N == BLOCK_N_WARPS * WARP_N
     else:
@@ -328,7 +352,7 @@ def compile_hgemm_wmma_kernel(
     BLOCK_NK_SIZE = BLOCK_N * BLOCK_K
     BLOCK_MN_SIZE = BLOCK_M * BLOCK_N
 
-    if IS_HT:
+    if const_expr(IS_HT):
         STG_SIZE_PER_M_STEP = BLOCK_M_WARPS * WARP_ATOM_M * HALF_BLOCK_N
         STG_WORK_SIZE_PER_M_STEP = STG_SIZE_PER_M_STEP // BLOCK_THREADS
         assert (STG_SIZE_PER_M_STEP % BLOCK_THREADS == 0) and (
@@ -357,7 +381,7 @@ def compile_hgemm_wmma_kernel(
     assert LDG_B_X_THREADS_AS * LDG_ASYNC_VEC_SIZE == BLOCK_K
     assert (BLOCK_M * BLOCK_N) % (BLOCK_THREADS * STG_VEC_SIZE) == 0
 
-    if IS_HT:
+    if const_expr(IS_HT):
         LDG_A_ITERS_AS = HALF_BLOCK_M * BLOCK_K // LDG_ASYNC_VEC_SIZE // BLOCK_THREADS
         assert (
             LDG_A_ITERS_AS * LDG_ASYNC_VEC_SIZE * BLOCK_THREADS
@@ -1612,59 +1636,42 @@ def compile_hgemm_wmma_kernel(
         c_frags = compute_final_tile_and_epilogue(k_offset, c_frags)
         return
 
-    @flyc.jit
-    def launch_hgemm_wmma_kernel(
-        c_ptr: fx.Pointer,
-        a_ptr: fx.Pointer,
-        b_ptr: fx.Pointer,
-        scale_a_ptr: fx.Pointer,
-        scale_b_ptr: fx.Pointer,
-        bias_ptr: fx.Pointer,
-        semaphore_ptr: fx.Pointer,
-        signal_ptr: fx.Pointer,
-        m: fx.Int32,
-        n: fx.Int32,
-        k: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
-    ):
-        allocator.finalized = False
-        ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            allocator.finalize()
+    allocator.finalized = False
+    ctx = CompilationContext.get_current()
+    with ir.InsertionPoint(ctx.gpu_module_body):
+        allocator.finalize()
 
-        working_k = (k + SPLIT_K - 1) // SPLIT_K
-        num_pid_m = (m + BLOCK_M - 1) // BLOCK_M
-        num_pid_n = (n + BLOCK_N - 1) // BLOCK_N
-        c_stride = n
-        a_stride = k
-        b_stride = k
-        hgemm_kernel_impl = hgemm_ht_kernel if IS_HT else hgemm_kernel
-        hgemm_kernel_impl._func.__name__ = KERNEL_NAME
-        hgemm_kernel_impl(
-            c_ptr,
-            a_ptr,
-            b_ptr,
-            scale_a_ptr,
-            scale_b_ptr,
-            bias_ptr,
-            semaphore_ptr,
-            signal_ptr,
-            m,
-            n,
-            k,
-            working_k,
-            num_pid_m,
-            num_pid_n,
-            c_stride,
-            a_stride,
-            b_stride,
-        ).launch(
-            grid=(num_pid_m * num_pid_n, SPLIT_K, 1),
-            block=(BLOCK_THREADS, 1, 1),
-            stream=stream,
-        )
-
-    return launch_hgemm_wmma_kernel
+    working_k = (k + SPLIT_K - 1) // SPLIT_K
+    num_pid_m = (m + BLOCK_M - 1) // BLOCK_M
+    num_pid_n = (n + BLOCK_N - 1) // BLOCK_N
+    c_stride = n
+    a_stride = k
+    b_stride = k
+    hgemm_kernel_impl = hgemm_ht_kernel if IS_HT else hgemm_kernel
+    hgemm_kernel_impl._func.__name__ = KERNEL_NAME
+    hgemm_kernel_impl(
+        c_ptr,
+        a_ptr,
+        b_ptr,
+        scale_a_ptr,
+        scale_b_ptr,
+        bias_ptr,
+        semaphore_ptr,
+        signal_ptr,
+        m,
+        n,
+        k,
+        working_k,
+        num_pid_m,
+        num_pid_n,
+        c_stride,
+        a_stride,
+        b_stride,
+    ).launch(
+        grid=(num_pid_m * num_pid_n, SPLIT_K, 1),
+        block=(BLOCK_THREADS, 1, 1),
+        stream=stream,
+    )
 
 
 def get_default_b16_kwargs(m, n, k):
@@ -2070,9 +2077,8 @@ def hgemm(
         assert scale_b.shape[0] == n
         assert c.dtype == torch.bfloat16
         assert hgemm_validate("fp8_ptpc", m, n, k, kwargs)
-        exe = compile_hgemm_wmma_kernel("fp8_ptpc", **kwargs)
         _run_compiled(
-            exe,
+            hgemm_wmma,
             c,
             a,
             b,
@@ -2085,19 +2091,59 @@ def hgemm(
             n,
             k,
             stream,
+            constexpr_param=HGemmWmmaConstexprParam(
+                DTYPE="fp8_ptpc",
+                TILE_SHAPE=(kwargs["TILE_M"], kwargs["TILE_N"], kwargs["TILE_K"]),
+                STAGES=kwargs["STAGES"],
+                SPLIT_K=kwargs["SPLIT_K"],
+                BLOCK_WARPS=(
+                    kwargs["BLOCK_M_WARPS"],
+                    kwargs["BLOCK_N_WARPS"],
+                    kwargs["BLOCK_K_WARPS"],
+                ),
+                HAS_BIAS=kwargs["HAS_BIAS"],
+                HAS_K_TAIL=kwargs["HAS_K_TAIL"],
+                GROUP_M=kwargs["GROUP_M"],
+                USE_HALF_TILE_INTERLEAVED=kwargs["USE_HALF_TILE_INTERLEAVED"],
+            ),
         )
     else:
         if a.dtype == torch.half:
             assert c.dtype == torch.half
             assert hgemm_validate("fp16", m, n, k, kwargs)
-            exe = compile_hgemm_wmma_kernel("f16", **kwargs)
         elif a.dtype == torch.bfloat16:
             assert c.dtype == torch.bfloat16
             assert hgemm_validate("bf16", m, n, k, kwargs)
-            exe = compile_hgemm_wmma_kernel("bf16", **kwargs)
         else:
             raise NotImplementedError()
         _run_compiled(
-            exe, c, a, b, a, b, bias_tensor, semaphore, signal, m, n, k, stream
+            hgemm_wmma,
+            c,
+            a,
+            b,
+            a,
+            b,
+            bias_tensor,
+            semaphore,
+            signal,
+            m,
+            n,
+            k,
+            stream,
+            constexpr_param=HGemmWmmaConstexprParam(
+                DTYPE="f16" if a.dtype == torch.half else "bf16",
+                TILE_SHAPE=(kwargs["TILE_M"], kwargs["TILE_N"], kwargs["TILE_K"]),
+                STAGES=kwargs["STAGES"],
+                SPLIT_K=kwargs["SPLIT_K"],
+                BLOCK_WARPS=(
+                    kwargs["BLOCK_M_WARPS"],
+                    kwargs["BLOCK_N_WARPS"],
+                    kwargs["BLOCK_K_WARPS"],
+                ),
+                HAS_BIAS=kwargs["HAS_BIAS"],
+                HAS_K_TAIL=kwargs["HAS_K_TAIL"],
+                GROUP_M=kwargs["GROUP_M"],
+                USE_HALF_TILE_INTERLEAVED=kwargs["USE_HALF_TILE_INTERLEAVED"],
+            ),
         )
     return c
