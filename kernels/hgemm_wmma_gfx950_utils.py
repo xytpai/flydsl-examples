@@ -2,26 +2,56 @@ from abc import ABC, abstractmethod
 from flydsl.expr import (
     range_constexpr,
     const_expr,
+    as_ir_value,
     arith,
-    vector,
     gpu,
     rocdl,
-    buffer_ops,
 )
 import flydsl.expr as fx
 import flydsl.compiler as flyc
-from flydsl.expr.typing import T, Vector as Vec
-from flydsl._mlir.dialects import llvm, fly, scf
+from flydsl.expr.typing import T, Vector
+from flydsl._mlir.dialects import llvm, fly
 from flydsl._mlir import ir
+from flydsl.runtime.device import get_rocm_arch, is_rdna_arch
 
 
-def _to_raw(v):
-    """Convert ArithValue / Numeric (Int32, Boolean, …) to raw ir.Value."""
-    if isinstance(v, ir.Value):
-        return v
-    if hasattr(v, "ir_value"):
-        return _to_raw(v.ir_value())
-    return ir.Value._CAPICreate(v._CAPIPtr)
+def make_buffer_rsrc(tensor):
+    """Build a ROCDL buffer resource (``!llvm.ptr<8>``) over a global tensor's
+    base address.
+    """
+    addr = fx.ptrtoint(fx.get_iter(tensor))
+    base = llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr"), as_ir_value(addr)).result
+    num_records = fx.Int64(0xFFFFFFFF)
+    flags = (7 << 12) | (4 << 15)
+    if is_rdna_arch(get_rocm_arch()):
+        flags |= 1 << 24  # reserved bit, must be 1 on RDNA
+        flags |= 2 << 28  # OOB_SELECT = 2 (no bounds checking)
+
+    return rocdl.MakeBufferRsrcOp(
+        ir.Type.parse("!llvm.ptr<8>"), base, fx.Int16(0).ir_value(), num_records.ir_value(), fx.Int32(flags).ir_value()
+    ).result
+
+
+def make_hgemm_lds(param, smem_input_ty, output_ty):
+    AS_ELEMS = param.STAGES * param.BLOCK_M * param.BLOCK_K
+    BS_ELEMS = param.STAGES * param.BLOCK_N * param.BLOCK_K
+    C_ELEMS = param.BLOCK_K_WARPS * param.BLOCK_M * param.BLOCK_N
+
+    @fx.struct
+    class MainloopStorage:
+        a: fx.Array[smem_input_ty, AS_ELEMS, 16]
+        b: fx.Array[smem_input_ty, BS_ELEMS, 16]
+
+    @fx.union
+    class SharedStorage:
+        mainloop: MainloopStorage
+        c: fx.Array[output_ty, C_ELEMS, 16]
+
+    storage = fx.SharedAllocator().allocate(SharedStorage)
+    smem_a = storage.mainloop.a.peek().ptr
+    smem_b = storage.mainloop.b.peek().ptr
+    smem_c = storage.c.peek().ptr
+    return smem_a, smem_b, smem_c
 
 
 def _run_compiled(jit_func, *runtime_args, constexpr_param):
@@ -65,8 +95,8 @@ class WmmaHalf_m16n16k16(WmmaHalfBase):
 
     def __call__(self, a_frag, b_frag, c_frag):
         if self.dtype == "bf16":
-            a_frag_vi16 = vector.bitcast(T.vec(self.WMMA_A_FRAG_VALUES, T.i16), a_frag)
-            b_frag_vi16 = vector.bitcast(T.vec(self.WMMA_B_FRAG_VALUES, T.i16), b_frag)
+            a_frag_vi16 = a_frag.bitcast(fx.Int16)
+            b_frag_vi16 = b_frag.bitcast(fx.Int16)
             c_frag_new = rocdl.mfma_f32_16x16x16bf16_1k(
                 T.f32x4, [a_frag_vi16, b_frag_vi16, c_frag, 0, 0, 0]
             )
@@ -97,7 +127,7 @@ class WmmaHalf_m16n16k32(WmmaHalfBase):
             if self.agpr:
                 return llvm.inline_asm(
                     res_ty,
-                    [_to_raw(c_frag), _to_raw(a_frag), _to_raw(b_frag)],
+                    [as_ir_value(c_frag), as_ir_value(a_frag), as_ir_value(b_frag)],
                     "v_mfma_f32_16x16x32_bf16 $0, $2, $3, $0",
                     "=a,0,v,v",
                     has_side_effects=False,
@@ -108,7 +138,7 @@ class WmmaHalf_m16n16k32(WmmaHalfBase):
             if self.agpr:
                 return llvm.inline_asm(
                     res_ty,
-                    [_to_raw(c_frag), _to_raw(a_frag), _to_raw(b_frag)],
+                    [as_ir_value(c_frag), as_ir_value(a_frag), as_ir_value(b_frag)],
                     "v_mfma_f32_16x16x32_f16 $0, $2, $3, $0",
                     "=a,0,v,v",
                     has_side_effects=False,
@@ -126,7 +156,7 @@ class WmmaFp8_m16n16k128:
 
     def _make_atom_call(self, a_frag, b_frag, c_frag):
         atom = fx.make_mma_atom(fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, fx.Float8E4M3FN))
-        accum_type = Vec.make_type(4, fx.Float32)
+        accum_type = Vector.make_type(4, fx.Float32)
         return fly.mma_atom_call_ssa([accum_type], atom, a_frag, b_frag, c_frag)
 
     def __call__(self, a_frag, b_frag, c_frag):
@@ -142,11 +172,9 @@ def swizzle_fp8_128(row, col_in_bytes):
 
 
 def get_llvm_ptr(ptr, offset, dtype_bytes, ptr_type):
-    base_ptr = fly.extract_aligned_pointer_as_index(ptr_type, ptr)
-    base_ptr = llvm.PtrToIntOp(T.i64, base_ptr).result
-    byte_offset = arith.index_cast(T.i64, fx.Index(offset) * fx.Index(dtype_bytes))
-    llvm_ptr = llvm.AddOp(base_ptr, byte_offset, llvm.IntegerOverflowFlags(0)).result
-    llvm_ptr = llvm.IntToPtrOp(ptr_type, llvm_ptr).result
+    byte_offset = fx.Int64(offset) * fx.Int64(dtype_bytes)
+    byte_ptr = fx.recast_iter(fx.Int8, fx.get_iter(ptr)) + byte_offset
+    llvm_ptr = llvm.IntToPtrOp(ptr_type, as_ir_value(fx.ptrtoint(byte_ptr))).result
     ptr_v = llvm_ptr._value if const_expr(hasattr(llvm_ptr, "_value")) else llvm_ptr
     return ptr_v
 
@@ -176,7 +204,13 @@ def buffer_load_lds_inline(rsrc, lds_ptr, global_offset, DMA_BYTES):
         raise NotImplementedError(f"DMA_BYTES={DMA_BYTES} not supported")
     llvm.InlineAsmOp(
         None,
-        [_to_raw(lds_ptr), _to_raw(global_offset), _to_raw(rsrc)],
+        [
+            llvm.IntToPtrOp(
+                ir.Type.parse("!llvm.ptr<3>"), as_ir_value(fx.ptrtoint(lds_ptr))
+            ).result,
+            as_ir_value(global_offset),
+            as_ir_value(rsrc),
+        ],
         asm,
         "s,v,s",
         has_side_effects=True,
@@ -212,7 +246,7 @@ class SplitKProtocol:
         semaphore_ptr,
         signal_ptr,
         c_ptr,
-        bias_rsrc,
+        bias_buf,
         tid,
         ks_idx,
         m,
@@ -226,7 +260,7 @@ class SplitKProtocol:
         self.semaphore_ptr = semaphore_ptr
         self.signal_ptr = signal_ptr
         self.c_ptr = c_ptr
-        self.bias_rsrc = bias_rsrc
+        self.bias_buf = bias_buf
         self.tid = tid
         self.ks_idx = ks_idx
         self.m = m
@@ -236,11 +270,12 @@ class SplitKProtocol:
         self.out_dtype_ = out_dtype_
         self.signal_idx = signal_idx
         self.c_stride = c_stride
-        self.c_zero_out = arith.constant(0.0, type=out_dtype_)
-        self.semaphore_rsrc = buffer_ops.create_buffer_resource(
-            semaphore_ptr, max_size=True
-        )
-        self.signal_rsrc = buffer_ops.create_buffer_resource(signal_ptr, max_size=True)
+        self.semaphore_buf = rocdl.make_buffer_tensor(semaphore_ptr)
+        self.signal_buf = rocdl.make_buffer_tensor(signal_ptr)
+        if const_expr(self.HAS_BIAS):
+            self.bias_vecs = fx.logical_divide(
+                self.bias_buf, fx.make_layout(self.STG_VEC_SIZE, 1)
+            )
 
     @flyc.jit
     def zero_c(self):
@@ -252,8 +287,8 @@ class SplitKProtocol:
                 store_asm = "global_store_dwordx4 $0, $1, off sc0 sc1"
             else:
                 raise NotImplementedError(f"STG_VEC_SIZE={self.STG_VEC_SIZE}")
-            zero_vec = vector.broadcast(
-                T.vec(self.STG_VEC_SIZE, self.out_dtype_), self.c_zero_out
+            zero_vec = fx.full(
+                self.STG_VEC_SIZE, 0.0, fx.Numeric.from_ir_type(self.out_dtype_)
             )
             for i in range_constexpr(self.STG_C_ITERS):
                 global_tid = self.BLOCK_THREADS * i + self.tid
@@ -263,12 +298,9 @@ class SplitKProtocol:
                 global_n_idx = self.block_n_offset + n_local_idx
                 safe_global_n_idx = (global_n_idx < self.n).select(global_n_idx, 0)
                 if const_expr(self.HAS_BIAS):
-                    init_vec = buffer_ops.buffer_load(
-                        self.bias_rsrc,
-                        safe_global_n_idx,
-                        vec_width=self.STG_VEC_SIZE,
-                        dtype=self.out_dtype_,
-                    )
+                    init_vec = self.bias_vecs[
+                        None, safe_global_n_idx // self.STG_VEC_SIZE
+                    ].load()
                 else:
                     init_vec = zero_vec
                 if global_m_idx < self.m and global_n_idx < self.n:
@@ -305,21 +337,12 @@ class SplitKProtocol:
     def split_k_barrier(self):
         # spin-wait until signal triggered
         if self.tid == 0:
-            init_cur = arith.constant(0, type=T.i32)
-            w = scf.WhileOp([T.i32], [init_cur])
-            before = ir.Block.create_at_start(w.before, [T.i32])
-            after = ir.Block.create_at_start(w.after, [T.i32])
-            with ir.InsertionPoint(before):
-                cur = before.arguments[0]
-                need_wait = arith.CmpIOp(
-                    arith.CmpIPredicate.eq, cur, arith.constant(0, type=T.i32)
-                ).result
-                scf.ConditionOp(need_wait, [cur])
-            with ir.InsertionPoint(after):
+            cur = 0
+            while cur == 0:
                 signal_ptr = get_llvm_ptr(
                     self.signal_ptr, self.signal_idx, 4, ir.Type.parse("!llvm.ptr<1>")
                 )
-                data = llvm.InlineAsmOp(
+                cur = llvm.InlineAsmOp(
                     T.i32,
                     [signal_ptr],
                     "global_load_dword $0, $1, off sc1",
@@ -327,7 +350,6 @@ class SplitKProtocol:
                     has_side_effects=True,
                 ).result
                 rocdl.s_waitcnt(0)
-                scf.YieldOp([data])
         rocdl.sched_barrier(0)
         gpu.barrier()
         # clean semaphore and signal if this is the last block within split-k group
@@ -344,9 +366,8 @@ class SplitKProtocol:
                 alignment=4,
             ).result
             if arrive_idx == self.SPLIT_K - 1:
-                zero_i32 = arith.constant(0, type=T.i32)
-                buffer_ops.buffer_store(zero_i32, self.semaphore_rsrc, self.signal_idx)
-                buffer_ops.buffer_store(zero_i32, self.signal_rsrc, self.signal_idx)
+                self.semaphore_buf[self.signal_idx] = 0
+                self.signal_buf[self.signal_idx] = 0
         gpu.barrier()
 
 
