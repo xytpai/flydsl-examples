@@ -40,8 +40,6 @@ from .hgemm_wmma_gfx950_utils import (
 SPLIT_K_SEMAPHORE_MAX_LEN = 256
 
 
-
-
 def assert_hgemm_wmma_kernel(
     DTYPE: str,
     TILE_M: int = 128,
@@ -230,7 +228,6 @@ def assert_hgemm_wmma_kernel(
 
 @fx.struct
 class HGemmWmmaConstexprParam:
-    DTYPE: fx.Constexpr[str]
     TILE_SHAPE: fx.Constexpr[Tuple[int, int, int]]
     STAGES: fx.Constexpr[int]
     SPLIT_K: fx.Constexpr[int]
@@ -254,9 +251,16 @@ def hgemm_wmma(
     n: fx.Int32,
     k: fx.Int32,
     stream: fx.Stream,
+    dtype: type,
     param: HGemmWmmaConstexprParam,
 ):
-    DTYPE = param.DTYPE
+    DTYPE = (
+        "fp8_ptpc"
+        if dtype is fx.Float8E4M3FN
+        else "f16"
+        if dtype is fx.Float16
+        else "bf16"
+    )
     TILE_M, TILE_N, TILE_K = param.TILE_SHAPE
     STAGES = param.STAGES
     SPLIT_K = param.SPLIT_K
@@ -2091,8 +2095,8 @@ def hgemm(
             n,
             k,
             stream,
+            type_param=fx.Float8E4M3FN,
             constexpr_param=HGemmWmmaConstexprParam(
-                DTYPE="fp8_ptpc",
                 TILE_SHAPE=(kwargs["TILE_M"], kwargs["TILE_N"], kwargs["TILE_K"]),
                 STAGES=kwargs["STAGES"],
                 SPLIT_K=kwargs["SPLIT_K"],
@@ -2130,8 +2134,8 @@ def hgemm(
             n,
             k,
             stream,
+            type_param=fx.Float16 if a.dtype == torch.half else fx.BFloat16,
             constexpr_param=HGemmWmmaConstexprParam(
-                DTYPE="f16" if a.dtype == torch.half else "bf16",
                 TILE_SHAPE=(kwargs["TILE_M"], kwargs["TILE_N"], kwargs["TILE_K"]),
                 STAGES=kwargs["STAGES"],
                 SPLIT_K=kwargs["SPLIT_K"],
