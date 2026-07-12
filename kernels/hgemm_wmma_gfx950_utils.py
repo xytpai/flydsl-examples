@@ -24,23 +24,20 @@ def _to_raw(v):
     return ir.Value._CAPICreate(v._CAPIPtr)
 
 
-def get_dtype_in_kernel(dtype: str):
-    if dtype == "f32":
-        return T.f32
-    elif dtype == "f16":
-        return T.f16
-    elif dtype == "bf16":
-        return T.bf16
+def _run_compiled(jit_func, *runtime_args, constexpr_param):
+    """Compile once per constexpr param, then use the fast compiled dispatcher."""
+    cache_key = constexpr_param.__cache_signature__()
+    args = runtime_args + (constexpr_param,)
 
+    compiled_cache = getattr(jit_func, "_compiled_cache", None)
+    if compiled_cache is None:
+        compiled_cache = {}
+        jit_func._compiled_cache = compiled_cache
 
-def _run_compiled(exe, *args):
-    """First call: ``flyc.compile(exe, *args)`` compiles **and** executes the kernel.
-    Subsequent calls: fast dispatch via the cached ``CompiledFunction``.
-    """
-    cf = getattr(exe, "_cf", None)
+    cf = compiled_cache.get(cache_key)
     if cf is None:
-        cf = flyc.compile(exe, *args)
-        exe._cf = cf
+        cf = flyc.compile(jit_func, *args)
+        compiled_cache[cache_key] = cf
     else:
         cf(*args)
 
