@@ -24,19 +24,10 @@ def _to_raw(v):
     return ir.Value._CAPICreate(v._CAPIPtr)
 
 
-def get_dtype_in_kernel(dtype: str):
-    if dtype == "f32":
-        return T.f32
-    elif dtype == "f16":
-        return T.f16
-    elif dtype == "bf16":
-        return T.bf16
-
-
-def _run_compiled(jit_func, *runtime_args, type_param=None, constexpr_param):
-    """Compile once per type/constexpr param, then use the fast compiled dispatcher."""
-    cache_key = (type_param, constexpr_param.__cache_signature__())
-    args = runtime_args + (type_param, constexpr_param)
+def _run_compiled(jit_func, *runtime_args, constexpr_param):
+    """Compile once per constexpr param, then use the fast compiled dispatcher."""
+    cache_key = constexpr_param.__cache_signature__()
+    args = runtime_args + (constexpr_param,)
 
     compiled_cache = getattr(jit_func, "_compiled_cache", None)
     if compiled_cache is None:
