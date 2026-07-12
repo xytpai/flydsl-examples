@@ -411,12 +411,13 @@ def assert_hgemm_wmma_kernel(
 
 def _make_hgemm_wmma_kernel_name(param: HGemmWmmaConstexprParam):
     dtype_str = HGEMM_DTYPE_STR_MAP[param.DTYPE_ID]
-    name = f"HGEMM_{dtype_str}_{param.BLOCK_M}x{param.BLOCK_N}x{param.BLOCK_K}x{param.STAGES}_SPK{param.SPLIT_K}_W{param.BLOCK_M_WARPS}x{param.BLOCK_N_WARPS}x{param.BLOCK_K_WARPS}_TN"
-    name += "_HT" if param.USE_HALF_TILE_INTERLEAVED else "_FT"
-    name += f"_GM{max(param.GROUP_M, 0)}"
-    name += "_BIAS" if param.HAS_BIAS else ""
-    name += "_KTAIL" if param.HAS_K_TAIL else ""
-    return name.upper()
+    out_dtype_str = "bf16" if "fp8" in dtype_str else dtype_str
+    policy = "ht" if param.USE_HALF_TILE_INTERLEAVED else "ft"
+    name = f"hgemm_a{dtype_str}_w{dtype_str}_{out_dtype_str}_t{param.BLOCK_M}x{param.BLOCK_N}x{param.BLOCK_K}x{param.STAGES}_ks{param.SPLIT_K}"
+    name += f"_w{param.BLOCK_M_WARPS}x{param.BLOCK_N_WARPS}x{param.BLOCK_K_WARPS}_bias{int(param.HAS_BIAS)}_ktail{int(param.HAS_K_TAIL)}"
+    name += f"_gm{param.GROUP_M}_p{policy}"
+    name += "nt"
+    return name
 
 
 def _make_hgemm_wmma_impl(param: HGemmWmmaConstexprParam):
