@@ -32,6 +32,7 @@ from .hgemm_wmma_gfx950_utils import (
     __barrier,
     __s_barrier,
     buffer_load_lds_inline,
+    atomic_add_stg_vec,
     SplitKProtocol,
     BlockSwizzle,
 )
@@ -53,6 +54,13 @@ HGEMM_DTYPE_STR_MAP = {
 }
 
 
+HGEMM_TORCH_DTYPE_ID_MAP = {
+    torch.float32: HGEMM_DTYPE_F32,
+    torch.bfloat16: HGEMM_DTYPE_BF16,
+    torch.float16: HGEMM_DTYPE_F16,
+}
+
+
 @flyc.jit
 def get_dtype_in_kernel(dtype_id):
     HGEMM_DTYPE_IN_KERNEL_MAP = {
@@ -64,9 +72,18 @@ def get_dtype_in_kernel(dtype_id):
     return HGEMM_DTYPE_IN_KERNEL_MAP[dtype_id]
 
 
+def get_hgemm_dtype_bytes(dtype_id: int):
+    if dtype_id == HGEMM_DTYPE_FP8_PTPC:
+        return 1
+    if dtype_id == HGEMM_DTYPE_F32:
+        return 4
+    return 2
+
+
 @fx.struct
 class HGemmWmmaConstexprParam:
     DTYPE_ID: fx.Constexpr[int]
+    OUT_DTYPE_ID: fx.Constexpr[int]
     BLOCK_M: fx.Constexpr[int]
     BLOCK_N: fx.Constexpr[int]
     BLOCK_K: fx.Constexpr[int]
@@ -128,6 +145,7 @@ class HGemmWmmaConstexprParam:
 
 def init_hgemm_wmma_constexpr_param(
     DTYPE_ID: int,
+    OUT_DTYPE_ID: int,
     TILE_M: int,
     TILE_N: int,
     TILE_K: int,
@@ -141,6 +159,16 @@ def init_hgemm_wmma_constexpr_param(
     GROUP_M: int,
     USE_HALF_TILE_INTERLEAVED: bool,
 ):
+    assert DTYPE_ID in (
+        HGEMM_DTYPE_BF16,
+        HGEMM_DTYPE_F16,
+        HGEMM_DTYPE_FP8_PTPC,
+    )
+    assert OUT_DTYPE_ID in (
+        HGEMM_DTYPE_F32,
+        HGEMM_DTYPE_BF16,
+        HGEMM_DTYPE_F16,
+    )
     DTYPE_STR = HGEMM_DTYPE_STR_MAP[DTYPE_ID]
     assert BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS <= 16
     assert STAGES >= 2
@@ -155,9 +183,9 @@ def init_hgemm_wmma_constexpr_param(
     IS_FP8 = "fp8" in DTYPE_STR
     IS_FP8_PTPC = DTYPE_STR == "fp8_ptpc"
     WARP_SIZE = 64
-    IN_DTYPE_BYTES = 1 if IS_FP8 else 2
-    OUT_DTYPE_BYTES = 2
-    LDG_VEC_SIZE = 16 if IS_FP8 else 8
+    IN_DTYPE_BYTES = get_hgemm_dtype_bytes(DTYPE_ID)
+    OUT_DTYPE_BYTES = get_hgemm_dtype_bytes(OUT_DTYPE_ID)
+    LDG_VEC_SIZE = 16 // IN_DTYPE_BYTES
     GPU_ARCH = get_rocm_arch()
 
     if IS_FP8:
@@ -235,13 +263,18 @@ def init_hgemm_wmma_constexpr_param(
         assert (STG_SIZE_PER_M_STEP % BLOCK_THREADS == 0) and (
             STG_WORK_SIZE_PER_M_STEP >= 1
         )
-        STG_VEC_SIZE = 8 if STG_WORK_SIZE_PER_M_STEP >= 8 else STG_WORK_SIZE_PER_M_STEP
-        assert STG_VEC_SIZE in [8, 4]
+        OUT_VEC_SIZE = 16 // OUT_DTYPE_BYTES
+        STG_VEC_SIZE = (
+            OUT_VEC_SIZE
+            if STG_WORK_SIZE_PER_M_STEP >= OUT_VEC_SIZE
+            else STG_WORK_SIZE_PER_M_STEP
+        )
+        assert STG_VEC_SIZE in [8, 4, 2]
         assert (STG_WORK_SIZE_PER_M_STEP % STG_VEC_SIZE == 0) and (
             STG_WORK_SIZE_PER_M_STEP // STG_VEC_SIZE >= 1
         )
     else:
-        STG_VEC_SIZE = 8
+        STG_VEC_SIZE = 16 // OUT_DTYPE_BYTES
 
     BLOCK_VECS_STG = STG_VEC_SIZE * BLOCK_THREADS
     STG_C_X_THREADS = BLOCK_N // STG_VEC_SIZE
@@ -293,6 +326,7 @@ def init_hgemm_wmma_constexpr_param(
 
     return HGemmWmmaConstexprParam(
         DTYPE_ID=DTYPE_ID,
+        OUT_DTYPE_ID=OUT_DTYPE_ID,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
@@ -355,6 +389,7 @@ def init_hgemm_wmma_constexpr_param(
 
 def assert_hgemm_wmma_kernel(
     DTYPE_ID: int,
+    OUT_DTYPE_ID: int,
     TILE_M: int = 128,
     TILE_N: int = 128,
     TILE_K: int = 64,
@@ -371,6 +406,7 @@ def assert_hgemm_wmma_kernel(
 ):
     param = init_hgemm_wmma_constexpr_param(
         DTYPE_ID,
+        OUT_DTYPE_ID,
         TILE_M,
         TILE_N,
         TILE_K,
@@ -411,7 +447,7 @@ def assert_hgemm_wmma_kernel(
 
 def _make_hgemm_wmma_kernel_name(param: HGemmWmmaConstexprParam):
     dtype_str = HGEMM_DTYPE_STR_MAP[param.DTYPE_ID]
-    out_dtype_str = "bf16" if "fp8" in dtype_str else dtype_str
+    out_dtype_str = HGEMM_DTYPE_STR_MAP[param.OUT_DTYPE_ID]
     policy = "ht" if param.USE_HALF_TILE_INTERLEAVED else "ft"
     name = f"hgemm_a{dtype_str}_w{dtype_str}_{out_dtype_str}_t{param.BLOCK_M}x{param.BLOCK_N}x{param.BLOCK_K}x{param.STAGES}_ks{param.SPLIT_K}"
     name += f"_w{param.BLOCK_M_WARPS}x{param.BLOCK_N_WARPS}x{param.BLOCK_K_WARPS}_bias{int(param.HAS_BIAS)}_ktail{int(param.HAS_K_TAIL)}"
@@ -534,7 +570,8 @@ def hgemm_kernel(
     # kernel impl
 
     input_dtype_ = get_dtype_in_kernel(DTYPE_ID)
-    output_dtype_ = T.bf16 if const_expr(IS_FP8) else input_dtype_
+    output_dtype_ = get_dtype_in_kernel(param.OUT_DTYPE_ID)
+    bias_dtype_ = T.bf16 if const_expr(IS_FP8_PTPC) else input_dtype_
     smem_input_dtype_ = T.i8 if const_expr(IS_FP8) else input_dtype_
 
     c_rsrc = buffer_ops.create_buffer_resource(c_ptr, max_size=True)
@@ -609,7 +646,7 @@ def hgemm_kernel(
             global_n_idx = block_n_offset + lds_n_idx
             safe_global_n_idx = (global_n_idx < n).select(global_n_idx, 0)
             bias_val = buffer_ops.buffer_load(
-                bias_rsrc, safe_global_n_idx, vec_width=1, dtype=output_dtype_
+                bias_rsrc, safe_global_n_idx, vec_width=1, dtype=bias_dtype_
             ).extf(T.f32)
             if const_expr(IS_SLICE_K):
                 is_first_k_slice = wid_k == 0
@@ -635,6 +672,7 @@ def hgemm_kernel(
             block_m_offset,
             block_n_offset,
             output_dtype_,
+            bias_dtype_,
             signal_idx,
             c_stride,
         )
@@ -966,10 +1004,11 @@ def hgemm_kernel(
                             bias_rsrc,
                             scale_b_offset,
                             vec_width=1,
-                            dtype=output_dtype_,
+                            dtype=bias_dtype_,
                         ).extf(T.f32)
                         val = val + bias
-                val = val.truncf(output_dtype_)
+                if const_expr(param.OUT_DTYPE_ID != HGEMM_DTYPE_F32):
+                    val = val.truncf(output_dtype_)
                 val = vector.from_elements(T.vec(1, output_dtype_), [val])
                 flat_offset = (wid_k * BLOCK_M + lds_m_idx) * BLOCK_N + lds_n_idx
                 vector.store(
@@ -1004,35 +1043,14 @@ def hgemm_kernel(
                 c_vec += peer_c_vec
             global_offset = global_m_idx * c_stride + global_n_idx
             if const_expr(IS_SPLIT_K):
-                # split to vec2s
-                vec2_ty = T.vec(2, output_dtype_)
-                for vec_idx in range_constexpr(STG_VEC_SIZE // 2):
-                    e0 = vector.extract(
-                        c_vec, static_position=[vec_idx * 2], dynamic_position=[]
-                    )
-                    e1 = vector.extract(
-                        c_vec,
-                        static_position=[vec_idx * 2 + 1],
-                        dynamic_position=[],
-                    )
-                    pair = vector.from_elements(vec2_ty, [e0, e1])
-                    pair_v = (
-                        pair._value if const_expr(hasattr(pair, "_value")) else pair
-                    )
-                    pair_ptr_v = get_llvm_ptr(
-                        c_ptr,
-                        global_offset + vec_idx * 2,
-                        OUT_DTYPE_BYTES,
-                        ir.Type.parse("!llvm.ptr<1>"),
-                    )
-                    llvm.AtomicRMWOp(
-                        llvm.AtomicBinOp.fadd,
-                        pair_ptr_v,
-                        pair_v,
-                        llvm.AtomicOrdering.monotonic,
-                        syncscope="agent",
-                        alignment=4,
-                    )
+                atomic_add_stg_vec(
+                    c_ptr,
+                    global_offset,
+                    c_vec,
+                    STG_VEC_SIZE,
+                    OUT_DTYPE_BYTES,
+                    output_dtype_,
+                )
             else:
                 buffer_ops.buffer_store(c_vec, c_rsrc, global_offset)
     return
@@ -1125,7 +1143,8 @@ def hgemm_ht_kernel(
     # kernel impl
 
     input_dtype_ = get_dtype_in_kernel(DTYPE_ID)
-    output_dtype_ = T.bf16 if const_expr(IS_FP8) else input_dtype_
+    output_dtype_ = get_dtype_in_kernel(param.OUT_DTYPE_ID)
+    bias_dtype_ = T.bf16 if const_expr(IS_FP8_PTPC) else input_dtype_
     smem_input_dtype_ = T.i8 if const_expr(IS_FP8) else input_dtype_
     acc_init = arith.constant_vector(0.0, T.vec(WMMA_C_FRAG_VALUES, T.f32))
 
@@ -1197,7 +1216,7 @@ def hgemm_ht_kernel(
                 global_n_idx = block_n_offset + lds_n_idx
                 safe_global_n_idx = (global_n_idx < n).select(global_n_idx, 0)
                 bias_val = buffer_ops.buffer_load(
-                    bias_rsrc, safe_global_n_idx, vec_width=1, dtype=output_dtype_
+                    bias_rsrc, safe_global_n_idx, vec_width=1, dtype=bias_dtype_
                 ).extf(T.f32)
                 bias_frags[n_part * WARP_N_STEPS + ni] = vector.broadcast(
                     T.vec(WMMA_C_FRAG_VALUES, T.f32), bias_val
@@ -1250,6 +1269,7 @@ def hgemm_ht_kernel(
             block_m_offset,
             block_n_offset,
             output_dtype_,
+            bias_dtype_,
             signal_idx,
             c_stride,
         )
@@ -1588,7 +1608,7 @@ def hgemm_ht_kernel(
                         bias_rsrc,
                         safe_col_global,
                         vec_width=1,
-                        dtype=output_dtype_,
+                        dtype=bias_dtype_,
                     ).extf(T.f32)
                 if const_expr(IS_FP8_PTPC):
                     scale_b = scale_b_frags[ni]
@@ -1611,7 +1631,8 @@ def hgemm_ht_kernel(
                         val = val * scale_a * scale_b
                         if const_expr(HAS_BIAS and not IS_SPLIT_K):
                             val = val + bias
-                    val = val.truncf(output_dtype_)
+                    if const_expr(param.OUT_DTYPE_ID != HGEMM_DTYPE_F32):
+                        val = val.truncf(output_dtype_)
                     val = vector.from_elements(T.vec(1, output_dtype_), [val])
                     flat_offset = lds_m_idx * BLOCK_N + lds_n_idx
                     vector.store(
@@ -1620,30 +1641,14 @@ def hgemm_ht_kernel(
 
     def atomic_add_vec_to_c(global_m_idx, global_n_idx, vec):
         global_offset = global_m_idx * c_stride + global_n_idx
-        vec2_ty = T.vec(2, output_dtype_)
-        for vec_idx in range_constexpr(STG_VEC_SIZE // 2):
-            e0 = vector.extract(vec, static_position=[vec_idx * 2], dynamic_position=[])
-            e1 = vector.extract(
-                vec,
-                static_position=[vec_idx * 2 + 1],
-                dynamic_position=[],
-            )
-            pair = vector.from_elements(vec2_ty, [e0, e1])
-            pair_v = pair._value if const_expr(hasattr(pair, "_value")) else pair
-            pair_ptr_v = get_llvm_ptr(
-                c_ptr,
-                global_offset + vec_idx * 2,
-                OUT_DTYPE_BYTES,
-                ir.Type.parse("!llvm.ptr<1>"),
-            )
-            llvm.AtomicRMWOp(
-                llvm.AtomicBinOp.fadd,
-                pair_ptr_v,
-                pair_v,
-                llvm.AtomicOrdering.monotonic,
-                syncscope="agent",
-                alignment=4,
-            )
+        atomic_add_stg_vec(
+            c_ptr,
+            global_offset,
+            vec,
+            STG_VEC_SIZE,
+            OUT_DTYPE_BYTES,
+            output_dtype_,
+        )
 
     def store_vec_to_c(global_m_idx, global_n_idx, vec):
         if const_expr(IS_SPLIT_K):
@@ -1933,7 +1938,11 @@ def get_default_b8_kwargs(m, n, k):
     return kwargs
 
 
-def hgemm_validate(dtype_id, m, n, k, kwargs, tune_mode=False):
+def hgemm_validate(dtype_id, m, n, k, kwargs, tune_mode=False, out_dtype_id=None):
+    if out_dtype_id is None:
+        out_dtype_id = (
+            HGEMM_DTYPE_BF16 if dtype_id == HGEMM_DTYPE_FP8_PTPC else dtype_id
+        )
     TILE_M = kwargs["TILE_M"]
     TILE_N = kwargs["TILE_N"]
     TILE_K = kwargs["TILE_K"]
@@ -1945,11 +1954,13 @@ def hgemm_validate(dtype_id, m, n, k, kwargs, tune_mode=False):
     USE_HALF_TILE_INTERLEAVED = kwargs["USE_HALF_TILE_INTERLEAVED"]
     GPU_ARCH = get_rocm_arch()
     IS_FP8 = "fp8" in HGEMM_DTYPE_STR_MAP[dtype_id]
-    DTYPE_BYTES = 1 if IS_FP8 else 2
+    DTYPE_BYTES = get_hgemm_dtype_bytes(dtype_id)
+    OUT_DTYPE_BYTES = get_hgemm_dtype_bytes(out_dtype_id)
 
     try:
         assert_hgemm_wmma_kernel(
             DTYPE_ID=dtype_id,
+            OUT_DTYPE_ID=out_dtype_id,
             TILE_M=TILE_M,
             TILE_N=TILE_N,
             TILE_K=TILE_K,
@@ -1979,7 +1990,7 @@ def hgemm_validate(dtype_id, m, n, k, kwargs, tune_mode=False):
     def get_stage_smem_use(stages_):
         SMEM_USE = stages_ * TILE_M * TILE_K * DTYPE_BYTES
         SMEM_USE += stages_ * TILE_N * TILE_K * DTYPE_BYTES
-        SMEM_USE = max(SMEM_USE, BLOCK_K_WARPS * TILE_M * TILE_N * DTYPE_BYTES)
+        SMEM_USE = max(SMEM_USE, BLOCK_K_WARPS * TILE_M * TILE_N * OUT_DTYPE_BYTES)
         return SMEM_USE
 
     smem_use_s0 = get_stage_smem_use(STAGES)
@@ -2070,7 +2081,11 @@ def _hgemm_has_smaller_supported_split_k(config, supported_split_k, m, n):
     )
 
 
-def hgemm_get_configs(dtype_id, m, n, k):
+def hgemm_get_configs(dtype_id, m, n, k, out_dtype_id=None):
+    if out_dtype_id is None:
+        out_dtype_id = (
+            HGEMM_DTYPE_BF16 if dtype_id == HGEMM_DTYPE_FP8_PTPC else dtype_id
+        )
     selections = {
         "TILE_M": [16, 32, 48, 64, 80, 96, 128, 256],
         "TILE_N": [64, 80, 96, 128, 256],
@@ -2113,7 +2128,9 @@ def hgemm_get_configs(dtype_id, m, n, k):
                 config, selections["SPLIT_K"], m, n
             )
             and _hgemm_config_tile_iou(m, n, k, config) >= tile_iou_threshold
-            and hgemm_validate(dtype_id, m, n, k, config, True)
+            and hgemm_validate(
+                dtype_id, m, n, k, config, True, out_dtype_id=out_dtype_id
+            )
         ]
     return configs
 
@@ -2153,6 +2170,7 @@ def hgemm(
     user_kwargs: dict = {},
     scale_a: Optional[torch.Tensor] = None,
     scale_b: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
     stream: Optional[torch.cuda.Stream] = None,
 ) -> torch.Tensor:
     if stream is None:
@@ -2172,13 +2190,16 @@ def hgemm(
     is_fp8_ptpc = scale_a is not None or scale_b is not None
 
     if c is None:
-        if is_fp8_ptpc:
-            c = torch.empty((m, n), dtype=torch.bfloat16, device=a.device)
-        else:
-            c = torch.empty((m, n), dtype=a.dtype, device=a.device)
+        if out_dtype is None:
+            out_dtype = torch.bfloat16 if is_fp8_ptpc else a.dtype
+        c = torch.empty((m, n), dtype=out_dtype, device=a.device)
+    elif out_dtype is not None:
+        assert c.dtype == out_dtype
     c = c.view(-1, n)
     assert c.shape[0] == m
     assert a.device == c.device
+    assert c.dtype in HGEMM_TORCH_DTYPE_ID_MAP
+    out_dtype_id = HGEMM_TORCH_DTYPE_ID_MAP[c.dtype]
 
     if not a.is_contiguous():
         a = a.contiguous()
@@ -2207,16 +2228,18 @@ def hgemm(
     bias_tensor = a if bias is None else bias
     if bias is not None:
         assert bias.shape[0] == n
+        expected_bias_dtype = torch.bfloat16 if is_fp8_ptpc else a.dtype
+        assert bias.dtype == expected_bias_dtype
 
     if is_fp8_ptpc:
         assert scale_a is not None and scale_b is not None
         assert scale_a.shape[0] == m
         assert scale_b.shape[0] == n
-        assert c.dtype == torch.bfloat16
         dtype_id = HGEMM_DTYPE_FP8_PTPC
-        hgemm_validate(dtype_id, m, n, k, kwargs)
+        hgemm_validate(dtype_id, m, n, k, kwargs, out_dtype_id=out_dtype_id)
         constexpr_param = init_hgemm_wmma_constexpr_param(
             dtype_id,
+            out_dtype_id,
             TILE_M=kwargs["TILE_M"],
             TILE_N=kwargs["TILE_N"],
             TILE_K=kwargs["TILE_K"],
@@ -2248,9 +2271,10 @@ def hgemm(
         )
     else:
         dtype_id = HGEMM_DTYPE_F16 if a.dtype == torch.half else HGEMM_DTYPE_BF16
-        hgemm_validate(dtype_id, m, n, k, kwargs)
+        hgemm_validate(dtype_id, m, n, k, kwargs, out_dtype_id=out_dtype_id)
         constexpr_param = init_hgemm_wmma_constexpr_param(
             dtype_id,
+            out_dtype_id,
             TILE_M=kwargs["TILE_M"],
             TILE_N=kwargs["TILE_N"],
             TILE_K=kwargs["TILE_K"],

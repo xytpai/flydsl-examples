@@ -27,6 +27,7 @@ class _TestArgs:
     HAS_BIAS: bool
     GROUP_M: int
     USE_HALF_TILE_INTERLEAVED: bool
+    out_dtype: torch.dtype | None = None
 
 
 def get_torch_fp8_dtype():
@@ -78,9 +79,10 @@ def create_inputs(args: _TestArgs):
 
 def create_outputs(args: _TestArgs):
     if args.dtype == "fp8_ptpc":
-        c = torch.randn((args.m, args.n), dtype=torch.bfloat16, device="cuda")
+        dtype = torch.bfloat16 if args.out_dtype is None else args.out_dtype
     else:
-        c = torch.randn((args.m, args.n), dtype=args.dtype, device="cuda")
+        dtype = args.dtype if args.out_dtype is None else args.out_dtype
+    c = torch.randn((args.m, args.n), dtype=dtype, device="cuda")
     return (c,)
 
 
@@ -97,6 +99,12 @@ def ref_func(*args):
     else:
         a, b, bias, c = args
         F.linear(a, b, out=c, bias=bias)
+        if c.dtype == a.dtype:
+            F.linear(a, b, out=c, bias=bias)
+        else:
+            c_ = torch.empty_like(c, dtype=a.dtype)
+            F.linear(a, b, out=c_, bias=bias)
+            c.copy_(c_.to(c.dtype))
 
 
 def func(*args):
@@ -164,6 +172,89 @@ def check_acc(args: _TestArgs):
                 check_dtype=True,
             )
     print(f"\n{args}\nmaxdiff_out:{maxdiff_out_}")
+
+
+@pytest.mark.parametrize(
+    "m, n, k, kwargs",
+    [
+        (
+            64,
+            64,
+            256,
+            {
+                "TILE_M": 64,
+                "TILE_N": 64,
+                "TILE_K": 64,
+                "STAGES": 4,
+                "SPLIT_K": 1,
+                "BLOCK_M_WARPS": 2,
+                "BLOCK_N_WARPS": 2,
+                "BLOCK_K_WARPS": 1,
+                "GROUP_M": 0,
+                "USE_HALF_TILE_INTERLEAVED": False,
+            },
+        ),
+        (
+            64,
+            64,
+            256,
+            {
+                "TILE_M": 64,
+                "TILE_N": 64,
+                "TILE_K": 64,
+                "STAGES": 2,
+                "SPLIT_K": 1,
+                "BLOCK_M_WARPS": 2,
+                "BLOCK_N_WARPS": 2,
+                "BLOCK_K_WARPS": 1,
+                "GROUP_M": 0,
+                "USE_HALF_TILE_INTERLEAVED": True,
+            },
+        ),
+        (
+            64,
+            64,
+            256,
+            {
+                "TILE_M": 64,
+                "TILE_N": 64,
+                "TILE_K": 64,
+                "STAGES": 4,
+                "SPLIT_K": 2,
+                "BLOCK_M_WARPS": 2,
+                "BLOCK_N_WARPS": 2,
+                "BLOCK_K_WARPS": 1,
+                "GROUP_M": 0,
+                "USE_HALF_TILE_INTERLEAVED": False,
+            },
+        ),
+        (
+            64,
+            64,
+            256,
+            {
+                "TILE_M": 64,
+                "TILE_N": 64,
+                "TILE_K": 64,
+                "STAGES": 2,
+                "SPLIT_K": 2,
+                "BLOCK_M_WARPS": 2,
+                "BLOCK_N_WARPS": 2,
+                "BLOCK_K_WARPS": 1,
+                "GROUP_M": 0,
+                "USE_HALF_TILE_INTERLEAVED": True,
+            },
+        ),
+    ],
+)
+def test_hgemm_bf16_fp32_out_dtype(m: int, n: int, k: int, kwargs: dict):
+    a = torch.empty((m, k), dtype=torch.bfloat16, device="cuda").uniform_(-1, 1)
+    b = torch.empty((n, k), dtype=torch.bfloat16, device="cuda").uniform_(-1, 1)
+    bias = torch.empty((n,), dtype=torch.bfloat16, device="cuda").uniform_(10, 20)
+    c = hgemm(a, b, bias=bias, user_kwargs=kwargs, out_dtype=torch.float32)
+    ref = torch.addmm(bias.float(), a.float(), b.float().t())
+    assert c.dtype is torch.float32
+    torch.testing.assert_close(c, ref, atol=2e-1, rtol=2e-1, check_dtype=True)
 
 
 def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
