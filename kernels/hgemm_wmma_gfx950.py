@@ -33,6 +33,7 @@ from .hgemm_wmma_gfx950_utils import (
     __s_barrier,
     buffer_load_lds_inline,
     atomic_add_stg_vec,
+    cast_vec_to_global_dtype,
     SplitKProtocol,
     BlockSwizzle,
 )
@@ -263,10 +264,10 @@ def init_hgemm_wmma_constexpr_param(
         assert (STG_SIZE_PER_M_STEP % BLOCK_THREADS == 0) and (
             STG_WORK_SIZE_PER_M_STEP >= 1
         )
-        OUT_VEC_SIZE = 16 // OUT_DTYPE_BYTES
+        SMEM_C_VEC_SIZE = 16 // 2
         STG_VEC_SIZE = (
-            OUT_VEC_SIZE
-            if STG_WORK_SIZE_PER_M_STEP >= OUT_VEC_SIZE
+            SMEM_C_VEC_SIZE
+            if STG_WORK_SIZE_PER_M_STEP >= SMEM_C_VEC_SIZE
             else STG_WORK_SIZE_PER_M_STEP
         )
         assert STG_VEC_SIZE in [8, 4, 2]
@@ -274,7 +275,7 @@ def init_hgemm_wmma_constexpr_param(
             STG_WORK_SIZE_PER_M_STEP // STG_VEC_SIZE >= 1
         )
     else:
-        STG_VEC_SIZE = 16 // OUT_DTYPE_BYTES
+        STG_VEC_SIZE = 16 // 2
 
     BLOCK_VECS_STG = STG_VEC_SIZE * BLOCK_THREADS
     STG_C_X_THREADS = BLOCK_N // STG_VEC_SIZE
@@ -321,7 +322,7 @@ def init_hgemm_wmma_constexpr_param(
     SMEM_USE = AS_BYTES
     BS_BYTES = STAGES * BLOCK_N * BLOCK_K * IN_DTYPE_BYTES
     SMEM_USE += BS_BYTES
-    SMEM_USE_ = max(SMEM_USE, BLOCK_K_WARPS * BLOCK_M * BLOCK_N * OUT_DTYPE_BYTES)
+    SMEM_USE_ = max(SMEM_USE, BLOCK_K_WARPS * BLOCK_M * BLOCK_N * 2)
     assert SMEM_USE_ <= SMEM_CAPACITY_MAP[GPU_ARCH]
 
     return HGemmWmmaConstexprParam(
@@ -478,7 +479,7 @@ def _make_hgemm_wmma_allocator(param: HGemmWmmaConstexprParam):
     SMEM_USE = AS_BYTES + BS_BYTES
     SMEM_USE_ = max(
         SMEM_USE,
-        param.BLOCK_K_WARPS * param.BLOCK_M * param.BLOCK_N * param.OUT_DTYPE_BYTES,
+        param.BLOCK_K_WARPS * param.BLOCK_M * param.BLOCK_N * 2,
     )
     allocator.ptr += SMEM_USE_ - SMEM_USE
     assert SMEM_USE_ <= SMEM_CAPACITY_MAP[GPU_ARCH]
@@ -570,7 +571,8 @@ def hgemm_kernel(
     # kernel impl
 
     input_dtype_ = get_dtype_in_kernel(DTYPE_ID)
-    output_dtype_ = get_dtype_in_kernel(param.OUT_DTYPE_ID)
+    smem_output_dtype_ = T.bf16 if const_expr(IS_FP8) else input_dtype_
+    global_output_dtype_ = get_dtype_in_kernel(param.OUT_DTYPE_ID)
     bias_dtype_ = T.bf16 if const_expr(IS_FP8_PTPC) else input_dtype_
     smem_input_dtype_ = T.i8 if const_expr(IS_FP8) else input_dtype_
 
@@ -603,7 +605,7 @@ def hgemm_kernel(
     smem_c_ptr = SmemPtr(
         base_ptr,
         smem_a_offset,
-        output_dtype_,
+        smem_output_dtype_,
         shape=(BLOCK_K_WARPS * BLOCK_M * BLOCK_N,),
     )
 
@@ -671,7 +673,7 @@ def hgemm_kernel(
             n,
             block_m_offset,
             block_n_offset,
-            output_dtype_,
+            global_output_dtype_,
             bias_dtype_,
             signal_idx,
             c_stride,
@@ -1007,9 +1009,8 @@ def hgemm_kernel(
                             dtype=bias_dtype_,
                         ).extf(T.f32)
                         val = val + bias
-                if const_expr(param.OUT_DTYPE_ID != HGEMM_DTYPE_F32):
-                    val = val.truncf(output_dtype_)
-                val = vector.from_elements(T.vec(1, output_dtype_), [val])
+                val = val.truncf(smem_output_dtype_)
+                val = vector.from_elements(T.vec(1, smem_output_dtype_), [val])
                 flat_offset = (wid_k * BLOCK_M + lds_m_idx) * BLOCK_N + lds_n_idx
                 vector.store(
                     val, smem_c_ptr.get(), [fx.Index(flat_offset)], alignment=16
@@ -1021,6 +1022,25 @@ def hgemm_kernel(
     else:
         gpu.barrier()
     smem_c_ptr_ = smem_c_ptr.get()
+
+    def store_global_vec(vec, global_offset):
+        if const_expr(param.OUT_DTYPE_ID == HGEMM_DTYPE_F32 and STG_VEC_SIZE == 8):
+            lo_vals = [arith.constant(0.0, type=global_output_dtype_)] * 4
+            hi_vals = [arith.constant(0.0, type=global_output_dtype_)] * 4
+            for elem_idx in range_constexpr(4):
+                lo_vals[elem_idx] = vector.extract(
+                    vec, static_position=[elem_idx], dynamic_position=[]
+                )
+                hi_vals[elem_idx] = vector.extract(
+                    vec, static_position=[elem_idx + 4], dynamic_position=[]
+                )
+            lo_vec = vector.from_elements(T.vec(4, global_output_dtype_), lo_vals)
+            hi_vec = vector.from_elements(T.vec(4, global_output_dtype_), hi_vals)
+            buffer_ops.buffer_store(lo_vec, c_rsrc, global_offset)
+            buffer_ops.buffer_store(hi_vec, c_rsrc, global_offset + 4)
+        else:
+            buffer_ops.buffer_store(vec, c_rsrc, global_offset)
+
     for i in range_constexpr(STG_C_ITERS):
         global_tid = BLOCK_THREADS * i + tid
         m_local_idx = global_tid // STG_C_X_THREADS
@@ -1030,29 +1050,37 @@ def hgemm_kernel(
         if (global_m_idx < m) and (global_n_idx < n):
             flat_offset = m_local_idx * BLOCK_N + n_local_idx
             c_vec = vector.load_op(
-                T.vec(STG_VEC_SIZE, output_dtype_),
+                T.vec(STG_VEC_SIZE, smem_output_dtype_),
                 smem_c_ptr_,
                 [fx.Index(flat_offset)],
             )
             for ksi in range_constexpr(1, BLOCK_K_WARPS):
                 peer_c_vec = vector.load_op(
-                    T.vec(STG_VEC_SIZE, output_dtype_),
+                    T.vec(STG_VEC_SIZE, smem_output_dtype_),
                     smem_c_ptr_,
                     [fx.Index(flat_offset + ksi * BLOCK_M * BLOCK_N)],
                 )
                 c_vec += peer_c_vec
+            c_vec_global = cast_vec_to_global_dtype(
+                c_vec,
+                STG_VEC_SIZE,
+                global_output_dtype_,
+                (param.OUT_DTYPE_ID == HGEMM_DTYPE_BF16 and IS_FP8)
+                or (param.OUT_DTYPE_ID == DTYPE_ID and not IS_FP8),
+                param.OUT_DTYPE_ID == HGEMM_DTYPE_F32,
+            )
             global_offset = global_m_idx * c_stride + global_n_idx
             if const_expr(IS_SPLIT_K):
                 atomic_add_stg_vec(
                     c_ptr,
                     global_offset,
-                    c_vec,
+                    c_vec_global,
                     STG_VEC_SIZE,
                     OUT_DTYPE_BYTES,
-                    output_dtype_,
+                    global_output_dtype_,
                 )
             else:
-                buffer_ops.buffer_store(c_vec, c_rsrc, global_offset)
+                store_global_vec(c_vec_global, global_offset)
     return
 
 
@@ -1143,7 +1171,8 @@ def hgemm_ht_kernel(
     # kernel impl
 
     input_dtype_ = get_dtype_in_kernel(DTYPE_ID)
-    output_dtype_ = get_dtype_in_kernel(param.OUT_DTYPE_ID)
+    smem_output_dtype_ = T.bf16 if const_expr(IS_FP8) else input_dtype_
+    global_output_dtype_ = get_dtype_in_kernel(param.OUT_DTYPE_ID)
     bias_dtype_ = T.bf16 if const_expr(IS_FP8_PTPC) else input_dtype_
     smem_input_dtype_ = T.i8 if const_expr(IS_FP8) else input_dtype_
     acc_init = arith.constant_vector(0.0, T.vec(WMMA_C_FRAG_VALUES, T.f32))
@@ -1177,7 +1206,7 @@ def hgemm_ht_kernel(
     smem_c_ptr = SmemPtr(
         base_ptr,
         smem_a_offset,
-        output_dtype_,
+        smem_output_dtype_,
         shape=(BLOCK_K_WARPS * BLOCK_M * BLOCK_N,),
     )
 
@@ -1268,7 +1297,7 @@ def hgemm_ht_kernel(
             n,
             block_m_offset,
             block_n_offset,
-            output_dtype_,
+            global_output_dtype_,
             bias_dtype_,
             signal_idx,
             c_stride,
@@ -1631,9 +1660,8 @@ def hgemm_ht_kernel(
                         val = val * scale_a * scale_b
                         if const_expr(HAS_BIAS and not IS_SPLIT_K):
                             val = val + bias
-                    if const_expr(param.OUT_DTYPE_ID != HGEMM_DTYPE_F32):
-                        val = val.truncf(output_dtype_)
-                    val = vector.from_elements(T.vec(1, output_dtype_), [val])
+                    val = val.truncf(smem_output_dtype_)
+                    val = vector.from_elements(T.vec(1, smem_output_dtype_), [val])
                     flat_offset = lds_m_idx * BLOCK_N + lds_n_idx
                     vector.store(
                         val, smem_c_ptr.get(), [fx.Index(flat_offset)], alignment=16
@@ -1641,21 +1669,52 @@ def hgemm_ht_kernel(
 
     def atomic_add_vec_to_c(global_m_idx, global_n_idx, vec):
         global_offset = global_m_idx * c_stride + global_n_idx
+        vec = cast_vec_to_global_dtype(
+            vec,
+            STG_VEC_SIZE,
+            global_output_dtype_,
+            (param.OUT_DTYPE_ID == HGEMM_DTYPE_BF16 and IS_FP8)
+            or (param.OUT_DTYPE_ID == DTYPE_ID and not IS_FP8),
+            param.OUT_DTYPE_ID == HGEMM_DTYPE_F32,
+        )
         atomic_add_stg_vec(
             c_ptr,
             global_offset,
             vec,
             STG_VEC_SIZE,
             OUT_DTYPE_BYTES,
-            output_dtype_,
+            global_output_dtype_,
         )
 
     def store_vec_to_c(global_m_idx, global_n_idx, vec):
         if const_expr(IS_SPLIT_K):
             atomic_add_vec_to_c(global_m_idx, global_n_idx, vec)
         else:
+            vec = cast_vec_to_global_dtype(
+                vec,
+                STG_VEC_SIZE,
+                global_output_dtype_,
+                (param.OUT_DTYPE_ID == HGEMM_DTYPE_BF16 and IS_FP8)
+                or (param.OUT_DTYPE_ID == DTYPE_ID and not IS_FP8),
+                param.OUT_DTYPE_ID == HGEMM_DTYPE_F32,
+            )
             global_offset = global_m_idx * c_stride + global_n_idx
-            buffer_ops.buffer_store(vec, c_rsrc, global_offset)
+            if const_expr(param.OUT_DTYPE_ID == HGEMM_DTYPE_F32 and STG_VEC_SIZE == 8):
+                lo_vals = [arith.constant(0.0, type=global_output_dtype_)] * 4
+                hi_vals = [arith.constant(0.0, type=global_output_dtype_)] * 4
+                for elem_idx in range_constexpr(4):
+                    lo_vals[elem_idx] = vector.extract(
+                        vec, static_position=[elem_idx], dynamic_position=[]
+                    )
+                    hi_vals[elem_idx] = vector.extract(
+                        vec, static_position=[elem_idx + 4], dynamic_position=[]
+                    )
+                lo_vec = vector.from_elements(T.vec(4, global_output_dtype_), lo_vals)
+                hi_vec = vector.from_elements(T.vec(4, global_output_dtype_), hi_vals)
+                buffer_ops.buffer_store(lo_vec, c_rsrc, global_offset)
+                buffer_ops.buffer_store(hi_vec, c_rsrc, global_offset + 4)
+            else:
+                buffer_ops.buffer_store(vec, c_rsrc, global_offset)
 
     def store_matrix_from_lds(m_, n_):
         smem_c_ptr_ = smem_c_ptr.get()
@@ -1679,7 +1738,7 @@ def hgemm_ht_kernel(
                 if (global_m_idx < m) and (global_n_idx < n):
                     flat_offset = m_tile_idx * BLOCK_N + n_tile_idx
                     c_vec = vector.load_op(
-                        T.vec(STG_VEC_SIZE, output_dtype_),
+                        T.vec(STG_VEC_SIZE, smem_output_dtype_),
                         smem_c_ptr_,
                         [fx.Index(flat_offset)],
                     )
@@ -1955,7 +2014,6 @@ def hgemm_validate(dtype_id, m, n, k, kwargs, tune_mode=False, out_dtype_id=None
     GPU_ARCH = get_rocm_arch()
     IS_FP8 = "fp8" in HGEMM_DTYPE_STR_MAP[dtype_id]
     DTYPE_BYTES = get_hgemm_dtype_bytes(dtype_id)
-    OUT_DTYPE_BYTES = get_hgemm_dtype_bytes(out_dtype_id)
 
     try:
         assert_hgemm_wmma_kernel(
@@ -1990,7 +2048,7 @@ def hgemm_validate(dtype_id, m, n, k, kwargs, tune_mode=False, out_dtype_id=None
     def get_stage_smem_use(stages_):
         SMEM_USE = stages_ * TILE_M * TILE_K * DTYPE_BYTES
         SMEM_USE += stages_ * TILE_N * TILE_K * DTYPE_BYTES
-        SMEM_USE = max(SMEM_USE, BLOCK_K_WARPS * TILE_M * TILE_N * OUT_DTYPE_BYTES)
+        SMEM_USE = max(SMEM_USE, BLOCK_K_WARPS * TILE_M * TILE_N * 2)
         return SMEM_USE
 
     smem_use_s0 = get_stage_smem_use(STAGES)
