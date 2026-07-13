@@ -28,7 +28,6 @@ from .hgemm_wmma_gfx950_utils import (
     WmmaFp8_m16n16k128,
     swizzle_xor16,
     swizzle_fp8_128,
-    get_llvm_ptr,
     __barrier,
     __s_barrier,
     buffer_load_lds_inline,
@@ -571,10 +570,9 @@ def hgemm_kernel(
     # kernel impl
 
     input_dtype_ = get_dtype_in_kernel(DTYPE_ID)
-    smem_output_dtype_ = T.bf16 if const_expr(IS_FP8) else input_dtype_
     global_output_dtype_ = get_dtype_in_kernel(param.OUT_DTYPE_ID)
-    bias_dtype_ = T.bf16 if const_expr(IS_FP8_PTPC) else input_dtype_
     smem_input_dtype_ = T.i8 if const_expr(IS_FP8) else input_dtype_
+    smem_output_dtype_ = T.bf16 if const_expr(IS_FP8) else input_dtype_
 
     c_rsrc = buffer_ops.create_buffer_resource(c_ptr, max_size=True)
     a_rsrc = buffer_ops.create_buffer_resource(a_ptr, max_size=True)
@@ -648,7 +646,7 @@ def hgemm_kernel(
             global_n_idx = block_n_offset + lds_n_idx
             safe_global_n_idx = (global_n_idx < n).select(global_n_idx, 0)
             bias_val = buffer_ops.buffer_load(
-                bias_rsrc, safe_global_n_idx, vec_width=1, dtype=bias_dtype_
+                bias_rsrc, safe_global_n_idx, vec_width=1, dtype=smem_output_dtype_
             ).extf(T.f32)
             if const_expr(IS_SLICE_K):
                 is_first_k_slice = wid_k == 0
@@ -674,7 +672,7 @@ def hgemm_kernel(
             block_m_offset,
             block_n_offset,
             global_output_dtype_,
-            bias_dtype_,
+            smem_output_dtype_,
             signal_idx,
             c_stride,
         )
@@ -1006,7 +1004,7 @@ def hgemm_kernel(
                             bias_rsrc,
                             scale_b_offset,
                             vec_width=1,
-                            dtype=bias_dtype_,
+                            dtype=smem_output_dtype_,
                         ).extf(T.f32)
                         val = val + bias
                 val = val.truncf(smem_output_dtype_)
@@ -1171,10 +1169,10 @@ def hgemm_ht_kernel(
     # kernel impl
 
     input_dtype_ = get_dtype_in_kernel(DTYPE_ID)
-    smem_output_dtype_ = T.bf16 if const_expr(IS_FP8) else input_dtype_
     global_output_dtype_ = get_dtype_in_kernel(param.OUT_DTYPE_ID)
-    bias_dtype_ = T.bf16 if const_expr(IS_FP8_PTPC) else input_dtype_
     smem_input_dtype_ = T.i8 if const_expr(IS_FP8) else input_dtype_
+    smem_output_dtype_ = T.bf16 if const_expr(IS_FP8) else input_dtype_
+
     acc_init = arith.constant_vector(0.0, T.vec(WMMA_C_FRAG_VALUES, T.f32))
 
     c_rsrc = buffer_ops.create_buffer_resource(c_ptr, max_size=True)
@@ -1245,7 +1243,7 @@ def hgemm_ht_kernel(
                 global_n_idx = block_n_offset + lds_n_idx
                 safe_global_n_idx = (global_n_idx < n).select(global_n_idx, 0)
                 bias_val = buffer_ops.buffer_load(
-                    bias_rsrc, safe_global_n_idx, vec_width=1, dtype=bias_dtype_
+                    bias_rsrc, safe_global_n_idx, vec_width=1, dtype=smem_output_dtype_
                 ).extf(T.f32)
                 bias_frags[n_part * WARP_N_STEPS + ni] = vector.broadcast(
                     T.vec(WMMA_C_FRAG_VALUES, T.f32), bias_val
@@ -1298,7 +1296,7 @@ def hgemm_ht_kernel(
             block_m_offset,
             block_n_offset,
             global_output_dtype_,
-            bias_dtype_,
+            smem_output_dtype_,
             signal_idx,
             c_stride,
         )
@@ -1637,7 +1635,7 @@ def hgemm_ht_kernel(
                         bias_rsrc,
                         safe_col_global,
                         vec_width=1,
-                        dtype=bias_dtype_,
+                        dtype=smem_output_dtype_,
                     ).extf(T.f32)
                 if const_expr(IS_FP8_PTPC):
                     scale_b = scale_b_frags[ni]
