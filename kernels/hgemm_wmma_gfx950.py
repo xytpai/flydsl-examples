@@ -1829,6 +1829,9 @@ def hgemm_wmma(
     m: fx.Int32,
     n: fx.Int32,
     k: fx.Int32,
+    c_stride: fx.Int32,
+    a_stride: fx.Int32,
+    b_stride: fx.Int32,
     stream: fx.Stream,
     param: HGemmWmmaConstexprParam,
 ):
@@ -1841,9 +1844,6 @@ def hgemm_wmma(
     working_k = (k + param.SPLIT_K - 1) // param.SPLIT_K
     num_pid_m = (m + param.BLOCK_M - 1) // param.BLOCK_M
     num_pid_n = (n + param.BLOCK_N - 1) // param.BLOCK_N
-    c_stride = n
-    a_stride = k
-    b_stride = k
     hgemm_kernel_impl = (
         hgemm_ht_kernel if param.USE_HALF_TILE_INTERLEAVED else hgemm_kernel
     )
@@ -2237,13 +2237,18 @@ def hgemm(
     device = a.device
     semaphore, signal = get_semaphore(stream, device)
     k = a.shape[-1]
+    if a.stride(-1) != 1:
+        a = a.contiguous()
     a = a.view(-1, k)
     m = a.shape[0]
     n = b.shape[0]
     assert a.device == b.device
     assert a.dtype == b.dtype
     assert b.shape[1] == k
-    assert b.numel() == n * k
+    if b.stride(1) != 1:
+        b = b.contiguous()
+    a_stride = a.stride(0)
+    b_stride = b.stride(0)
 
     is_fp8_ptpc = scale_a is not None or scale_b is not None
 
@@ -2253,16 +2258,15 @@ def hgemm(
         c = torch.empty((m, n), dtype=out_dtype, device=a.device)
     elif out_dtype is not None:
         assert c.dtype == out_dtype
+    if c.stride(-1) != 1:
+        c = c.contiguous()
     c = c.view(-1, n)
     assert c.shape[0] == m
     assert a.device == c.device
     assert c.dtype in HGEMM_TORCH_DTYPE_ID_MAP
+    c_stride = c.stride(0)
     out_dtype_id = HGEMM_TORCH_DTYPE_ID_MAP[c.dtype]
 
-    if not a.is_contiguous():
-        a = a.contiguous()
-    if not b.is_contiguous():
-        b = b.contiguous()
     if bias is not None and not bias.is_contiguous():
         bias = bias.contiguous()
 
@@ -2324,6 +2328,9 @@ def hgemm(
             m,
             n,
             k,
+            c_stride,
+            a_stride,
+            b_stride,
             stream,
             constexpr_param=constexpr_param,
         )
@@ -2359,6 +2366,9 @@ def hgemm(
             m,
             n,
             k,
+            c_stride,
+            a_stride,
+            b_stride,
             stream,
             constexpr_param=constexpr_param,
         )

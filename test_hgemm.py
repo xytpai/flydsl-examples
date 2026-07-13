@@ -179,6 +179,58 @@ def _resolve_out_dtype(out_dtype: str | None):
     return torch.float32 if out_dtype == "fp32" else None
 
 
+@pytest.mark.parametrize("out_dtype", [None, torch.float32])
+@pytest.mark.parametrize("USE_HALF_TILE_INTERLEAVED", [False, True])
+def test_hgemm_runtime_strides(
+    out_dtype: torch.dtype | None,
+    USE_HALF_TILE_INTERLEAVED: bool,
+):
+    m, n, k = 3, 16, 80
+    dtype = torch.half
+    a_stride = 96
+    b_stride = 96
+    c_stride = 32
+    a_base = torch.empty((m, a_stride), dtype=dtype, device="cuda")
+    b_base = torch.empty((n, b_stride), dtype=dtype, device="cuda")
+    a_base.uniform_(-1, 1)
+    b_base.uniform_(-1, 1)
+    a = a_base[:, :k]
+    b = b_base[:, :k]
+    bias = torch.empty((n,), dtype=dtype, device="cuda")
+    bias.uniform_(10, 20)
+    c_dtype = dtype if out_dtype is None else out_dtype
+    c_base = torch.empty((m, c_stride), dtype=c_dtype, device="cuda")
+    c = c_base[:, :n]
+
+    assert a.stride() == (a_stride, 1)
+    assert b.stride() == (b_stride, 1)
+    assert c.stride() == (c_stride, 1)
+    assert a_stride != k
+    assert b_stride != k
+    assert c_stride != n
+    assert a_stride * a.element_size() % 16 == 0
+    assert b_stride * b.element_size() % 16 == 0
+    assert c_stride * c.element_size() % 16 == 0
+
+    kwargs = {
+        "TILE_M": 64,
+        "TILE_N": 64,
+        "TILE_K": 64,
+        "STAGES": 2,
+        "SPLIT_K": 3,
+        "BLOCK_M_WARPS": 2,
+        "BLOCK_N_WARPS": 2,
+        "BLOCK_K_WARPS": 1,
+        "GROUP_M": 0,
+        "USE_HALF_TILE_INTERLEAVED": USE_HALF_TILE_INTERLEAVED,
+    }
+    output = hgemm(a, b, c, bias=bias, user_kwargs=kwargs)
+    assert output.data_ptr() == c.data_ptr()
+    assert output.stride(0) == c_stride
+    ref = torch.addmm(bias.float(), a.float(), b.float().t()).to(output.dtype)
+    torch.testing.assert_close(output, ref, atol=5e-2, rtol=5e-2, check_dtype=True)
+
+
 def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
     kwargs = {
         "TILE_M": args.TILE_M,
