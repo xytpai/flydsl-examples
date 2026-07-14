@@ -287,9 +287,7 @@ class SplitKProtocol:
                 store_asm = "global_store_dwordx4 $0, $1, off sc0 sc1"
             else:
                 raise NotImplementedError(f"STG_VEC_SIZE={self.STG_VEC_SIZE}")
-            zero_vec = fx.full(
-                self.STG_VEC_SIZE, 0.0, fx.Numeric.from_ir_type(self.out_dtype_)
-            )
+            zero_vec = fx.full(self.STG_VEC_SIZE, 0.0, self.out_dtype_)
             for i in range_constexpr(self.STG_C_ITERS):
                 global_tid = self.BLOCK_THREADS * i + self.tid
                 m_local_idx = global_tid // self.STG_C_X_THREADS

@@ -1080,7 +1080,7 @@ def hgemm_ht_kernel(
                 safe_global_n_idx = (global_n_idx < n).select(global_n_idx, 0)
                 bias_val = bias_buf[safe_global_n_idx].to(fx.Float32)
                 bias_frags[n_part * WARP_N_STEPS + ni] = vector.broadcast(
-                    T.vec(WMMA_C_FRAG_VALUES, T.f32), bias_val
+                    T.vec(WMMA_C_FRAG_VALUES, T.f32), arith.unwrap(bias_val)
                 )
         for m_part in range_constexpr(2):
             for n_part in range_constexpr(2):
