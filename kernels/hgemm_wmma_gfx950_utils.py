@@ -183,6 +183,72 @@ def buffer_load_lds_inline(rsrc, lds_ptr, global_offset, DMA_BYTES):
     )
 
 
+def atomic_add_stg_vec(c_ptr, global_offset, vec, STG_VEC_SIZE, C_DTYPE_BYTES, dtype_):
+    if const_expr(C_DTYPE_BYTES == 4):
+        for elem_idx in range_constexpr(STG_VEC_SIZE):
+            elem = vector.extract(vec, static_position=[elem_idx], dynamic_position=[])
+            elem_v = elem._value if const_expr(hasattr(elem, "_value")) else elem
+            elem_ptr_v = get_llvm_ptr(
+                c_ptr,
+                global_offset + elem_idx,
+                C_DTYPE_BYTES,
+                ir.Type.parse("!llvm.ptr<1>"),
+            )
+            llvm.AtomicRMWOp(
+                llvm.AtomicBinOp.fadd,
+                elem_ptr_v,
+                elem_v,
+                llvm.AtomicOrdering.monotonic,
+                syncscope="agent",
+                alignment=4,
+            )
+    else:
+        vec2_ty = T.vec(2, dtype_)
+        for vec_idx in range_constexpr(STG_VEC_SIZE // 2):
+            e0 = vector.extract(vec, static_position=[vec_idx * 2], dynamic_position=[])
+            e1 = vector.extract(
+                vec,
+                static_position=[vec_idx * 2 + 1],
+                dynamic_position=[],
+            )
+            pair = vector.from_elements(vec2_ty, [e0, e1])
+            pair_v = pair._value if const_expr(hasattr(pair, "_value")) else pair
+            pair_ptr_v = get_llvm_ptr(
+                c_ptr,
+                global_offset + vec_idx * 2,
+                C_DTYPE_BYTES,
+                ir.Type.parse("!llvm.ptr<1>"),
+            )
+            llvm.AtomicRMWOp(
+                llvm.AtomicBinOp.fadd,
+                pair_ptr_v,
+                pair_v,
+                llvm.AtomicOrdering.monotonic,
+                syncscope="agent",
+                alignment=4,
+            )
+
+
+def cast_vec_to_global_dtype(
+    vec,
+    STG_VEC_SIZE,
+    global_dtype_,
+    is_same_dtype,
+    is_global_f32,
+):
+    if const_expr(is_same_dtype):
+        return vec
+    elems = [arith.constant(0.0, type=global_dtype_)] * STG_VEC_SIZE
+    for elem_idx in range_constexpr(STG_VEC_SIZE):
+        elem = vector.extract(
+            vec, static_position=[elem_idx], dynamic_position=[]
+        ).extf(T.f32)
+        if const_expr(not is_global_f32):
+            elem = elem.truncf(global_dtype_)
+        elems[elem_idx] = elem
+    return vector.from_elements(T.vec(STG_VEC_SIZE, global_dtype_), elems)
+
+
 class SplitKProtocol:
     def __init__(
         self,
@@ -220,6 +286,7 @@ class SplitKProtocol:
         block_m_offset,
         block_n_offset,
         out_dtype_,
+        bias_dtype_,
         signal_idx,
         c_stride,
     ):
@@ -234,6 +301,7 @@ class SplitKProtocol:
         self.block_m_offset = block_m_offset
         self.block_n_offset = block_n_offset
         self.out_dtype_ = out_dtype_
+        self.bias_dtype_ = bias_dtype_
         self.signal_idx = signal_idx
         self.c_stride = c_stride
         self.c_zero_out = arith.constant(0.0, type=out_dtype_)
@@ -246,12 +314,20 @@ class SplitKProtocol:
     def zero_c(self):
         # zero c if current block is the first block
         if self.ks_idx == 0:
-            if const_expr(self.STG_VEC_SIZE == 4):
-                store_asm = "global_store_dwordx2 $0, $1, off sc0 sc1"
-            elif const_expr(self.STG_VEC_SIZE == 8):
+            GLOBAL_C_STORE_BYTES = self.STG_VEC_SIZE * self.C_DTYPE_BYTES
+            if const_expr(GLOBAL_C_STORE_BYTES == 32):
                 store_asm = "global_store_dwordx4 $0, $1, off sc0 sc1"
+            elif const_expr(GLOBAL_C_STORE_BYTES == 16):
+                store_asm = "global_store_dwordx4 $0, $1, off sc0 sc1"
+            elif const_expr(GLOBAL_C_STORE_BYTES == 8):
+                store_asm = "global_store_dwordx2 $0, $1, off sc0 sc1"
+            elif const_expr(GLOBAL_C_STORE_BYTES == 4):
+                store_asm = "global_store_dword $0, $1, off sc0 sc1"
             else:
-                raise NotImplementedError(f"STG_VEC_SIZE={self.STG_VEC_SIZE}")
+                raise NotImplementedError(
+                    f"STG_VEC_SIZE={self.STG_VEC_SIZE}, C_DTYPE_BYTES={self.C_DTYPE_BYTES}, "
+                    f"GLOBAL_C_STORE_BYTES={GLOBAL_C_STORE_BYTES}"
+                )
             zero_vec = vector.broadcast(
                 T.vec(self.STG_VEC_SIZE, self.out_dtype_), self.c_zero_out
             )
@@ -263,12 +339,27 @@ class SplitKProtocol:
                 global_n_idx = self.block_n_offset + n_local_idx
                 safe_global_n_idx = (global_n_idx < self.n).select(global_n_idx, 0)
                 if const_expr(self.HAS_BIAS):
-                    init_vec = buffer_ops.buffer_load(
+                    bias_vec = buffer_ops.buffer_load(
                         self.bias_rsrc,
                         safe_global_n_idx,
                         vec_width=self.STG_VEC_SIZE,
-                        dtype=self.out_dtype_,
+                        dtype=self.bias_dtype_,
                     )
+                    if const_expr(self.bias_dtype_ == self.out_dtype_):
+                        init_vec = bias_vec
+                    else:
+                        init_vals = [self.c_zero_out] * self.STG_VEC_SIZE
+                        for j in range_constexpr(self.STG_VEC_SIZE):
+                            bias_val = vector.extract(
+                                bias_vec, static_position=[j], dynamic_position=[]
+                            )
+                            bias_val = bias_val.extf(T.f32)
+                            if const_expr(self.C_DTYPE_BYTES != 4):
+                                bias_val = bias_val.truncf(self.out_dtype_)
+                            init_vals[j] = bias_val
+                        init_vec = vector.from_elements(
+                            T.vec(self.STG_VEC_SIZE, self.out_dtype_), init_vals
+                        )
                 else:
                     init_vec = zero_vec
                 if global_m_idx < self.m and global_n_idx < self.n:
@@ -279,13 +370,54 @@ class SplitKProtocol:
                         self.C_DTYPE_BYTES,
                         ir.Type.parse("!llvm.ptr<1>"),
                     )
-                    llvm.InlineAsmOp(
-                        None,
-                        [c_ptr, init_vec],
-                        store_asm,
-                        "v,v",
-                        has_side_effects=True,
-                    )
+                    if const_expr(GLOBAL_C_STORE_BYTES == 32):
+                        init_vec0_vals = [self.c_zero_out] * 4
+                        init_vec1_vals = [self.c_zero_out] * 4
+                        for j in range_constexpr(4):
+                            init_vec0_vals[j] = vector.extract(
+                                init_vec,
+                                static_position=[j],
+                                dynamic_position=[],
+                            )
+                            init_vec1_vals[j] = vector.extract(
+                                init_vec,
+                                static_position=[j + 4],
+                                dynamic_position=[],
+                            )
+                        init_vec0 = vector.from_elements(
+                            T.vec(4, self.out_dtype_), init_vec0_vals
+                        )
+                        init_vec1 = vector.from_elements(
+                            T.vec(4, self.out_dtype_), init_vec1_vals
+                        )
+                        c_ptr1 = get_llvm_ptr(
+                            self.c_ptr,
+                            c_offset + 4,
+                            self.C_DTYPE_BYTES,
+                            ir.Type.parse("!llvm.ptr<1>"),
+                        )
+                        llvm.InlineAsmOp(
+                            None,
+                            [c_ptr, init_vec0],
+                            store_asm,
+                            "v,v",
+                            has_side_effects=True,
+                        )
+                        llvm.InlineAsmOp(
+                            None,
+                            [c_ptr1, init_vec1],
+                            store_asm,
+                            "v,v",
+                            has_side_effects=True,
+                        )
+                    else:
+                        llvm.InlineAsmOp(
+                            None,
+                            [c_ptr, init_vec],
+                            store_asm,
+                            "v,v",
+                            has_side_effects=True,
+                        )
             gpu.barrier()
             # trigger signal when zeroc is done by the first arrived block
             if self.tid == 0:

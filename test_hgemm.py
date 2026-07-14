@@ -27,6 +27,7 @@ class _TestArgs:
     HAS_BIAS: bool
     GROUP_M: int
     USE_HALF_TILE_INTERLEAVED: bool
+    out_dtype: torch.dtype | None = None
 
 
 def get_torch_fp8_dtype():
@@ -78,9 +79,10 @@ def create_inputs(args: _TestArgs):
 
 def create_outputs(args: _TestArgs):
     if args.dtype == "fp8_ptpc":
-        c = torch.randn((args.m, args.n), dtype=torch.bfloat16, device="cuda")
+        dtype = torch.bfloat16 if args.out_dtype is None else args.out_dtype
     else:
-        c = torch.randn((args.m, args.n), dtype=args.dtype, device="cuda")
+        dtype = args.dtype if args.out_dtype is None else args.out_dtype
+    c = torch.randn((args.m, args.n), dtype=dtype, device="cuda")
     return (c,)
 
 
@@ -96,7 +98,14 @@ def ref_func(*args):
         c.copy_(ref.to(c.dtype))
     else:
         a, b, bias, c = args
-        F.linear(a, b, out=c, bias=bias)
+        if c.dtype == a.dtype:
+            F.linear(a, b, out=c, bias=bias)
+        else:
+            if bias is not None:
+                ref = torch.addmm(bias.float(), a.float(), b.float().t())
+            else:
+                ref = torch.mm(a.float(), b.float().t())
+            c.copy_(ref.to(c.dtype))
 
 
 def func(*args):
@@ -166,6 +175,62 @@ def check_acc(args: _TestArgs):
     print(f"\n{args}\nmaxdiff_out:{maxdiff_out_}")
 
 
+def _resolve_out_dtype(out_dtype: str | None):
+    return torch.float32 if out_dtype == "fp32" else None
+
+
+@pytest.mark.parametrize("out_dtype", [None, torch.float32])
+@pytest.mark.parametrize("USE_HALF_TILE_INTERLEAVED", [False, True])
+def test_hgemm_runtime_strides(
+    out_dtype: torch.dtype | None,
+    USE_HALF_TILE_INTERLEAVED: bool,
+):
+    m, n, k = 3, 16, 80
+    dtype = torch.half
+    a_stride = 96
+    b_stride = 96
+    c_stride = 32
+    a_base = torch.empty((m, a_stride), dtype=dtype, device="cuda")
+    b_base = torch.empty((n, b_stride), dtype=dtype, device="cuda")
+    a_base.uniform_(-1, 1)
+    b_base.uniform_(-1, 1)
+    a = a_base[:, :k]
+    b = b_base[:, :k]
+    bias = torch.empty((n,), dtype=dtype, device="cuda")
+    bias.uniform_(10, 20)
+    c_dtype = dtype if out_dtype is None else out_dtype
+    c_base = torch.empty((m, c_stride), dtype=c_dtype, device="cuda")
+    c = c_base[:, :n]
+
+    assert a.stride() == (a_stride, 1)
+    assert b.stride() == (b_stride, 1)
+    assert c.stride() == (c_stride, 1)
+    assert a_stride != k
+    assert b_stride != k
+    assert c_stride != n
+    assert a_stride * a.element_size() % 16 == 0
+    assert b_stride * b.element_size() % 16 == 0
+    assert c_stride * c.element_size() % 16 == 0
+
+    kwargs = {
+        "TILE_M": 64,
+        "TILE_N": 64,
+        "TILE_K": 64,
+        "STAGES": 2,
+        "SPLIT_K": 3,
+        "BLOCK_M_WARPS": 2,
+        "BLOCK_N_WARPS": 2,
+        "BLOCK_K_WARPS": 1,
+        "GROUP_M": 0,
+        "USE_HALF_TILE_INTERLEAVED": USE_HALF_TILE_INTERLEAVED,
+    }
+    output = hgemm(a, b, c, bias=bias, user_kwargs=kwargs)
+    assert output.data_ptr() == c.data_ptr()
+    assert output.stride(0) == c_stride
+    ref = torch.addmm(bias.float(), a.float(), b.float().t()).to(output.dtype)
+    torch.testing.assert_close(output, ref, atol=5e-2, rtol=5e-2, check_dtype=True)
+
+
 def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
     kwargs = {
         "TILE_M": args.TILE_M,
@@ -226,6 +291,7 @@ def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
     print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))
 
 
+@pytest.mark.parametrize("out_dtype", [None, "fp32"])
 @pytest.mark.parametrize("dtype", ["fp16", "bf16", "fp8_ptpc"])
 @pytest.mark.parametrize(
     "m, n, k, TILE_M, TILE_N, TILE_K, STAGES, SPLIT_K, BLOCK_M_WARPS, BLOCK_N_WARPS, BLOCK_K_WARPS, HAS_BIAS, GROUP_M, USE_HALF_TILE_INTERLEAVED",
@@ -314,6 +380,7 @@ def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
     ],
 )
 def test_hgemm_acc_main_loop(
+    out_dtype: str | None,
     dtype: str,
     m: int,
     n: int,
@@ -350,10 +417,12 @@ def test_hgemm_acc_main_loop(
         HAS_BIAS,
         GROUP_M,
         USE_HALF_TILE_INTERLEAVED,
+        out_dtype=_resolve_out_dtype(out_dtype),
     )
     check_acc(args)
 
 
+@pytest.mark.parametrize("out_dtype", [None, "fp32"])
 @pytest.mark.parametrize("dtype", ["fp16", "bf16", "fp8_ptpc"])
 @pytest.mark.parametrize(
     "m, n, k, TILE_M, TILE_N, TILE_K, STAGES, SPLIT_K, BLOCK_M_WARPS, BLOCK_N_WARPS, BLOCK_K_WARPS, HAS_BIAS, GROUP_M, USE_HALF_TILE_INTERLEAVED",
@@ -365,6 +434,7 @@ def test_hgemm_acc_main_loop(
     ],
 )
 def test_hgemm_acc_ft_stage_split_k(
+    out_dtype: str | None,
     dtype: str,
     m: int,
     n: int,
@@ -401,10 +471,12 @@ def test_hgemm_acc_ft_stage_split_k(
         HAS_BIAS,
         GROUP_M,
         USE_HALF_TILE_INTERLEAVED,
+        out_dtype=_resolve_out_dtype(out_dtype),
     )
     check_acc(args)
 
 
+@pytest.mark.parametrize("out_dtype", [None, "fp32"])
 @pytest.mark.parametrize("dtype", ["fp16", "bf16", "fp8_ptpc"])
 @pytest.mark.parametrize(
     "m, n, k, TILE_M, TILE_N, TILE_K, STAGES, SPLIT_K, BLOCK_M_WARPS, BLOCK_N_WARPS, BLOCK_K_WARPS, HAS_BIAS, GROUP_M, USE_HALF_TILE_INTERLEAVED",
@@ -420,6 +492,7 @@ def test_hgemm_acc_ft_stage_split_k(
     ],
 )
 def test_hgemm_acc_ht_split_k(
+    out_dtype: str | None,
     dtype: str,
     m: int,
     n: int,
@@ -456,10 +529,12 @@ def test_hgemm_acc_ht_split_k(
         HAS_BIAS,
         GROUP_M,
         USE_HALF_TILE_INTERLEAVED,
+        out_dtype=_resolve_out_dtype(out_dtype),
     )
     check_acc(args)
 
 
+@pytest.mark.parametrize("out_dtype", [None, "fp32"])
 @pytest.mark.parametrize("dtype", ["fp16", "bf16", "fp8_ptpc"])
 @pytest.mark.parametrize(
     "m, n, k, TILE_M, TILE_N, TILE_K, STAGES, SPLIT_K, BLOCK_M_WARPS, BLOCK_N_WARPS, BLOCK_K_WARPS, HAS_BIAS, GROUP_M, USE_HALF_TILE_INTERLEAVED",
@@ -472,6 +547,7 @@ def test_hgemm_acc_ht_split_k(
     ],
 )
 def test_hgemm_acc_small_m(
+    out_dtype: str | None,
     dtype: str,
     m: int,
     n: int,
@@ -508,10 +584,12 @@ def test_hgemm_acc_small_m(
         HAS_BIAS,
         GROUP_M,
         USE_HALF_TILE_INTERLEAVED,
+        out_dtype=_resolve_out_dtype(out_dtype),
     )
     check_acc(args)
 
 
+@pytest.mark.parametrize("out_dtype", [None, "fp32"])
 @pytest.mark.parametrize("dtype", ["fp16", "bf16", "fp8_ptpc"])
 @pytest.mark.parametrize(
     "m, n, k, TILE_M, TILE_N, TILE_K, STAGES, SPLIT_K, BLOCK_M_WARPS, BLOCK_N_WARPS, BLOCK_K_WARPS, HAS_BIAS, GROUP_M, USE_HALF_TILE_INTERLEAVED",
@@ -534,6 +612,7 @@ def test_hgemm_acc_small_m(
     ],
 )
 def test_hgemm_acc_small_mnk(
+    out_dtype: str | None,
     dtype: str,
     m: int,
     n: int,
@@ -570,10 +649,12 @@ def test_hgemm_acc_small_mnk(
         HAS_BIAS,
         GROUP_M,
         USE_HALF_TILE_INTERLEAVED,
+        out_dtype=_resolve_out_dtype(out_dtype),
     )
     check_acc(args)
 
 
+@pytest.mark.parametrize("out_dtype", [None, "fp32"])
 @pytest.mark.parametrize("dtype", ["fp16", "bf16"])
 @pytest.mark.parametrize(
     "m, n, k, TILE_M, TILE_N, TILE_K, STAGES, SPLIT_K, BLOCK_M_WARPS, BLOCK_N_WARPS, BLOCK_K_WARPS, HAS_BIAS, GROUP_M, USE_HALF_TILE_INTERLEAVED",
@@ -586,6 +667,7 @@ def test_hgemm_acc_small_mnk(
     ],
 )
 def test_hgemm_acc_ft_slice_k(
+    out_dtype: str | None,
     dtype: str,
     m: int,
     n: int,
@@ -622,10 +704,12 @@ def test_hgemm_acc_ft_slice_k(
         HAS_BIAS,
         GROUP_M,
         USE_HALF_TILE_INTERLEAVED,
+        out_dtype=_resolve_out_dtype(out_dtype),
     )
     check_acc(args)
 
 
+@pytest.mark.parametrize("out_dtype", [None, "fp32"])
 @pytest.mark.parametrize("dtype", ["bf16", "fp16"])
 @pytest.mark.parametrize(
     "m, n, k, TILE_M, TILE_N, TILE_K, STAGES, SPLIT_K, BLOCK_M_WARPS, BLOCK_N_WARPS, BLOCK_K_WARPS, HAS_BIAS, GROUP_M, USE_HALF_TILE_INTERLEAVED",
@@ -636,6 +720,7 @@ def test_hgemm_acc_ft_slice_k(
     ],
 )
 def test_hgemm_acc_ft_special(
+    out_dtype: str | None,
     dtype: str,
     m: int,
     n: int,
@@ -672,6 +757,7 @@ def test_hgemm_acc_ft_special(
         HAS_BIAS,
         GROUP_M,
         USE_HALF_TILE_INTERLEAVED,
+        out_dtype=_resolve_out_dtype(out_dtype),
     )
     check_acc(args)
 
