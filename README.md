@@ -11,12 +11,12 @@ The goal of this repository is to show how to write high-performance GEMM kernel
 
 ## Results
 
-![HGEMM BF16 benchmark vs Torch hipBLAS](images/hgemm_benchmark.svg)
+![HGEMM BF16 benchmark vs Torch hipBLAS](images/hgemm_benchmark_gfx950.svg)
 
 ## Run Tests And Benchmarks
 
 ```bash
-rm -rf ~/.flydsl/ ; pytest -sv test_hgemm.py
+rm -rf ~/.flydsl/ ; pytest -sv test_hgemm_gfx950.py
 ```
 
 ## References

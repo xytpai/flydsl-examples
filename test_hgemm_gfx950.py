@@ -3,8 +3,12 @@ import pytest
 import torch.nn.functional as F
 from torch.profiler import profile, ProfilerActivity
 from dataclasses import dataclass
-from flydsl.runtime.device import get_rocm_arch
 
+from quant_utils import (
+    quantize_ptpc_fp8,
+    quantize_input_block_fp8,
+    quantize_weight_block_fp8,
+)
 from kernels.hgemm_wmma_gfx950 import hgemm
 
 ROTARY_INPUTS_TARGET_BYTES = 8 * 1024**3
@@ -28,57 +32,49 @@ class _TestArgs:
     GROUP_M: int
     USE_HALF_TILE_INTERLEAVED: bool
     out_dtype: torch.dtype | None = None
-
-
-def get_torch_fp8_dtype():
-    arch = str(get_rocm_arch())
-    if ("gfx95" in arch or "gfx12" in arch) and hasattr(torch, "float8_e4m3fn"):
-        return torch.float8_e4m3fn
-    if hasattr(torch, "float8_e4m3fnuz"):
-        return torch.float8_e4m3fnuz
-    if hasattr(torch, "float8_e4m3fn"):
-        return torch.float8_e4m3fn
-    raise RuntimeError("This PyTorch build does not expose an E4M3 FP8 dtype")
-
-
-def quantize_ptpc_fp8(x: torch.Tensor):
-    fp8_dtype = get_torch_fp8_dtype()
-    fp8_max = float(torch.finfo(fp8_dtype).max)
-    scale = x.float().abs().amax(dim=1, keepdim=True) / fp8_max
-    scale[scale == 0] = 1
-    x_fp8 = (x.float() / scale).to(fp8_dtype)
-    scale = torch.nan_to_num(scale, nan=1.0, posinf=1.0, neginf=1.0).squeeze(1)
-    return x_fp8, scale.float()
+    block_scale_n: int = 128
+    block_scale_k: int = 128
 
 
 def create_inputs(args: _TestArgs):
-    if args.dtype == "fp8_ptpc":
+    if isinstance(args.dtype, str) and "fp8" in args.dtype:
         a_f32 = torch.empty((args.m, args.k), dtype=torch.float32, device="cuda")
         b_f32 = torch.empty((args.n, args.k), dtype=torch.float32, device="cuda")
         a_f32.uniform_(-1, 1)
         b_f32.uniform_(-1, 1)
-        a, scale_a = quantize_ptpc_fp8(a_f32)
-        b, scale_b = quantize_ptpc_fp8(b_f32)
+        block_scale_k = args.block_scale_k
+        block_scale_n = args.block_scale_n
+        if args.dtype == "fp8_ptpc":
+            a, scale_a = quantize_ptpc_fp8(a_f32)
+            b, scale_b = quantize_ptpc_fp8(b_f32)
+        elif args.dtype == "fp8_block_scale":
+            a, scale_a = quantize_input_block_fp8(a_f32, block_k=block_scale_k)
+            b, scale_b = quantize_weight_block_fp8(
+                b_f32, block_n=block_scale_n, block_k=block_scale_k
+            )
+        else:
+            raise NotImplementedError(f"not implemented for {args.dtype}")
         if args.HAS_BIAS:
             bias = torch.empty((args.n,), dtype=torch.bfloat16, device="cuda")
             bias.uniform_(10, 20)
         else:
             bias = None
         return (a, b, scale_a, scale_b, bias)
-    a = torch.empty((args.m, args.k), dtype=args.dtype, device="cuda")
-    a.uniform_(-1, 1)
-    b = torch.empty((args.n, args.k), dtype=args.dtype, device="cuda")
-    b.uniform_(-1, 1)
-    if args.HAS_BIAS:
-        bias = torch.empty((args.n,), dtype=args.dtype, device="cuda")
-        bias.uniform_(10, 20)
     else:
-        bias = None
-    return (a, b, bias)
+        a = torch.empty((args.m, args.k), dtype=args.dtype, device="cuda")
+        b = torch.empty((args.n, args.k), dtype=args.dtype, device="cuda")
+        a.uniform_(-1, 1)
+        b.uniform_(-1, 1)
+        if args.HAS_BIAS:
+            bias = torch.empty((args.n,), dtype=args.dtype, device="cuda")
+            bias.uniform_(10, 20)
+        else:
+            bias = None
+        return (a, b, bias)
 
 
 def create_outputs(args: _TestArgs):
-    if args.dtype == "fp8_ptpc":
+    if isinstance(args.dtype, str) and "fp8" in args.dtype:
         dtype = torch.bfloat16 if args.out_dtype is None else args.out_dtype
     else:
         dtype = args.dtype if args.out_dtype is None else args.out_dtype
@@ -89,8 +85,18 @@ def create_outputs(args: _TestArgs):
 def ref_func(*args):
     if len(args) == 6:
         a, b, scale_a, scale_b, bias, c = args
-        a_f32 = a.float() * scale_a[:, None]
-        b_f32 = b.float() * scale_b[:, None]
+        if scale_a.dim() == 1:  # fp8_ptpc
+            a_f32 = a.float() * scale_a[:, None]
+            b_f32 = b.float() * scale_b[:, None]
+        else:  # fp8_block_scale
+            k = a.shape[1]
+            n = b.shape[0]
+            block_scale_n = n // scale_b.shape[0]
+            block_scale_k = k // scale_b.shape[1]
+            a_f32 = a.float() * scale_a.repeat_interleave(block_scale_k, dim=1)
+            b_f32 = b.float() * scale_b.repeat_interleave(
+                block_scale_n, dim=0
+            ).repeat_interleave(block_scale_k, dim=1)
         if bias is not None:
             ref = torch.addmm(bias.float(), a_f32, b_f32.t())
         else:
@@ -151,7 +157,7 @@ def check_acc(args: _TestArgs):
     def get_tol(args):
         k_scale = (args.k / 8192) ** 0.5
         k_scale *= args.SPLIT_K * args.BLOCK_K_WARPS
-        if args.dtype == "fp8_ptpc":
+        if args.dtype in ("fp8_ptpc", "fp8_block_scale"):
             return 2e-1 * k_scale, 2e-1
         if args.dtype is torch.bfloat16:
             return 2e-1 * k_scale, 2e-1
