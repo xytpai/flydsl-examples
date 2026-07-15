@@ -203,6 +203,9 @@ def hgemm_gfx950_kernel(
     b_rsrc = buffer_ops.create_buffer_resource(b, max_size=True)
     out = fx.rocdl.make_buffer_tensor(out, max_size=False)
     gC = fx.flat_divide(out, (block_m, block_n))[None, None, bid_m, bid_n]
+    coord_zero = fx.make_int_tuple(0)
+    row_coords = fx.make_view(coord_zero, fx.make_layout((block_m, block_n), (1, 0)))
+    col_coords = fx.make_view(coord_zero, fx.make_layout((block_m, block_n), (0, 1)))
 
     thr_mma = tiled_mma.thr_slice(tid)
     uni_copy = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
@@ -225,18 +228,31 @@ def hgemm_gfx950_kernel(
 
     sA0 = fx.make_view(smem_a, a_lds_layout)
     sB0 = fx.make_view(smem_b, b_lds_layout)
-    thr_gC = thr_copy_C.partition_S(gC)
+    thr_gC = thr_copy_C.partition_D(gC)
+    thr_cRow = thr_copy_C.partition_S(row_coords)[(0, None), None, None]
+    thr_cCol = thr_copy_C.partition_S(col_coords)[(0, None), None, None]
 
     frag_A = thr_mma.make_fragment_A(sA0)
     frag_B = thr_mma.make_fragment_B(sB0)
     frag_C = thr_mma.make_fragment_C(gC)
     frag_C_bf16 = fx.make_fragment_like(frag_C, fx.BFloat16.ir_type)
+    pred_C = fx.make_fragment_like(thr_gC, dtype=fx.Boolean)
 
     frag_A_retile = thr_copy_s2r_A.retile(frag_A)
     frag_B_retile = thr_copy_s2r_B.retile(frag_B)
     frag_C_retile = thr_copy_C.retile(frag_C_bf16)
 
     frag_C.fill(0.0)
+    for i in range_constexpr(fx.get_scalar(fx.size(pred_C.shape))):
+        row_coord = fx.int_tuple_add(
+            thr_cRow[i],
+            fx.make_int_tuple(arith.index_cast(T.i32, bid_m * block_m)),
+        )
+        col_coord = fx.int_tuple_add(
+            thr_cCol[i],
+            fx.make_int_tuple(arith.index_cast(T.i32, bid_n * block_n)),
+        )
+        pred_C[i] = (fx.get_scalar(row_coord) < m) & (fx.get_scalar(col_coord) < n)
 
     def swizzled_col_idx(row, col, layout):
         elem_offset = fx.get_scalar(
@@ -269,12 +285,13 @@ def hgemm_gfx950_kernel(
             m_local_idx = global_tid // ldg_x_threads
             k_local_idx = global_tid % ldg_x_threads * async_load_vec_size
             global_m_idx = bid_m * block_m + m_local_idx
+            safe_global_m_idx = (global_m_idx < m).select(global_m_idx, 0)
             global_k_idx = k_tile * block_k + swizzled_col_idx(
                 m_local_idx,
                 k_local_idx,
                 a_lds_layout,
             )
-            global_offset = (global_m_idx * k + global_k_idx) * in_data_bytes
+            global_offset = (safe_global_m_idx * k + global_k_idx) * in_data_bytes
             global_offset = arith.index_cast(T.i32, global_offset)
             buffer_load_lds_inline(a_rsrc, lds_ptr, global_offset, async_load_bytes)
             if i < ldg_a_iters - 1:
@@ -287,12 +304,13 @@ def hgemm_gfx950_kernel(
             n_local_idx = global_tid // ldg_x_threads
             k_local_idx = global_tid % ldg_x_threads * async_load_vec_size
             global_n_idx = bid_n * block_n + n_local_idx
+            safe_global_n_idx = (global_n_idx < n).select(global_n_idx, 0)
             global_k_idx = k_tile * block_k + swizzled_col_idx(
                 n_local_idx,
                 k_local_idx,
                 b_lds_layout,
             )
-            global_offset = (global_n_idx * k + global_k_idx) * in_data_bytes
+            global_offset = (safe_global_n_idx * k + global_k_idx) * in_data_bytes
             global_offset = arith.index_cast(T.i32, global_offset)
             buffer_load_lds_inline(b_rsrc, lds_ptr, global_offset, async_load_bytes)
             if i < ldg_b_iters - 1:
@@ -344,7 +362,8 @@ def hgemm_gfx950_kernel(
         current_stage = (current_stage + 1) % stages
 
     frag_C_bf16.store(fx.Vector(frag_C.load()).to(fx.BFloat16).ir_value())
-    fx.copy(copy_c, frag_C_retile, thr_gC)
+
+    fx.copy(copy_c, frag_C_retile, thr_gC, pred=pred_C)
 
 
 @flyc.jit
@@ -426,10 +445,8 @@ def layout_gemm(
         )
     if c.shape != (m, n):
         raise ValueError(f"C must have shape {(m, n)}, got {tuple(c.shape)}")
-    if m % block_m or n % block_n or k % block_k:
-        raise ValueError(
-            f"M/N/K must be multiples of {(block_m, block_n, block_k)}, got {(m, n, k)}"
-        )
+    if k % block_k:
+        raise ValueError(f"K must be a multiple of block_k={block_k}, got K={k}")
     effective_stages = min(stages, k // block_k)
     if effective_stages < 2:
         raise ValueError(
@@ -448,6 +465,7 @@ def layout_gemm(
         mma_n=mma_n,
         mma_k=mma_k,
     )
+
     launch_hgemm_gfx950(
         c,
         a,
