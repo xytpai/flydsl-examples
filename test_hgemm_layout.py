@@ -54,7 +54,8 @@ def make_triton_maxautotune_func():
     inductor_config.max_autotune_gemm_backends = "TRITON"
 
     def triton_maxautotune_func(a, b, bias, c):
-        c.copy_(F.linear(a, b, bias=bias))
+        out = F.linear(a, b, bias=bias)
+        c.copy_(out)
 
     return torch.compile(triton_maxautotune_func, mode="max-autotune", fullgraph=True)
 
@@ -289,6 +290,7 @@ def test_hgemm_acc_small_m(
         (4096, 4096, 8192, 256, 256, 64, 2, 4, 4, True),
         (2048, 2048, 2048, 128, 128, 64, 4, 4, 4, True),
         (1024, 1024, 1024, 64, 64, 64, 6, 4, 4, True),
+        (8, 7168, 2048, 16, 32, 128, 6, 1, 2, True),
     ],
 )
 def test_hgemm_benchmark_smoke(

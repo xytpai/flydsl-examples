@@ -81,6 +81,7 @@ def make_hgemm_gfx950_param(
     block_threads = m_waves * n_waves * GFX950_WAVE_SIZE
     ldg_a_iters = (block_m * block_k) // (block_threads * async_load_vec_size)
     ldg_b_iters = (block_n * block_k) // (block_threads * async_load_vec_size)
+    assert (stages - 2) * (ldg_a_iters + ldg_b_iters) < 63
     mma_m_repeat = block_m // m_waves // mma_m
     mma_n_repeat = block_n // n_waves // mma_n
     if mma_m_repeat * m_waves * mma_m != block_m:
