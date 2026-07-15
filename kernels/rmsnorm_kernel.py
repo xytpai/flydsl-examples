@@ -309,6 +309,82 @@ def build_rmsnorm_module(N: int, dtype_str: str):
 
 
 def _build_rmsnorm_large_m_small_n_module(N: int, dtype_str: str):
+    if (
+        dtype_str != "f32"
+        and N % VEC_WIDTH == 0
+        and (N & (N - 1)) == 0
+        and (N // VEC_WIDTH) % min(WARP_SIZE, N // VEC_WIDTH) == 0
+    ):
+        n_vecs = N // VEC_WIDTH
+        block_threads = min(WARP_SIZE, n_vecs)
+        num_iters = n_vecs // block_threads
+        log2_block_threads = int(math.log2(block_threads))
+        elem_bits = 16
+        elem_dtype = dtype_to_elem_type(dtype_str)
+        arch = get_hip_arch()
+        use_hw_cvt_bf16 = (arch == "gfx950") or str(arch).startswith("gfx95")
+
+        @flyc.kernel(known_block_size=[block_threads, 1, 1])
+        def rmsnorm_large_m_small_n_kernel(
+            Input: fx.Tensor,
+            Gamma: fx.Tensor,
+            Output: fx.Tensor,
+        ):
+            bid = fx.block_idx.x
+            tid = fx.thread_idx.x
+            fm_fast = arith.FastMathFlags.fast
+            eps_c = EPS
+
+            Input_buf = fx.rocdl.make_buffer_tensor(Input)
+            Output_buf = fx.rocdl.make_buffer_tensor(Output)
+            Gamma_buf = fx.rocdl.make_buffer_tensor(Gamma)
+
+            row_in = fx.slice(Input_buf, (bid, None))
+            row_out = fx.slice(Output_buf, (bid, None))
+            in_div = fx.logical_divide(row_in, fx.make_layout(VEC_WIDTH, 1))
+            out_div = fx.logical_divide(row_out, fx.make_layout(VEC_WIDTH, 1))
+            gamma_div = fx.logical_divide(Gamma_buf, fx.make_layout(VEC_WIDTH, 1))
+            copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_bits)
+
+            thread_sumsq = fx.Float32(0.0)
+            for it in range(fx.Int32(0), fx.Int32(num_iters), fx.Int32(1)):
+                vec_idx = fx.Int32(it) * fx.Int32(block_threads) + tid
+                x = _load_vec(copy_atom, VEC_WIDTH, elem_dtype, in_div, vec_idx).to(fx.Float32)
+                thread_sumsq = thread_sumsq + (x * x).reduce(
+                    ReductionOp.ADD, fastmath=fm_fast
+                )
+
+            w = thread_sumsq
+            for _sh_exp in range_constexpr(log2_block_threads):
+                off = block_threads // (2 << _sh_exp)
+                peer = w.shuffle_xor(off, block_threads)
+                w = w.addf(peer, fastmath=fm_fast)
+
+            rrms = fmath.rsqrt(w / float(N) + eps_c, fastmath=fm_fast)
+
+            for it in range(fx.Int32(0), fx.Int32(num_iters), fx.Int32(1)):
+                vec_idx = fx.Int32(it) * fx.Int32(block_threads) + tid
+                x = _load_vec(copy_atom, VEC_WIDTH, elem_dtype, in_div, vec_idx).to(fx.Float32)
+                g = _load_vec(copy_atom, VEC_WIDTH, elem_dtype, gamma_div, vec_idx).to(fx.Float32)
+                y_e = _to_elem_vec(dtype_str, elem_dtype, use_hw_cvt_bf16, (x * rrms) * g)
+                _store_vec(copy_atom, VEC_WIDTH, elem_dtype, y_e, out_div, vec_idx)
+
+        @flyc.jit
+        def launch_rmsnorm_large_m_small_n(
+            Input: fx.Tensor,
+            Gamma: fx.Tensor,
+            Output: fx.Tensor,
+            m_in: fx.Int32,
+            stream: fx.Stream = fx.Stream(None),
+        ):
+            rmsnorm_large_m_small_n_kernel(Input, Gamma, Output).launch(
+                grid=(m_in, 1, 1),
+                block=(block_threads, 1, 1),
+                stream=stream,
+            )
+
+        return launch_rmsnorm_large_m_small_n
+
     BLOCK_N = 1 << (N - 1).bit_length()
     BLOCK_M = max(min(16384 // BLOCK_N, 32), 8)
     THREADS_PER_ROW = min(WARP_SIZE, 1024 // BLOCK_M)
@@ -377,8 +453,8 @@ def _build_rmsnorm_large_m_small_n_module(N: int, dtype_str: str):
             ms_eps = mean_sq + eps_c
             rrms = fmath.rsqrt(ms_eps, fastmath=fm_fast)
 
-            for base_idx_int in range_constexpr(0, BLOCK_N, THREADS_PER_ROW):
-                idx = lane + base_idx_int
+            for base_idx_int in range_constexpr(fx.Int32(0), fx.Int32(BLOCK_N), fx.Int32(THREADS_PER_ROW)):
+                idx = lane + fx.Int32(base_idx_int)
                 if idx < N:
                     x_e = _load_scalar(copy_atom_s, elem_dtype, row_div, idx)
                     g_e = _load_scalar(copy_atom_s, elem_dtype, gamma_div, idx)

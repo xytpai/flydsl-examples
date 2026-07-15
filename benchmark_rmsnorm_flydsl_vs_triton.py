@@ -92,6 +92,17 @@ def _prewarm_cuda_runtime() -> None:
     torch.cuda.synchronize()
 
 
+def _disable_flydsl_source_locations() -> None:
+    import flydsl.expr.meta as meta
+    from flydsl._mlir import ir
+
+    if getattr(meta, "_benchmark_source_locs_disabled", False):
+        return
+
+    meta.capture_user_location = lambda: ir.Location.unknown()
+    meta._benchmark_source_locs_disabled = True
+
+
 def _prewarm_triton_runtime() -> None:
     import torch
     import triton
@@ -199,6 +210,9 @@ def _reference_rmsnorm(x, weight, eps: float):
 def _bench_flydsl(args: argparse.Namespace) -> dict[str, Any]:
     import torch
 
+    if not args.flydsl_source_locs:
+        _disable_flydsl_source_locations()
+
     import flydsl.compiler as flyc
     from kernels.rmsnorm_kernel import build_rmsnorm_module
 
@@ -244,6 +258,7 @@ def _bench_flydsl(args: argparse.Namespace) -> dict[str, Any]:
             "bytes": num_bytes,
             "input_dtype": _dtype_name(input_dtype),
             "output_dtype": _dtype_name(input_dtype),
+            "flydsl_source_locs": args.flydsl_source_locs,
         }
     )
 
@@ -393,6 +408,8 @@ def _run_worker(
         cmd.append("--prewarm-runtime")
     else:
         cmd.append("--no-prewarm-runtime")
+    if base_args.flydsl_source_locs:
+        cmd.append("--flydsl-source-locs")
     if base_args.check:
         cmd.append("--check")
 
@@ -572,6 +589,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--json-out")
     parser.add_argument("--prewarm-runtime", dest="prewarm_runtime", action="store_true", default=True)
     parser.add_argument("--no-prewarm-runtime", dest="prewarm_runtime", action="store_false")
+    parser.add_argument(
+        "--flydsl-source-locs",
+        action="store_true",
+        help="keep full FlyDSL source locations during benchmark compilation",
+    )
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--keep-going", action="store_true")
     parser.add_argument("--quiet", action="store_true")
