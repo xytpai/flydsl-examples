@@ -200,7 +200,7 @@ def hgemm_gfx950_kernel(
     )
 
     def make_wave_lds_ptr(ptr):
-        return fx.recast_iter(fx.Int8, ptr) + wave_offset
+        return fx.recast_iter(fx.Int8, ptr) + fx.Int32(wave_offset)
 
     a_rsrc = buffer_ops.create_buffer_resource(a, max_size=True)
     b_rsrc = buffer_ops.create_buffer_resource(b, max_size=True)
