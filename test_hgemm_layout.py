@@ -1,275 +1,204 @@
-import argparse
-
-import pytest
 import torch
+import pytest
+import torch.nn.functional as F
+from torch.profiler import profile, ProfilerActivity
+from dataclasses import dataclass
+from flydsl.runtime.device import get_rocm_arch
 
-from kernels.hgemm_gfx950 import benchmark_layout_gemm, layout_gemm
+from kernels.hgemm_layout_gfx950 import hgemm
 
-try:
-    import triton
-    import triton.language as tl
-except ImportError:
-    triton = None
-    tl = None
-
-
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="CUDA/ROCm is required for FlyDSL GEMM tests",
-)
+ROTARY_INPUTS_TARGET_BYTES = 8 * 1024**3
 
 
-if triton is not None:
-
-    @triton.jit
-    def _triton_gemm_kernel(
-        a_ptr,
-        b_ptr,
-        c_ptr,
-        stride_am,
-        stride_ak,
-        stride_bn,
-        stride_bk,
-        stride_cm,
-        stride_cn,
-        M: tl.constexpr,
-        N: tl.constexpr,
-        K: tl.constexpr,
-        BLOCK_M: tl.constexpr,
-        BLOCK_N: tl.constexpr,
-        BLOCK_K: tl.constexpr,
-        GROUP_M: tl.constexpr,
-    ):
-        pid = tl.program_id(0)
-        num_pid_m = tl.cdiv(M, BLOCK_M)
-        num_pid_n = tl.cdiv(N, BLOCK_N)
-        num_pid_in_group = GROUP_M * num_pid_n
-        group_id = pid // num_pid_in_group
-        first_pid_m = group_id * GROUP_M
-        group_size_m = tl.minimum(num_pid_m - first_pid_m, GROUP_M)
-        pid_m = first_pid_m + (pid % group_size_m)
-        pid_n = (pid % num_pid_in_group) // group_size_m
-
-        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-        offs_k = tl.arange(0, BLOCK_K)
-        acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
-
-        for k0 in range(0, K, BLOCK_K):
-            k_idxs = k0 + offs_k
-            a = tl.load(
-                a_ptr + offs_m[:, None] * stride_am + k_idxs[None, :] * stride_ak,
-                mask=(offs_m[:, None] < M) & (k_idxs[None, :] < K),
-                other=0.0,
-            )
-            b = tl.load(
-                b_ptr + offs_n[None, :] * stride_bn + k_idxs[:, None] * stride_bk,
-                mask=(offs_n[None, :] < N) & (k_idxs[:, None] < K),
-                other=0.0,
-            )
-            acc += tl.dot(a, b, out_dtype=tl.float32)
-
-        tl.store(
-            c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
-            acc,
-            mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
-        )
+@dataclass
+class _TestArgs:
+    dtype: torch.dtype
+    m: int
+    n: int
+    k: int
+    block_m: int
+    block_n: int
+    block_k: int
+    stages: int
+    m_waves: int
+    n_waves: int
+    has_bias: bool
 
 
-def benchmark_triton_gemm(
-    m: int = 8192,
-    n: int = 8192,
-    k: int = 8192,
-    *,
-    warmup: int = 10,
-    iters: int = 50,
-    block_m: int = 128,
-    block_n: int = 128,
-    block_k: int = 64,
-    group_m: int = 8,
-    num_warps: int = 8,
-) -> dict[str, float] | None:
-    if triton is None:
-        print("triton_gemm skipped: triton is not installed")
-        return None
+def create_inputs(args: _TestArgs):
+    a = torch.empty((args.m, args.k), dtype=args.dtype, device="cuda")
+    a.uniform_(-1, 1)
+    b = torch.empty((args.n, args.k), dtype=args.dtype, device="cuda")
+    b.uniform_(-1, 1)
+    if args.has_bias:
+        bias = torch.empty((args.n,), dtype=args.dtype, device="cuda")
+        bias.uniform_(10, 20)
+    else:
+        bias = None
+    return (a, b, bias)
 
-    a = torch.randn((m, k), dtype=torch.bfloat16, device="cuda")
-    b = torch.randn((n, k), dtype=torch.bfloat16, device="cuda")
-    c = torch.empty((m, n), dtype=a.dtype, device="cuda")
-    grid = (triton.cdiv(m, block_m) * triton.cdiv(n, block_n),)
 
-    def launch():
-        _triton_gemm_kernel[grid](
-            a,
-            b,
-            c,
-            a.stride(0),
-            a.stride(1),
-            b.stride(0),
-            b.stride(1),
-            c.stride(0),
-            c.stride(1),
-            m,
-            n,
-            k,
-            BLOCK_M=block_m,
-            BLOCK_N=block_n,
-            BLOCK_K=block_k,
-            GROUP_M=group_m,
-            num_warps=num_warps,
-        )
+def create_outputs(args: _TestArgs):
+    c = torch.randn((args.m, args.n), dtype=args.dtype, device="cuda")
+    return (c,)
 
-    launch()
-    torch.cuda.synchronize()
 
-    for _ in range(warmup):
-        launch()
-    torch.cuda.synchronize()
+def ref_func(*args):
+    a, b, bias, c = args
+    F.linear(a, b, out=c, bias=bias)
 
-    stream = torch.cuda.current_stream()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record(stream)
-    for _ in range(iters):
-        launch()
-    end.record(stream)
-    end.synchronize()
 
-    avg_ms = start.elapsed_time(end) / iters
-    tflops = (2.0 * m * n * k) / (avg_ms / 1e3) / 1e12
-    result = {
-        "m": float(m),
-        "n": float(n),
-        "k": float(k),
-        "avg_ms": avg_ms,
-        "tflops": tflops,
-        "block_m": float(block_m),
-        "block_n": float(block_n),
-        "block_k": float(block_k),
+def func(*args):
+    a, b, bias, c, kwargs = args
+    hgemm(a, b, c, bias=bias, user_kwargs=kwargs)
+
+
+def tensor_nbytes(tensors: torch.Tensor):
+    return sum(t.numel() * t.element_size() for t in tensors if t is not None)
+
+
+def get_rotary_inputs(sample_inputs: torch.Tensor, sample_outputs: torch.Tensor):
+    global ROTARY_INPUTS_TARGET_BYTES
+    slot_bytes = 2 * (tensor_nbytes(sample_inputs) + tensor_nbytes(sample_outputs))
+    rotary_inputs = ROTARY_INPUTS_TARGET_BYTES // slot_bytes
+    return max(1, int(rotary_inputs))
+
+
+def check_acc(args: _TestArgs):
+    kwargs = {
+        "block_m": args.block_m,
+        "block_n": args.block_n,
+        "block_k": args.block_k,
+        "stages": args.stages,
+        "m_waves": args.m_waves,
+        "n_waves": args.n_waves,
     }
+    inputs = create_inputs(args)
+    outputs = create_outputs(args)
+    ref_outputs = create_outputs(args)
+    inouts = inputs + outputs
+    ref_inouts = inputs + ref_outputs
+    maxdiff_out_ = []
+
+    def get_tol(args):
+        k_scale = (args.k / 8192) ** 0.5
+        if args.dtype is torch.bfloat16:
+            return 2e-1 * k_scale, 2e-1
+        return 5e-2 * k_scale, 5e-2
+
+    atol, rtol = get_tol(args)
+    for _ in range(5):
+        func(*(inouts + (kwargs,)))
+        ref_func(*ref_inouts)
+        for output, ref_output in zip(outputs, ref_outputs):
+            maxdiff_out = (output - ref_output).abs().max().item()
+            maxdiff_out_.append(maxdiff_out)
+            print(maxdiff_out, flush=True)
+            torch.testing.assert_close(
+                output,
+                ref_output,
+                atol=atol,
+                rtol=rtol,
+                check_dtype=True,
+            )
+    print(f"\n{args}\nmaxdiff_out:{maxdiff_out_}")
+
+
+def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
+    kwargs = {
+        "block_m": args.block_m,
+        "block_n": args.block_n,
+        "block_k": args.block_k,
+        "stages": args.stages,
+        "m_waves": args.m_waves,
+        "n_waves": args.n_waves,
+    }
+    sample_inputs = create_inputs(args)
+    sample_outputs = create_outputs(args)
+    rotary_inputs = get_rotary_inputs(sample_inputs, sample_outputs)
+    inputs = [sample_inputs] + [create_inputs(args) for _ in range(rotary_inputs - 1)]
+    ref_inputs = [create_inputs(args) for _ in range(rotary_inputs)]
+    outputs = [sample_outputs] + [
+        create_outputs(args) for _ in range(rotary_inputs - 1)
+    ]
+    ref_outputs = [create_outputs(args) for _ in range(rotary_inputs)]
+    global ROTARY_INPUTS_TARGET_BYTES
     print(
-        "triton_gemm "
-        f"tile={block_m}x{block_n}x{block_k} M={m} N={n} K={k}: "
-        f"{avg_ms:.4f} ms, {tflops:.2f} TFLOP/s"
+        f"rotary_inputs:{rotary_inputs}, target_bytes:{ROTARY_INPUTS_TARGET_BYTES}, "
+        f"warmup:{warmup}, niters:{niters}"
     )
-    return result
+
+    def run_ref(idx):
+        ref_func(*(ref_inputs[idx] + ref_outputs[idx]))
+
+    def run_flydsl(idx):
+        func(*(inputs[idx] + outputs[idx] + (kwargs,)))
+
+    print("===================== [INTERLEAVED] =====================")
+    for i in range(warmup):
+        idx = i % rotary_inputs
+        if i % 2 == 0:
+            run_ref(idx)
+            run_flydsl(idx)
+        else:
+            run_flydsl(idx)
+            run_ref(idx)
+        torch.cuda.synchronize()
+
+    with profile(
+        activities=[ProfilerActivity.CUDA],
+    ) as prof:
+        for i in range(warmup, niters):
+            idx = i % rotary_inputs
+            if i % 2 == 0:
+                run_ref(idx)
+                run_flydsl(idx)
+            else:
+                run_flydsl(idx)
+                run_ref(idx)
+            torch.cuda.synchronize()
+    print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))
 
 
-def test_layout_gemm_correctness():
-    torch.manual_seed(0)
-    m, n, k = 256, 256, 128
-    a = torch.randn((m, k), dtype=torch.bfloat16, device="cuda")
-    b = torch.randn((n, k), dtype=torch.bfloat16, device="cuda")
-    c = torch.empty((m, n), dtype=a.dtype, device="cuda")
-
-    out = layout_gemm(a, b, c)
-    torch.cuda.synchronize()
-
-    assert out.data_ptr() == c.data_ptr()
-    ref = (a.float() @ b.float().T).to(out.dtype)
-    torch.testing.assert_close(out, ref, atol=5e-2, rtol=5e-2)
-
-
-@pytest.mark.parametrize("dtype", ["bf16"])
 @pytest.mark.parametrize(
-    "m, n, k, TILE_M, TILE_N, TILE_K, STAGES, SPLIT_K, BLOCK_M_WARPS, BLOCK_N_WARPS, BLOCK_K_WARPS, HAS_BIAS, GROUP_M, USE_HALF_TILE_INTERLEAVED",
+    "dtype",
     [
-        # (16384, 16384, 16384, 256, 256, 64, 2, 1, 2, 4, 1, True, 4, True),
-        # (8192, 8192, 8192, 256, 256, 64, 2, 1, 2, 4, 1, False, 0, False),
-        # (8160, 8160, 8160, 256, 256, 64, 2, 1, 2, 4, 1, True, 0, True),
-        # (4096, 4096, 8192, 256, 256, 64, 2, 1, 2, 4, 1, True, 4, True),
-        # (4096, 4096, 4096, 256, 256, 64, 2, 1, 2, 4, 1, True, 0, True),
-        (2048, 2048, 2048, 128, 128, 64, 4, 1, 4, 4, 1, False, 0, False),
+        "bf16",
     ],
 )
-def test_layout_gemm_benchmark_smoke(
+@pytest.mark.parametrize(
+    "m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, has_bias",
+    [
+        # k 8192
+        # (8192, 8192, 8192, 256, 256, 64, 2, 2, 4, True),
+        (8192, 8192, 8192, 256, 256, 64, 2, 2, 4, False),
+    ],
+)
+def test_hgemm_acc_main_loop(
     dtype: str,
     m: int,
     n: int,
     k: int,
-    TILE_M: int,
-    TILE_N: int,
-    TILE_K: int,
-    STAGES: int,
-    SPLIT_K: int,
-    BLOCK_M_WARPS: int,
-    BLOCK_N_WARPS: int,
-    BLOCK_K_WARPS: int,
-    HAS_BIAS: bool,
-    GROUP_M: int,
-    USE_HALF_TILE_INTERLEAVED: bool,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    stages: int,
+    m_waves: int,
+    n_waves: int,
+    has_bias: bool,
 ):
-    if dtype != "bf16":
-        pytest.skip("layout_gemm currently supports bf16 only")
-    if SPLIT_K != 1 or BLOCK_K_WARPS != 1:
-        pytest.skip(
-            "layout_gemm benchmark path currently supports split_k=1 and block_k_warps=1"
-        )
-    if m % TILE_M or n % TILE_N or k % TILE_K:
-        pytest.skip("layout_gemm benchmark path currently requires tile-aligned M/N/K")
-
-    result = benchmark_layout_gemm(
+    dtype = torch.bfloat16 if "bf16" in dtype else torch.half
+    args = _TestArgs(
+        dtype,
         m,
         n,
         k,
-        warmup=10,
-        iters=20,
-        block_m=TILE_M,
-        block_n=TILE_N,
-        block_k=TILE_K,
-        stages=STAGES,
-        m_waves=BLOCK_M_WARPS,
-        n_waves=BLOCK_N_WARPS,
+        block_m,
+        block_n,
+        block_k,
+        stages,
+        m_waves,
+        n_waves,
+        has_bias,
     )
-
-    assert result["avg_ms"] > 0
-    assert result["tflops"] > 0
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Benchmark layout-system GEMM")
-    parser.add_argument("--m", type=int, default=8192)
-    parser.add_argument("--n", type=int, default=8192)
-    parser.add_argument("--k", type=int, default=8192)
-    parser.add_argument("--warmup", type=int, default=10)
-    parser.add_argument("--iters", type=int, default=50)
-    parser.add_argument("--profiler-row-limit", type=int, default=20)
-    parser.add_argument("--block-m-warps", type=int, default=4)
-    parser.add_argument("--block-n-warps", type=int, default=4)
-    parser.add_argument("--skip-triton", action="store_true")
-    parser.add_argument("--triton-block-m", type=int, default=128)
-    parser.add_argument("--triton-block-n", type=int, default=128)
-    parser.add_argument("--triton-block-k", type=int, default=64)
-    parser.add_argument("--triton-group-m", type=int, default=8)
-    parser.add_argument("--triton-num-warps", type=int, default=8)
-    args = parser.parse_args()
-
-    flydsl_result = benchmark_layout_gemm(
-        args.m,
-        args.n,
-        args.k,
-        warmup=args.warmup,
-        iters=args.iters,
-        profiler_row_limit=args.profiler_row_limit,
-        m_waves=args.block_m_warps,
-        n_waves=args.block_n_warps,
-    )
-
-    triton_result = None
-    if not args.skip_triton:
-        triton_result = benchmark_triton_gemm(
-            args.m,
-            args.n,
-            args.k,
-            warmup=args.warmup,
-            iters=args.iters,
-            block_m=args.triton_block_m,
-            block_n=args.triton_block_n,
-            block_k=args.triton_block_k,
-            group_m=args.triton_group_m,
-            num_warps=args.triton_num_warps,
-        )
-
-    if triton_result is not None:
-        ratio = flydsl_result["tflops"] / triton_result["tflops"]
-        print(f"FlyDSL / Triton TFLOP ratio: {ratio:.3f}x")
+    check_acc(args)

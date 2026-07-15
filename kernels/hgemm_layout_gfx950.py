@@ -1,12 +1,12 @@
 import torch
+from typing import Optional
 
 import flydsl
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, buffer_ops, range_constexpr, rocdl
+from flydsl.expr import arith, buffer_ops, const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch
-from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
 from flydsl._mlir.dialects import llvm
 
 GFX950_DMA_BYTES = 16
@@ -21,6 +21,7 @@ class HGemmGfx950Param:
     stages: fx.Constexpr[int]
     m_waves: fx.Constexpr[int]
     n_waves: fx.Constexpr[int]
+    has_bias: fx.Constexpr[bool]
     # derived params
     async_load_bytes: fx.Constexpr[int]
     in_data_bytes: fx.Constexpr[int]
@@ -32,8 +33,6 @@ class HGemmGfx950Param:
     mma_m: fx.Constexpr[int]
     mma_n: fx.Constexpr[int]
     mma_k: fx.Constexpr[int]
-    mma_m_repeat: fx.Constexpr[int]
-    mma_n_repeat: fx.Constexpr[int]
 
 
 def make_hgemm_gfx950_param(
@@ -43,6 +42,7 @@ def make_hgemm_gfx950_param(
     stages: int = 2,
     m_waves: int = 2,
     n_waves: int = 4,
+    has_bias: bool = False,
     mma_m: int = 16,
     mma_n: int = 16,
     mma_k: int = 32,
@@ -58,8 +58,12 @@ def make_hgemm_gfx950_param(
     in_dbytes = out_dbytes = 2  # for hgemm
     smem_bytes = stages * (block_m + block_n) * block_k * in_dbytes
     arch = get_rocm_arch()
-    smem_capacity = SMEM_CAPACITY_MAP.get(arch)
-    if smem_capacity is not None and smem_bytes > smem_capacity:
+    SMEM_CAPACITY_MAP = {
+        "gfx942": 65536,
+        "gfx950": 163840,
+    }
+    smem_capacity = SMEM_CAPACITY_MAP[arch]
+    if smem_bytes > smem_capacity:
         raise ValueError(
             "staged LDS buffers exceed the device shared-memory capacity: "
             f"stages={stages}, block_m={block_m}, block_n={block_n}, "
@@ -98,6 +102,7 @@ def make_hgemm_gfx950_param(
         stages=stages,
         m_waves=m_waves,
         n_waves=n_waves,
+        has_bias=has_bias,
         async_load_bytes=GFX950_DMA_BYTES,
         in_data_bytes=in_dbytes,
         out_data_bytes=out_dbytes,
@@ -108,14 +113,13 @@ def make_hgemm_gfx950_param(
         mma_m=mma_m,
         mma_n=mma_n,
         mma_k=mma_k,
-        mma_m_repeat=mma_m_repeat,
-        mma_n_repeat=mma_n_repeat,
     )
 
 
 def make_hgemm_gfx950_kernel_name(param: HGemmGfx950Param):
     name = f"hgemm_t{param.block_m}x{param.block_n}x{param.block_k}x{param.stages}"
     name += f"_w{param.m_waves}x{param.n_waves}"
+    name += f"_bias{int(param.has_bias)}"
     name += "_nt"
     return name
 
@@ -157,6 +161,7 @@ def hgemm_gfx950_kernel(
     out: fx.Tensor,
     a: fx.Tensor,
     b: fx.Tensor,
+    bias: fx.Tensor,
     m: fx.Int32,
     n: fx.Int32,
     k: fx.Int32,
@@ -175,8 +180,6 @@ def hgemm_gfx950_kernel(
     block_threads = param.block_threads
     ldg_a_iters = param.ldg_a_iters
     ldg_b_iters = param.ldg_b_iters
-    mma_m_repeat = param.mma_m_repeat
-    mma_n_repeat = param.mma_n_repeat
 
     tid = fx.thread_idx.x
     bid_m, bid_n, _ = fx.block_idx
@@ -196,11 +199,15 @@ def hgemm_gfx950_kernel(
         fx.Int64(tid // wave_size * wave_size * async_load_bytes),
     )
 
-    def make_warp_lds_ptr(ptr):
+    def make_wave_lds_ptr(ptr):
         return fx.recast_iter(fx.Int8, ptr) + wave_offset
 
     a_rsrc = buffer_ops.create_buffer_resource(a, max_size=True)
     b_rsrc = buffer_ops.create_buffer_resource(b, max_size=True)
+    if const_expr(param.has_bias):
+        bias_buf = fx.rocdl.make_buffer_tensor(bias, max_size=True)
+    else:
+        bias_buf = None
     out = fx.rocdl.make_buffer_tensor(out, max_size=False)
     gC = fx.flat_divide(out, (block_m, block_n))[None, None, bid_m, bid_n]
     coord_zero = fx.make_int_tuple(0)
@@ -231,6 +238,7 @@ def hgemm_gfx950_kernel(
     thr_gC = thr_copy_C.partition_D(gC)
     thr_cRow = thr_copy_C.partition_S(row_coords)[(0, None), None, None]
     thr_cCol = thr_copy_C.partition_S(col_coords)[(0, None), None, None]
+    thr_mma_cCol = thr_mma.partition_C(col_coords)
 
     frag_A = thr_mma.make_fragment_A(sA0)
     frag_B = thr_mma.make_fragment_B(sB0)
@@ -243,6 +251,13 @@ def hgemm_gfx950_kernel(
     frag_C_retile = thr_copy_C.retile(frag_C_bf16)
 
     frag_C.fill(0.0)
+    if const_expr(param.has_bias):
+        for i in range_constexpr(fx.get_scalar(fx.size(frag_C.shape))):
+            col_idx = fx.get_scalar(thr_mma_cCol[i])
+            global_n_idx = bid_n * block_n + col_idx
+            safe_global_n_idx = (global_n_idx < n).select(global_n_idx, 0)
+            bias_val = bias_buf[safe_global_n_idx].extf(T.f32)
+            frag_C[i] = bias_val
     for i in range_constexpr(fx.get_scalar(fx.size(pred_C.shape))):
         row_coord = fx.int_tuple_add(
             thr_cRow[i],
@@ -279,7 +294,7 @@ def hgemm_gfx950_kernel(
         return fx.make_view(get_b_stage_ptr(stage), b_lds_layout)
 
     def async_load_a_to_lds(k_tile, stage):
-        lds_ptr = make_warp_lds_ptr(get_a_stage_ptr(stage))
+        lds_ptr = make_wave_lds_ptr(get_a_stage_ptr(stage))
         for i in range_constexpr(ldg_a_iters):
             global_tid = block_threads * i + tid
             m_local_idx = global_tid // ldg_x_threads
@@ -292,13 +307,13 @@ def hgemm_gfx950_kernel(
                 a_lds_layout,
             )
             global_offset = (safe_global_m_idx * k + global_k_idx) * in_data_bytes
-            global_offset = arith.index_cast(T.i32, global_offset)
+            # global_offset = arith.index_cast(T.i32, global_offset)
             buffer_load_lds_inline(a_rsrc, lds_ptr, global_offset, async_load_bytes)
             if i < ldg_a_iters - 1:
                 lds_ptr = advance_lds_ptr(lds_ptr)
 
     def async_load_b_to_lds(k_tile, stage):
-        lds_ptr = make_warp_lds_ptr(get_b_stage_ptr(stage))
+        lds_ptr = make_wave_lds_ptr(get_b_stage_ptr(stage))
         for i in range_constexpr(ldg_b_iters):
             global_tid = block_threads * i + tid
             n_local_idx = global_tid // ldg_x_threads
@@ -311,7 +326,7 @@ def hgemm_gfx950_kernel(
                 b_lds_layout,
             )
             global_offset = (safe_global_n_idx * k + global_k_idx) * in_data_bytes
-            global_offset = arith.index_cast(T.i32, global_offset)
+            # global_offset = arith.index_cast(T.i32, global_offset)
             buffer_load_lds_inline(b_rsrc, lds_ptr, global_offset, async_load_bytes)
             if i < ldg_b_iters - 1:
                 lds_ptr = advance_lds_ptr(lds_ptr)
@@ -371,6 +386,7 @@ def launch_hgemm_gfx950(
     out: fx.Tensor,
     a: fx.Tensor,
     b: fx.Tensor,
+    bias: fx.Tensor,
     m: fx.Int32,
     n: fx.Int32,
     k: fx.Int32,
@@ -400,218 +416,88 @@ def launch_hgemm_gfx950(
     num_pid_n = (n + param.block_n - 1) // param.block_n
     hgemm_gfx950_kernel._known_block_size = [param.block_threads, 1, 1]
     hgemm_gfx950_kernel._func.__name__ = make_hgemm_gfx950_kernel_name(param)
-    hgemm_gfx950_kernel(out, a, b, m, n, k, tiled_mma, param).launch(
+    hgemm_gfx950_kernel(out, a, b, bias, m, n, k, tiled_mma, param).launch(
         grid=(num_pid_m, num_pid_n, 1),
         block=(param.block_threads, 1, 1),
         stream=stream,
     )
 
 
-def layout_gemm(
+def make_hgemm_param_and_validate(m, n, k, kwargs):
+    block_k = kwargs["block_k"]
+    num_k_tiles = k // block_k
+    result = None
+    try:
+        result = make_hgemm_gfx950_param(**kwargs)
+    except Exception as e:
+        return None
+    if not ((n % 32 == 0) and (k % 32 == 0)):
+        return None
+    if not (num_k_tiles * block_k == k):
+        return None
+    return result
+
+
+def hgemm(
     a: torch.Tensor,
     b: torch.Tensor,
-    c: torch.Tensor | None = None,
-    *,
-    block_m: int = 128,
-    block_n: int = 128,
-    block_k: int = 64,
-    stages: int = 5,
-    m_waves: int = 4,
-    n_waves: int = 4,
-    mma_m: int = 16,
-    mma_n: int = 16,
-    mma_k: int = 32,
-    stream: torch.cuda.Stream | None = None,
+    out: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    user_kwargs: dict = {},
+    stream: Optional[torch.cuda.Stream] = None,
 ) -> torch.Tensor:
-    """Compute C = A @ B.T with the FlyDSL layout-system tiled MMA path."""
+    if stream is None:
+        stream = torch.cuda.current_stream()
+    device = a.device
+    assert a.device == b.device
+    k = a.shape[-1]
+    a = a.view(-1, k)
+    m = a.shape[0]
+    n = b.shape[0]
+    assert b.shape[1] == k
+    if not a.is_contiguous():
+        a = a.contiguous()
+    if not b.is_contiguous():
+        b = b.contiguous()
+    assert a.dtype == b.dtype
+    if out is None:
+        out = torch.empty((m, n), dtype=a.dtype, device=a.device)
+    else:
+        assert out.dtype == a.dtype
+        assert out.device == device
+        assert out.is_contiguous()
+    out = out.view(-1, n)
+    assert out.shape[0] == m
+    assert out.dtype == a.dtype
 
-    if c is None:
-        c = torch.empty((a.shape[0], b.shape[0]), dtype=a.dtype, device=a.device)
-    if a.ndim != 2 or b.ndim != 2 or c.ndim != 2:
-        raise ValueError("layout_gemm expects 2D tensors")
-    if not (a.is_cuda and b.is_cuda and c.is_cuda):
-        raise ValueError("layout_gemm expects CUDA tensors")
-    if a.dtype != torch.bfloat16 or b.dtype != torch.bfloat16:
-        raise TypeError("layout_gemm currently supports bf16 A/B only")
-    if c.dtype != a.dtype:
-        raise TypeError("layout_gemm expects C to have the same dtype as A/B")
-    if not a.is_contiguous() or not b.is_contiguous() or not c.is_contiguous():
-        raise ValueError("layout_gemm expects contiguous row-major tensors")
-    m, k = a.shape
-    n, kb = b.shape
-    if kb != k:
-        raise ValueError(
-            f"inner dimensions must match, got A.shape={a.shape}, B.shape={b.shape}"
-        )
-    if c.shape != (m, n):
-        raise ValueError(f"C must have shape {(m, n)}, got {tuple(c.shape)}")
-    if k % block_k:
-        raise ValueError(f"K must be a multiple of block_k={block_k}, got K={k}")
-    effective_stages = min(stages, k // block_k)
-    if effective_stages < 2:
-        raise ValueError(
-            f"K must contain at least 2 block_k tiles for the staged pipeline, got K={k}, block_k={block_k}"
-        )
+    if bias is not None and not bias.is_contiguous():
+        bias = bias.contiguous()
 
-    launch_stream = torch.cuda.current_stream(a.device) if stream is None else stream
-    param = make_hgemm_gfx950_param(
-        block_m=block_m,
-        block_n=block_n,
-        block_k=block_k,
-        stages=effective_stages,
-        m_waves=m_waves,
-        n_waves=n_waves,
-        mma_m=mma_m,
-        mma_n=mma_n,
-        mma_k=mma_k,
-    )
-
-    launch_hgemm_gfx950(
-        c,
-        a,
-        b,
-        a.shape[0],
-        b.shape[0],
-        a.shape[1],
-        param,
-        stream=launch_stream,
-    )
-    return c
-
-
-def benchmark_layout_gemm(
-    m: int = 8192,
-    n: int = 8192,
-    k: int = 8192,
-    *,
-    warmup: int = 10,
-    iters: int = 50,
-    block_m: int = 128,
-    block_n: int = 128,
-    block_k: int = 64,
-    stages: int = 4,
-    m_waves: int = 4,
-    n_waves: int = 4,
-    mma_m: int = 16,
-    mma_n: int = 16,
-    mma_k: int = 32,
-    profiler_row_limit: int = 20,
-) -> dict[str, float]:
-    """Run a profiler-backed benchmark for the layout-system GEMM kernel."""
-
-    a = torch.randn((m, k), dtype=torch.bfloat16, device="cuda")
-    b = torch.randn((n, k), dtype=torch.bfloat16, device="cuda")
-    c = torch.empty((m, n), dtype=a.dtype, device="cuda")
-    stream = torch.cuda.current_stream()
-
-    layout_gemm(
-        a,
-        b,
-        c,
-        block_m=block_m,
-        block_n=block_n,
-        block_k=block_k,
-        stages=stages,
-        m_waves=m_waves,
-        n_waves=n_waves,
-        mma_m=mma_m,
-        mma_n=mma_n,
-        mma_k=mma_k,
-        stream=stream,
-    )
-    torch.cuda.synchronize()
-
-    for _ in range(warmup):
-        layout_gemm(
-            a,
-            b,
-            c,
-            block_m=block_m,
-            block_n=block_n,
-            block_k=block_k,
-            stages=stages,
-            m_waves=m_waves,
-            n_waves=n_waves,
-            mma_m=mma_m,
-            mma_n=mma_n,
-            mma_k=mma_k,
-            stream=stream,
-        )
-    torch.cuda.synchronize()
-
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record(stream)
-    for _ in range(iters):
-        layout_gemm(
-            a,
-            b,
-            c,
-            block_m=block_m,
-            block_n=block_n,
-            block_k=block_k,
-            stages=stages,
-            m_waves=m_waves,
-            n_waves=n_waves,
-            mma_m=mma_m,
-            mma_n=mma_n,
-            mma_k=mma_k,
-            stream=stream,
-        )
-    end.record(stream)
-    end.synchronize()
-
-    activities = [
-        torch.profiler.ProfilerActivity.CPU,
-        torch.profiler.ProfilerActivity.CUDA,
-    ]
-    with torch.profiler.profile(activities=activities) as prof:
-        for _ in range(iters):
-            layout_gemm(
-                a,
-                b,
-                c,
-                block_m=block_m,
-                block_n=block_n,
-                block_k=block_k,
-                stages=stages,
-                m_waves=m_waves,
-                n_waves=n_waves,
-                mma_m=mma_m,
-                mma_n=mma_n,
-                mma_k=mma_k,
-                stream=stream,
-            )
-        torch.cuda.synchronize()
-
-    avg_ms = start.elapsed_time(end) / iters
-    tflops = (2.0 * m * n * k) / (avg_ms / 1e3) / 1e12
-    result = {
-        "m": float(m),
-        "n": float(n),
-        "k": float(k),
-        "avg_ms": avg_ms,
-        "tflops": tflops,
-        "block_m": float(block_m),
-        "block_n": float(block_n),
-        "block_k": float(block_k),
-        "stages": float(stages),
-        "m_waves": float(m_waves),
-        "n_waves": float(n_waves),
-        "mma_m": float(mma_m),
-        "mma_n": float(mma_n),
-        "mma_k": float(mma_k),
+    kwargs = {
+        "block_m": 256,
+        "block_n": 256,
+        "block_k": 64,
+        "stages": 2,
+        "m_waves": 4,
+        "n_waves": 4,
     }
-    print(
-        "layout_gemm "
-        f"tile={block_m}x{block_n}x{block_k}x{stages} "
-        f"waves={m_waves}x{n_waves} M={m} N={n} K={k}: "
-        f"{avg_ms:.4f} ms, {tflops:.2f} TFLOP/s"
-    )
-    print(
-        prof.key_averages().table(
-            sort_by="cuda_time_total",
-            row_limit=profiler_row_limit,
-        )
-    )
-    return result
+    if m == 2048 and n == 2048 and k == 2048:
+        kwargs = {
+            "block_m": 128,
+            "block_n": 128,
+            "block_k": 64,
+            "stages": 4,
+            "m_waves": 4,
+            "n_waves": 4,
+        }
+    kwargs.update(user_kwargs)
+    kwargs["has_bias"] = False if bias is None else True
+    bias_tensor = a if bias is None else bias
+
+    if bias is not None:
+        assert bias.shape[0] == n
+        assert bias.dtype == a.dtype
+
+    param = make_hgemm_param_and_validate(m, n, k, kwargs)
+    launch_hgemm_gfx950(out, a, b, bias_tensor, m, n, k, param, stream)
+    return out
