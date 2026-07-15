@@ -9,6 +9,8 @@ from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch
 from flydsl._mlir.dialects import llvm
 
+from .hgemm_wmma_gfx950_utils import BlockSwizzle
+
 GFX950_DMA_BYTES = 16
 GFX950_WAVE_SIZE = 64
 
@@ -21,6 +23,7 @@ class HGemmGfx950Param:
     stages: fx.Constexpr[int]
     m_waves: fx.Constexpr[int]
     n_waves: fx.Constexpr[int]
+    group_m: fx.Constexpr[int]
     has_bias: fx.Constexpr[bool]
     # derived params
     async_load_bytes: fx.Constexpr[int]
@@ -42,6 +45,7 @@ def make_hgemm_gfx950_param(
     stages: int = 2,
     m_waves: int = 2,
     n_waves: int = 4,
+    group_m: int = 0,
     has_bias: bool = False,
     mma_m: int = 16,
     mma_n: int = 16,
@@ -55,6 +59,8 @@ def make_hgemm_gfx950_param(
         raise ValueError("stages must be at least 2 for the staged LDS pipeline")
     if m_waves <= 0 or n_waves <= 0:
         raise ValueError("m_waves, and n_waves must be positive")
+    if group_m < 0:
+        raise ValueError("group_m must be non-negative")
     in_dbytes = out_dbytes = 2  # for hgemm
     smem_bytes = stages * (block_m + block_n) * block_k * in_dbytes
     arch = get_rocm_arch()
@@ -103,6 +109,7 @@ def make_hgemm_gfx950_param(
         stages=stages,
         m_waves=m_waves,
         n_waves=n_waves,
+        group_m=group_m,
         has_bias=has_bias,
         async_load_bytes=GFX950_DMA_BYTES,
         in_data_bytes=in_dbytes,
@@ -120,6 +127,7 @@ def make_hgemm_gfx950_param(
 def make_hgemm_gfx950_kernel_name(param: HGemmGfx950Param):
     name = f"hgemm_t{param.block_m}x{param.block_n}x{param.block_k}x{param.stages}"
     name += f"_w{param.m_waves}x{param.n_waves}"
+    name += f"_gm{param.group_m}"
     name += f"_bias{int(param.has_bias)}"
     name += "_nt"
     return name
@@ -183,7 +191,12 @@ def hgemm_gfx950_kernel(
     ldg_b_iters = param.ldg_b_iters
 
     tid = fx.thread_idx.x
-    bid_m, bid_n, _ = fx.block_idx
+    num_pid_m = (m + block_m - 1) // block_m
+    num_pid_n = (n + block_n - 1) // block_n
+    block_swizzle = BlockSwizzle(
+        NUM_XCDS=8, NUM_PIDS_THRESHOLD=256, GROUP_M=param.group_m
+    )
+    bid_m, bid_n = block_swizzle.swizzle(num_pid_m, num_pid_n, fx.block_idx.x)
     k_tiles = k // block_k
 
     @fx.struct
@@ -410,7 +423,7 @@ def launch_hgemm_gfx950(
     hgemm_gfx950_kernel._known_block_size = [param.block_threads, 1, 1]
     hgemm_gfx950_kernel._func.__name__ = make_hgemm_gfx950_kernel_name(param)
     hgemm_gfx950_kernel(out, a, b, bias, m, n, k, tiled_mma, param).launch(
-        grid=(num_pid_m, num_pid_n, 1),
+        grid=(num_pid_m * num_pid_n, 1, 1),
         block=(param.block_threads, 1, 1),
         stream=stream,
     )
@@ -473,6 +486,7 @@ def hgemm(
         "stages": 2,
         "m_waves": 4,
         "n_waves": 4,
+        "group_m": 0,
     }
     if m == 2048 and n == 2048 and k == 2048:
         kwargs = {
@@ -482,6 +496,7 @@ def hgemm(
             "stages": 4,
             "m_waves": 4,
             "n_waves": 4,
+            "group_m": 0,
         }
     kwargs.update(user_kwargs)
     kwargs["has_bias"] = False if bias is None else True

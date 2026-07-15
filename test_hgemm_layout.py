@@ -22,6 +22,7 @@ class _TestArgs:
     stages: int
     m_waves: int
     n_waves: int
+    group_m: int
     has_bias: bool
 
 
@@ -84,6 +85,7 @@ def check_acc(args: _TestArgs):
         "stages": args.stages,
         "m_waves": args.m_waves,
         "n_waves": args.n_waves,
+        "group_m": args.group_m,
     }
     inputs = create_inputs(args)
     outputs = create_outputs(args)
@@ -124,6 +126,7 @@ def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
         "stages": args.stages,
         "m_waves": args.m_waves,
         "n_waves": args.n_waves,
+        "group_m": args.group_m,
     }
     sample_inputs = create_inputs(args)
     sample_outputs = create_outputs(args)
@@ -187,20 +190,20 @@ def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
     ],
 )
 @pytest.mark.parametrize(
-    "m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, has_bias",
+    "m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, group_m, has_bias",
     [
-        (8192, 8192, 8192, 256, 256, 64, 2, 2, 4, False),
-        (8192, 8192, 8192, 256, 256, 64, 2, 2, 4, True),
-        (8160, 8160, 8192, 256, 256, 64, 2, 2, 4, False),
-        (8160, 8160, 8192, 256, 256, 64, 2, 2, 4, True),
-        (8192, 8192, 8192 + 64, 256, 256, 64, 2, 2, 4, False),
-        (8192, 8192, 8192 + 64, 256, 256, 64, 2, 2, 4, True),
-        (8160, 8160, 8192 + 64, 256, 256, 64, 2, 2, 4, False),
-        (8160, 8160, 8192 + 64, 256, 256, 64, 2, 2, 4, True),
-        (2048, 2048, 2048, 128, 128, 64, 2, 4, 4, False),
-        (2048, 2048, 2048, 128, 128, 64, 4, 4, 4, True),
-        (2048, 2048, 2048 - 64, 128, 128, 64, 2, 4, 4, False),
-        (2048, 2048, 2048 - 64, 128, 128, 64, 4, 4, 4, True),
+        (8192, 8192, 8192, 256, 256, 64, 2, 2, 4, 0, False),
+        (8192, 8192, 8192, 256, 256, 64, 2, 2, 4, 4, True),
+        (8160, 8160, 8192, 256, 256, 64, 2, 2, 4, 0, False),
+        (8160, 8160, 8192, 256, 256, 64, 2, 2, 4, 0, True),
+        (8192, 8192, 8192 + 64, 256, 256, 64, 2, 2, 4, 0, False),
+        (8192, 8192, 8192 + 64, 256, 256, 64, 2, 2, 4, 0, True),
+        (8160, 8160, 8192 + 64, 256, 256, 64, 2, 2, 4, 0, False),
+        (8160, 8160, 8192 + 64, 256, 256, 64, 2, 2, 4, 0, True),
+        (2048, 2048, 2048, 128, 128, 64, 2, 4, 4, 0, False),
+        (2048, 2048, 2048, 128, 128, 64, 4, 4, 4, 0, True),
+        (2048, 2048, 2048 - 64, 128, 128, 64, 2, 4, 4, 0, False),
+        (2048, 2048, 2048 - 64, 128, 128, 64, 4, 4, 4, 0, True),
     ],
 )
 def test_hgemm_acc_main_loop(
@@ -214,6 +217,7 @@ def test_hgemm_acc_main_loop(
     stages: int,
     m_waves: int,
     n_waves: int,
+    group_m: int,
     has_bias: bool,
 ):
     dtype = torch.bfloat16 if "bf16" in dtype else torch.half
@@ -228,6 +232,7 @@ def test_hgemm_acc_main_loop(
         stages,
         m_waves,
         n_waves,
+        group_m,
         has_bias,
     )
     check_acc(args)
@@ -240,12 +245,12 @@ def test_hgemm_acc_main_loop(
     ],
 )
 @pytest.mark.parametrize(
-    "m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, has_bias",
+    "m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, group_m, has_bias",
     [
-        (3, 5120, 2880, 64, 64, 64, 5, 2, 2, True),
-        (3, 5120, 2880, 64, 64, 64, 5, 2, 2, False),
-        (3, 5120, 2880, 64, 64, 64, 2, 2, 2, True),
-        (3, 5120, 2880, 64, 64, 64, 2, 2, 2, False),
+        (3, 5120, 2880, 64, 64, 64, 5, 2, 2, 4, True),
+        (3, 5120, 2880, 64, 64, 64, 5, 2, 2, 0, False),
+        (3, 5120, 2880, 64, 64, 64, 2, 2, 2, 0, True),
+        (3, 5120, 2880, 64, 64, 64, 2, 2, 2, 0, False),
     ],
 )
 def test_hgemm_acc_small_m(
@@ -259,6 +264,7 @@ def test_hgemm_acc_small_m(
     stages: int,
     m_waves: int,
     n_waves: int,
+    group_m: int,
     has_bias: bool,
 ):
     dtype = torch.bfloat16 if "bf16" in dtype else torch.half
@@ -273,6 +279,7 @@ def test_hgemm_acc_small_m(
         stages,
         m_waves,
         n_waves,
+        group_m,
         has_bias,
     )
     check_acc(args)
@@ -283,14 +290,14 @@ def test_hgemm_acc_small_m(
 
 @pytest.mark.parametrize("dtype", ["bf16"])
 @pytest.mark.parametrize(
-    "m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, has_bias",
+    "m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, group_m, has_bias",
     [
-        (8192, 8192, 8192, 256, 256, 64, 2, 4, 4, True),
-        (4096, 4096, 4096, 256, 256, 64, 2, 4, 4, True),
-        (4096, 4096, 8192, 256, 256, 64, 2, 4, 4, True),
-        (2048, 2048, 2048, 128, 128, 64, 4, 4, 4, True),
-        (1024, 1024, 1024, 64, 64, 64, 6, 4, 4, True),
-        (8, 7168, 2048, 16, 32, 128, 6, 1, 2, True),
+        (8192, 8192, 8192, 256, 256, 64, 2, 4, 4, 0, True),
+        (4096, 4096, 4096, 256, 256, 64, 2, 2, 4, 4, True),
+        (4096, 4096, 8192, 256, 256, 64, 2, 2, 4, 4, True),
+        (2048, 2048, 2048, 128, 128, 64, 5, 2, 4, 0, True),
+        (1024, 1024, 1024, 64, 64, 64, 6, 4, 4, 0, True),
+        (8, 7168, 2048, 16, 32, 128, 6, 1, 2, 0, True),
     ],
 )
 def test_hgemm_benchmark_smoke(
@@ -304,6 +311,7 @@ def test_hgemm_benchmark_smoke(
     stages: int,
     m_waves: int,
     n_waves: int,
+    group_m: int,
     has_bias: bool,
 ):
     dtype = torch.bfloat16 if "bf16" in dtype else torch.half
@@ -318,6 +326,7 @@ def test_hgemm_benchmark_smoke(
         stages,
         m_waves,
         n_waves,
+        group_m,
         has_bias,
     )
     benchmark(args)
