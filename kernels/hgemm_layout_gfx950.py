@@ -256,23 +256,17 @@ def hgemm_gfx950_kernel(
             col_idx = fx.get_scalar(thr_mma_cCol[i])
             global_n_idx = bid_n * block_n + col_idx
             safe_global_n_idx = (global_n_idx < n).select(global_n_idx, 0)
-            bias_val = bias_buf[safe_global_n_idx].extf(T.f32)
+            bias_val = bias_buf[safe_global_n_idx].to(fx.Float32)
             frag_C[i] = bias_val
     for i in range_constexpr(fx.get_scalar(fx.size(pred_C.shape))):
-        row_coord = fx.int_tuple_add(
-            thr_cRow[i],
-            fx.make_int_tuple(arith.index_cast(T.i32, bid_m * block_m)),
-        )
-        col_coord = fx.int_tuple_add(
-            thr_cCol[i],
-            fx.make_int_tuple(arith.index_cast(T.i32, bid_n * block_n)),
-        )
-        pred_C[i] = (fx.get_scalar(row_coord) < m) & (fx.get_scalar(col_coord) < n)
+        row_idx = bid_m * block_m + fx.get_scalar(thr_cRow[i])
+        col_idx = bid_n * block_n + fx.get_scalar(thr_cCol[i])
+        pred_C[i] = (row_idx < m) & (col_idx < n)
 
     def swizzled_col_idx(row, col, layout):
         elem_offset = fx.get_scalar(
             fx.crd2idx(
-                (arith.index_cast(T.i32, row), arith.index_cast(T.i32, col)),
+                (row, col),
                 layout,
             )
         )
@@ -307,7 +301,6 @@ def hgemm_gfx950_kernel(
                 a_lds_layout,
             )
             global_offset = (safe_global_m_idx * k + global_k_idx) * in_data_bytes
-            # global_offset = arith.index_cast(T.i32, global_offset)
             buffer_load_lds_inline(a_rsrc, lds_ptr, global_offset, async_load_bytes)
             if i < ldg_a_iters - 1:
                 lds_ptr = advance_lds_ptr(lds_ptr)
@@ -326,7 +319,6 @@ def hgemm_gfx950_kernel(
                 b_lds_layout,
             )
             global_offset = (safe_global_n_idx * k + global_k_idx) * in_data_bytes
-            # global_offset = arith.index_cast(T.i32, global_offset)
             buffer_load_lds_inline(b_rsrc, lds_ptr, global_offset, async_load_bytes)
             if i < ldg_b_iters - 1:
                 lds_ptr = advance_lds_ptr(lds_ptr)

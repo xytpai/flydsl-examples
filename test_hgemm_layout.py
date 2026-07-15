@@ -169,9 +169,9 @@ def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
 @pytest.mark.parametrize(
     "m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, has_bias",
     [
-        # k 8192
-        # (8192, 8192, 8192, 256, 256, 64, 2, 2, 4, True),
-        (8192, 8192, 8192, 256, 256, 64, 2, 2, 4, False),
+        (8192, 8192, 8192, 256, 256, 64, 2, 4, 4, False),
+        (2048, 2048, 2048, 128, 128, 64, 2, 4, 4, False),
+        (2048, 2048, 2048, 128, 128, 64, 4, 4, 4, True),
     ],
 )
 def test_hgemm_acc_main_loop(
