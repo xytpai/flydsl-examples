@@ -48,6 +48,17 @@ def ref_func(*args):
     F.linear(a, b, out=c, bias=bias)
 
 
+def make_triton_maxautotune_func():
+    import torch._inductor.config as inductor_config
+
+    inductor_config.max_autotune_gemm_backends = "TRITON"
+
+    def triton_maxautotune_func(a, b, bias, c):
+        c.copy_(F.linear(a, b, bias=bias))
+
+    return torch.compile(triton_maxautotune_func, mode="max-autotune", fullgraph=True)
+
+
 def func(*args):
     a, b, bias, c, kwargs = args
     hgemm(a, b, c, bias=bias, user_kwargs=kwargs)
@@ -122,6 +133,7 @@ def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
         create_outputs(args) for _ in range(rotary_inputs - 1)
     ]
     ref_outputs = [create_outputs(args) for _ in range(rotary_inputs)]
+    triton_maxautotune_func = make_triton_maxautotune_func()
     global ROTARY_INPUTS_TARGET_BYTES
     print(
         f"rotary_inputs:{rotary_inputs}, target_bytes:{ROTARY_INPUTS_TARGET_BYTES}, "
@@ -131,6 +143,9 @@ def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
     def run_ref(idx):
         ref_func(*(ref_inputs[idx] + ref_outputs[idx]))
 
+    def run_triton_maxautotune(idx):
+        triton_maxautotune_func(*(ref_inputs[idx] + ref_outputs[idx]))
+
     def run_flydsl(idx):
         func(*(inputs[idx] + outputs[idx] + (kwargs,)))
 
@@ -139,9 +154,11 @@ def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
         idx = i % rotary_inputs
         if i % 2 == 0:
             run_ref(idx)
+            run_triton_maxautotune(idx)
             run_flydsl(idx)
         else:
             run_flydsl(idx)
+            run_triton_maxautotune(idx)
             run_ref(idx)
         torch.cuda.synchronize()
 
@@ -152,9 +169,11 @@ def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
             idx = i % rotary_inputs
             if i % 2 == 0:
                 run_ref(idx)
+                run_triton_maxautotune(idx)
                 run_flydsl(idx)
             else:
                 run_flydsl(idx)
+                run_triton_maxautotune(idx)
                 run_ref(idx)
             torch.cuda.synchronize()
     print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))
@@ -269,6 +288,7 @@ def test_hgemm_acc_small_m(
         (4096, 4096, 4096, 256, 256, 64, 2, 4, 4, True),
         (4096, 4096, 8192, 256, 256, 64, 2, 4, 4, True),
         (2048, 2048, 2048, 128, 128, 64, 4, 4, 4, True),
+        (1024, 1024, 1024, 64, 64, 64, 6, 4, 4, True),
     ],
 )
 def test_hgemm_benchmark_smoke(
