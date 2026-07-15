@@ -211,3 +211,91 @@ def test_hgemm_acc_main_loop(
         has_bias,
     )
     check_acc(args)
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        "bf16",
+    ],
+)
+@pytest.mark.parametrize(
+    "m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, has_bias",
+    [
+        (3, 5120, 2880, 64, 64, 64, 5, 2, 2, True),
+        (3, 5120, 2880, 64, 64, 64, 5, 2, 2, False),
+        (3, 5120, 2880, 64, 64, 64, 2, 2, 2, True),
+        (3, 5120, 2880, 64, 64, 64, 2, 2, 2, False),
+    ],
+)
+def test_hgemm_acc_small_m(
+    dtype: str,
+    m: int,
+    n: int,
+    k: int,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    stages: int,
+    m_waves: int,
+    n_waves: int,
+    has_bias: bool,
+):
+    dtype = torch.bfloat16 if "bf16" in dtype else torch.half
+    args = _TestArgs(
+        dtype,
+        m,
+        n,
+        k,
+        block_m,
+        block_n,
+        block_k,
+        stages,
+        m_waves,
+        n_waves,
+        has_bias,
+    )
+    check_acc(args)
+
+
+# =========================================== benchmark ===========================================
+
+
+@pytest.mark.parametrize("dtype", ["bf16"])
+@pytest.mark.parametrize(
+    "m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, has_bias",
+    [
+        (8192, 8192, 8192, 256, 256, 64, 2, 4, 4, True),
+        (4096, 4096, 4096, 256, 256, 64, 2, 4, 4, True),
+        (4096, 4096, 8192, 256, 256, 64, 2, 4, 4, True),
+        (2048, 2048, 2048, 128, 128, 64, 4, 4, 4, True),
+    ],
+)
+def test_hgemm_benchmark_smoke(
+    dtype: str,
+    m: int,
+    n: int,
+    k: int,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    stages: int,
+    m_waves: int,
+    n_waves: int,
+    has_bias: bool,
+):
+    dtype = torch.bfloat16 if "bf16" in dtype else torch.half
+    args = _TestArgs(
+        dtype,
+        m,
+        n,
+        k,
+        block_m,
+        block_n,
+        block_k,
+        stages,
+        m_waves,
+        n_waves,
+        has_bias,
+    )
+    benchmark(args)
