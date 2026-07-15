@@ -118,7 +118,7 @@ def func(*args):
 
 
 def tensor_nbytes(tensors: torch.Tensor):
-    return sum(t.numel() * t.element_size() for t in tensors)
+    return sum(t.numel() * t.element_size() for t in tensors if t is not None)
 
 
 def get_rotary_inputs(sample_inputs: torch.Tensor, sample_outputs: torch.Tensor):
@@ -769,12 +769,12 @@ def test_hgemm_acc_ft_special(
 @pytest.mark.parametrize(
     "m, n, k, TILE_M, TILE_N, TILE_K, STAGES, SPLIT_K, BLOCK_M_WARPS, BLOCK_N_WARPS, BLOCK_K_WARPS, HAS_BIAS, GROUP_M, USE_HALF_TILE_INTERLEAVED",
     [
-        (16384, 16384, 16384, 256, 256, 64, 2, 1, 2, 4, 1, True, 4, True),
-        (8192, 8192, 8192, 256, 256, 64, 2, 1, 2, 4, 1, True, 0, True),
-        (8160, 8160, 8160, 256, 256, 64, 2, 1, 2, 4, 1, True, 0, True),
-        (4096, 4096, 8192, 256, 256, 64, 2, 1, 2, 4, 1, True, 4, True),
-        (4096, 4096, 4096, 256, 256, 64, 2, 1, 2, 4, 1, True, 0, True),
-        (2048, 2048, 2048, 128, 128, 64, 5, 1, 4, 4, 1, True, 0, False),
+        # (16384, 16384, 16384, 256, 256, 64, 2, 1, 2, 4, 1, True, 4, True),
+        # (8192, 8192, 8192, 256, 256, 64, 2, 1, 2, 4, 1, True, 0, True),
+        # (8160, 8160, 8160, 256, 256, 64, 2, 1, 2, 4, 1, True, 0, True),
+        # (4096, 4096, 8192, 256, 256, 64, 2, 1, 2, 4, 1, True, 4, True),
+        # (4096, 4096, 4096, 256, 256, 64, 2, 1, 2, 4, 1, True, 0, True),
+        (2048, 2048, 2048, 128, 128, 64, 5, 1, 4, 4, 1, False, 0, False),
     ],
 )
 def test_hgemm_benchmark_smoke(

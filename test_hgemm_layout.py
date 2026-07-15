@@ -93,9 +93,9 @@ def benchmark_triton_gemm(
         print("triton_gemm skipped: triton is not installed")
         return None
 
-    a = torch.randn((m, k), dtype=torch.float16, device="cuda")
-    b = torch.randn((n, k), dtype=torch.float16, device="cuda")
-    c = torch.empty((m, n), dtype=torch.float32, device="cuda")
+    a = torch.randn((m, k), dtype=torch.bfloat16, device="cuda")
+    b = torch.randn((n, k), dtype=torch.bfloat16, device="cuda")
+    c = torch.empty((m, n), dtype=a.dtype, device="cuda")
     grid = (triton.cdiv(m, block_m) * triton.cdiv(n, block_n),)
 
     def launch():
@@ -158,20 +158,69 @@ def benchmark_triton_gemm(
 def test_layout_gemm_correctness():
     torch.manual_seed(0)
     m, n, k = 256, 256, 128
-    a = torch.randn((m, k), dtype=torch.float16, device="cuda")
-    b = torch.randn((n, k), dtype=torch.float16, device="cuda")
-    c = torch.empty((m, n), dtype=torch.float32, device="cuda")
+    a = torch.randn((m, k), dtype=torch.bfloat16, device="cuda")
+    b = torch.randn((n, k), dtype=torch.bfloat16, device="cuda")
+    c = torch.empty((m, n), dtype=a.dtype, device="cuda")
 
     out = layout_gemm(a, b, c)
     torch.cuda.synchronize()
 
     assert out.data_ptr() == c.data_ptr()
-    ref = a.float() @ b.float().T
+    ref = (a.float() @ b.float().T).to(out.dtype)
     torch.testing.assert_close(out, ref, atol=5e-2, rtol=5e-2)
 
 
-def test_layout_gemm_benchmark_smoke():
-    result = benchmark_layout_gemm(8192, 8192, 8192, warmup=10, iters=20)
+@pytest.mark.parametrize("dtype", ["bf16"])
+@pytest.mark.parametrize(
+    "m, n, k, TILE_M, TILE_N, TILE_K, STAGES, SPLIT_K, BLOCK_M_WARPS, BLOCK_N_WARPS, BLOCK_K_WARPS, HAS_BIAS, GROUP_M, USE_HALF_TILE_INTERLEAVED",
+    [
+        # (16384, 16384, 16384, 256, 256, 64, 2, 1, 2, 4, 1, True, 4, True),
+        # (8192, 8192, 8192, 256, 256, 64, 2, 1, 2, 4, 1, False, 0, False),
+        # (8160, 8160, 8160, 256, 256, 64, 2, 1, 2, 4, 1, True, 0, True),
+        # (4096, 4096, 8192, 256, 256, 64, 2, 1, 2, 4, 1, True, 4, True),
+        # (4096, 4096, 4096, 256, 256, 64, 2, 1, 2, 4, 1, True, 0, True),
+        (2048, 2048, 2048, 128, 128, 64, 2, 1, 4, 4, 1, False, 0, False),
+    ],
+)
+def test_layout_gemm_benchmark_smoke(
+    dtype: str,
+    m: int,
+    n: int,
+    k: int,
+    TILE_M: int,
+    TILE_N: int,
+    TILE_K: int,
+    STAGES: int,
+    SPLIT_K: int,
+    BLOCK_M_WARPS: int,
+    BLOCK_N_WARPS: int,
+    BLOCK_K_WARPS: int,
+    HAS_BIAS: bool,
+    GROUP_M: int,
+    USE_HALF_TILE_INTERLEAVED: bool,
+):
+    if dtype != "bf16":
+        pytest.skip("layout_gemm currently supports bf16 only")
+    if SPLIT_K != 1 or BLOCK_K_WARPS != 1:
+        pytest.skip(
+            "layout_gemm benchmark path currently supports split_k=1 and block_k_warps=1"
+        )
+    if m % TILE_M or n % TILE_N or k % TILE_K:
+        pytest.skip("layout_gemm benchmark path currently requires tile-aligned M/N/K")
+
+    result = benchmark_layout_gemm(
+        m,
+        n,
+        k,
+        warmup=10,
+        iters=20,
+        block_m=TILE_M,
+        block_n=TILE_N,
+        block_k=TILE_K,
+        stages=STAGES,
+        m_waves=BLOCK_M_WARPS,
+        n_waves=BLOCK_N_WARPS,
+    )
 
     assert result["avg_ms"] > 0
     assert result["tflops"] > 0
@@ -184,7 +233,8 @@ if __name__ == "__main__":
     parser.add_argument("--k", type=int, default=8192)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=50)
-    parser.add_argument("--block-m-warps", type=int, default=2)
+    parser.add_argument("--profiler-row-limit", type=int, default=20)
+    parser.add_argument("--block-m-warps", type=int, default=4)
     parser.add_argument("--block-n-warps", type=int, default=4)
     parser.add_argument("--skip-triton", action="store_true")
     parser.add_argument("--triton-block-m", type=int, default=128)
@@ -200,8 +250,9 @@ if __name__ == "__main__":
         args.k,
         warmup=args.warmup,
         iters=args.iters,
-        block_m_warps=args.block_m_warps,
-        block_n_warps=args.block_n_warps,
+        profiler_row_limit=args.profiler_row_limit,
+        m_waves=args.block_m_warps,
+        n_waves=args.block_n_warps,
     )
 
     triton_result = None

@@ -1,207 +1,316 @@
 import torch
 
+import flydsl
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, range_constexpr, rocdl
+from flydsl.expr import arith, buffer_ops, range_constexpr, rocdl
 from flydsl.expr.typing import T
+from flydsl.runtime.device import get_rocm_arch
+from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
+from flydsl._mlir.dialects import llvm
 
-BLOCK_M = 256
-BLOCK_N = 256
-BLOCK_K = 64
-STAGES_A = 2
-WARP_SIZE = 64
-DEFAULT_BLOCK_M_WARPS = 2
-DEFAULT_BLOCK_N_WARPS = 4
-DMA_BYTES = 16
-IN_DTYPE_BYTES = 2
-LDG_ASYNC_VEC_SIZE = DMA_BYTES // IN_DTYPE_BYTES
-LDG_X_THREADS = BLOCK_K // LDG_ASYNC_VEC_SIZE
+GFX950_DMA_BYTES = 16
+GFX950_WAVE_SIZE = 64
 
 
 @fx.struct
-class _LayoutGemmSharedStorage:
-    a0: fx.Array[fx.Float16, BLOCK_M * BLOCK_K, 16]
-    a1: fx.Array[fx.Float16, BLOCK_M * BLOCK_K, 16]
-    b0: fx.Array[fx.Float16, BLOCK_N * BLOCK_K, 16]
-    b1: fx.Array[fx.Float16, BLOCK_N * BLOCK_K, 16]
+class HGemmGfx950Param:
+    block_m: fx.Constexpr[int]
+    block_n: fx.Constexpr[int]
+    block_k: fx.Constexpr[int]
+    stages: fx.Constexpr[int]
+    m_waves: fx.Constexpr[int]
+    n_waves: fx.Constexpr[int]
+    # derived params
+    async_load_bytes: fx.Constexpr[int]
+    in_data_bytes: fx.Constexpr[int]
+    out_data_bytes: fx.Constexpr[int]
+    ldg_x_threads: fx.Constexpr[int]
+    block_threads: fx.Constexpr[int]
+    ldg_a_iters: fx.Constexpr[int]
+    ldg_b_iters: fx.Constexpr[int]
+    mma_m: fx.Constexpr[int]
+    mma_n: fx.Constexpr[int]
+    mma_k: fx.Constexpr[int]
+    mma_m_repeat: fx.Constexpr[int]
+    mma_n_repeat: fx.Constexpr[int]
+
+
+def make_hgemm_gfx950_param(
+    block_m: int = 256,
+    block_n: int = 256,
+    block_k: int = 64,
+    stages: int = 2,
+    m_waves: int = 2,
+    n_waves: int = 4,
+    mma_m: int = 16,
+    mma_n: int = 16,
+    mma_k: int = 32,
+) -> HGemmGfx950Param:
+    if block_m <= 0 or block_n <= 0 or block_k <= 0 or stages <= 0:
+        raise ValueError("block_m, block_n, block_k, and stages must be positive")
+    if (mma_m, mma_n, mma_k) != (16, 16, 32):
+        raise ValueError("the gfx950 layout kernel currently requires mma=16x16x32")
+    if stages < 2:
+        raise ValueError("stages must be at least 2 for the staged LDS pipeline")
+    if m_waves <= 0 or n_waves <= 0:
+        raise ValueError("m_waves, and n_waves must be positive")
+    in_dbytes = out_dbytes = 2  # for hgemm
+    smem_bytes = stages * (block_m + block_n) * block_k * in_dbytes
+    arch = get_rocm_arch()
+    smem_capacity = SMEM_CAPACITY_MAP.get(arch)
+    if smem_capacity is not None and smem_bytes > smem_capacity:
+        raise ValueError(
+            "staged LDS buffers exceed the device shared-memory capacity: "
+            f"stages={stages}, block_m={block_m}, block_n={block_n}, "
+            f"block_k={block_k}, smem_bytes={smem_bytes}, "
+            f"capacity={smem_capacity} for arch={arch}"
+        )
+    async_load_vec_size = GFX950_DMA_BYTES // in_dbytes
+    ldg_x_threads = block_k // async_load_vec_size
+    if ldg_x_threads * async_load_vec_size != block_k:
+        raise ValueError(
+            "block_k must be divisible by the async load vector size: "
+            f"block_k={block_k}, async_load_vec_size={async_load_vec_size}, "
+            f"covered_k={ldg_x_threads * async_load_vec_size}"
+        )
+    block_threads = m_waves * n_waves * GFX950_WAVE_SIZE
+    ldg_a_iters = (block_m * block_k) // (block_threads * async_load_vec_size)
+    ldg_b_iters = (block_n * block_k) // (block_threads * async_load_vec_size)
+    mma_m_repeat = block_m // m_waves // mma_m
+    mma_n_repeat = block_n // n_waves // mma_n
+    if mma_m_repeat * m_waves * mma_m != block_m:
+        raise ValueError(
+            "block_m must be divisible by m_waves * mma_m: "
+            f"block_m={block_m}, m_waves={m_waves}, mma_m={mma_m}, "
+            f"mma_m_repeat={mma_m_repeat}, covered_m={mma_m_repeat * m_waves * mma_m}"
+        )
+    if mma_n_repeat * n_waves * mma_n != block_n:
+        raise ValueError(
+            "block_n must be divisible by n_waves * mma_n: "
+            f"block_n={block_n}, n_waves={n_waves}, mma_n={mma_n}, "
+            f"mma_n_repeat={mma_n_repeat}, covered_n={mma_n_repeat * n_waves * mma_n}"
+        )
+    return HGemmGfx950Param(
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        stages=stages,
+        m_waves=m_waves,
+        n_waves=n_waves,
+        async_load_bytes=GFX950_DMA_BYTES,
+        in_data_bytes=in_dbytes,
+        out_data_bytes=out_dbytes,
+        ldg_x_threads=ldg_x_threads,
+        block_threads=block_threads,
+        ldg_a_iters=ldg_a_iters,
+        ldg_b_iters=ldg_b_iters,
+        mma_m=mma_m,
+        mma_n=mma_n,
+        mma_k=mma_k,
+        mma_m_repeat=mma_m_repeat,
+        mma_n_repeat=mma_n_repeat,
+    )
+
+
+def make_hgemm_gfx950_kernel_name(param: HGemmGfx950Param):
+    name = f"hgemm_t{param.block_m}x{param.block_n}x{param.block_k}x{param.stages}"
+    name += f"_w{param.m_waves}x{param.n_waves}"
+    name += "_nt"
+    return name
+
+
+def __barrier(vmcnt=0):
+    llvm.InlineAsmOp(
+        None,
+        [],
+        f"s_waitcnt vmcnt({vmcnt})\n\ts_barrier",
+        "",
+        has_side_effects=True,
+    )
+
+
+def buffer_load_lds_inline(rsrc, lds_ptr, global_offset, DMA_BYTES):
+    buffer_load_asm_dict = {
+        16: "buffer_load_dwordx4",
+        8: "buffer_load_dwordx2",
+        4: "buffer_load_dword",
+    }
+    llvm.InlineAsmOp(
+        None,
+        [
+            llvm.IntToPtrOp(
+                flydsl._mlir.ir.Type.parse("!llvm.ptr<3>"),
+                fx.as_ir_value(fx.ptrtoint(lds_ptr)),
+            ).result,
+            fx.as_ir_value(global_offset),
+            fx.as_ir_value(rsrc),
+        ],
+        f"s_mov_b32 m0, $0\n\t{buffer_load_asm_dict[DMA_BYTES]} $1, $2, 0 offen sc0 lds",
+        "s,v,s",
+        has_side_effects=True,
+    )
 
 
 @flyc.kernel
-def hgemm_wmma_kernel(
-    A: fx.Tensor,
-    B: fx.Tensor,
-    C: fx.Tensor,
-    k_tiles: fx.Constexpr[int],
-    block_threads: fx.Constexpr[int],
-    ldg_a_iters: fx.Constexpr[int],
-    ldg_b_iters: fx.Constexpr[int],
+def hgemm_gfx950_kernel(
+    out: fx.Tensor,
+    a: fx.Tensor,
+    b: fx.Tensor,
+    m: fx.Int32,
+    n: fx.Int32,
+    k: fx.Int32,
     tiled_mma: fx.TiledMma,
+    param: HGemmGfx950Param,
 ):
+    block_m = param.block_m
+    block_n = param.block_n
+    block_k = param.block_k
+    stages = param.stages
+    wave_size = GFX950_WAVE_SIZE
+    async_load_bytes = param.async_load_bytes
+    in_data_bytes = param.in_data_bytes
+    async_load_vec_size = async_load_bytes // in_data_bytes
+    ldg_x_threads = param.ldg_x_threads
+    block_threads = param.block_threads
+    ldg_a_iters = param.ldg_a_iters
+    ldg_b_iters = param.ldg_b_iters
+    mma_m_repeat = param.mma_m_repeat
+    mma_n_repeat = param.mma_n_repeat
+
     tid = fx.thread_idx.x
     bid_m, bid_n, _ = fx.block_idx
+    k_tiles = k // block_k
 
-    a_bytes = fx.rocdl.make_buffer_tensor(
-        fx.Tensor(
-            fx.make_view(
-                fx.recast_iter(fx.Int8, fx.get_iter(A)),
-                fx.make_layout(65536 * k_tiles * BLOCK_K * IN_DTYPE_BYTES, 1),
-            )
-        ),
-        max_size=True,
-    )
-    b_bytes = fx.rocdl.make_buffer_tensor(
-        fx.Tensor(
-            fx.make_view(
-                fx.recast_iter(fx.Int8, fx.get_iter(B)),
-                fx.make_layout(65536 * k_tiles * BLOCK_K * IN_DTYPE_BYTES, 1),
-            )
-        ),
-        max_size=True,
-    )
-    a_bytes = fx.logical_divide(a_bytes, fx.make_layout(1, 1))
-    b_bytes = fx.logical_divide(b_bytes, fx.make_layout(1, 1))
-    C = fx.rocdl.make_buffer_tensor(C, max_size=False)
+    @fx.struct
+    class LayoutGemmSharedStorage:
+        a: fx.Array[fx.BFloat16, stages * block_m * block_k, 16]
+        b: fx.Array[fx.BFloat16, stages * block_n * block_k, 16]
 
-    gC = fx.flat_divide(C, (BLOCK_M, BLOCK_N))[None, None, bid_m, bid_n]
+    lds = fx.SharedAllocator().allocate(LayoutGemmSharedStorage).peek()
+    smem_a = lds.a.ptr
+    smem_b = lds.b.ptr
+
+    wave_offset = rocdl.readfirstlane(
+        T.i64,
+        fx.Int64(tid // wave_size * wave_size * async_load_bytes),
+    )
+
+    def make_warp_lds_ptr(ptr):
+        return fx.recast_iter(fx.Int8, ptr) + wave_offset
+
+    a_rsrc = buffer_ops.create_buffer_resource(a, max_size=True)
+    b_rsrc = buffer_ops.create_buffer_resource(b, max_size=True)
+    out = fx.rocdl.make_buffer_tensor(out, max_size=False)
+    gC = fx.flat_divide(out, (block_m, block_n))[None, None, bid_m, bid_n]
 
     thr_mma = tiled_mma.thr_slice(tid)
-
-    uni_copy = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Float16)
-    copy_ab = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float16)
-    copy_g2s = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
-    copy_c = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
-
+    uni_copy = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
+    copy_c = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16)
+    copy_ab = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
     thr_copy_s2r_A = fx.make_tiled_copy_A(copy_ab, tiled_mma).get_slice(tid)
     thr_copy_s2r_B = fx.make_tiled_copy_B(copy_ab, tiled_mma).get_slice(tid)
     thr_copy_C = fx.make_tiled_copy_C(copy_c, tiled_mma).get_slice(tid)
 
-    lds = fx.SharedAllocator().allocate(_LayoutGemmSharedStorage).peek()
     swizzle = fx.static(fx.SwizzleType.get(3, 3, 3))
 
-    def make_lds_view(ptr, rows):
-        return fx.make_view(
-            ptr,
-            fx.make_composed_layout(
-                swizzle,
-                fx.make_ordered_layout((rows, BLOCK_K), (1, 0)),
-            ),
+    def make_lds_layout(rows):
+        return fx.make_composed_layout(
+            swizzle,
+            fx.make_ordered_layout((rows, block_k), (1, 0)),
         )
 
-    sA_stages = [
-        make_lds_view(lds.a0.ptr, BLOCK_M),
-        make_lds_view(lds.a1.ptr, BLOCK_M),
-    ]
-    sB_stages = [
-        make_lds_view(lds.b0.ptr, BLOCK_N),
-        make_lds_view(lds.b1.ptr, BLOCK_N),
-    ]
+    a_lds_layout = make_lds_layout(block_m)
+    b_lds_layout = make_lds_layout(block_n)
 
-    thr_sA_s2r_stages = [thr_copy_s2r_A.partition_S(sA) for sA in sA_stages]
-    thr_sB_s2r_stages = [thr_copy_s2r_B.partition_S(sB) for sB in sB_stages]
+    sA0 = fx.make_view(smem_a, a_lds_layout)
+    sB0 = fx.make_view(smem_b, b_lds_layout)
     thr_gC = thr_copy_C.partition_S(gC)
 
-    frag_A = thr_mma.make_fragment_A(sA_stages[0])
-    frag_B = thr_mma.make_fragment_B(sB_stages[0])
+    frag_A = thr_mma.make_fragment_A(sA0)
+    frag_B = thr_mma.make_fragment_B(sB0)
     frag_C = thr_mma.make_fragment_C(gC)
+    frag_C_bf16 = fx.make_fragment_like(frag_C, fx.BFloat16.ir_type)
 
     frag_A_retile = thr_copy_s2r_A.retile(frag_A)
     frag_B_retile = thr_copy_s2r_B.retile(frag_B)
-    frag_C_retile = thr_copy_C.retile(frag_C)
+    frag_C_retile = thr_copy_C.retile(frag_C_bf16)
 
     frag_C.fill(0.0)
 
-    warp_offset = rocdl.readfirstlane(
-        fx.Int32.ir_type,
-        fx.Int32((tid // WARP_SIZE) * WARP_SIZE * DMA_BYTES),
-    )
-
-    def make_warp_lds_ptr(ptr):
-        return fx.add_offset(fx.recast_iter(fx.Int8, ptr), warp_offset)
-
-    a_lds_ptrs = [
-        make_warp_lds_ptr(lds.a0.ptr),
-        make_warp_lds_ptr(lds.a1.ptr),
-    ]
-    b_lds_ptrs = [
-        make_warp_lds_ptr(lds.b0.ptr),
-        make_warp_lds_ptr(lds.b1.ptr),
-    ]
-
-    k_blocks16 = (BLOCK_K * IN_DTYPE_BYTES) // 16
-
-    def swizzle_col_bytes(row, col_in_bytes):
-        return col_in_bytes ^ ((row % k_blocks16) * 16)
+    def swizzled_col_idx(row, col, layout):
+        elem_offset = fx.get_scalar(
+            fx.crd2idx(
+                (arith.index_cast(T.i32, row), arith.index_cast(T.i32, col)),
+                layout,
+            )
+        )
+        return elem_offset % block_k
 
     def advance_lds_ptr(lds_ptr):
-        return fx.add_offset(lds_ptr, block_threads * DMA_BYTES)
+        return lds_ptr + block_threads * async_load_bytes
+
+    def get_a_stage_ptr(stage):
+        return fx.add_offset(smem_a, stage * block_m * block_k)
+
+    def get_b_stage_ptr(stage):
+        return fx.add_offset(smem_b, stage * block_n * block_k)
+
+    def get_a_stage_view(stage):
+        return fx.make_view(get_a_stage_ptr(stage), a_lds_layout)
+
+    def get_b_stage_view(stage):
+        return fx.make_view(get_b_stage_ptr(stage), b_lds_layout)
 
     def async_load_a_to_lds(k_tile, stage):
-        lds_ptr = a_lds_ptrs[stage]
+        lds_ptr = make_warp_lds_ptr(get_a_stage_ptr(stage))
         for i in range_constexpr(ldg_a_iters):
-            global_tid = fx.Index(block_threads * i) + fx.Index(tid)
-            m_local_idx = global_tid // LDG_X_THREADS
-            k_local_idx = global_tid % LDG_X_THREADS * LDG_ASYNC_VEC_SIZE
-            col_in_bytes = swizzle_col_bytes(m_local_idx, k_local_idx * IN_DTYPE_BYTES)
-            global_m_idx = fx.Index(bid_m) * BLOCK_M + m_local_idx
-            global_k_idx = fx.Index(k_tile * BLOCK_K) + col_in_bytes // IN_DTYPE_BYTES
-            global_offset = (
-                global_m_idx * (k_tiles * BLOCK_K) + global_k_idx
-            ) * IN_DTYPE_BYTES
-            src = fx.slice(a_bytes, (None, arith.index_cast(T.i32, global_offset)))
-            dst = fx.make_view(lds_ptr, fx.make_layout(1, 1))
-            fx.copy(copy_g2s, src, dst)
+            global_tid = block_threads * i + tid
+            m_local_idx = global_tid // ldg_x_threads
+            k_local_idx = global_tid % ldg_x_threads * async_load_vec_size
+            global_m_idx = bid_m * block_m + m_local_idx
+            global_k_idx = k_tile * block_k + swizzled_col_idx(
+                m_local_idx,
+                k_local_idx,
+                a_lds_layout,
+            )
+            global_offset = (global_m_idx * k + global_k_idx) * in_data_bytes
+            global_offset = arith.index_cast(T.i32, global_offset)
+            buffer_load_lds_inline(a_rsrc, lds_ptr, global_offset, async_load_bytes)
             if i < ldg_a_iters - 1:
                 lds_ptr = advance_lds_ptr(lds_ptr)
 
     def async_load_b_to_lds(k_tile, stage):
-        lds_ptr = b_lds_ptrs[stage]
+        lds_ptr = make_warp_lds_ptr(get_b_stage_ptr(stage))
         for i in range_constexpr(ldg_b_iters):
-            global_tid = fx.Index(block_threads * i) + fx.Index(tid)
-            n_local_idx = global_tid // LDG_X_THREADS
-            k_local_idx = global_tid % LDG_X_THREADS * LDG_ASYNC_VEC_SIZE
-            col_in_bytes = swizzle_col_bytes(n_local_idx, k_local_idx * IN_DTYPE_BYTES)
-            global_n_idx = fx.Index(bid_n) * BLOCK_N + n_local_idx
-            global_k_idx = fx.Index(k_tile * BLOCK_K) + col_in_bytes // IN_DTYPE_BYTES
-            global_offset = (
-                global_n_idx * (k_tiles * BLOCK_K) + global_k_idx
-            ) * IN_DTYPE_BYTES
-            src = fx.slice(b_bytes, (None, arith.index_cast(T.i32, global_offset)))
-            dst = fx.make_view(lds_ptr, fx.make_layout(1, 1))
-            fx.copy(copy_g2s, src, dst)
+            global_tid = block_threads * i + tid
+            n_local_idx = global_tid // ldg_x_threads
+            k_local_idx = global_tid % ldg_x_threads * async_load_vec_size
+            global_n_idx = bid_n * block_n + n_local_idx
+            global_k_idx = k_tile * block_k + swizzled_col_idx(
+                n_local_idx,
+                k_local_idx,
+                b_lds_layout,
+            )
+            global_offset = (global_n_idx * k + global_k_idx) * in_data_bytes
+            global_offset = arith.index_cast(T.i32, global_offset)
+            buffer_load_lds_inline(b_rsrc, lds_ptr, global_offset, async_load_bytes)
             if i < ldg_b_iters - 1:
                 lds_ptr = advance_lds_ptr(lds_ptr)
 
-    def hot_loop_scheduler_tile(read_next=True):
-        if read_next:
-            for _ in range_constexpr(ldg_a_iters):
-                rocdl.sched_vmem(1)  # async_load_a_to_lds next
-            for _ in range_constexpr(ldg_b_iters):
-                rocdl.sched_vmem(1)  # async_load_b_to_lds next
-        for _ in range_constexpr(BLOCK_K // 32):
-            rocdl.sched_dsrd(2)  # LDS -> frag_A and LDS -> frag_B
-            rocdl.sched_mfma(1)  # one tiled_mma k32 step
-        rocdl.sched_barrier(0)
-
-    def hot_loop_scheduler_double_tile(second_read_next=True):
-        hot_loop_scheduler_tile(read_next=True)
-        hot_loop_scheduler_tile(read_next=second_read_next)
-
-    def run_pipeline_stage(read_stage, next_k=None, read_next=True):
-        write_stage = read_stage ^ 1
-        if read_next:
-            async_load_a_to_lds(next_k, write_stage)
-            async_load_b_to_lds(next_k, write_stage)
-
-        for block_k_iter in range_constexpr(BLOCK_K // 32):
+    def compute_stage(read_stage):
+        thr_sA_s2r = thr_copy_s2r_A.partition_S(get_a_stage_view(read_stage))
+        thr_sB_s2r = thr_copy_s2r_B.partition_S(get_b_stage_view(read_stage))
+        for block_k_iter in range_constexpr(block_k // param.mma_k):
             fx.copy(
                 uni_copy,
-                thr_sA_s2r_stages[read_stage][None, None, block_k_iter],
-                frag_A_retile[None, None, block_k_iter],
+                thr_sB_s2r[None, None, block_k_iter],
+                frag_B_retile[None, None, block_k_iter],
             )
             fx.copy(
                 uni_copy,
-                thr_sB_s2r_stages[read_stage][None, None, block_k_iter],
-                frag_B_retile[None, None, block_k_iter],
+                thr_sA_s2r[None, None, block_k_iter],
+                frag_A_retile[None, None, block_k_iter],
             )
             fx.gemm(
                 tiled_mma,
@@ -212,81 +321,103 @@ def hgemm_wmma_kernel(
                 traversal_order=fx.GemmTraversalOrder.KNM,
             )
 
-        if read_next:
-            rocdl.s_waitcnt(0)
-            fx.gpu.barrier()
+    LDG_WAIT_COUNT = ldg_a_iters + ldg_b_iters
 
-    async_load_a_to_lds(0, 0)
-    async_load_b_to_lds(0, 0)
-    for _ in range_constexpr(ldg_a_iters + ldg_b_iters):
-        rocdl.sched_vmem(1)
+    for stage in range_constexpr(stages - 1):
+        async_load_b_to_lds(stage, stage)
+        async_load_a_to_lds(stage, stage)
     rocdl.sched_barrier(0)
-    # rocdl.s_waitcnt(0)
-    fx.gpu.barrier()
 
-    for k_tile in range(0, k_tiles - 2, 2):
-        run_pipeline_stage(read_stage=0, next_k=k_tile + 1)
-        run_pipeline_stage(read_stage=1, next_k=k_tile + 2)
-        # hot_loop_scheduler_double_tile()
+    main_loop_end = k_tiles - (stages - 1)
+    for k_tile in range(0, main_loop_end, 1):
+        current_stage = k_tile % stages
+        write_stage = (current_stage + stages - 1) % stages
+        __barrier((stages - 2) * LDG_WAIT_COUNT)
+        async_load_b_to_lds(k_tile + (stages - 1), write_stage)
+        async_load_a_to_lds(k_tile + (stages - 1), write_stage)
+        compute_stage(current_stage)
 
-    run_pipeline_stage(read_stage=0, next_k=k_tiles - 1)
-    run_pipeline_stage(read_stage=1, read_next=False)
-    # hot_loop_scheduler_double_tile(second_read_next=False)
+    current_stage = main_loop_end % stages
+    for s in range_constexpr(0, stages - 1):
+        __barrier((stages - 2 - s) * LDG_WAIT_COUNT)
+        compute_stage(current_stage)
+        current_stage = (current_stage + 1) % stages
 
+    frag_C_bf16.store(fx.Vector(frag_C.load()).to(fx.BFloat16).ir_value())
     fx.copy(copy_c, frag_C_retile, thr_gC)
 
 
 @flyc.jit
-def _layout_gemm_f16_f32(
-    A: fx.Tensor,
-    B: fx.Tensor,
-    C: fx.Tensor,
-    m: fx.Constexpr[int],
-    n: fx.Constexpr[int],
-    k: fx.Constexpr[int],
-    block_m_warps: fx.Constexpr[int],
-    block_n_warps: fx.Constexpr[int],
+def launch_hgemm_gfx950(
+    out: fx.Tensor,
+    a: fx.Tensor,
+    b: fx.Tensor,
+    m: fx.Int32,
+    n: fx.Int32,
+    k: fx.Int32,
+    param: HGemmGfx950Param,
     stream: fx.Stream = fx.Stream(None),
 ):
-    mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.Float16))
-    block_threads = block_m_warps * block_n_warps * WARP_SIZE
-    ldg_a_iters = (BLOCK_M * BLOCK_K) // (block_threads * LDG_ASYNC_VEC_SIZE)
-    ldg_b_iters = (BLOCK_N * BLOCK_K) // (block_threads * LDG_ASYNC_VEC_SIZE)
-    atom_layout_stride_m = 0 if block_m_warps == 1 else 1
+    mma_atom = fx.make_mma_atom(
+        fx.rocdl.MFMA(param.mma_m, param.mma_n, param.mma_k, fx.BFloat16)
+    )
+    k_per_mfma_group = param.mma_k // 4
     tiled_mma = fx.make_tiled_mma(
         mma_atom,
         fx.make_layout(
-            (block_m_warps, block_n_warps, 1),
-            (atom_layout_stride_m, block_m_warps, 0),
+            (param.m_waves, param.n_waves, 1),
+            (param.n_waves, 1, 0),
         ),
-        fx.make_tile(None, None, fx.make_layout((8, 4), (1, 8))),
+        fx.make_tile(
+            None,
+            None,
+            fx.make_layout(
+                (k_per_mfma_group, 4),
+                (1, k_per_mfma_group),
+            ),
+        ),
     )
-    hgemm_wmma_kernel._known_block_size = [block_threads, 1, 1]
-    hgemm_wmma_kernel(
-        A, B, C, k // BLOCK_K, block_threads, ldg_a_iters, ldg_b_iters, tiled_mma
-    ).launch(
-        grid=(m // BLOCK_M, n // BLOCK_N, 1),
-        block=(block_threads, 1, 1),
+    num_pid_m = (m + param.block_m - 1) // param.block_m
+    num_pid_n = (n + param.block_n - 1) // param.block_n
+    hgemm_gfx950_kernel._known_block_size = [param.block_threads, 1, 1]
+    hgemm_gfx950_kernel._func.__name__ = make_hgemm_gfx950_kernel_name(param)
+    hgemm_gfx950_kernel(out, a, b, m, n, k, tiled_mma, param).launch(
+        grid=(num_pid_m, num_pid_n, 1),
+        block=(param.block_threads, 1, 1),
         stream=stream,
     )
 
 
-def _check_layout_gemm_inputs(
+def layout_gemm(
     a: torch.Tensor,
     b: torch.Tensor,
-    c: torch.Tensor,
-    block_m_warps: int,
-    block_n_warps: int,
-):
+    c: torch.Tensor | None = None,
+    *,
+    block_m: int = 128,
+    block_n: int = 128,
+    block_k: int = 64,
+    stages: int = 5,
+    m_waves: int = 4,
+    n_waves: int = 4,
+    mma_m: int = 16,
+    mma_n: int = 16,
+    mma_k: int = 32,
+    stream: torch.cuda.Stream | None = None,
+) -> torch.Tensor:
+    """Compute C = A @ B.T with the FlyDSL layout-system tiled MMA path."""
+
+    if c is None:
+        c = torch.empty((a.shape[0], b.shape[0]), dtype=a.dtype, device=a.device)
     if a.ndim != 2 or b.ndim != 2 or c.ndim != 2:
         raise ValueError("layout_gemm expects 2D tensors")
     if not (a.is_cuda and b.is_cuda and c.is_cuda):
         raise ValueError("layout_gemm expects CUDA tensors")
-    if a.dtype != torch.float16 or b.dtype != torch.float16:
-        raise TypeError("layout_gemm currently supports fp16 A/B only")
-    if c.dtype != torch.float32:
-        raise TypeError("layout_gemm currently writes fp32 C")
-
+    if a.dtype != torch.bfloat16 or b.dtype != torch.bfloat16:
+        raise TypeError("layout_gemm currently supports bf16 A/B only")
+    if c.dtype != a.dtype:
+        raise TypeError("layout_gemm expects C to have the same dtype as A/B")
+    if not a.is_contiguous() or not b.is_contiguous() or not c.is_contiguous():
+        raise ValueError("layout_gemm expects contiguous row-major tensors")
     m, k = a.shape
     n, kb = b.shape
     if kb != k:
@@ -295,63 +426,36 @@ def _check_layout_gemm_inputs(
         )
     if c.shape != (m, n):
         raise ValueError(f"C must have shape {(m, n)}, got {tuple(c.shape)}")
-    if not a.is_contiguous() or not b.is_contiguous() or not c.is_contiguous():
-        raise ValueError("layout_gemm expects contiguous row-major tensors")
-    if m % BLOCK_M or n % BLOCK_N or k % BLOCK_K:
+    if m % block_m or n % block_n or k % block_k:
         raise ValueError(
-            f"M/N/K must be multiples of {(BLOCK_M, BLOCK_N, BLOCK_K)}, got {(m, n, k)}"
+            f"M/N/K must be multiples of {(block_m, block_n, block_k)}, got {(m, n, k)}"
         )
-    if k // BLOCK_K < STAGES_A:
-        raise ValueError(f"K must cover at least {STAGES_A} K tiles for ping-pong")
-    if block_m_warps <= 0 or block_n_warps <= 0:
-        raise ValueError("block_m_warps and block_n_warps must be positive")
-    block_threads = block_m_warps * block_n_warps * WARP_SIZE
-    if block_threads > 1024:
-        raise ValueError(f"too many block threads: {block_threads}")
-    if block_threads not in (64, 128, 256, 512, 1024):
+    effective_stages = min(stages, k // block_k)
+    if effective_stages < 2:
         raise ValueError(
-            "unsupported block_m_warps * block_n_warps; "
-            "supported total waves are 1, 2, 4, 8, or 16"
+            f"K must contain at least 2 block_k tiles for the staged pipeline, got K={k}, block_k={block_k}"
         )
-    if (BLOCK_M * BLOCK_K) % (block_threads * LDG_ASYNC_VEC_SIZE):
-        raise ValueError(
-            "block_m_warps * block_n_warps does not evenly cover A async loads"
-        )
-    if (BLOCK_N * BLOCK_K) % (block_threads * LDG_ASYNC_VEC_SIZE):
-        raise ValueError(
-            "block_m_warps * block_n_warps does not evenly cover B async loads"
-        )
-
-
-def layout_gemm(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    c: torch.Tensor | None = None,
-    *,
-    block_m_warps: int = DEFAULT_BLOCK_M_WARPS,
-    block_n_warps: int = DEFAULT_BLOCK_N_WARPS,
-    stream: torch.cuda.Stream | None = None,
-) -> torch.Tensor:
-    """Compute C = A @ B.T with the FlyDSL layout-system tiled MMA path.
-
-    This intentionally keeps the public wrapper narrow: fp16 inputs, fp32 output,
-    row-major contiguous tensors, and tile-aligned dimensions.
-    """
-
-    if c is None:
-        c = torch.empty((a.shape[0], b.shape[0]), dtype=torch.float32, device=a.device)
-    _check_layout_gemm_inputs(a, b, c, block_m_warps, block_n_warps)
 
     launch_stream = torch.cuda.current_stream(a.device) if stream is None else stream
-    _layout_gemm_f16_f32(
+    param = make_hgemm_gfx950_param(
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        stages=effective_stages,
+        m_waves=m_waves,
+        n_waves=n_waves,
+        mma_m=mma_m,
+        mma_n=mma_n,
+        mma_k=mma_k,
+    )
+    launch_hgemm_gfx950(
+        c,
         a,
         b,
-        c,
         a.shape[0],
         b.shape[0],
         a.shape[1],
-        block_m_warps,
-        block_n_warps,
+        param,
         stream=launch_stream,
     )
     return c
@@ -364,18 +468,38 @@ def benchmark_layout_gemm(
     *,
     warmup: int = 10,
     iters: int = 50,
-    block_m_warps: int = DEFAULT_BLOCK_M_WARPS,
-    block_n_warps: int = DEFAULT_BLOCK_N_WARPS,
+    block_m: int = 128,
+    block_n: int = 128,
+    block_k: int = 64,
+    stages: int = 4,
+    m_waves: int = 4,
+    n_waves: int = 4,
+    mma_m: int = 16,
+    mma_n: int = 16,
+    mma_k: int = 32,
+    profiler_row_limit: int = 20,
 ) -> dict[str, float]:
-    """Run a simple CUDA-event benchmark for the layout-system GEMM kernel."""
+    """Run a profiler-backed benchmark for the layout-system GEMM kernel."""
 
-    a = torch.randn((m, k), dtype=torch.float16, device="cuda")
-    b = torch.randn((n, k), dtype=torch.float16, device="cuda")
-    c = torch.empty((m, n), dtype=torch.float32, device="cuda")
+    a = torch.randn((m, k), dtype=torch.bfloat16, device="cuda")
+    b = torch.randn((n, k), dtype=torch.bfloat16, device="cuda")
+    c = torch.empty((m, n), dtype=a.dtype, device="cuda")
     stream = torch.cuda.current_stream()
 
     layout_gemm(
-        a, b, c, block_m_warps=block_m_warps, block_n_warps=block_n_warps, stream=stream
+        a,
+        b,
+        c,
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        stages=stages,
+        m_waves=m_waves,
+        n_waves=n_waves,
+        mma_m=mma_m,
+        mma_n=mma_n,
+        mma_k=mma_k,
+        stream=stream,
     )
     torch.cuda.synchronize()
 
@@ -384,8 +508,15 @@ def benchmark_layout_gemm(
             a,
             b,
             c,
-            block_m_warps=block_m_warps,
-            block_n_warps=block_n_warps,
+            block_m=block_m,
+            block_n=block_n,
+            block_k=block_k,
+            stages=stages,
+            m_waves=m_waves,
+            n_waves=n_waves,
+            mma_m=mma_m,
+            mma_n=mma_n,
+            mma_k=mma_k,
             stream=stream,
         )
     torch.cuda.synchronize()
@@ -398,12 +529,42 @@ def benchmark_layout_gemm(
             a,
             b,
             c,
-            block_m_warps=block_m_warps,
-            block_n_warps=block_n_warps,
+            block_m=block_m,
+            block_n=block_n,
+            block_k=block_k,
+            stages=stages,
+            m_waves=m_waves,
+            n_waves=n_waves,
+            mma_m=mma_m,
+            mma_n=mma_n,
+            mma_k=mma_k,
             stream=stream,
         )
     end.record(stream)
     end.synchronize()
+
+    activities = [
+        torch.profiler.ProfilerActivity.CPU,
+        torch.profiler.ProfilerActivity.CUDA,
+    ]
+    with torch.profiler.profile(activities=activities) as prof:
+        for _ in range(iters):
+            layout_gemm(
+                a,
+                b,
+                c,
+                block_m=block_m,
+                block_n=block_n,
+                block_k=block_k,
+                stages=stages,
+                m_waves=m_waves,
+                n_waves=n_waves,
+                mma_m=mma_m,
+                mma_n=mma_n,
+                mma_k=mma_k,
+                stream=stream,
+            )
+        torch.cuda.synchronize()
 
     avg_ms = start.elapsed_time(end) / iters
     tflops = (2.0 * m * n * k) / (avg_ms / 1e3) / 1e12
@@ -413,13 +574,26 @@ def benchmark_layout_gemm(
         "k": float(k),
         "avg_ms": avg_ms,
         "tflops": tflops,
-        "block_m_warps": float(block_m_warps),
-        "block_n_warps": float(block_n_warps),
+        "block_m": float(block_m),
+        "block_n": float(block_n),
+        "block_k": float(block_k),
+        "stages": float(stages),
+        "m_waves": float(m_waves),
+        "n_waves": float(n_waves),
+        "mma_m": float(mma_m),
+        "mma_n": float(mma_n),
+        "mma_k": float(mma_k),
     }
     print(
         "layout_gemm "
-        f"tile={BLOCK_M}x{BLOCK_N}x{BLOCK_K} "
-        f"warps={block_m_warps}x{block_n_warps} M={m} N={n} K={k}: "
+        f"tile={block_m}x{block_n}x{block_k}x{stages} "
+        f"waves={m_waves}x{n_waves} M={m} N={n} K={k}: "
         f"{avg_ms:.4f} ms, {tflops:.2f} TFLOP/s"
+    )
+    print(
+        prof.key_averages().table(
+            sort_by="cuda_time_total",
+            row_limit=profiler_row_limit,
+        )
     )
     return result
