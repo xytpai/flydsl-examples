@@ -24,6 +24,7 @@ class HGemmGfx950Param:
     n_waves: fx.Constexpr[int]
     group_m: fx.Constexpr[int]
     has_bias: fx.Constexpr[bool]
+    has_k_tail: fx.Constexpr[bool]
     # derived params
     async_load_bytes: fx.Constexpr[int]
     in_data_bytes: fx.Constexpr[int]
@@ -46,6 +47,7 @@ def make_hgemm_gfx950_param(
     n_waves: int = 4,
     group_m: int = 0,
     has_bias: bool = False,
+    has_k_tail: bool = False,
     mma_m: int = 16,
     mma_n: int = 16,
     mma_k: int = 32,
@@ -110,6 +112,7 @@ def make_hgemm_gfx950_param(
         n_waves=n_waves,
         group_m=group_m,
         has_bias=has_bias,
+        has_k_tail=has_k_tail,
         async_load_bytes=GFX950_DMA_BYTES,
         in_data_bytes=in_dbytes,
         out_data_bytes=out_dbytes,
@@ -128,6 +131,7 @@ def make_hgemm_gfx950_kernel_name(param: HGemmGfx950Param):
     name += f"_w{param.m_waves}x{param.n_waves}"
     name += f"_gm{param.group_m}"
     name += f"_bias{int(param.has_bias)}"
+    name += f"_ktail{int(param.has_k_tail)}"
     name += "_nt"
     return name
 
@@ -180,6 +184,7 @@ def hgemm_gfx950_kernel(
     block_n = param.block_n
     block_k = param.block_k
     stages = param.stages
+    has_k_tail = param.has_k_tail
     wave_size = GFX950_WAVE_SIZE
     async_load_bytes = param.async_load_bytes
     in_data_bytes = param.in_data_bytes
@@ -196,7 +201,7 @@ def hgemm_gfx950_kernel(
         NUM_XCDS=8, NUM_PIDS_THRESHOLD=256, GROUP_M=param.group_m
     )
     bid_m, bid_n = block_swizzle.swizzle(num_pid_m, num_pid_n, fx.block_idx.x)
-    k_tiles = k // block_k
+    k_tiles = (k + block_k - 1) // block_k
 
     @fx.struct
     class LayoutGemmSharedStorage:
@@ -314,7 +319,11 @@ def hgemm_gfx950_kernel(
                 k_local_idx,
                 a_lds_layout,
             )
-            global_offset = (safe_global_m_idx * k + global_k_idx) * in_data_bytes
+            if const_expr(has_k_tail):
+                safe_global_k_idx = (global_k_idx < k).select(global_k_idx, 0)
+            else:
+                safe_global_k_idx = global_k_idx
+            global_offset = (safe_global_m_idx * k + safe_global_k_idx) * in_data_bytes
             buffer_load_lds_inline(a_rsrc, lds_ptr, global_offset, async_load_bytes)
             if i < ldg_a_iters - 1:
                 lds_ptr = advance_lds_ptr(lds_ptr)
@@ -332,15 +341,20 @@ def hgemm_gfx950_kernel(
                 k_local_idx,
                 b_lds_layout,
             )
-            global_offset = (safe_global_n_idx * k + global_k_idx) * in_data_bytes
+            if const_expr(has_k_tail):
+                safe_global_k_idx = (global_k_idx < k).select(global_k_idx, 0)
+            else:
+                safe_global_k_idx = global_k_idx
+            global_offset = (safe_global_n_idx * k + safe_global_k_idx) * in_data_bytes
             buffer_load_lds_inline(b_rsrc, lds_ptr, global_offset, async_load_bytes)
             if i < ldg_b_iters - 1:
                 lds_ptr = advance_lds_ptr(lds_ptr)
 
-    def compute_stage(read_stage):
+    def compute_stage(read_stage, k_tile):
         thr_sA_s2r = thr_copy_s2r_A.partition_S(get_a_stage_view(read_stage))
         thr_sB_s2r = thr_copy_s2r_B.partition_S(get_b_stage_view(read_stage))
-        for block_k_iter in range_constexpr(block_k // param.mma_k):
+
+        def compute_k_chunk(block_k_iter):
             fx.copy(
                 uni_copy,
                 thr_sB_s2r[None, None, block_k_iter],
@@ -360,6 +374,14 @@ def hgemm_gfx950_kernel(
                 traversal_order=fx.GemmTraversalOrder.KNM,
             )
 
+        for block_k_iter in range_constexpr(block_k // param.mma_k):
+            if const_expr(has_k_tail):
+                global_k_iter = k_tile * block_k + block_k_iter * param.mma_k
+                if global_k_iter < k:
+                    compute_k_chunk(block_k_iter)
+            else:
+                compute_k_chunk(block_k_iter)
+
     LDG_WAIT_COUNT = ldg_a_iters + ldg_b_iters
 
     for stage in range_constexpr(stages - 1):
@@ -367,19 +389,22 @@ def hgemm_gfx950_kernel(
         async_load_a_to_lds(stage, stage)
     rocdl.sched_barrier(0)
 
-    main_loop_end = k_tiles - (stages - 1)
+    if const_expr(has_k_tail):
+        main_loop_end = (k_tiles > stages - 1).select(k_tiles - (stages - 1), 0)
+    else:
+        main_loop_end = k_tiles - (stages - 1)
     for k_tile in range(0, main_loop_end, 1):
         current_stage = k_tile % stages
         write_stage = (current_stage + stages - 1) % stages
         __barrier((stages - 2) * LDG_WAIT_COUNT)
         async_load_b_to_lds(k_tile + (stages - 1), write_stage)
         async_load_a_to_lds(k_tile + (stages - 1), write_stage)
-        compute_stage(current_stage)
+        compute_stage(current_stage, k_tile)
 
     current_stage = main_loop_end % stages
     for s in range_constexpr(0, stages - 1):
         __barrier((stages - 2 - s) * LDG_WAIT_COUNT)
-        compute_stage(current_stage)
+        compute_stage(current_stage, main_loop_end + s)
         current_stage = (current_stage + 1) % stages
 
     frag_C_bf16.store(frag_C.load().to(fx.BFloat16))
@@ -430,18 +455,19 @@ def launch_hgemm_gfx950(
 
 
 def make_hgemm_param_and_validate(m, n, k, kwargs):
-    block_k = kwargs["block_k"]
-    num_k_tiles = k // block_k
     result = None
     try:
         result = make_hgemm_gfx950_param(**kwargs)
     except Exception as e:
         return None
-    if not ((n % 32 == 0) and (k % 32 == 0)):
-        return None
-    if not (num_k_tiles * block_k == k):
+    if not ((n % 32 == 0) and (k % result.mma_k == 0)):
         return None
     return result
+
+
+def infer_has_k_tail(k: int, block_k: int, stages: int):
+    k_tiles = (k + block_k - 1) // block_k
+    return (k % block_k != 0) or (k_tiles < stages - 1)
 
 
 def hgemm(
@@ -500,6 +526,11 @@ def hgemm(
         }
     kwargs.update(user_kwargs)
     kwargs["has_bias"] = False if bias is None else True
+    kwargs["has_k_tail"] = infer_has_k_tail(
+        k=k,
+        block_k=kwargs["block_k"],
+        stages=kwargs["stages"],
+    )
     bias_tensor = a if bias is None else bias
 
     if bias is not None:
@@ -507,5 +538,6 @@ def hgemm(
         assert bias.dtype == a.dtype
 
     param = make_hgemm_param_and_validate(m, n, k, kwargs)
+    assert param is not None, "unsupported hgemm_layout_gfx950 shape/config"
     launch_hgemm_gfx950(out, a, b, bias_tensor, m, n, k, param, stream)
     return out
