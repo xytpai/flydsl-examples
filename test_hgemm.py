@@ -118,7 +118,7 @@ def func(*args):
 
 
 def tensor_nbytes(tensors: torch.Tensor):
-    return sum(t.numel() * t.element_size() for t in tensors)
+    return sum(t.numel() * t.element_size() for t in tensors if t is not None)
 
 
 def get_rotary_inputs(sample_inputs: torch.Tensor, sample_outputs: torch.Tensor):
