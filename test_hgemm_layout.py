@@ -1,11 +1,11 @@
 import torch
 import pytest
+import itertools
 import torch.nn.functional as F
 from torch.profiler import profile, ProfilerActivity
 from dataclasses import dataclass
-from flydsl.runtime.device import get_rocm_arch
 
-from kernels.hgemm_layout_gfx950 import hgemm
+from kernels.hgemm_layout_gfx950 import hgemm, make_hgemm_gfx950_param
 
 ROTARY_INPUTS_TARGET_BYTES = 8 * 1024**3
 
@@ -336,3 +336,35 @@ def test_hgemm_benchmark_smoke(
         has_bias,
     )
     benchmark(args)
+
+
+def hgemm_get_configs():
+    selections = {
+        "block_m": [16, 32, 48, 64, 80, 96, 128, 256],
+        "block_n": [64, 80, 96, 128, 256],
+        "block_k": [64, 128, 256],
+        "stages": [i for i in range(2, 10)],
+        "m_waves": [1, 2, 4],
+        "n_waves": [1, 2, 4],
+        "group_m": [0, 4],
+    }
+    keys = selections.keys()
+    values = selections.values()
+    configs = [dict(zip(keys, combo)) for combo in itertools.product(*values)]
+    valid_configs = []
+    for config in configs:
+        mma_m_iters = config["block_m"] // config["m_waves"] // 16
+        mma_n_iters = config["block_n"] // config["n_waves"] // 16
+        if mma_m_iters > 4 or mma_n_iters > 4:
+            continue
+        try:
+            make_hgemm_gfx950_param(**config)
+            valid_configs.append(config)
+        except Exception as e:
+            pass
+    return valid_configs
+
+
+if __name__ == "__main__":
+    configs = hgemm_get_configs()
+    print(len(configs))
