@@ -4,8 +4,7 @@ from typing import Optional
 import flydsl
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, buffer_ops, const_expr, range_constexpr, rocdl
-from flydsl.expr.typing import T
+from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.runtime.device import get_rocm_arch
 from flydsl._mlir.dialects import llvm
 
@@ -209,24 +208,25 @@ def hgemm_gfx950_kernel(
     smem_b = lds.b.ptr
 
     wave_offset = rocdl.readfirstlane(
-        T.i64,
+        fx.Int64.ir_type,
         fx.Int64(tid // wave_size * wave_size * async_load_bytes),
     )
 
     def make_wave_lds_ptr(ptr):
         return fx.recast_iter(fx.Int8, ptr) + fx.Int32(wave_offset)
 
-    a_rsrc = buffer_ops.create_buffer_resource(a, max_size=True)
-    b_rsrc = buffer_ops.create_buffer_resource(b, max_size=True)
+    a_buf = fx.rocdl.make_buffer_tensor(a, max_size=True)
+    b_buf = fx.rocdl.make_buffer_tensor(b, max_size=True)
+    a_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(a_buf))
+    b_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(b_buf))
     if const_expr(param.has_bias):
         bias_buf = fx.rocdl.make_buffer_tensor(bias, max_size=True)
     else:
         bias_buf = None
     out = fx.rocdl.make_buffer_tensor(out, max_size=False)
     gC = fx.flat_divide(out, (block_m, block_n))[None, None, bid_m, bid_n]
-    coord_zero = fx.make_int_tuple(0)
-    row_coords = fx.make_view(coord_zero, fx.make_layout((block_m, block_n), (1, 0)))
-    col_coords = fx.make_view(coord_zero, fx.make_layout((block_m, block_n), (0, 1)))
+    row_coords = fx.make_view(0, fx.make_layout((block_m, block_n), (1, 0)))
+    col_coords = fx.make_view(0, fx.make_layout((block_m, block_n), (0, 1)))
 
     thr_mma = tiled_mma.thr_slice(tid)
     uni_copy = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
@@ -257,7 +257,7 @@ def hgemm_gfx950_kernel(
     frag_A = thr_mma.make_fragment_A(sA0)
     frag_B = thr_mma.make_fragment_B(sB0)
     frag_C = thr_mma.make_fragment_C(gC)
-    frag_C_bf16 = fx.make_fragment_like(frag_C, fx.BFloat16.ir_type)
+    frag_C_bf16 = fx.make_fragment_like(frag_C, fx.BFloat16)
     pred_C = fx.make_fragment_like(thr_gC, dtype=fx.Boolean)
 
     frag_A_retile = thr_copy_s2r_A.retile(frag_A)
@@ -266,13 +266,13 @@ def hgemm_gfx950_kernel(
 
     frag_C.fill(0.0)
     if const_expr(param.has_bias):
-        for i in range_constexpr(fx.get_scalar(fx.size(frag_C.shape))):
+        for i in range_constexpr(fx.size(frag_C.shape).unpack()):
             col_idx = fx.get_scalar(thr_mma_cCol[i])
             global_n_idx = bid_n * block_n + col_idx
             safe_global_n_idx = (global_n_idx < n).select(global_n_idx, 0)
             bias_val = bias_buf[safe_global_n_idx].to(fx.Float32)
             frag_C[i] = bias_val
-    for i in range_constexpr(fx.get_scalar(fx.size(pred_C.shape))):
+    for i in range_constexpr(fx.size(pred_C.shape).unpack()):
         row_idx = bid_m * block_m + fx.get_scalar(thr_cRow[i])
         col_idx = bid_n * block_n + fx.get_scalar(thr_cCol[i])
         pred_C[i] = (row_idx < m) & (col_idx < n)
@@ -290,10 +290,10 @@ def hgemm_gfx950_kernel(
         return lds_ptr + block_threads * async_load_bytes
 
     def get_a_stage_ptr(stage):
-        return fx.add_offset(smem_a, stage * block_m * block_k)
+        return smem_a + stage * block_m * block_k
 
     def get_b_stage_ptr(stage):
-        return fx.add_offset(smem_b, stage * block_n * block_k)
+        return smem_b + stage * block_n * block_k
 
     def get_a_stage_view(stage):
         return fx.make_view(get_a_stage_ptr(stage), a_lds_layout)
@@ -382,7 +382,7 @@ def hgemm_gfx950_kernel(
         compute_stage(current_stage)
         current_stage = (current_stage + 1) % stages
 
-    frag_C_bf16.store(fx.Vector(frag_C.load()).to(fx.BFloat16).ir_value())
+    frag_C_bf16.store(frag_C.load().to(fx.BFloat16))
 
     fx.copy(copy_c, frag_C_retile, thr_gC, pred=pred_C)
 
