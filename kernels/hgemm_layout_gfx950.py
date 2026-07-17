@@ -88,6 +88,24 @@ def make_hgemm_gfx950_param(
     block_threads = m_waves * n_waves * GFX950_WAVE_SIZE
     ldg_a_iters = (block_m * block_k) // (block_threads * async_load_vec_size)
     ldg_b_iters = (block_n * block_k) // (block_threads * async_load_vec_size)
+    if ldg_a_iters * block_threads * async_load_vec_size != block_m * block_k:
+        raise ValueError(
+            "A async load tile must be exactly covered by whole-thread vector loads: "
+            f"block_m={block_m}, block_k={block_k}, "
+            f"block_threads={block_threads}, async_load_vec_size={async_load_vec_size}, "
+            f"ldg_a_iters={ldg_a_iters}, "
+            f"covered={ldg_a_iters * block_threads * async_load_vec_size}, "
+            f"required={block_m * block_k}"
+        )
+    if ldg_b_iters * block_threads * async_load_vec_size != block_n * block_k:
+        raise ValueError(
+            "B async load tile must be exactly covered by whole-thread vector loads: "
+            f"block_n={block_n}, block_k={block_k}, "
+            f"block_threads={block_threads}, async_load_vec_size={async_load_vec_size}, "
+            f"ldg_b_iters={ldg_b_iters}, "
+            f"covered={ldg_b_iters * block_threads * async_load_vec_size}, "
+            f"required={block_n * block_k}"
+        )
     assert (stages - 2) * (ldg_a_iters + ldg_b_iters) < 63
     mma_m_repeat = block_m // m_waves // mma_m
     mma_n_repeat = block_n // n_waves // mma_n
