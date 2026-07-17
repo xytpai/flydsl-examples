@@ -54,7 +54,7 @@ def create_outputs(args):
     return (c,)
 
 
-def tuning_benchmark(args, kwargs={}, niters=8):
+def tuning_benchmark(args, kwargs={}, niters=50):
     # correctness test
     a, b, bias = create_inputs(args)
     c = create_outputs(args)[0]
@@ -151,7 +151,7 @@ def tune_all(
     out_prefix,
 ):
     mnks = [
-        # (8, 4096, 4096),
+        (8, 4096, 4096),
         (16, 4096, 4096),
         (32, 4096, 4096),
         (64, 4096, 4096),
