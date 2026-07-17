@@ -25,6 +25,7 @@ class HGemmGfx950Param:
     group_m: fx.Constexpr[int]
     has_bias: fx.Constexpr[bool]
     has_k_tail: fx.Constexpr[bool]
+    has_partial_load: fx.Constexpr[bool]
     # derived params
     async_load_bytes: fx.Constexpr[int]
     in_data_bytes: fx.Constexpr[int]
@@ -86,8 +87,13 @@ def make_hgemm_gfx950_param(
             f"covered_k={ldg_x_threads * async_load_vec_size}"
         )
     block_threads = m_waves * n_waves * GFX950_WAVE_SIZE
-    ldg_a_iters = (block_m * block_k) // (block_threads * async_load_vec_size)
-    ldg_b_iters = (block_n * block_k) // (block_threads * async_load_vec_size)
+    load_elems_per_iter = block_threads * async_load_vec_size
+    has_partial_load = (
+        (block_m * block_k) % load_elems_per_iter != 0
+        or (block_n * block_k) % load_elems_per_iter != 0
+    )
+    ldg_a_iters = (block_m * block_k + load_elems_per_iter - 1) // load_elems_per_iter
+    ldg_b_iters = (block_n * block_k + load_elems_per_iter - 1) // load_elems_per_iter
     assert (stages - 2) * (ldg_a_iters + ldg_b_iters) < 63
     mma_m_repeat = block_m // m_waves // mma_m
     mma_n_repeat = block_n // n_waves // mma_n
@@ -113,6 +119,7 @@ def make_hgemm_gfx950_param(
         group_m=group_m,
         has_bias=has_bias,
         has_k_tail=has_k_tail,
+        has_partial_load=has_partial_load,
         async_load_bytes=GFX950_DMA_BYTES,
         in_data_bytes=in_dbytes,
         out_data_bytes=out_dbytes,
@@ -132,6 +139,7 @@ def make_hgemm_gfx950_kernel_name(param: HGemmGfx950Param):
     name += f"_gm{param.group_m}"
     name += f"_bias{int(param.has_bias)}"
     name += f"_ktail{int(param.has_k_tail)}"
+    name += f"_pload{int(param.has_partial_load)}"
     name += "_nt"
     return name
 
@@ -185,6 +193,7 @@ def hgemm_gfx950_kernel(
     block_k = param.block_k
     stages = param.stages
     has_k_tail = param.has_k_tail
+    has_partial_load = param.has_partial_load
     wave_size = GFX950_WAVE_SIZE
     async_load_bytes = param.async_load_bytes
     in_data_bytes = param.in_data_bytes
@@ -310,21 +319,22 @@ def hgemm_gfx950_kernel(
         lds_ptr = make_wave_lds_ptr(get_a_stage_ptr(stage))
         for i in range_constexpr(ldg_a_iters):
             global_tid = block_threads * i + tid
-            m_local_idx = global_tid // ldg_x_threads
-            k_local_idx = global_tid % ldg_x_threads * async_load_vec_size
-            global_m_idx = bid_m * block_m + m_local_idx
-            safe_global_m_idx = (global_m_idx < m).select(global_m_idx, 0)
-            global_k_idx = k_tile * block_k + swizzled_col_idx(
-                m_local_idx,
-                k_local_idx,
-                a_lds_layout,
-            )
-            if const_expr(has_k_tail):
-                safe_global_k_idx = (global_k_idx < k).select(global_k_idx, 0)
-            else:
-                safe_global_k_idx = global_k_idx
-            global_offset = (safe_global_m_idx * k + safe_global_k_idx) * in_data_bytes
-            buffer_load_lds_inline(a_rsrc, lds_ptr, global_offset, async_load_bytes)
+            if global_tid < block_m * block_k // async_load_vec_size:
+                m_local_idx = global_tid // ldg_x_threads
+                k_local_idx = global_tid % ldg_x_threads * async_load_vec_size
+                global_m_idx = bid_m * block_m + m_local_idx
+                safe_global_m_idx = (global_m_idx < m).select(global_m_idx, 0)
+                global_k_idx = k_tile * block_k + swizzled_col_idx(
+                    m_local_idx,
+                    k_local_idx,
+                    a_lds_layout,
+                )
+                if const_expr(has_k_tail):
+                    safe_global_k_idx = (global_k_idx < k).select(global_k_idx, 0)
+                else:
+                    safe_global_k_idx = global_k_idx
+                global_offset = (safe_global_m_idx * k + safe_global_k_idx) * in_data_bytes
+                buffer_load_lds_inline(a_rsrc, lds_ptr, global_offset, async_load_bytes)
             if i < ldg_a_iters - 1:
                 lds_ptr = advance_lds_ptr(lds_ptr)
 
@@ -332,21 +342,22 @@ def hgemm_gfx950_kernel(
         lds_ptr = make_wave_lds_ptr(get_b_stage_ptr(stage))
         for i in range_constexpr(ldg_b_iters):
             global_tid = block_threads * i + tid
-            n_local_idx = global_tid // ldg_x_threads
-            k_local_idx = global_tid % ldg_x_threads * async_load_vec_size
-            global_n_idx = bid_n * block_n + n_local_idx
-            safe_global_n_idx = (global_n_idx < n).select(global_n_idx, 0)
-            global_k_idx = k_tile * block_k + swizzled_col_idx(
-                n_local_idx,
-                k_local_idx,
-                b_lds_layout,
-            )
-            if const_expr(has_k_tail):
-                safe_global_k_idx = (global_k_idx < k).select(global_k_idx, 0)
-            else:
-                safe_global_k_idx = global_k_idx
-            global_offset = (safe_global_n_idx * k + safe_global_k_idx) * in_data_bytes
-            buffer_load_lds_inline(b_rsrc, lds_ptr, global_offset, async_load_bytes)
+            if global_tid < block_n * block_k // async_load_vec_size:
+                n_local_idx = global_tid // ldg_x_threads
+                k_local_idx = global_tid % ldg_x_threads * async_load_vec_size
+                global_n_idx = bid_n * block_n + n_local_idx
+                safe_global_n_idx = (global_n_idx < n).select(global_n_idx, 0)
+                global_k_idx = k_tile * block_k + swizzled_col_idx(
+                    n_local_idx,
+                    k_local_idx,
+                    b_lds_layout,
+                )
+                if const_expr(has_k_tail):
+                    safe_global_k_idx = (global_k_idx < k).select(global_k_idx, 0)
+                else:
+                    safe_global_k_idx = global_k_idx
+                global_offset = (safe_global_n_idx * k + safe_global_k_idx) * in_data_bytes
+                buffer_load_lds_inline(b_rsrc, lds_ptr, global_offset, async_load_bytes)
             if i < ldg_b_iters - 1:
                 lds_ptr = advance_lds_ptr(lds_ptr)
 
@@ -382,7 +393,7 @@ def hgemm_gfx950_kernel(
             else:
                 compute_k_chunk(block_k_iter)
 
-    LDG_WAIT_COUNT = ldg_a_iters + ldg_b_iters
+    LDG_WAIT_COUNT = 0 if const_expr(has_partial_load) else ldg_a_iters + ldg_b_iters
 
     for stage in range_constexpr(stages - 1):
         async_load_b_to_lds(stage, stage)
