@@ -12,10 +12,13 @@ from .hgemm_wmma_gfx950_utils import BlockSwizzle
 
 GFX950_DMA_BYTES = 16
 GFX950_WAVE_SIZE = 64
+HGEMM_DTYPE_BF16 = 2
+HGEMM_DTYPE_FP16 = 3
 
 
 @fx.struct
 class HGemmGfx950Param:
+    dtype_id: fx.Constexpr[int]
     block_m: fx.Constexpr[int]
     block_n: fx.Constexpr[int]
     block_k: fx.Constexpr[int]
@@ -39,6 +42,7 @@ class HGemmGfx950Param:
 
 
 def make_hgemm_gfx950_param(
+    dtype_id: int = HGEMM_DTYPE_BF16,
     block_m: int = 256,
     block_n: int = 256,
     block_k: int = 64,
@@ -52,6 +56,8 @@ def make_hgemm_gfx950_param(
     mma_n: int = 16,
     mma_k: int = 32,
 ) -> HGemmGfx950Param:
+    if dtype_id not in (HGEMM_DTYPE_BF16, HGEMM_DTYPE_FP16):
+        raise ValueError(f"unsupported dtype_id={dtype_id}")
     if block_m <= 0 or block_n <= 0 or block_k <= 0 or stages <= 0:
         raise ValueError("block_m, block_n, block_k, and stages must be positive")
     if (mma_m, mma_n, mma_k) != (16, 16, 32):
@@ -122,6 +128,7 @@ def make_hgemm_gfx950_param(
             f"mma_n_repeat={mma_n_repeat}, covered_n={mma_n_repeat * n_waves * mma_n}"
         )
     return HGemmGfx950Param(
+        dtype_id=dtype_id,
         block_m=block_m,
         block_n=block_n,
         block_k=block_k,
@@ -145,7 +152,8 @@ def make_hgemm_gfx950_param(
 
 
 def make_hgemm_gfx950_kernel_name(param: HGemmGfx950Param):
-    name = f"hgemm_t{param.block_m}x{param.block_n}x{param.block_k}x{param.stages}"
+    dtype_str = "fp16" if param.dtype_id == HGEMM_DTYPE_FP16 else "bf16"
+    name = f"hgemm_{dtype_str}_t{param.block_m}x{param.block_n}x{param.block_k}x{param.stages}"
     name += f"_w{param.m_waves}x{param.n_waves}"
     name += f"_gm{param.group_m}"
     name += f"_bias{int(param.has_bias)}"
@@ -211,6 +219,9 @@ def hgemm_gfx950_kernel(
     ldg_a_iters = param.ldg_a_iters
     ldg_b_iters = param.ldg_b_iters
     ldg_wait_count = ldg_a_iters + ldg_b_iters
+    elem_dtype = (
+        fx.Float16 if const_expr(param.dtype_id == HGEMM_DTYPE_FP16) else fx.BFloat16
+    )
 
     tid = fx.thread_idx.x
     num_pid_m = (m + block_m - 1) // block_m
@@ -223,13 +234,13 @@ def hgemm_gfx950_kernel(
 
     @fx.struct
     class SharedABStorage:
-        a: fx.Array[fx.BFloat16, stages * block_m * block_k, 16]
-        b: fx.Array[fx.BFloat16, stages * block_n * block_k, 16]
+        a: fx.Array[elem_dtype, stages * block_m * block_k, 16]
+        b: fx.Array[elem_dtype, stages * block_n * block_k, 16]
 
     @fx.union
     class SharedStorage:
         ab: SharedABStorage
-        c: fx.Array[fx.BFloat16, block_m * block_n, 16]
+        c: fx.Array[elem_dtype, block_m * block_n, 16]
 
     storage = fx.SharedAllocator().allocate(SharedStorage)
     smem_a = storage.ab.a.peek().ptr
@@ -250,9 +261,9 @@ def hgemm_gfx950_kernel(
     a_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(a_buf))
     b_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(b_buf))
 
-    s2r_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
-    g2r_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
-    r2g_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
+    s2r_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), elem_dtype)
+    g2r_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_dtype)
+    r2g_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_dtype)
 
     gC = fx.flat_divide(out, (block_m, block_n))[None, None, bid_m, bid_n]
 
@@ -450,14 +461,14 @@ def hgemm_gfx950_kernel(
         compute_stage(current_stage, main_loop_end + s)
         current_stage = (current_stage + 1) % stages
 
-    frag_C_bf16 = fx.make_fragment_like(frag_C, fx.BFloat16)
-    frag_C_bf16.store(frag_C.load().to(fx.BFloat16))
+    frag_C_out = fx.make_fragment_like(frag_C, elem_dtype)
+    frag_C_out.store(frag_C.load().to(elem_dtype))
 
     fx.gpu.barrier()
-    for i in range_constexpr(fx.size(frag_C_bf16.shape).unpack()):
+    for i in range_constexpr(fx.size(frag_C_out.shape).unpack()):
         row = fx.get_scalar(thr_mma_cRow[i])
         col = fx.get_scalar(thr_mma_cCol[i])
-        sC[row, col] = frag_C_bf16[i]
+        sC[row, col] = frag_C_out[i]
 
     fx.gpu.barrier()
     fx.copy(s2r_copy_atom, thr_sC, frag_C_cshuffle)
@@ -476,8 +487,11 @@ def launch_hgemm_gfx950(
     param: HGemmGfx950Param,
     stream: fx.Stream = fx.Stream(None),
 ):
+    elem_dtype = (
+        fx.Float16 if const_expr(param.dtype_id == HGEMM_DTYPE_FP16) else fx.BFloat16
+    )
     mma_atom = fx.make_mma_atom(
-        fx.rocdl.MFMA(param.mma_m, param.mma_n, param.mma_k, fx.BFloat16)
+        fx.rocdl.MFMA(param.mma_m, param.mma_n, param.mma_k, elem_dtype)
     )
     k_per_mfma_group = param.mma_k // 4
     tiled_mma = fx.make_tiled_mma(
@@ -544,6 +558,7 @@ def hgemm(
     if not b.is_contiguous():
         b = b.contiguous()
     assert a.dtype == b.dtype
+    assert a.dtype in (torch.float16, torch.bfloat16)
     if out is None:
         out = torch.empty((m, n), dtype=a.dtype, device=a.device)
     else:
@@ -577,6 +592,9 @@ def hgemm(
             "group_m": 0,
         }
     kwargs.update(user_kwargs)
+    kwargs["dtype_id"] = (
+        HGEMM_DTYPE_FP16 if a.dtype is torch.float16 else HGEMM_DTYPE_BF16
+    )
     kwargs["has_bias"] = False if bias is None else True
     kwargs["has_k_tail"] = infer_has_k_tail(
         k=k,

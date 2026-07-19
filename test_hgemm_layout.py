@@ -187,6 +187,7 @@ def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
     "dtype",
     [
         "bf16",
+        "fp16",
     ],
 )
 @pytest.mark.parametrize(
@@ -246,6 +247,7 @@ def test_hgemm_acc_main_loop(
     "dtype",
     [
         "bf16",
+        "fp16",
     ],
 )
 @pytest.mark.parametrize(
