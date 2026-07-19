@@ -203,7 +203,6 @@ def hgemm_gfx950_kernel(
     block_k = param.block_k
     stages = param.stages
     has_k_tail = param.has_k_tail
-    wave_size = GFX950_WAVE_SIZE
     async_load_bytes = param.async_load_bytes
     in_data_bytes = param.in_data_bytes
     async_load_vec_size = async_load_bytes // in_data_bytes
@@ -281,6 +280,8 @@ def hgemm_gfx950_kernel(
     frag_B = thr_mma.make_fragment_B(sB)
     frag_C = thr_mma.make_fragment_C(gC)
 
+    # `retile` does not allocate new data; it reinterprets the MMA register
+    # fragments with the tiled-copy layout so LDS-to-register `fx.copy` can fill them.
     frag_A_retile = thr_copy_g2r_A.retile(frag_A)
     frag_B_retile = thr_copy_g2r_B.retile(frag_B)
 
@@ -321,6 +322,7 @@ def hgemm_gfx950_kernel(
             safe_global_n_idx = (global_n_idx < n).select(global_n_idx, 0)
             bias_val = bias_buf[safe_global_n_idx].to(fx.Float32)
             frag_C[i] = bias_val
+
     for i in range_constexpr(fx.size(pred_C.shape).unpack()):
         row_idx = bid_m * block_m + fx.get_scalar(thr_cRow[i])
         col_idx = bid_n * block_n + fx.get_scalar(thr_cCol[i])
@@ -328,7 +330,7 @@ def hgemm_gfx950_kernel(
 
     wave_offset = rocdl.readfirstlane(
         fx.Int64.ir_type,
-        fx.Int64(tid // wave_size * wave_size * async_load_bytes),
+        fx.Int64(tid // GFX950_WAVE_SIZE * GFX950_WAVE_SIZE * async_load_bytes),
     )
 
     def make_wave_lds_ptr(ptr):
