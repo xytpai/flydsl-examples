@@ -200,5 +200,6 @@ if __name__ == "__main__":
 
     # rm -rf ~/.flydsl/ ; python3 gemm_tune.py --single --dtype bf16 --m 8 --n 7168 --k 2048
     # rm -rf ~/.flydsl/ ; python3 gemm_tune.py --single --dtype bf16 --m 4096 --n 256 --k 4096
+    # rm -rf ~/.flydsl/ ; python3 gemm_tune.py --single --dtype bf16 --m 32 --n 384 --k 7168
 
     # rm -rf ~/.flydsl/ ; python3 gemm_tune.py --tune_all
