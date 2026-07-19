@@ -24,6 +24,7 @@ class _TestArgs:
     n_waves: int
     group_m: int
     has_bias: bool
+    use_half_tile_interleaved: bool = False
 
 
 def create_inputs(args: _TestArgs):
@@ -86,6 +87,7 @@ def check_acc(args: _TestArgs):
         "m_waves": args.m_waves,
         "n_waves": args.n_waves,
         "group_m": args.group_m,
+        "use_half_tile_interleaved": args.use_half_tile_interleaved,
     }
     inputs = create_inputs(args)
     outputs = create_outputs(args)
@@ -127,6 +129,7 @@ def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
         "m_waves": args.m_waves,
         "n_waves": args.n_waves,
         "group_m": args.group_m,
+        "use_half_tile_interleaved": args.use_half_tile_interleaved,
     }
     sample_inputs = create_inputs(args)
     sample_outputs = create_outputs(args)
@@ -191,24 +194,39 @@ def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
     ],
 )
 @pytest.mark.parametrize(
-    "m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, group_m, has_bias",
+    "m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, group_m, has_bias, is_hti",
     [
-        (8192, 8192, 8192, 256, 256, 64, 2, 2, 4, 0, False),
-        (8192, 8192, 8192, 256, 256, 64, 2, 2, 4, 4, True),
-        (8160, 8160, 8192, 256, 256, 64, 2, 2, 4, 0, False),
-        (8160, 8160, 8192, 256, 256, 64, 2, 2, 4, 0, True),
-        (8192, 8192, 8192 + 64, 256, 256, 64, 2, 2, 4, 0, False),
-        (8192, 8192, 8192 + 64, 256, 256, 64, 2, 2, 4, 0, True),
-        (8192, 8192, 8192 + 32, 256, 256, 64, 2, 2, 4, 0, False),
-        (8192, 8192, 8192 + 32, 256, 256, 64, 2, 2, 4, 0, True),
-        (8160, 8160, 8192 + 64, 256, 256, 64, 2, 2, 4, 0, False),
-        (8160, 8160, 8192 + 64, 256, 256, 64, 2, 2, 4, 0, True),
-        (8160, 8160, 8192 + 32, 256, 256, 64, 2, 2, 4, 0, False),
-        (8160, 8160, 8192 + 32, 256, 256, 64, 2, 2, 4, 0, True),
-        (2048, 2048, 2048, 128, 128, 64, 2, 4, 4, 0, False),
-        (2048, 2048, 2048, 128, 128, 64, 4, 4, 4, 0, True),
-        (2048, 2048, 2048 - 64, 128, 128, 64, 2, 4, 4, 0, False),
-        (2048, 2048, 2048 - 64, 128, 128, 64, 4, 4, 4, 0, True),
+        (8192, 8192, 8192, 256, 256, 64, 2, 2, 4, 0, False, False),
+        (8192, 8192, 8192, 256, 256, 64, 2, 2, 4, 4, True, False),
+        (8160, 8160, 8192, 256, 256, 64, 2, 2, 4, 0, False, False),
+        (8160, 8160, 8192, 256, 256, 64, 2, 2, 4, 0, True, False),
+        (8192, 8192, 8192 + 64, 256, 256, 64, 2, 2, 4, 0, False, False),
+        (8192, 8192, 8192 + 64, 256, 256, 64, 2, 2, 4, 0, True, False),
+        (8192, 8192, 8192 + 32, 256, 256, 64, 2, 2, 4, 0, False, False),
+        (8192, 8192, 8192 + 32, 256, 256, 64, 2, 2, 4, 0, True, False),
+        (8160, 8160, 8192 + 64, 256, 256, 64, 2, 2, 4, 0, False, False),
+        (8160, 8160, 8192 + 64, 256, 256, 64, 2, 2, 4, 0, True, False),
+        (8160, 8160, 8192 + 32, 256, 256, 64, 2, 2, 4, 0, False, False),
+        (8160, 8160, 8192 + 32, 256, 256, 64, 2, 2, 4, 0, True, False),
+        (2048, 2048, 2048, 128, 128, 64, 2, 4, 4, 0, False, False),
+        (2048, 2048, 2048, 128, 128, 64, 4, 4, 4, 0, True, False),
+        (2048, 2048, 2048 - 64, 128, 128, 64, 2, 4, 4, 0, False, False),
+        (2048, 2048, 2048 - 64, 128, 128, 64, 4, 4, 4, 0, True, False),
+        # hti
+        (8192, 8192, 8192, 256, 256, 64, 2, 2, 4, 0, False, True),
+        (8192, 8192, 8192, 256, 256, 64, 2, 2, 4, 4, True, True),
+        (8160, 8160, 8192, 256, 256, 64, 2, 2, 4, 0, False, True),
+        (8160, 8160, 8192, 256, 256, 64, 2, 2, 4, 0, True, True),
+        (8192, 8192, 8192 + 64, 256, 256, 64, 2, 2, 4, 0, False, True),
+        (8192, 8192, 8192 + 64, 256, 256, 64, 2, 2, 4, 0, True, True),
+        (8192, 8192, 8192 + 32, 256, 256, 64, 2, 2, 4, 0, False, True),
+        (8192, 8192, 8192 + 32, 256, 256, 64, 2, 2, 4, 0, True, True),
+        (8160, 8160, 8192 + 64, 256, 256, 64, 2, 2, 4, 0, False, True),
+        (8160, 8160, 8192 + 64, 256, 256, 64, 2, 2, 4, 0, True, True),
+        (8160, 8160, 8192 + 32, 256, 256, 64, 2, 2, 4, 0, False, True),
+        (8160, 8160, 8192 + 32, 256, 256, 64, 2, 2, 4, 0, True, True),
+        (2048, 2048, 2048, 128, 128, 64, 2, 2, 2, 0, False, True),
+        (2048, 2048, 2048 - 64, 128, 128, 64, 2, 2, 2, 0, False, True),
     ],
 )
 def test_hgemm_acc_main_loop(
@@ -224,6 +242,7 @@ def test_hgemm_acc_main_loop(
     n_waves: int,
     group_m: int,
     has_bias: bool,
+    is_hti: bool,
 ):
     dtype = torch.bfloat16 if "bf16" in dtype else torch.half
     args = _TestArgs(
@@ -239,6 +258,7 @@ def test_hgemm_acc_main_loop(
         n_waves,
         group_m,
         has_bias,
+        is_hti,
     )
     check_acc(args)
 
@@ -251,14 +271,21 @@ def test_hgemm_acc_main_loop(
     ],
 )
 @pytest.mark.parametrize(
-    "m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, group_m, has_bias",
+    "m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, group_m, has_bias, is_hti",
     [
-        (3, 5120, 2880, 64, 64, 64, 5, 2, 2, 4, True),
-        (3, 5120, 2880, 64, 64, 64, 5, 2, 2, 0, False),
-        (3, 5120, 2880, 64, 64, 64, 2, 2, 2, 0, True),
-        (3, 5120, 2880, 64, 64, 64, 2, 2, 2, 0, False),
-        (3, 32, 128 + 64, 128, 128, 64, 3, 2, 2, 4, True),
-        (3, 32, 128 - 64, 128, 128, 64, 3, 2, 2, 0, False),
+        (3, 5120, 2880, 64, 64, 64, 5, 2, 2, 4, True, False),
+        (3, 5120, 2880, 64, 64, 64, 5, 2, 2, 0, False, False),
+        (3, 5120, 2880, 64, 64, 64, 2, 2, 2, 0, True, False),
+        (3, 5120, 2880, 64, 64, 64, 2, 2, 2, 0, False, False),
+        (3, 32, 128 + 64, 128, 128, 64, 3, 2, 2, 4, True, False),
+        (3, 32, 128 - 64, 128, 128, 64, 3, 2, 2, 0, False, False),
+        # hti
+        (3, 5120, 2880, 64, 64, 64, 2, 2, 2, 4, True, True),
+        (3, 5120, 2880, 64, 64, 64, 2, 2, 2, 0, False, True),
+        (3, 5120, 2880, 64, 64, 64, 2, 2, 2, 0, True, True),
+        (3, 5120, 2880, 64, 64, 64, 2, 2, 2, 0, False, True),
+        (3, 32, 128 + 64, 128, 128, 64, 2, 2, 2, 4, True, True),
+        (3, 32, 128 + 64 * 3, 128, 128, 64, 2, 2, 2, 4, True, True),
     ],
 )
 def test_hgemm_acc_small_m(
@@ -274,6 +301,7 @@ def test_hgemm_acc_small_m(
     n_waves: int,
     group_m: int,
     has_bias: bool,
+    is_hti: bool,
 ):
     dtype = torch.bfloat16 if "bf16" in dtype else torch.half
     args = _TestArgs(
@@ -289,6 +317,7 @@ def test_hgemm_acc_small_m(
         n_waves,
         group_m,
         has_bias,
+        is_hti,
     )
     check_acc(args)
 
@@ -298,15 +327,15 @@ def test_hgemm_acc_small_m(
 
 @pytest.mark.parametrize("dtype", ["bf16"])
 @pytest.mark.parametrize(
-    "m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, group_m, has_bias",
+    "m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, group_m, has_bias, is_hti",
     [
-        (1024, 1024, 1024, 64, 64, 64, 4, 2, 4, 0, True),
-        (2048, 2048, 2048, 128, 128, 64, 3, 4, 2, 0, True),
-        (4096, 4096, 4096, 256, 256, 64, 2, 2, 4, 4, True),
-        (4096, 4096, 8192, 256, 256, 64, 2, 2, 4, 4, True),
-        (8192, 8192, 8192, 256, 256, 64, 2, 4, 4, 0, True),
-        (8, 7168, 2048, 16, 64, 128, 5, 1, 4, 0, True),
-        (32, 384, 7168, 16, 64, 128, 4, 1, 4, 0, True),
+        (1024, 1024, 1024, 64, 64, 64, 4, 2, 4, 0, True, False),
+        (2048, 2048, 2048, 128, 128, 64, 3, 4, 2, 0, True, False),
+        (4096, 4096, 4096, 256, 256, 64, 2, 2, 4, 4, True, False),
+        (4096, 4096, 8192, 256, 256, 64, 2, 2, 4, 4, True, False),
+        (8192, 8192, 8192, 256, 256, 64, 2, 4, 4, 0, True, False),
+        (8, 7168, 2048, 16, 64, 128, 5, 1, 4, 0, True, False),
+        (32, 384, 7168, 16, 64, 128, 4, 1, 4, 0, True, False),
     ],
 )
 def test_hgemm_benchmark_smoke(
@@ -322,6 +351,7 @@ def test_hgemm_benchmark_smoke(
     n_waves: int,
     group_m: int,
     has_bias: bool,
+    is_hti: bool,
 ):
     dtype = torch.bfloat16 if "bf16" in dtype else torch.half
     args = _TestArgs(
@@ -337,6 +367,7 @@ def test_hgemm_benchmark_smoke(
         n_waves,
         group_m,
         has_bias,
+        is_hti,
     )
     benchmark(args)
 
@@ -363,7 +394,7 @@ def hgemm_get_configs():
         try:
             make_hgemm_gfx950_param(**config)
             valid_configs.append(config)
-        except Exception as e:
+        except Exception:
             pass
     return valid_configs
 
