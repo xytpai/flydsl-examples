@@ -211,6 +211,7 @@ def hgemm_gfx950_kernel(
     block_threads = param.block_threads
     ldg_a_iters = param.ldg_a_iters
     ldg_b_iters = param.ldg_b_iters
+    ldg_wait_count = ldg_a_iters + ldg_b_iters
 
     tid = fx.thread_idx.x
     num_pid_m = (m + block_m - 1) // block_m
@@ -236,6 +237,8 @@ def hgemm_gfx950_kernel(
     smem_b = storage.ab.b.peek().ptr
     smem_c = storage.c.peek().ptr
 
+    # Wrap tensor arguments as ROCDL buffer tensors so later code can use
+    # buffer resources/copy atoms while preserving the original tensor layout.
     a_buf = fx.rocdl.make_buffer_tensor(a, max_size=True)
     b_buf = fx.rocdl.make_buffer_tensor(b, max_size=True)
     out = fx.rocdl.make_buffer_tensor(out, max_size=False)
@@ -244,6 +247,7 @@ def hgemm_gfx950_kernel(
     else:
         bias_buf = None
 
+    # Extract raw buffer descriptors for the inline global-to-LDS load path.
     a_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(a_buf))
     b_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(b_buf))
 
@@ -254,11 +258,9 @@ def hgemm_gfx950_kernel(
     gC = fx.flat_divide(out, (block_m, block_n))[None, None, bid_m, bid_n]
 
     thr_mma = tiled_mma.thr_slice(tid)
-    thr_copy_s2r_A = fx.make_tiled_copy_A(g2r_copy_atom, tiled_mma).get_slice(tid)
-    thr_copy_s2r_B = fx.make_tiled_copy_B(g2r_copy_atom, tiled_mma).get_slice(tid)
+    thr_copy_g2r_A = fx.make_tiled_copy_A(g2r_copy_atom, tiled_mma).get_slice(tid)
+    thr_copy_g2r_B = fx.make_tiled_copy_B(g2r_copy_atom, tiled_mma).get_slice(tid)
 
-    row_coords = fx.make_view(0, fx.make_layout((block_m, block_n), (1, 0)))
-    col_coords = fx.make_view(0, fx.make_layout((block_m, block_n), (0, 1)))
     swizzle = fx.static(fx.SwizzleType.get(3, 3, 3))
 
     def make_lds_layout(rows):
@@ -274,15 +276,19 @@ def hgemm_gfx950_kernel(
     sA = fx.make_view(smem_a, a_lds_layout)
     sB = fx.make_view(smem_b, b_lds_layout)
     sC = fx.make_view(smem_c, c_lds_layout)
+
     frag_A = thr_mma.make_fragment_A(sA)
     frag_B = thr_mma.make_fragment_B(sB)
     frag_C = thr_mma.make_fragment_C(gC)
-    frag_A_retile = thr_copy_s2r_A.retile(frag_A)
-    frag_B_retile = thr_copy_s2r_B.retile(frag_B)
-    frag_C.fill(0.0)
 
+    frag_A_retile = thr_copy_g2r_A.retile(frag_A)
+    frag_B_retile = thr_copy_g2r_B.retile(frag_B)
+
+    row_coords = fx.make_view(0, fx.make_layout((block_m, block_n), (1, 0)))
+    col_coords = fx.make_view(0, fx.make_layout((block_m, block_n), (0, 1)))
     thr_mma_cRow = thr_mma.partition_C(row_coords)
     thr_mma_cCol = thr_mma.partition_C(col_coords)
+
     cshuffle_vec_size = GFX950_DMA_BYTES // param.out_data_bytes
     cshuffle_x_threads = block_n // cshuffle_vec_size
     cshuffle_thr_layout = fx.make_layout(
@@ -307,6 +313,7 @@ def hgemm_gfx950_kernel(
     frag_C_cshuffle = fx.make_fragment_like(thr_sC)
     pred_C = fx.make_fragment_like(thr_cRow, dtype=fx.Boolean)
 
+    frag_C.fill(0.0)
     if const_expr(param.has_bias):
         for i in range_constexpr(fx.size(frag_C.shape).unpack()):
             col_idx = fx.get_scalar(thr_mma_cCol[i])
@@ -381,10 +388,10 @@ def hgemm_gfx950_kernel(
                 lds_ptr = lds_ptr + block_threads * async_load_bytes
 
     def compute_stage(read_stage, k_tile):
-        thr_sA_s2r = thr_copy_s2r_A.partition_S(
+        thr_sA_s2r = thr_copy_g2r_A.partition_S(
             fx.make_view(smem_a + read_stage * block_m * block_k, a_lds_layout)
         )
-        thr_sB_s2r = thr_copy_s2r_B.partition_S(
+        thr_sB_s2r = thr_copy_g2r_B.partition_S(
             fx.make_view(smem_b + read_stage * block_n * block_k, b_lds_layout)
         )
 
@@ -416,8 +423,6 @@ def hgemm_gfx950_kernel(
             else:
                 compute_k_chunk(block_k_iter)
 
-    LDG_WAIT_COUNT = ldg_a_iters + ldg_b_iters
-
     for stage in range_constexpr(stages - 1):
         async_load_b_to_lds(stage, stage)
         async_load_a_to_lds(stage, stage)
@@ -430,14 +435,14 @@ def hgemm_gfx950_kernel(
     for k_tile in range(0, main_loop_end, 1):
         current_stage = k_tile % stages
         write_stage = (current_stage + stages - 1) % stages
-        __barrier((stages - 2) * LDG_WAIT_COUNT)
+        __barrier((stages - 2) * ldg_wait_count)
         async_load_b_to_lds(k_tile + (stages - 1), write_stage)
         async_load_a_to_lds(k_tile + (stages - 1), write_stage)
         compute_stage(current_stage, k_tile)
 
     current_stage = main_loop_end % stages
     for s in range_constexpr(0, stages - 1):
-        __barrier((stages - 2 - s) * LDG_WAIT_COUNT)
+        __barrier((stages - 2 - s) * ldg_wait_count)
         compute_stage(current_stage, main_loop_end + s)
         current_stage = (current_stage + 1) % stages
 
