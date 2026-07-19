@@ -70,6 +70,8 @@ def make_hgemm_gfx950_param(
         raise ValueError("m_waves, and n_waves must be positive")
     if group_m < 0:
         raise ValueError("group_m must be non-negative")
+    in_dbytes = out_dbytes = 2  # for hgemm
+    cshuffle_vec_size = 16 // in_dbytes
     if use_half_tile_interleaved:
         half_block_m = block_m // 2
         half_block_n = block_n // 2
@@ -81,10 +83,11 @@ def make_hgemm_gfx950_param(
         mma_n_half_repeat = half_block_n // n_waves // mma_n
         assert mma_m_half_repeat * m_waves * mma_m == half_block_m
         assert mma_n_half_repeat * n_waves * mma_n == half_block_n
-        cshuffle_vec_size = GFX950_DMA_BYTES // 2
         assert half_block_n % cshuffle_vec_size == 0
-    in_dbytes = out_dbytes = 2  # for hgemm
+    else:
+        assert block_n % cshuffle_vec_size == 0
     smem_bytes = stages * (block_m + block_n) * block_k * in_dbytes
+    smem_bytes = max(smem_bytes, block_m * block_n * in_dbytes)
     arch = get_rocm_arch()
     SMEM_CAPACITY_MAP = {
         "gfx942": 65536,

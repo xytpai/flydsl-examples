@@ -63,7 +63,7 @@ def tuning_benchmark(args, kwargs={}, niters=50):
     hgemm(a, b, c, bias=bias, user_kwargs=kwargs)
     tol = float(args.k) / 2048 * 6e-1
     is_allclose = torch.allclose(c, c_ref, atol=tol, rtol=tol)
-    assert is_allclose == True
+    assert is_allclose
     # performance bench
     inputs = [create_inputs(args) for i in range(niters)]
     outputs = [create_outputs(args) for i in range(niters)]
@@ -80,7 +80,7 @@ def tuning_benchmark(args, kwargs={}, niters=50):
             )
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
-    table = prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1)
+    # table = prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1)
     hgemm_durations = []
     for event in prof.events():
         if event.name.startswith("hgemm_"):
@@ -98,20 +98,22 @@ def hgemm_get_configs():
         "m_waves": [1, 2, 4],
         "n_waves": [1, 2, 4],
         "group_m": [0, 4],
+        "use_half_tile_interleaved": [False, True],
     }
     keys = selections.keys()
     values = selections.values()
     configs = [dict(zip(keys, combo)) for combo in itertools.product(*values)]
     valid_configs = []
     for config in configs:
-        mma_m_iters = config["block_m"] // config["m_waves"] // 16
-        mma_n_iters = config["block_n"] // config["n_waves"] // 16
-        if mma_m_iters > 4 or mma_n_iters > 4:
-            continue
+        if not config["use_half_tile_interleaved"]:
+            mma_m_iters = config["block_m"] // config["m_waves"] // 16
+            mma_n_iters = config["block_n"] // config["n_waves"] // 16
+            if mma_m_iters > 4 or mma_n_iters > 4:
+                continue
         try:
             make_hgemm_gfx950_param(**config)
             valid_configs.append(config)
-        except Exception as e:
+        except Exception:
             pass
     return valid_configs
 
@@ -124,7 +126,7 @@ def tune_single(args):
     for i, config in enumerate(configs):
         try:
             dur = tuning_benchmark(args, kwargs=config)
-        except:
+        except Exception:
             dur = float(1e10)
         if dur < best_duration:
             best_duration = dur
@@ -159,10 +161,18 @@ def tune_all(
         (256, 4096, 4096),
         (512, 4096, 4096),
         (2048, 4096, 4096),
-        (4096, 4096, 4096),
         (32, 14336, 4096),
         (16, 28672, 4096),
         (4096, 256, 4096),
+        (1024, 1024, 1024),
+        (2048, 2048, 2048),
+        (4096, 4096, 4096),
+        (4096, 4096, 8192),
+        (8192, 8192, 8192),
+        (16384, 16384, 16384),
+        (8, 7168, 2048),
+        (8, 7168, 2048),
+        (32, 384, 7168),
     ]
     with open(f"{out_prefix}.jsonl", "w", encoding="utf-8") as f:
         for mnk in mnks:

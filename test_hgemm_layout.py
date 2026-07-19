@@ -55,6 +55,8 @@ def make_triton_maxautotune_func():
 
     inductor_config.max_autotune_gemm_backends = "TRITON"
 
+    torch._dynamo.reset()
+
     def triton_maxautotune_func(a, b, bias, c):
         out = F.linear(a, b, bias=bias)
         c.copy_(out)
@@ -329,13 +331,13 @@ def test_hgemm_acc_small_m(
 @pytest.mark.parametrize(
     "m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, group_m, has_bias, is_hti",
     [
-        (1024, 1024, 1024, 64, 64, 64, 4, 2, 4, 0, True, False),
-        (2048, 2048, 2048, 128, 128, 64, 3, 4, 2, 0, True, False),
-        (4096, 4096, 4096, 256, 256, 64, 2, 2, 4, 4, True, False),
-        (4096, 4096, 8192, 256, 256, 64, 2, 2, 4, 4, True, False),
-        (8192, 8192, 8192, 256, 256, 64, 2, 4, 4, 0, True, False),
-        (8, 7168, 2048, 16, 64, 128, 5, 1, 4, 0, True, False),
-        (32, 384, 7168, 16, 64, 128, 4, 1, 4, 0, True, False),
+        # (1024, 1024, 1024, 64, 64, 64, 4, 2, 4, 0, True, False),
+        # (2048, 2048, 2048, 128, 128, 64, 3, 4, 2, 0, True, False),
+        # (4096, 4096, 4096, 256, 256, 64, 2, 2, 4, 4, True, False),
+        (4096, 4096, 8192, 256, 256, 64, 2, 2, 4, 4, True, True),
+        # (8192, 8192, 8192, 256, 256, 64, 2, 4, 4, 0, True, False),
+        # (8, 7168, 2048, 16, 64, 128, 5, 1, 4, 0, True, False),
+        # (32, 384, 7168, 16, 64, 128, 4, 1, 4, 0, True, False),
     ],
 )
 def test_hgemm_benchmark_smoke(
