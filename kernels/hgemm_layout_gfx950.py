@@ -524,7 +524,7 @@ def make_hgemm_param_and_validate(m, n, k, kwargs):
     result = None
     try:
         result = make_hgemm_gfx950_param(**kwargs)
-    except Exception as e:
+    except Exception:
         return None
     if not ((n % 32 == 0) and (k % result.mma_k == 0)):
         return None
