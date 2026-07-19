@@ -257,8 +257,8 @@ def hgemm_gfx950_kernel(
     gC = fx.flat_divide(out, (block_m, block_n))[None, None, bid_m, bid_n]
 
     thr_mma = tiled_mma.thr_slice(tid)
-    thr_copy_g2r_A = fx.make_tiled_copy_A(g2r_copy_atom, tiled_mma).get_slice(tid)
-    thr_copy_g2r_B = fx.make_tiled_copy_B(g2r_copy_atom, tiled_mma).get_slice(tid)
+    thr_copy_A = fx.make_tiled_copy_A(g2r_copy_atom, tiled_mma).get_slice(tid)
+    thr_copy_B = fx.make_tiled_copy_B(g2r_copy_atom, tiled_mma).get_slice(tid)
 
     swizzle = fx.static(fx.SwizzleType.get(3, 3, 3))
 
@@ -282,8 +282,8 @@ def hgemm_gfx950_kernel(
 
     # `retile` does not allocate new data; it reinterprets the MMA register
     # fragments with the tiled-copy layout so LDS-to-register `fx.copy` can fill them.
-    frag_A_retile = thr_copy_g2r_A.retile(frag_A)
-    frag_B_retile = thr_copy_g2r_B.retile(frag_B)
+    frag_A_retile = thr_copy_A.retile(frag_A)
+    frag_B_retile = thr_copy_B.retile(frag_B)
 
     row_coords = fx.make_view(0, fx.make_layout((block_m, block_n), (1, 0)))
     col_coords = fx.make_view(0, fx.make_layout((block_m, block_n), (0, 1)))
@@ -390,10 +390,10 @@ def hgemm_gfx950_kernel(
                 lds_ptr = lds_ptr + block_threads * async_load_bytes
 
     def compute_stage(read_stage, k_tile):
-        thr_sA_s2r = thr_copy_g2r_A.partition_S(
+        thr_sA_s2r = thr_copy_A.partition_S(
             fx.make_view(smem_a + read_stage * block_m * block_k, a_lds_layout)
         )
-        thr_sB_s2r = thr_copy_g2r_B.partition_S(
+        thr_sB_s2r = thr_copy_B.partition_S(
             fx.make_view(smem_b + read_stage * block_n * block_k, b_lds_layout)
         )
 
@@ -425,6 +425,8 @@ def hgemm_gfx950_kernel(
             else:
                 compute_k_chunk(block_k_iter)
 
+    # Prime the staged LDS pipeline: preload the first `stages - 1` K tiles
+    # before entering the main loop that overlaps async loads with compute.
     for stage in range_constexpr(stages - 1):
         async_load_b_to_lds(stage, stage)
         async_load_a_to_lds(stage, stage)
