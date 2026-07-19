@@ -837,8 +837,6 @@ def hgemm_hti_gfx950_kernel(
     c10 = make_c_fragment(1, 0)
     c11 = make_c_fragment(1, 1)
 
-    # Prime the first double-K tile.  The missing A(1, stage=1) load is issued
-    # at the beginning of the fixed schedule below, matching the WMMA HTI kernel.
     async_load_b_to_lds(0, 0, 0)
     async_load_a_to_lds(0, 0, 0)
     async_load_b_to_lds(1, 0, 0)
