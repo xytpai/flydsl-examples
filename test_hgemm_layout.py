@@ -161,13 +161,17 @@ def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
     print("===================== [INTERLEAVED] =====================")
     for i in range(warmup):
         idx = i % rotary_inputs
-        if i % 2 == 0:
+        if i % 3 == 0:
             run_ref(idx)
             run_triton_maxautotune(idx)
             run_flydsl(idx)
-        else:
+        if i % 3 == 1:
             run_flydsl(idx)
+            run_ref(idx)
             run_triton_maxautotune(idx)
+        elif i % 3 == 2:
+            run_triton_maxautotune(idx)
+            run_flydsl(idx)
             run_ref(idx)
         torch.cuda.synchronize()
 
@@ -176,13 +180,17 @@ def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
     ) as prof:
         for i in range(warmup, niters):
             idx = i % rotary_inputs
-            if i % 2 == 0:
+            if i % 3 == 0:
                 run_ref(idx)
                 run_triton_maxautotune(idx)
                 run_flydsl(idx)
-            else:
+            if i % 3 == 1:
                 run_flydsl(idx)
+                run_ref(idx)
                 run_triton_maxautotune(idx)
+            elif i % 3 == 2:
+                run_triton_maxautotune(idx)
+                run_flydsl(idx)
                 run_ref(idx)
             torch.cuda.synchronize()
     print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))
