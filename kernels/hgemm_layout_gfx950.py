@@ -302,7 +302,7 @@ def hgemm_gfx950_kernel(
     # buffer resources/copy atoms while preserving the original tensor layout.
     a_buf = fx.rocdl.make_buffer_tensor(a, max_size=True)
     b_buf = fx.rocdl.make_buffer_tensor(b, max_size=True)
-    out = fx.rocdl.make_buffer_tensor(out, max_size=False)
+    out_buf = fx.rocdl.make_buffer_tensor(out, max_size=True)
     if const_expr(param.has_bias):
         bias_buf = fx.rocdl.make_buffer_tensor(bias, max_size=True)
     else:
@@ -316,7 +316,7 @@ def hgemm_gfx950_kernel(
     g2r_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_dtype)
     r2g_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_dtype)
 
-    gC = fx.flat_divide(out, (block_m, block_n))[None, None, bid_m, bid_n]
+    gC = fx.flat_divide(out_buf, (block_m, block_n))[None, None, bid_m, bid_n]
 
     thr_mma = tiled_mma.thr_slice(tid)
     thr_copy_A = fx.make_tiled_copy_A(g2r_copy_atom, tiled_mma).get_slice(tid)
