@@ -399,7 +399,7 @@ def test_hgemm_benchmark_smoke(
 def hgemm_get_configs():
     selections = {
         "block_m": [16, 32, 48, 64, 80, 96, 128, 256],
-        "block_n": [64, 80, 96, 128, 256],
+        "block_n": [16, 32, 64, 80, 96, 128, 256],
         "block_k": [64, 128, 256],
         "stages": [i for i in range(2, 10)],
         "m_waves": [1, 2, 4],
