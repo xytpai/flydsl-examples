@@ -12,7 +12,7 @@ ROTARY_INPUTS_TARGET_BYTES = 8 * 1024**3
 
 @dataclass
 class _TestArgs:
-    dtype: torch.dtype
+    dtype: torch.dtype | str
     m: int
     n: int
     k: int
@@ -27,27 +27,68 @@ class _TestArgs:
     use_half_tile_interleaved: bool = False
 
 
+def get_torch_fp8_dtype():
+    if hasattr(torch, "float8_e4m3fn"):
+        return torch.float8_e4m3fn
+    pytest.skip("This PyTorch build does not expose torch.float8_e4m3fn")
+
+
+def quantize_ptpc_fp8(x: torch.Tensor):
+    fp8_dtype = get_torch_fp8_dtype()
+    fp8_max = float(torch.finfo(fp8_dtype).max)
+    scale = x.float().abs().amax(dim=1, keepdim=True) / fp8_max
+    scale[scale == 0] = 1
+    x_fp8 = (x.float() / scale).to(fp8_dtype)
+    scale = torch.nan_to_num(scale, nan=1.0, posinf=1.0, neginf=1.0).squeeze(1)
+    return x_fp8, scale.float()
+
+
 def create_inputs(args: _TestArgs):
-    a = torch.empty((args.m, args.k), dtype=args.dtype, device="cuda")
-    a.uniform_(-1, 1)
-    b = torch.empty((args.n, args.k), dtype=args.dtype, device="cuda")
-    b.uniform_(-1, 1)
-    if args.has_bias:
-        bias = torch.empty((args.n,), dtype=args.dtype, device="cuda")
-        bias.uniform_(10, 20)
+    if args.dtype == "fp8_ptpc":
+        a_f32 = torch.empty((args.m, args.k), dtype=torch.float32, device="cuda")
+        b_f32 = torch.empty((args.n, args.k), dtype=torch.float32, device="cuda")
+        a_f32.uniform_(-1, 1)
+        b_f32.uniform_(-1, 1)
+        a, scale_a = quantize_ptpc_fp8(a_f32)
+        b, scale_b = quantize_ptpc_fp8(b_f32)
+        if args.has_bias:
+            bias = torch.empty((args.n,), dtype=torch.bfloat16, device="cuda")
+            bias.uniform_(10, 20)
+        else:
+            bias = None
+        return (a, b, scale_a, scale_b, bias)
     else:
-        bias = None
-    return (a, b, bias)
+        a = torch.empty((args.m, args.k), dtype=args.dtype, device="cuda")
+        a.uniform_(-1, 1)
+        b = torch.empty((args.n, args.k), dtype=args.dtype, device="cuda")
+        b.uniform_(-1, 1)
+        if args.has_bias:
+            bias = torch.empty((args.n,), dtype=args.dtype, device="cuda")
+            bias.uniform_(10, 20)
+        else:
+            bias = None
+        return (a, b, bias)
 
 
 def create_outputs(args: _TestArgs):
-    c = torch.randn((args.m, args.n), dtype=args.dtype, device="cuda")
+    dtype = torch.bfloat16 if args.dtype == "fp8_ptpc" else args.dtype
+    c = torch.randn((args.m, args.n), dtype=dtype, device="cuda")
     return (c,)
 
 
 def ref_func(*args):
-    a, b, bias, c = args
-    F.linear(a, b, out=c, bias=bias)
+    if len(args) == 6:
+        a, b, scale_a, scale_b, bias, c = args
+        a_f32 = a.float() * scale_a[:, None]
+        b_f32 = b.float() * scale_b[:, None]
+        if bias is not None:
+            ref = torch.addmm(bias.float(), a_f32, b_f32.t())
+        else:
+            ref = torch.mm(a_f32, b_f32.t())
+        c.copy_(ref.to(c.dtype))
+    else:
+        a, b, bias, c = args
+        F.linear(a, b, out=c, bias=bias)
 
 
 def make_triton_maxautotune_func():
@@ -66,8 +107,49 @@ def make_triton_maxautotune_func():
 
 
 def func(*args):
-    a, b, bias, c, kwargs = args
-    hgemm(a, b, c, bias=bias, user_kwargs=kwargs)
+    if len(args) == 7:
+        a, b, scale_a, scale_b, bias, c, kwargs = args
+        hgemm(a, b, c, bias=bias, scale_a=scale_a, scale_b=scale_b, user_kwargs=kwargs)
+    else:
+        a, b, bias, c, kwargs = args
+        hgemm(a, b, c, bias=bias, user_kwargs=kwargs)
+
+
+def make_test_args(
+    dtype: str,
+    m: int,
+    n: int,
+    k: int,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    stages: int,
+    m_waves: int,
+    n_waves: int,
+    group_m: int,
+    has_bias: bool,
+    use_half_tile_interleaved: bool,
+):
+    if dtype == "fp8_ptpc":
+        block_k = 128
+        resolved_dtype = dtype
+    else:
+        resolved_dtype = torch.bfloat16 if "bf16" in dtype else torch.half
+    return _TestArgs(
+        resolved_dtype,
+        m,
+        n,
+        k,
+        block_m,
+        block_n,
+        block_k,
+        stages,
+        m_waves,
+        n_waves,
+        group_m,
+        has_bias,
+        use_half_tile_interleaved,
+    )
 
 
 def tensor_nbytes(tensors: torch.Tensor):
@@ -101,7 +183,9 @@ def check_acc(args: _TestArgs):
 
     def get_tol(args):
         k_scale = (args.k / 8192) ** 0.5
-        if args.dtype is torch.bfloat16:
+        if args.dtype == "fp8_ptpc":
+            return 2e-1 * k_scale, 2e-1
+        elif args.dtype is torch.bfloat16:
             return 2e-1 * k_scale, 2e-1
         return 5e-2 * k_scale, 5e-2
 
@@ -202,6 +286,7 @@ def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
     [
         "bf16",
         "fp16",
+        # "fp8_ptpc",
     ],
 )
 @pytest.mark.parametrize(
@@ -255,8 +340,7 @@ def test_hgemm_acc_main_loop(
     has_bias: bool,
     is_hti: bool,
 ):
-    dtype = torch.bfloat16 if "bf16" in dtype else torch.half
-    args = _TestArgs(
+    args = make_test_args(
         dtype,
         m,
         n,
@@ -279,6 +363,7 @@ def test_hgemm_acc_main_loop(
     [
         "bf16",
         "fp16",
+        # "fp8_ptpc",
     ],
 )
 @pytest.mark.parametrize(
@@ -314,8 +399,7 @@ def test_hgemm_acc_small_m(
     has_bias: bool,
     is_hti: bool,
 ):
-    dtype = torch.bfloat16 if "bf16" in dtype else torch.half
-    args = _TestArgs(
+    args = make_test_args(
         dtype,
         m,
         n,
@@ -338,6 +422,7 @@ def test_hgemm_acc_small_m(
     [
         "bf16",
         "fp16",
+        # "fp8_ptpc",
     ],
 )
 @pytest.mark.parametrize(
@@ -380,8 +465,7 @@ def test_hgemm_acc_bench(
     has_bias: bool,
     is_hti: bool,
 ):
-    dtype = torch.bfloat16 if "bf16" in dtype else torch.half
-    args = _TestArgs(
+    args = make_test_args(
         dtype,
         m,
         n,
