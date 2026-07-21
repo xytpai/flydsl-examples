@@ -333,6 +333,72 @@ def test_hgemm_acc_small_m(
     check_acc(args)
 
 
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        "bf16",
+        "fp16",
+    ],
+)
+@pytest.mark.parametrize(
+    "m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, group_m, has_bias, is_hti",
+    [
+        (8, 4096, 4096, 16, 16, 128, 8, 1, 1, 4, True, False),
+        (16, 4096, 4096, 16, 16, 128, 8, 1, 1, 4, True, False),
+        (32, 4096, 4096, 16, 16, 64, 8, 1, 1, 0, True, False),
+        (64, 4096, 4096, 32, 32, 64, 8, 2, 2, 4, True, False),
+        (128, 4096, 4096, 64, 32, 128, 4, 4, 2, 4, True, False),
+        (256, 4096, 4096, 64, 64, 64, 7, 4, 2, 4, True, False),
+        (512, 4096, 4096, 64, 128, 64, 6, 2, 4, 4, True, False),
+        (1024, 4096, 4096, 128, 128, 64, 4, 2, 4, 4, True, False),
+        (2048, 4096, 4096, 128, 256, 64, 3, 4, 4, 4, True, False),
+        (1024, 1024, 1024, 64, 64, 64, 4, 2, 4, 0, True, False),
+        (2048, 2048, 2048, 128, 128, 64, 3, 4, 2, 0, True, False),
+        (4096, 4096, 4096, 256, 256, 64, 2, 2, 4, 4, True, True),
+        (4096, 4096, 8192, 256, 256, 64, 2, 2, 4, 4, True, True),
+        (8192, 8192, 8192, 256, 256, 64, 2, 2, 4, 0, True, True),
+        (16384, 16384, 16384, 256, 256, 64, 2, 2, 4, 4, True, True),
+        (8, 7168, 2048, 16, 16, 128, 8, 1, 1, 4, True, False),
+        (32, 384, 7168, 16, 16, 128, 8, 1, 1, 0, True, False),
+        (32, 14336, 4096, 32, 64, 64, 8, 2, 2, 0, True, False),
+        (16, 28672, 4096, 16, 64, 128, 3, 1, 4, 4, True, False),
+        (4096, 256, 4096, 64, 64, 64, 6, 4, 2, 4, True, False),
+    ],
+)
+def test_hgemm_acc_bench(
+    dtype: str,
+    m: int,
+    n: int,
+    k: int,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    stages: int,
+    m_waves: int,
+    n_waves: int,
+    group_m: int,
+    has_bias: bool,
+    is_hti: bool,
+):
+    dtype = torch.bfloat16 if "bf16" in dtype else torch.half
+    args = _TestArgs(
+        dtype,
+        m,
+        n,
+        k,
+        block_m,
+        block_n,
+        block_k,
+        stages,
+        m_waves,
+        n_waves,
+        group_m,
+        has_bias,
+        is_hti,
+    )
+    check_acc(args)
+
+
 # =========================================== benchmark ===========================================
 
 

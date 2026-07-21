@@ -386,9 +386,16 @@ def hgemm_gfx950_kernel(
             frag_C[i] = bias_val
 
     for i in range_constexpr(fx.size(pred_C.shape).unpack()):
-        row_idx = bid_m * block_m + fx.get_scalar(thr_cRow[i])
-        col_idx = bid_n * block_n + fx.get_scalar(thr_cCol[i])
-        pred_C[i] = (row_idx < m) & (col_idx < n)
+        local_row = fx.get_scalar(thr_cRow[i])
+        local_col = fx.get_scalar(thr_cCol[i])
+        row_idx = bid_m * block_m + local_row
+        col_idx = bid_n * block_n + local_col
+        pred_C[i] = (
+            (local_row < block_m)
+            & (local_col < block_n)
+            & (row_idx < m)
+            & (col_idx < n)
+        )
 
     wave_offset = rocdl.readfirstlane(
         fx.Int64.ir_type,
@@ -799,13 +806,16 @@ def hgemm_hti_gfx950_kernel(
         pred_C = fx.make_fragment_like(thr_cRow, dtype=fx.Boolean)
 
         for i in range_constexpr(fx.size(pred_C.shape).unpack()):
-            row_idx = (
-                bid_m * block_m + m_part * half_block_m + fx.get_scalar(thr_cRow[i])
+            local_row = fx.get_scalar(thr_cRow[i])
+            local_col = fx.get_scalar(thr_cCol[i])
+            row_idx = bid_m * block_m + m_part * half_block_m + local_row
+            col_idx = bid_n * block_n + n_part * half_block_n + local_col
+            pred_C[i] = (
+                (local_row < half_block_m)
+                & (local_col < half_block_n)
+                & (row_idx < m)
+                & (col_idx < n)
             )
-            col_idx = (
-                bid_n * block_n + n_part * half_block_n + fx.get_scalar(thr_cCol[i])
-            )
-            pred_C[i] = (row_idx < m) & (col_idx < n)
 
         frag_C_out = fx.make_fragment_like(frag_C, elem_dtype)
         for i in range_constexpr(fx.size(frag_C.shape).unpack()):
