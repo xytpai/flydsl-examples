@@ -58,13 +58,28 @@ User task:
 
     def step(self) -> str:
         prompt = "\n\n".join(self.memory)
-        resp_chunks = []
-        for chunk in self.backend.stream_response(
+        resp = ""
+        stream = self.backend.stream_response(
             prompt + "\n\n" + self.react_note, self.max_tokens
-        ):
-            resp_chunks.append(chunk)
-            print(chunk, end="", flush=True)
-        resp = "".join(resp_chunks)
+        )
+        try:
+            for chunk in stream:
+                chunk_start = len(resp)
+                resp += chunk
+                action_end = self.actions.first_complete_action_end(resp)
+                if action_end is None:
+                    print(chunk, end="", flush=True)
+                    continue
+
+                print(resp[chunk_start:action_end], end="", flush=True)
+                resp = resp[:action_end]
+                break
+        finally:
+            close = getattr(stream, "close", None)
+            if close is not None:
+                close()
+
+        resp = self.actions.trim_to_first_action(resp)
         self.memory.append(resp)
         return resp
 
@@ -128,7 +143,7 @@ User task:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="AToy: An agent create shit")
     parser.add_argument("--max_tokens", type=int, default=65536)
-    parser.add_argument("--max_steps", type=int, default=20)
+    parser.add_argument("--max_steps", type=int, default=100)
     parser.add_argument("--input", type=str, default="None")
     args = parser.parse_args()
     agent = Agent(max_tokens=args.max_tokens, max_steps=args.max_steps)
