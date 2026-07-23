@@ -1,1 +1,3 @@
-Please write flydsl bf16/fp16 gemm like hgemm_layout_gfx950.py for MI308 and test the funcionality yourself
+Please write flydsl bf16/fp16 gemm like hgemm_layout_gfx950.py for MI308 and test the funcionality yourself.
+Please also write a test file like test_hgemm_layout.py to test for MI308.
+Also add benchmark test and report tflops compared with torch as well as triton

@@ -141,6 +141,28 @@ class ActionRunner:
                 return f"Invalid action name: {action_name}"
         return None
 
+    def first_complete_action_end(self, text: str) -> int | None:
+        normalized = self._strip_leading_observation(text)
+        prefix_length = len(text) - len(normalized)
+        action_match = self.action_pattern.search(normalized)
+        if not action_match:
+            return None
+
+        tail = normalized[action_match.end() :]
+        action_input_match = self.action_input_pattern.search(tail)
+        if not action_input_match:
+            return None
+
+        action_input_start = action_match.end() + action_input_match.end()
+        fenced_match = re.match(
+            r"(?ims)\s*```[^\n]*\n.*?^\s*```",
+            normalized[action_input_start:],
+        )
+        if not fenced_match:
+            return None
+
+        return prefix_length + action_input_start + fenced_match.end()
+
     def trim_to_first_action(self, text: str) -> str:
         text = self._strip_leading_observation(text)
         action_match = self.action_pattern.search(text)
