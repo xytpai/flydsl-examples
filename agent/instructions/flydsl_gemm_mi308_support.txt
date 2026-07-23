@@ -1,0 +1,1 @@
+Please write flydsl bf16/fp16 gemm like hgemm_layout_gfx950.py for MI308 and test the funcionality yourself

@@ -19,6 +19,12 @@ The goal of this repository is to show how to write high-performance GEMM kernel
 rm -rf ~/.flydsl/ ; pytest -sv test_hgemm.py
 ```
 
+## Use code agent to scale the kernel to your hardware
+
+```bash
+python agent/agent.py --input=agent/instructions/flydsl_gemm_mi308_support.txt
+```
+
 ## References
 
 - [FlyDSL](https://github.com/ROCm/FlyDSL)
