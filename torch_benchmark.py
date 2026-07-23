@@ -169,7 +169,7 @@ def main():
     shapes = SHAPES if args.shape_index is None else [SHAPES[args.shape_index]]
 
     header = (
-        f"{'Backend':<8} {'Shape':<18} {'DType':<10} {'Accuracy':<8} "
+        f"{'Backend':<8} {'Shape (M/N/K)':<28} {'DType':<10} {'Accuracy':<8} "
         f"{'E2E ms':>10} {'E2E TFLOPS':>12} "
         f"{'Graph ms':>10} {'Graph TFLOPS':>13} {'Max diff':>11}  Error"
     )
@@ -223,8 +223,9 @@ def main():
                     else "-"
                 )
                 error = row.get("error") or row.get("graph_error") or ""
+                shape = f"M={m} N={n} K={k}"
                 print(
-                    f"{backend.upper():<8} {f'{m}x{n}x{k}':<18} "
+                    f"{backend.upper():<8} {shape:<28} "
                     f"{args.dtype:<10} {accuracy:<8} "
                     f"{e2e_ms:>10} {e2e_tflops:>12} "
                     f"{graph_ms:>10} {graph_tflops:>13} "
