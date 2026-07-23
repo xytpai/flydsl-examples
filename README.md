@@ -6,8 +6,8 @@ The goal of this repository is to show how to write high-performance GEMM kernel
 
 ## Kernels
 
-- [x] FP16/BF16 GEMM WMMA for MI350
-- [x] FP8 PTPC GEMM WMMA for MI350
+- [x] FP16/BF16 GEMM WMMA for MI355
+- [x] FP8 PTPC GEMM WMMA for MI355
 
 ## Results
 
