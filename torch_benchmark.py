@@ -60,8 +60,9 @@ def mm_nt(a, b):
 
 
 def run_padded_stride_regression(args):
-    """Check padded A/B rows in both full-tile and HTI FlyDSL kernels."""
+    """Check aligned padded rows and reject unaligned FlyDSL row strides."""
     from torch._inductor.heuristics.template import flydsl as flydsl_heuristics
+    from torch._inductor.utils import run_and_get_code
 
     dtype = DTYPES[args.dtype]
     common_config = {
@@ -80,6 +81,7 @@ def run_padded_stride_regression(args):
             "shape": (64, 64, 128),
             "a_row_stride": 160,
             "b_row_stride": 160,
+            "expect_flydsl": True,
             "kernel_config": {
                 **common_config,
                 "BLOCK_M_WARPS": 4,
@@ -92,11 +94,25 @@ def run_padded_stride_regression(args):
             "shape": (1024, 1024, 1024),
             "a_row_stride": 1056,
             "b_row_stride": 1088,
+            "expect_flydsl": True,
             "kernel_config": {
                 **common_config,
                 "BLOCK_M_WARPS": 2,
                 "BLOCK_N_WARPS": 2,
                 "USE_HALF_TILE_INTERLEAVED": True,
+            },
+        },
+        {
+            "name": "unaligned-row-stride",
+            "shape": (64, 64, 128),
+            "a_row_stride": 129,
+            "b_row_stride": 129,
+            "expect_flydsl": False,
+            "kernel_config": {
+                **common_config,
+                "BLOCK_M_WARPS": 4,
+                "BLOCK_N_WARPS": 4,
+                "USE_HALF_TILE_INTERLEAVED": False,
             },
         },
     )
@@ -112,6 +128,7 @@ def run_padded_stride_regression(args):
         m, n, k = case["shape"]
         a_row_stride = case["a_row_stride"]
         b_row_stride = case["b_row_stride"]
+        expect_flydsl = case["expect_flydsl"]
 
         torch._dynamo.reset()
         torch.cuda.empty_cache()
@@ -129,16 +146,30 @@ def run_padded_stride_regression(args):
         assert b.stride() == (b_row_stride, 1)
         assert b.t().stride() == (1, b_row_stride)
 
+        case_config = regression_config
+        if not expect_flydsl:
+            case_config = {
+                **regression_config,
+                "max_autotune_gemm_backends": "ATEN,FLYDSL",
+            }
+
         with (
-            inductor_config.patch(**regression_config),
+            inductor_config.patch(**case_config),
             mock.patch.object(
                 flydsl_heuristics,
                 "get_gemm_configs",
                 return_value=[case["kernel_config"]],
-            ),
+            ) as get_gemm_configs,
         ):
             compiled = torch.compile(mm_nt, backend="inductor")
-            result = compiled(a, b)
+            result, (code,) = run_and_get_code(compiled, a, b)
+
+        uses_flydsl = "async_compile.flydsl" in code
+        assert uses_flydsl == expect_flydsl
+        if expect_flydsl:
+            get_gemm_configs.assert_called()
+        else:
+            get_gemm_configs.assert_not_called()
 
         ref = mm_nt(a, b)
         abs_diff = (result.float() - ref.float()).abs()
@@ -149,7 +180,8 @@ def run_padded_stride_regression(args):
             f"FlyDSL padded-stride regression [{name}]: "
             f"M={m} N={n} K={k}, "
             f"A.stride={a.stride()}, B.stride={b.stride()}, "
-            f"B.T.stride={b.t().stride()}"
+            f"B.T.stride={b.t().stride()}, "
+            f"selected={'FlyDSL' if uses_flydsl else 'fallback'}"
         )
         print(f"max absolute error: {max_diff}")
         print(f"entries with absolute error > 0.03: {mismatches}/{m * n}")
@@ -264,7 +296,7 @@ def main():
     parser.add_argument(
         "--padded-stride-regression",
         action="store_true",
-        help="run the known FlyDSL padded-row correctness reproducer",
+        help="run aligned padded-row and unaligned-stride FlyDSL regressions",
     )
     args = parser.parse_args()
 
