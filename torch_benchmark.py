@@ -2,6 +2,7 @@ import argparse
 import json
 import statistics
 from pathlib import Path
+from unittest import mock
 
 import torch
 import torch._dynamo
@@ -21,6 +22,7 @@ SHAPES = [
     (4096, 4096, 4096),
     (4096, 4096, 8192),
     (8192, 8192, 8192),
+    (8160, 8160, 8160),
     (32, 14336, 4096),
     (16, 28672, 4096),
     (4096, 256, 4096),
@@ -55,6 +57,104 @@ DTYPES = {
 
 def mm_nt(a, b):
     return torch.mm(a, b.t())
+
+
+def run_padded_stride_regression(args):
+    """Check padded A/B rows in both full-tile and HTI FlyDSL kernels."""
+    from torch._inductor.heuristics.template import flydsl as flydsl_heuristics
+
+    dtype = DTYPES[args.dtype]
+    common_config = {
+        "TILE_M": 128,
+        "TILE_N": 128,
+        "TILE_K": 64,
+        "STAGES": 2,
+        "SPLIT_K": 1,
+        "BLOCK_K_WARPS": 1,
+        "GROUP_M": 0,
+        "B_TO_LDS": True,
+    }
+    cases = (
+        {
+            "name": "full-tile-small",
+            "shape": (64, 64, 128),
+            "a_row_stride": 160,
+            "b_row_stride": 160,
+            "kernel_config": {
+                **common_config,
+                "BLOCK_M_WARPS": 4,
+                "BLOCK_N_WARPS": 4,
+                "USE_HALF_TILE_INTERLEAVED": False,
+            },
+        },
+        {
+            "name": "hti-large",
+            "shape": (1024, 1024, 1024),
+            "a_row_stride": 1056,
+            "b_row_stride": 1088,
+            "kernel_config": {
+                **common_config,
+                "BLOCK_M_WARPS": 2,
+                "BLOCK_N_WARPS": 2,
+                "USE_HALF_TILE_INTERLEAVED": True,
+            },
+        },
+    )
+
+    torch.manual_seed(0)
+    regression_config = {
+        **BACKEND_PATCHES["flydsl"],
+        "max_autotune_gemm_search_space": "DEFAULT",
+        "flydsl_enable_autotuning": False,
+    }
+    for case in cases:
+        name = case["name"]
+        m, n, k = case["shape"]
+        a_row_stride = case["a_row_stride"]
+        b_row_stride = case["b_row_stride"]
+
+        torch._dynamo.reset()
+        torch.cuda.empty_cache()
+
+        a_storage = torch.randn(
+            (m, a_row_stride), device="cuda", dtype=dtype
+        )
+        b_storage = torch.randn(
+            (n, b_row_stride), device="cuda", dtype=dtype
+        )
+        a = a_storage[:, :k]
+        b = b_storage[:, :k]
+
+        assert a.stride() == (a_row_stride, 1)
+        assert b.stride() == (b_row_stride, 1)
+        assert b.t().stride() == (1, b_row_stride)
+
+        with (
+            inductor_config.patch(**regression_config),
+            mock.patch.object(
+                flydsl_heuristics,
+                "get_gemm_configs",
+                return_value=[case["kernel_config"]],
+            ),
+        ):
+            compiled = torch.compile(mm_nt, backend="inductor")
+            result = compiled(a, b)
+
+        ref = mm_nt(a, b)
+        abs_diff = (result.float() - ref.float()).abs()
+        max_diff = abs_diff.max().item()
+        mismatches = (abs_diff > 3e-2).sum().item()
+
+        print(
+            f"FlyDSL padded-stride regression [{name}]: "
+            f"M={m} N={n} K={k}, "
+            f"A.stride={a.stride()}, B.stride={b.stride()}, "
+            f"B.T.stride={b.t().stride()}"
+        )
+        print(f"max absolute error: {max_diff}")
+        print(f"entries with absolute error > 0.03: {mismatches}/{m * n}")
+
+        torch.testing.assert_close(result, ref, atol=3e-2, rtol=3e-2)
 
 
 def tflops(m, n, k, ms):
@@ -161,7 +261,16 @@ def main():
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--shape-index", type=int, default=None)
     parser.add_argument("--dtype", choices=sorted(DTYPES), default="bfloat16")
+    parser.add_argument(
+        "--padded-stride-regression",
+        action="store_true",
+        help="run the known FlyDSL padded-row correctness reproducer",
+    )
     args = parser.parse_args()
+
+    if args.padded_stride_regression:
+        run_padded_stride_regression(args)
+        return
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
