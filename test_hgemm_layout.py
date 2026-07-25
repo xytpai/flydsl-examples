@@ -54,7 +54,7 @@ def make_triton_maxautotune_func():
     import torch._inductor.config as inductor_config
 
     inductor_config.max_autotune_gemm_backends = "TRITON"
-    inductor_config.max_autotune_gemm_search_space = "EXHAUSTIVE"
+    inductor_config.max_autotune_gemm_search_space = "DEFAULT"
 
     torch._dynamo.reset()
 

@@ -254,6 +254,8 @@ def hgemm_gfx950_kernel(
     m: fx.Int32,
     n: fx.Int32,
     k: fx.Int32,
+    a_row_stride: fx.Int32,
+    b_row_stride: fx.Int32,
     tiled_mma: fx.TiledMma,
     param: HGemmGfx950Param,
 ):
@@ -431,7 +433,9 @@ def hgemm_gfx950_kernel(
                 safe_global_k_idx = (global_k_idx < k).select(global_k_idx, 0)
             else:
                 safe_global_k_idx = global_k_idx
-            global_offset = (safe_global_m_idx * k + safe_global_k_idx) * in_data_bytes
+            global_offset = (
+                safe_global_m_idx * a_row_stride + safe_global_k_idx
+            ) * in_data_bytes
             buffer_load_lds_inline(a_rsrc, lds_ptr, global_offset, async_load_bytes)
             if i < ldg_a_iters - 1:
                 lds_ptr = lds_ptr + block_threads * async_load_bytes
@@ -453,7 +457,9 @@ def hgemm_gfx950_kernel(
                 safe_global_k_idx = (global_k_idx < k).select(global_k_idx, 0)
             else:
                 safe_global_k_idx = global_k_idx
-            global_offset = (safe_global_n_idx * k + safe_global_k_idx) * in_data_bytes
+            global_offset = (
+                safe_global_n_idx * b_row_stride + safe_global_k_idx
+            ) * in_data_bytes
             buffer_load_lds_inline(b_rsrc, lds_ptr, global_offset, async_load_bytes)
             if i < ldg_b_iters - 1:
                 lds_ptr = lds_ptr + block_threads * async_load_bytes
@@ -542,6 +548,8 @@ def hgemm_hti_gfx950_kernel(
     m: fx.Int32,
     n: fx.Int32,
     k: fx.Int32,
+    a_row_stride: fx.Int32,
+    b_row_stride: fx.Int32,
     tiled_mma: fx.TiledMma,
     param: HGemmGfx950Param,
 ):
@@ -655,7 +663,9 @@ def hgemm_hti_gfx950_kernel(
                 safe_global_k_idx = (global_k_idx < k).select(global_k_idx, 0)
             else:
                 safe_global_k_idx = global_k_idx
-            global_offset = (safe_global_m_idx * k + safe_global_k_idx) * in_data_bytes
+            global_offset = (
+                safe_global_m_idx * a_row_stride + safe_global_k_idx
+            ) * in_data_bytes
             buffer_load_lds_inline(a_rsrc, lds_ptr, global_offset, async_load_bytes)
             if i < half_ldg_a_iters - 1:
                 lds_ptr = lds_ptr + block_threads * async_load_bytes
@@ -677,7 +687,9 @@ def hgemm_hti_gfx950_kernel(
                 safe_global_k_idx = (global_k_idx < k).select(global_k_idx, 0)
             else:
                 safe_global_k_idx = global_k_idx
-            global_offset = (safe_global_n_idx * k + safe_global_k_idx) * in_data_bytes
+            global_offset = (
+                safe_global_n_idx * b_row_stride + safe_global_k_idx
+            ) * in_data_bytes
             buffer_load_lds_inline(b_rsrc, lds_ptr, global_offset, async_load_bytes)
             if i < half_ldg_b_iters - 1:
                 lds_ptr = lds_ptr + block_threads * async_load_bytes
@@ -937,12 +949,14 @@ def launch_hgemm_gfx950(
     a: fx.Tensor,
     b: fx.Tensor,
     bias: fx.Tensor,
-    m: fx.Int32,
-    n: fx.Int32,
-    k: fx.Int32,
     param: HGemmGfx950Param,
     stream: fx.Stream = fx.Stream(None),
 ):
+    m = fx.Int32(fx.get_scalar(a.shape[0]))
+    n = fx.Int32(fx.get_scalar(b.shape[0]))
+    k = fx.Int32(fx.get_scalar(a.shape[1]))
+    a_row_stride = fx.Int32(fx.get_scalar(a.stride[0]))
+    b_row_stride = fx.Int32(fx.get_scalar(b.stride[0]))
     elem_dtype = (
         fx.Float16 if const_expr(param.dtype_id == HGEMM_DTYPE_FP16) else fx.BFloat16
     )
@@ -974,7 +988,19 @@ def launch_hgemm_gfx950(
     )
     hgemm_kernel_impl._known_block_size = [param.block_threads, 1, 1]
     hgemm_kernel_impl._func.__name__ = make_hgemm_gfx950_kernel_name(param)
-    hgemm_kernel_impl(out, a, b, bias, m, n, k, tiled_mma, param).launch(
+    hgemm_kernel_impl(
+        out,
+        a,
+        b,
+        bias,
+        m,
+        n,
+        k,
+        a_row_stride,
+        b_row_stride,
+        tiled_mma,
+        param,
+    ).launch(
         grid=(num_pid_m * num_pid_n, 1, 1),
         block=(param.block_threads, 1, 1),
         stream=stream,
@@ -1014,13 +1040,22 @@ def hgemm(
     device = a.device
     assert a.device == b.device
     k = a.shape[-1]
+    if a.stride(-1) != 1:
+        a = a.contiguous()
     a = a.view(-1, k)
     m = a.shape[0]
     n = b.shape[0]
     assert b.shape[1] == k
-    if not a.is_contiguous():
+    if (
+        a.data_ptr() % GFX950_DMA_BYTES != 0
+        or a.stride(0) * a.element_size() % GFX950_DMA_BYTES != 0
+    ):
         a = a.contiguous()
-    if not b.is_contiguous():
+    if (
+        b.stride(1) != 1
+        or b.data_ptr() % GFX950_DMA_BYTES != 0
+        or b.stride(0) * b.element_size() % GFX950_DMA_BYTES != 0
+    ):
         b = b.contiguous()
     assert a.dtype == b.dtype
     assert a.dtype in (torch.float16, torch.bfloat16)
@@ -1070,5 +1105,5 @@ def hgemm(
 
     param = make_hgemm_param_and_validate(m, n, k, kwargs)
     assert param is not None, "unsupported hgemm_layout_gfx950 shape/config"
-    launch_hgemm_gfx950(out, a, b, bias_tensor, m, n, k, param, stream)
+    launch_hgemm_gfx950(out, a, b, bias_tensor, param, stream)
     return out
