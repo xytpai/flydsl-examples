@@ -421,6 +421,70 @@ def test_hgemm_acc_bench(
     check_acc(args)
 
 
+@pytest.mark.parametrize("b_layout", ["nt", "nn"])
+@pytest.mark.parametrize("use_half_tile_interleaved", [False, True])
+def test_hgemm_padded_stride_and_storage_offset(
+    b_layout: str,
+    use_half_tile_interleaved: bool,
+):
+    m = n = 64
+    k = 128
+    dtype = torch.bfloat16
+    column_offset = 8
+
+    a_pitch = k + 32
+    a_storage = torch.empty((m + 1, a_pitch), dtype=dtype, device="cuda")
+    a_storage.uniform_(-1, 1)
+    a = a_storage[1:, column_offset : column_offset + k]
+
+    b_rows, b_cols = (k, n) if b_layout == "nn" else (n, k)
+    b_pitch = b_cols + 48
+    b_storage = torch.empty((b_rows + 1, b_pitch), dtype=dtype, device="cuda")
+    b_storage.uniform_(-1, 1)
+    b = b_storage[1:, column_offset : column_offset + b_cols]
+
+    for tensor in (a, b):
+        assert not tensor.is_contiguous()
+        assert tensor.stride(1) == 1
+        assert tensor.stride(0) > tensor.shape[1]
+        assert tensor.storage_offset() > 0
+        assert tensor.data_ptr() % 16 == 0
+        assert tensor.stride(0) * tensor.element_size() % 16 == 0
+
+    bias = torch.empty((n,), dtype=dtype, device="cuda").uniform_(-1, 1)
+    out = torch.empty((m, n), dtype=dtype, device="cuda")
+    ref = torch.empty_like(out)
+    kwargs = {
+        "block_m": 64,
+        "block_n": 64,
+        "block_k": 64,
+        "stages": 2,
+        "m_waves": 2,
+        "n_waves": 2,
+        "group_m": 0,
+        "use_half_tile_interleaved": use_half_tile_interleaved,
+    }
+
+    result = hgemm(
+        a,
+        b,
+        out,
+        bias=bias,
+        user_kwargs=kwargs,
+        b_layout=b_layout,
+    )
+    ref_func(a, b, bias, ref, b_layout)
+
+    assert result.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(
+        out,
+        ref,
+        atol=3e-2,
+        rtol=2e-1,
+        check_dtype=True,
+    )
+
+
 # =========================================== benchmark ===========================================
 
 

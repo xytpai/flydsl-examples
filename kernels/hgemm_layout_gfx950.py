@@ -917,20 +917,17 @@ def hgemm_hti_gfx950_kernel(
     c10 = make_c_fragment(1, 0)
     c11 = make_c_fragment(1, 1)
 
-    async_load_b_to_lds(0, 0, 0)
-    async_load_a_to_lds(0, 0, 0)
-    async_load_b_to_lds(1, 0, 0)
-    async_load_a_to_lds(1, 0, 0)
-    rocdl.sched_barrier(0)
-    if wid // n_waves == 1:
-        rocdl.s_barrier()
-    rocdl.sched_barrier(0)
-    rocdl.s_barrier()
-    rocdl.sched_barrier(0)
-    async_load_b_to_lds(0, 1, 1)
-    async_load_a_to_lds(0, 1, 1)
-    async_load_b_to_lds(1, 1, 1)
-    __barrier(1 * half_ldg_b_iters + 1 * half_ldg_a_iters)
+    def compute_loaded_tile(k_tile, read_stage):
+        b0 = load_b_fragment(0, read_stage, k_tile)
+        a0 = load_a_fragment(0, read_stage, k_tile)
+        consume(k_tile, c00, a0, b0, True)
+
+        b1 = load_b_fragment(1, read_stage, k_tile)
+        consume(k_tile, c01, a0, b1, True)
+
+        a1 = load_a_fragment(1, read_stage, k_tile)
+        consume(k_tile, c10, a1, b0, True)
+        consume(k_tile, c11, a1, b1, True)
 
     def compute_double_tile(k_tile, prefetch_next):
         next_k_tile = k_tile + 2
@@ -992,12 +989,45 @@ def hgemm_hti_gfx950_kernel(
         consume(k_tile + 1, c11, a1, b1, True)
         rocdl.s_barrier()
 
-    final_double_tile = ((k_tiles % 2) == 0).select(k_tiles - 2, k_tiles - 1)
-    main_loop_end = (k_tiles > 2).select(final_double_tile, 0)
-    for k_tile in range(0, main_loop_end, 2):
-        compute_double_tile(k_tile, True)
+    if k_tiles == 2:
+        # The interleaved pipeline below intentionally staggers wave barriers
+        # while prefetching later double tiles. With no later tile, use a
+        # symmetric preload path so all four A/B halves are visible before use.
+        async_load_b_to_lds(0, 0, 0)
+        async_load_a_to_lds(0, 0, 0)
+        async_load_b_to_lds(1, 0, 0)
+        async_load_a_to_lds(1, 0, 0)
+        async_load_b_to_lds(0, 1, 1)
+        async_load_a_to_lds(0, 1, 1)
+        async_load_b_to_lds(1, 1, 1)
+        async_load_a_to_lds(1, 1, 1)
+        __waitcnt(0)
+        rocdl.s_barrier()
 
-    compute_double_tile(main_loop_end, False)
+        compute_loaded_tile(0, 0)
+        compute_loaded_tile(1, 1)
+    else:
+        async_load_b_to_lds(0, 0, 0)
+        async_load_a_to_lds(0, 0, 0)
+        async_load_b_to_lds(1, 0, 0)
+        async_load_a_to_lds(1, 0, 0)
+        rocdl.sched_barrier(0)
+        if wid // n_waves == 1:
+            rocdl.s_barrier()
+        rocdl.sched_barrier(0)
+        rocdl.s_barrier()
+        rocdl.sched_barrier(0)
+        async_load_b_to_lds(0, 1, 1)
+        async_load_a_to_lds(0, 1, 1)
+        async_load_b_to_lds(1, 1, 1)
+        __barrier(1 * half_ldg_b_iters + 1 * half_ldg_a_iters)
+
+        final_double_tile = ((k_tiles % 2) == 0).select(k_tiles - 2, k_tiles - 1)
+        main_loop_end = (k_tiles > 2).select(final_double_tile, 0)
+        for k_tile in range(0, main_loop_end, 2):
+            compute_double_tile(k_tile, True)
+
+        compute_double_tile(main_loop_end, False)
 
     store_half_tile(0, 0, c00)
     store_half_tile(0, 1, c01)
