@@ -25,12 +25,14 @@ class _TestArgs:
     group_m: int
     has_bias: bool
     use_half_tile_interleaved: bool = False
+    b_layout: str = "nt"
 
 
 def create_inputs(args: _TestArgs):
     a = torch.empty((args.m, args.k), dtype=args.dtype, device="cuda")
     a.uniform_(-1, 1)
-    b = torch.empty((args.n, args.k), dtype=args.dtype, device="cuda")
+    b_shape = (args.k, args.n) if args.b_layout == "nn" else (args.n, args.k)
+    b = torch.empty(b_shape, dtype=args.dtype, device="cuda")
     b.uniform_(-1, 1)
     if args.has_bias:
         bias = torch.empty((args.n,), dtype=args.dtype, device="cuda")
@@ -46,11 +48,17 @@ def create_outputs(args: _TestArgs):
 
 
 def ref_func(*args):
-    a, b, bias, c = args
-    F.linear(a, b, out=c, bias=bias)
+    a, b, bias, c, b_layout = args
+    if b_layout == "nn":
+        if bias is None:
+            torch.mm(a, b, out=c)
+        else:
+            torch.addmm(bias, a, b, out=c)
+    else:
+        F.linear(a, b, out=c, bias=bias)
 
 
-def make_triton_maxautotune_func():
+def make_triton_maxautotune_func(b_layout: str):
     import torch._inductor.config as inductor_config
 
     inductor_config.max_autotune_gemm_backends = "TRITON"
@@ -59,15 +67,20 @@ def make_triton_maxautotune_func():
     torch._dynamo.reset()
 
     def triton_maxautotune_func(a, b, bias, c):
-        out = F.linear(a, b, bias=bias)
+        if b_layout == "nn":
+            out = torch.mm(a, b)
+            if bias is not None:
+                out = out + bias
+        else:
+            out = F.linear(a, b, bias=bias)
         c.copy_(out)
 
     return torch.compile(triton_maxautotune_func, mode="max-autotune", fullgraph=True)
 
 
 def func(*args):
-    a, b, bias, c, kwargs = args
-    hgemm(a, b, c, bias=bias, user_kwargs=kwargs)
+    a, b, bias, c, kwargs, b_layout = args
+    hgemm(a, b, c, bias=bias, user_kwargs=kwargs, b_layout=b_layout)
 
 
 def tensor_nbytes(tensors: torch.Tensor):
@@ -107,8 +120,8 @@ def check_acc(args: _TestArgs):
 
     atol, rtol = get_tol(args)
     for _ in range(5):
-        func(*(inouts + (kwargs,)))
-        ref_func(*ref_inouts)
+        func(*(inouts + (kwargs, args.b_layout)))
+        ref_func(*(ref_inouts + (args.b_layout,)))
         for output, ref_output in zip(outputs, ref_outputs):
             maxdiff_out = (output - ref_output).abs().max().item()
             maxdiff_out_.append(maxdiff_out)
@@ -143,7 +156,7 @@ def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
         create_outputs(args) for _ in range(rotary_inputs - 1)
     ]
     ref_outputs = [create_outputs(args) for _ in range(rotary_inputs)]
-    triton_maxautotune_func = make_triton_maxautotune_func()
+    triton_maxautotune_func = make_triton_maxautotune_func(args.b_layout)
     global ROTARY_INPUTS_TARGET_BYTES
     print(
         f"rotary_inputs:{rotary_inputs}, target_bytes:{ROTARY_INPUTS_TARGET_BYTES}, "
@@ -151,13 +164,13 @@ def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
     )
 
     def run_ref(idx):
-        ref_func(*(ref_inputs[idx] + ref_outputs[idx]))
+        ref_func(*(ref_inputs[idx] + ref_outputs[idx] + (args.b_layout,)))
 
     def run_triton_maxautotune(idx):
         triton_maxautotune_func(*(ref_inputs[idx] + ref_outputs[idx]))
 
     def run_flydsl(idx):
-        func(*(inputs[idx] + outputs[idx] + (kwargs,)))
+        func(*(inputs[idx] + outputs[idx] + (kwargs, args.b_layout)))
 
     print("===================== [INTERLEAVED] =====================")
     for i in range(warmup):
@@ -197,6 +210,7 @@ def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
     print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))
 
 
+@pytest.mark.parametrize("b_layout", ["nt", "nn"])
 @pytest.mark.parametrize(
     "dtype",
     [
@@ -241,6 +255,7 @@ def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
     ],
 )
 def test_hgemm_acc_main_loop(
+    b_layout: str,
     dtype: str,
     m: int,
     n: int,
@@ -270,10 +285,12 @@ def test_hgemm_acc_main_loop(
         group_m,
         has_bias,
         is_hti,
+        b_layout,
     )
     check_acc(args)
 
 
+@pytest.mark.parametrize("b_layout", ["nt", "nn"])
 @pytest.mark.parametrize(
     "dtype",
     [
@@ -300,6 +317,7 @@ def test_hgemm_acc_main_loop(
     ],
 )
 def test_hgemm_acc_small_m(
+    b_layout: str,
     dtype: str,
     m: int,
     n: int,
@@ -329,10 +347,12 @@ def test_hgemm_acc_small_m(
         group_m,
         has_bias,
         is_hti,
+        b_layout,
     )
     check_acc(args)
 
 
+@pytest.mark.parametrize("b_layout", ["nt", "nn"])
 @pytest.mark.parametrize(
     "dtype",
     [
@@ -366,6 +386,7 @@ def test_hgemm_acc_small_m(
     ],
 )
 def test_hgemm_acc_bench(
+    b_layout: str,
     dtype: str,
     m: int,
     n: int,
@@ -395,6 +416,7 @@ def test_hgemm_acc_bench(
         group_m,
         has_bias,
         is_hti,
+        b_layout,
     )
     check_acc(args)
 
@@ -402,6 +424,7 @@ def test_hgemm_acc_bench(
 # =========================================== benchmark ===========================================
 
 
+@pytest.mark.parametrize("b_layout", ["nt", "nn"])
 @pytest.mark.parametrize("dtype", ["bf16"])
 @pytest.mark.parametrize(
     "m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, group_m, has_bias, is_hti",
@@ -429,6 +452,7 @@ def test_hgemm_acc_bench(
     ],
 )
 def test_hgemm_benchmark_smoke(
+    b_layout: str,
     dtype: str,
     m: int,
     n: int,
@@ -458,6 +482,7 @@ def test_hgemm_benchmark_smoke(
         group_m,
         has_bias,
         is_hti,
+        b_layout,
     )
     benchmark(args)
 
