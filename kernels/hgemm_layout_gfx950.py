@@ -318,15 +318,16 @@ def hgemm_gfx950_kernel(
     b_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(b_buf))
 
     s2r_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), elem_dtype)
-    scalar_s2r_copy_atom = fx.make_copy_atom(fx.UniversalCopy(16), elem_dtype)
     g2r_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_dtype)
     r2g_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_dtype)
-    b_tiled_copy_atom = (
-        scalar_s2r_copy_atom if const_expr(param.b_is_nn) else g2r_copy_atom
-    )
-    b_s2r_copy_atom = (
-        scalar_s2r_copy_atom if const_expr(param.b_is_nn) else s2r_copy_atom
-    )
+    if const_expr(param.b_is_nn):
+        b_s2r_copy_atom = fx.make_copy_atom(
+            fx.rocdl.cdna4.LDSReadTrans16_64b(), elem_dtype
+        )
+        b_tiled_copy_atom = b_s2r_copy_atom
+    else:
+        b_tiled_copy_atom = g2r_copy_atom
+        b_s2r_copy_atom = s2r_copy_atom
 
     gC = fx.flat_divide(out_buf, (block_m, block_n))[None, None, bid_m, bid_n]
 
@@ -344,8 +345,8 @@ def hgemm_gfx950_kernel(
 
     a_lds_layout = make_lds_layout(block_m)
     # NN reads B[K, N] in contiguous N-vectors. Keep that physical order in
-    # LDS and use scalar LDS-to-register copies to present the logical [N, K]
-    # operand expected by the MFMA partition.
+    # LDS; gfx950 ds_read_b64_tr_b16 transposes each 4x16 subtile while loading
+    # it, producing the K-contiguous per-lane fragments expected by MFMA.
     b_lds_layout = (
         fx.make_ordered_layout((block_n, block_k), (0, 1))
         if const_expr(param.b_is_nn)
@@ -640,15 +641,16 @@ def hgemm_hti_gfx950_kernel(
     b_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(b_buf))
 
     s2r_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), elem_dtype)
-    scalar_s2r_copy_atom = fx.make_copy_atom(fx.UniversalCopy(16), elem_dtype)
     g2r_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_dtype)
     r2g_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_dtype)
-    b_tiled_copy_atom = (
-        scalar_s2r_copy_atom if const_expr(param.b_is_nn) else g2r_copy_atom
-    )
-    b_s2r_copy_atom = (
-        scalar_s2r_copy_atom if const_expr(param.b_is_nn) else s2r_copy_atom
-    )
+    if const_expr(param.b_is_nn):
+        b_s2r_copy_atom = fx.make_copy_atom(
+            fx.rocdl.cdna4.LDSReadTrans16_64b(), elem_dtype
+        )
+        b_tiled_copy_atom = b_s2r_copy_atom
+    else:
+        b_tiled_copy_atom = g2r_copy_atom
+        b_s2r_copy_atom = s2r_copy_atom
 
     thr_mma = tiled_mma.thr_slice(tid)
     thr_copy_A = fx.make_tiled_copy_A(g2r_copy_atom, tiled_mma).get_slice(tid)
