@@ -21,6 +21,7 @@ class _TestArgs:
     stages: int
     m_waves: int
     n_waves: int
+    k_waves: int
     group_m: int
     has_bias: bool
     use_half_tile_interleaved: bool = False
@@ -111,6 +112,7 @@ def check_acc(args: _TestArgs):
         "stages": args.stages,
         "m_waves": args.m_waves,
         "n_waves": args.n_waves,
+        "k_waves": args.k_waves,
         "group_m": args.group_m,
         "use_half_tile_interleaved": args.use_half_tile_interleaved,
         "split_k": args.split_k,
@@ -124,7 +126,7 @@ def check_acc(args: _TestArgs):
 
     def get_tol(args):
         k_scale = (args.k / 8192) ** 0.5
-        k_scale *= args.split_k
+        k_scale *= args.split_k * args.k_waves
         if args.dtype is torch.bfloat16:
             return 2e-1 * k_scale, 2e-1
         return 5e-2 * k_scale, 5e-2
@@ -155,6 +157,7 @@ def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
         "stages": args.stages,
         "m_waves": args.m_waves,
         "n_waves": args.n_waves,
+        "k_waves": args.k_waves,
         "group_m": args.group_m,
         "use_half_tile_interleaved": args.use_half_tile_interleaved,
         "split_k": args.split_k,
@@ -294,6 +297,7 @@ def test_hgemm_acc_main_loop(
         stages,
         m_waves,
         n_waves,
+        1,
         group_m,
         has_bias,
         is_hti,
@@ -306,7 +310,7 @@ def test_hgemm_acc_main_loop(
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
     "m, n, k, block_m, block_n, block_k, stages, split_k, "
-    "m_waves, n_waves, block_k_waves, has_bias, group_m, "
+    "m_waves, n_waves, k_waves, has_bias, group_m, "
     "use_half_tile_interleaved",
     [
         # Layout-kernel split-K smoke cases.
@@ -347,6 +351,8 @@ def test_hgemm_acc_main_loop(
         (3, 16, 144, 64, 64, 64, 2, 3, 2, 2, 1, True, 0, True),
         (3, 16, 144, 64, 64, 64, 2, 3, 2, 2, 1, False, 4, True),
         # test_hgemm_acc_ft_slice_k
+        (800, 384, 7168, 32, 64, 128, 6, 1, 1, 2, 2, True, 0, False),
+        (800, 384, 7168, 32, 64, 128, 6, 1, 1, 2, 2, False, 0, False),
         (800, 384, 7168, 32, 64, 128, 6, 2, 1, 2, 2, True, 0, False),
         (800, 384, 7168, 32, 64, 128, 6, 2, 1, 2, 2, False, 0, False),
         (800, 384, 7168, 32, 64, 128, 6, 2, 1, 2, 2, False, 4, False),
@@ -369,15 +375,13 @@ def test_hgemm_acc_split_k(
     split_k: int,
     m_waves: int,
     n_waves: int,
-    block_k_waves: int,
+    k_waves: int,
     has_bias: bool,
     group_m: int,
     use_half_tile_interleaved: bool,
 ):
-    # The layout kernel has no K-wave dimension, so preserve the source
-    # workgroup size by folding BLOCK_K_WARPS into its N-wave dimension.
-    assert block_k_waves > 0
-    assert split_k > 1
+    assert k_waves > 0
+    assert split_k > 1 or k_waves > 1
     args = _TestArgs(
         dtype=dtype,
         m=m,
@@ -388,7 +392,8 @@ def test_hgemm_acc_split_k(
         block_k=block_k,
         stages=stages,
         m_waves=m_waves,
-        n_waves=n_waves * block_k_waves,
+        n_waves=n_waves,
+        k_waves=k_waves,
         group_m=group_m,
         has_bias=has_bias,
         use_half_tile_interleaved=use_half_tile_interleaved,
@@ -452,6 +457,7 @@ def test_hgemm_acc_small_m(
         stages,
         m_waves,
         n_waves,
+        1,
         group_m,
         has_bias,
         is_hti,
@@ -521,6 +527,7 @@ def test_hgemm_acc_bench(
         stages,
         m_waves,
         n_waves,
+        1,
         group_m,
         has_bias,
         is_hti,
@@ -665,6 +672,7 @@ def test_hgemm_benchmark_smoke(
         stages,
         m_waves,
         n_waves,
+        1,
         group_m,
         has_bias,
         is_hti,

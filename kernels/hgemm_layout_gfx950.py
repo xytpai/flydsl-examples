@@ -198,6 +198,7 @@ class HGemmGfx950Param:
     split_k: fx.Constexpr[int]
     m_waves: fx.Constexpr[int]
     n_waves: fx.Constexpr[int]
+    k_waves: fx.Constexpr[int]
     group_m: fx.Constexpr[int]
     use_half_tile_interleaved: fx.Constexpr[bool]
     a_is_transposed: fx.Constexpr[bool]
@@ -226,6 +227,7 @@ def make_hgemm_gfx950_param(
     split_k: int = 1,
     m_waves: int = 2,
     n_waves: int = 4,
+    k_waves: int = 1,
     group_m: int = 0,
     use_half_tile_interleaved: bool = False,
     a_is_transposed: bool = False,
@@ -252,13 +254,17 @@ def make_hgemm_gfx950_param(
         raise ValueError("the gfx950 layout kernel currently requires mma=16x16x32")
     if stages < 2:
         raise ValueError("stages must be at least 2 for the staged LDS pipeline")
-    if m_waves <= 0 or n_waves <= 0:
-        raise ValueError("m_waves, and n_waves must be positive")
+    if m_waves <= 0 or n_waves <= 0 or k_waves <= 0:
+        raise ValueError("m_waves, n_waves, and k_waves must be positive")
+    if m_waves * n_waves * k_waves > 16:
+        raise ValueError("the workgroup cannot contain more than 16 waves")
     if group_m < 0:
         raise ValueError("group_m must be non-negative")
     in_dbytes = out_dbytes = 2  # for hgemm
     cshuffle_vec_size = 16 // in_dbytes
     if use_half_tile_interleaved:
+        if k_waves != 1:
+            raise ValueError("half-tile interleaved does not support slice-K")
         half_block_m = block_m // 2
         half_block_n = block_n // 2
         assert stages == 2
@@ -273,7 +279,9 @@ def make_hgemm_gfx950_param(
     else:
         assert block_n % cshuffle_vec_size == 0
     smem_bytes = stages * (block_m + block_n) * block_k * in_dbytes
-    smem_bytes = max(smem_bytes, block_m * block_n * in_dbytes)
+    smem_bytes = max(
+        smem_bytes, k_waves * block_m * block_n * out_dbytes
+    )
     arch = get_rocm_arch()
     SMEM_CAPACITY_MAP = {
         "gfx942": 65536,
@@ -288,6 +296,11 @@ def make_hgemm_gfx950_param(
             f"capacity={smem_capacity} for arch={arch}"
         )
     async_load_vec_size = GFX950_DMA_BYTES // in_dbytes
+    if block_k % (k_waves * mma_k) != 0:
+        raise ValueError(
+            "block_k must be divisible by k_waves * mma_k: "
+            f"block_k={block_k}, k_waves={k_waves}, mma_k={mma_k}"
+        )
     ldg_x_threads = block_k // async_load_vec_size
     if ldg_x_threads * async_load_vec_size != block_k:
         raise ValueError(
@@ -295,7 +308,7 @@ def make_hgemm_gfx950_param(
             f"block_k={block_k}, async_load_vec_size={async_load_vec_size}, "
             f"covered_k={ldg_x_threads * async_load_vec_size}"
         )
-    block_threads = m_waves * n_waves * GFX950_WAVE_SIZE
+    block_threads = m_waves * n_waves * k_waves * GFX950_WAVE_SIZE
     ldg_a_iters = (block_m * block_k) // (block_threads * async_load_vec_size)
     ldg_b_iters = (block_n * block_k) // (block_threads * async_load_vec_size)
     if use_half_tile_interleaved:
@@ -367,6 +380,7 @@ def make_hgemm_gfx950_param(
         split_k=split_k,
         m_waves=m_waves,
         n_waves=n_waves,
+        k_waves=k_waves,
         group_m=group_m,
         use_half_tile_interleaved=use_half_tile_interleaved,
         a_is_transposed=a_is_transposed,
@@ -390,7 +404,7 @@ def make_hgemm_gfx950_kernel_name(param: HGemmGfx950Param):
     dtype_str = "fp16" if param.dtype_id == HGEMM_DTYPE_FP16 else "bf16"
     name = f"hgemm_{dtype_str}_t{param.block_m}x{param.block_n}x{param.block_k}x{param.stages}"
     name += f"_ks{param.split_k}"
-    name += f"_w{param.m_waves}x{param.n_waves}"
+    name += f"_w{param.m_waves}x{param.n_waves}x{param.k_waves}"
     name += f"_gm{param.group_m}"
     name += f"_bias{int(param.has_bias)}"
     name += f"_ktail{int(param.has_k_tail)}"
@@ -455,9 +469,12 @@ def hgemm_gfx950_kernel(
     param: HGemmGfx950Param,
 ):
     is_split_k = param.split_k > 1
+    is_slice_k = param.k_waves > 1
     block_m = param.block_m
     block_n = param.block_n
     block_k = param.block_k
+    k_waves = param.k_waves
+    k_mma_iters_per_wave = block_k // (k_waves * param.mma_k)
     stages = param.stages
     has_k_tail = param.has_k_tail
     async_load_bytes = param.async_load_bytes
@@ -484,6 +501,9 @@ def hgemm_gfx950_kernel(
         )
 
     tid = fx.thread_idx.x
+    mma_threads = param.m_waves * param.n_waves * GFX950_WAVE_SIZE
+    mma_tid = tid % mma_threads
+    k_wave_idx = tid // mma_threads
     num_pid_m = (m + block_m - 1) // block_m
     num_pid_n = (n + block_n - 1) // block_n
     block_swizzle = BlockSwizzle(
@@ -506,7 +526,7 @@ def hgemm_gfx950_kernel(
     @fx.union
     class SharedStorage:
         ab: SharedABStorage
-        c: fx.Array[elem_dtype, block_m * block_n, 16]
+        c: fx.Array[elem_dtype, k_waves * block_m * block_n, 16]
 
     storage = fx.SharedAllocator().allocate(SharedStorage)
     smem_a = storage.ab.a.peek().ptr
@@ -565,9 +585,13 @@ def hgemm_gfx950_kernel(
 
     gC = fx.flat_divide(out_buf, (block_m, block_n))[None, None, bid_m, bid_n]
 
-    thr_mma = tiled_mma.thr_slice(tid)
-    thr_copy_A = fx.make_tiled_copy_A(a_tiled_copy_atom, tiled_mma).get_slice(tid)
-    thr_copy_B = fx.make_tiled_copy_B(b_tiled_copy_atom, tiled_mma).get_slice(tid)
+    thr_mma = tiled_mma.thr_slice(mma_tid)
+    thr_copy_A = fx.make_tiled_copy_A(a_tiled_copy_atom, tiled_mma).get_slice(
+        mma_tid
+    )
+    thr_copy_B = fx.make_tiled_copy_B(b_tiled_copy_atom, tiled_mma).get_slice(
+        mma_tid
+    )
 
     swizzle = fx.static(fx.SwizzleType.get(3, 3, 3))
 
@@ -612,6 +636,9 @@ def hgemm_gfx950_kernel(
     sA = fx.make_view(smem_a, a_lds_layout)
     sB = fx.make_view(smem_b, b_lds_layout)
     sC = fx.make_view(smem_c, c_lds_layout)
+    sC_write = fx.make_view(
+        smem_c + k_wave_idx * block_m * block_n, c_lds_layout
+    )
 
     frag_A = thr_mma.make_fragment_A(sA)
     frag_B = thr_mma.make_fragment_B(sB)
@@ -659,6 +686,9 @@ def hgemm_gfx950_kernel(
             global_n_idx = block_n_offset + col_idx
             safe_global_n_idx = (global_n_idx < n).select(global_n_idx, 0)
             bias_val = bias_buf[safe_global_n_idx].to(fx.Float32)
+            if const_expr(is_slice_k):
+                is_first_k_slice = k_wave_idx == 0
+                bias_val = is_first_k_slice.select(bias_val, fx.Float32(0.0))
             frag_C[i] = bias_val
 
     for i in range_constexpr(fx.size(pred_C.shape).unpack()):
@@ -806,9 +836,6 @@ def hgemm_gfx950_kernel(
                 frag_A_retile[None, None, block_k_iter],
             )
             if const_expr(has_k_tail):
-                global_k_iter = (
-                    ks_begin + k_tile * block_k + block_k_iter * param.mma_k
-                )
                 frag_a_k_coords = thr_mma_aK[None, None, block_k_iter]
                 for i in range_constexpr(fx.size(frag_A_chunk.shape).unpack()):
                     local_k_idx = fx.get_scalar(frag_a_k_coords[i])
@@ -828,15 +855,20 @@ def hgemm_gfx950_kernel(
                 traversal_order=fx.GemmTraversalOrder.KNM,
             )
 
-        for block_k_iter in range_constexpr(block_k // param.mma_k):
-            if const_expr(has_k_tail):
-                global_k_iter = (
-                    ks_begin + k_tile * block_k + block_k_iter * param.mma_k
-                )
-                if global_k_iter < ks_end:
-                    compute_k_chunk(block_k_iter)
-            else:
-                compute_k_chunk(block_k_iter)
+        for k_slice in range_constexpr(k_waves):
+            if k_wave_idx == k_slice:
+                for block_k_iter in range_constexpr(k_mma_iters_per_wave):
+                    k_iter = k_slice * k_mma_iters_per_wave + block_k_iter
+                    if const_expr(has_k_tail):
+                        global_k_iter = (
+                            ks_begin
+                            + k_tile * block_k
+                            + k_iter * param.mma_k
+                        )
+                        if global_k_iter < ks_end:
+                            compute_k_chunk(k_iter)
+                    else:
+                        compute_k_chunk(k_iter)
 
     if const_expr(is_split_k):
         splitk_protocol.zero_c()
@@ -873,7 +905,7 @@ def hgemm_gfx950_kernel(
     for i in range_constexpr(fx.size(frag_C_out.shape).unpack()):
         row = fx.get_scalar(thr_mma_cRow[i])
         col = fx.get_scalar(thr_mma_cCol[i])
-        sC[row, col] = frag_C_out[i]
+        sC_write[row, col] = frag_C_out[i]
 
     fx.gpu.barrier()
     if const_expr(is_split_k):
@@ -895,17 +927,38 @@ def hgemm_gfx950_kernel(
                     result_type=fx.Vector.make_type(
                         cshuffle_vec_size, elem_dtype
                     ),
-                ).ir_value()
+                )
+                for k_slice in range_constexpr(1, k_waves):
+                    peer_c_vec = fx.ptr_load(
+                        smem_c
+                        + k_slice * block_m * block_n
+                        + local_row * block_n
+                        + local_col,
+                        result_type=fx.Vector.make_type(
+                            cshuffle_vec_size, elem_dtype
+                        ),
+                    )
+                    c_vec = c_vec + peer_c_vec
                 atomic_add_stg_vec(
                     out,
                     global_row * n + global_col,
-                    c_vec,
+                    c_vec.ir_value(),
                     cshuffle_vec_size,
                     param.out_data_bytes,
                     elem_dtype.ir_type,
                 )
     else:
         fx.copy(s2r_copy_atom, thr_sC, frag_C_cshuffle)
+        for k_slice in range_constexpr(1, k_waves):
+            peer_sC = fx.make_view(
+                smem_c + k_slice * block_m * block_n, c_lds_layout
+            )
+            thr_peer_sC = thr_copy_cshuffle.partition_S(peer_sC)
+            peer_frag_C = fx.make_fragment_like(thr_peer_sC)
+            fx.copy(s2r_copy_atom, thr_peer_sC, peer_frag_C)
+            frag_C_cshuffle.store(
+                frag_C_cshuffle.load() + peer_frag_C.load()
+            )
         fx.copy(r2g_copy_atom, frag_C_cshuffle, thr_gC, pred=pred_C)
 
 
@@ -1695,6 +1748,7 @@ def hgemm(
     Each layout character controls only the corresponding tensor stride:
     N is row-major and T is column-major. Logical tensor shapes never change.
     Set ``user_kwargs["split_k"]`` above 1 to atomically reduce K partitions.
+    Set ``user_kwargs["k_waves"]`` above 1 for full-tile workgroup-local slice-K.
     """
     if stream is None:
         stream = torch.cuda.current_stream()
@@ -1773,6 +1827,7 @@ def hgemm(
         "split_k": 1,
         "m_waves": 2,
         "n_waves": 4,
+        "k_waves": 1,
         "group_m": 0,
         "use_half_tile_interleaved": True,
     }

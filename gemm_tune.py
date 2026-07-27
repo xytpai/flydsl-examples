@@ -82,7 +82,13 @@ def tuning_benchmark(args, kwargs={}, niters=50):
     c_ref = create_outputs(args)[0]
     torch.addmm(bias, a, b, out=c_ref)
     hgemm(a, b, c, bias=bias, user_kwargs=kwargs, layout=args.layout)
-    tol = float(args.k) / 2048 * 6e-1 * kwargs.get("split_k", 1)
+    tol = (
+        float(args.k)
+        / 2048
+        * 6e-1
+        * kwargs.get("split_k", 1)
+        * kwargs.get("k_waves", 1)
+    )
     is_allclose = torch.allclose(c, c_ref, atol=tol, rtol=tol)
     assert is_allclose
     # performance bench
@@ -203,6 +209,7 @@ def hgemm_get_configs(args):
         "split_k": split_k_candidates,
         "m_waves": [1, 2, 4],
         "n_waves": [1, 2, 4],
+        "k_waves": [1, 2],
         "group_m": [0, 4],
         "use_half_tile_interleaved": [False, True],
     }
