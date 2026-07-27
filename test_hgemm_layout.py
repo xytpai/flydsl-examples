@@ -1,7 +1,6 @@
 import torch
 import pytest
 import itertools
-import torch.nn.functional as F
 from torch.profiler import profile, ProfilerActivity
 from dataclasses import dataclass
 
@@ -25,14 +24,29 @@ class _TestArgs:
     group_m: int
     has_bias: bool
     use_half_tile_interleaved: bool = False
-    b_layout: str = "nt"
+    layout: str = "nt"
+
+
+def empty_layout_matrix(rows: int, cols: int, dtype: torch.dtype, is_t: bool):
+    if is_t:
+        return torch.empty((cols, rows), dtype=dtype, device="cuda").t()
+    return torch.empty((rows, cols), dtype=dtype, device="cuda")
 
 
 def create_inputs(args: _TestArgs):
-    a = torch.empty((args.m, args.k), dtype=args.dtype, device="cuda")
+    a = empty_layout_matrix(
+        args.m,
+        args.k,
+        args.dtype,
+        args.layout[0] == "t",
+    )
     a.uniform_(-1, 1)
-    b_shape = (args.k, args.n) if args.b_layout == "nn" else (args.n, args.k)
-    b = torch.empty(b_shape, dtype=args.dtype, device="cuda")
+    b = empty_layout_matrix(
+        args.k,
+        args.n,
+        args.dtype,
+        args.layout[1] == "t",
+    )
     b.uniform_(-1, 1)
     if args.has_bias:
         bias = torch.empty((args.n,), dtype=args.dtype, device="cuda")
@@ -48,17 +62,14 @@ def create_outputs(args: _TestArgs):
 
 
 def ref_func(*args):
-    a, b, bias, c, b_layout = args
-    if b_layout == "nn":
-        if bias is None:
-            torch.mm(a, b, out=c)
-        else:
-            torch.addmm(bias, a, b, out=c)
+    a, b, bias, c, _layout = args
+    if bias is None:
+        torch.mm(a, b, out=c)
     else:
-        F.linear(a, b, out=c, bias=bias)
+        torch.addmm(bias, a, b, out=c)
 
 
-def make_triton_maxautotune_func(b_layout: str):
+def make_triton_maxautotune_func():
     import torch._inductor.config as inductor_config
 
     inductor_config.max_autotune_gemm_backends = "TRITON"
@@ -67,20 +78,17 @@ def make_triton_maxautotune_func(b_layout: str):
     torch._dynamo.reset()
 
     def triton_maxautotune_func(a, b, bias, c):
-        if b_layout == "nn":
-            out = torch.mm(a, b)
-            if bias is not None:
-                out = out + bias
-        else:
-            out = F.linear(a, b, bias=bias)
+        out = torch.mm(a, b)
+        if bias is not None:
+            out = out + bias
         c.copy_(out)
 
     return torch.compile(triton_maxautotune_func, mode="max-autotune", fullgraph=True)
 
 
 def func(*args):
-    a, b, bias, c, kwargs, b_layout = args
-    hgemm(a, b, c, bias=bias, user_kwargs=kwargs, b_layout=b_layout)
+    a, b, bias, c, kwargs, layout = args
+    hgemm(a, b, c, bias=bias, user_kwargs=kwargs, layout=layout)
 
 
 def tensor_nbytes(tensors: torch.Tensor):
@@ -120,8 +128,8 @@ def check_acc(args: _TestArgs):
 
     atol, rtol = get_tol(args)
     for _ in range(5):
-        func(*(inouts + (kwargs, args.b_layout)))
-        ref_func(*(ref_inouts + (args.b_layout,)))
+        func(*(inouts + (kwargs, args.layout)))
+        ref_func(*(ref_inouts + (args.layout,)))
         for output, ref_output in zip(outputs, ref_outputs):
             maxdiff_out = (output - ref_output).abs().max().item()
             maxdiff_out_.append(maxdiff_out)
@@ -156,7 +164,7 @@ def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
         create_outputs(args) for _ in range(rotary_inputs - 1)
     ]
     ref_outputs = [create_outputs(args) for _ in range(rotary_inputs)]
-    triton_maxautotune_func = make_triton_maxautotune_func(args.b_layout)
+    triton_maxautotune_func = make_triton_maxautotune_func()
     global ROTARY_INPUTS_TARGET_BYTES
     print(
         f"rotary_inputs:{rotary_inputs}, target_bytes:{ROTARY_INPUTS_TARGET_BYTES}, "
@@ -164,13 +172,13 @@ def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
     )
 
     def run_ref(idx):
-        ref_func(*(ref_inputs[idx] + ref_outputs[idx] + (args.b_layout,)))
+        ref_func(*(ref_inputs[idx] + ref_outputs[idx] + (args.layout,)))
 
     def run_triton_maxautotune(idx):
         triton_maxautotune_func(*(ref_inputs[idx] + ref_outputs[idx]))
 
     def run_flydsl(idx):
-        func(*(inputs[idx] + outputs[idx] + (kwargs, args.b_layout)))
+        func(*(inputs[idx] + outputs[idx] + (kwargs, args.layout)))
 
     print("===================== [INTERLEAVED] =====================")
     for i in range(warmup):
@@ -210,7 +218,7 @@ def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
     print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))
 
 
-@pytest.mark.parametrize("b_layout", ["nt", "nn"])
+@pytest.mark.parametrize("layout", ["nn", "nt", "tn", "tt"])
 @pytest.mark.parametrize(
     "dtype",
     [
@@ -255,7 +263,7 @@ def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
     ],
 )
 def test_hgemm_acc_main_loop(
-    b_layout: str,
+    layout: str,
     dtype: str,
     m: int,
     n: int,
@@ -285,12 +293,12 @@ def test_hgemm_acc_main_loop(
         group_m,
         has_bias,
         is_hti,
-        b_layout,
+        layout,
     )
     check_acc(args)
 
 
-@pytest.mark.parametrize("b_layout", ["nt", "nn"])
+@pytest.mark.parametrize("layout", ["nn", "nt", "tn", "tt"])
 @pytest.mark.parametrize(
     "dtype",
     [
@@ -317,7 +325,7 @@ def test_hgemm_acc_main_loop(
     ],
 )
 def test_hgemm_acc_small_m(
-    b_layout: str,
+    layout: str,
     dtype: str,
     m: int,
     n: int,
@@ -347,12 +355,12 @@ def test_hgemm_acc_small_m(
         group_m,
         has_bias,
         is_hti,
-        b_layout,
+        layout,
     )
     check_acc(args)
 
 
-@pytest.mark.parametrize("b_layout", ["nt", "nn"])
+@pytest.mark.parametrize("layout", ["nn", "nt", "tn", "tt"])
 @pytest.mark.parametrize(
     "dtype",
     [
@@ -386,7 +394,7 @@ def test_hgemm_acc_small_m(
     ],
 )
 def test_hgemm_acc_bench(
-    b_layout: str,
+    layout: str,
     dtype: str,
     m: int,
     n: int,
@@ -416,15 +424,15 @@ def test_hgemm_acc_bench(
         group_m,
         has_bias,
         is_hti,
-        b_layout,
+        layout,
     )
     check_acc(args)
 
 
-@pytest.mark.parametrize("b_layout", ["nt", "nn"])
+@pytest.mark.parametrize("layout", ["nn", "nt", "tn", "tt"])
 @pytest.mark.parametrize("use_half_tile_interleaved", [False, True])
 def test_hgemm_padded_stride_and_storage_offset(
-    b_layout: str,
+    layout: str,
     use_half_tile_interleaved: bool,
 ):
     m = n = 64
@@ -432,24 +440,38 @@ def test_hgemm_padded_stride_and_storage_offset(
     dtype = torch.bfloat16
     column_offset = 8
 
-    a_pitch = k + 32
-    a_storage = torch.empty((m + 1, a_pitch), dtype=dtype, device="cuda")
-    a_storage.uniform_(-1, 1)
-    a = a_storage[1:, column_offset : column_offset + k]
+    def make_padded_matrix(rows: int, cols: int, padding: int, is_t: bool):
+        if is_t:
+            pitch = rows + padding
+            storage = torch.empty((cols + 1, pitch), dtype=dtype, device="cuda")
+            storage.uniform_(-1, 1)
+            return storage[1:, column_offset : column_offset + rows].t()
+        pitch = cols + padding
+        storage = torch.empty((rows + 1, pitch), dtype=dtype, device="cuda")
+        storage.uniform_(-1, 1)
+        return storage[1:, column_offset : column_offset + cols]
 
-    b_rows, b_cols = (k, n) if b_layout == "nn" else (n, k)
-    b_pitch = b_cols + 48
-    b_storage = torch.empty((b_rows + 1, b_pitch), dtype=dtype, device="cuda")
-    b_storage.uniform_(-1, 1)
-    b = b_storage[1:, column_offset : column_offset + b_cols]
+    a = make_padded_matrix(m, k, 32, layout[0] == "t")
+    b = make_padded_matrix(k, n, 48, layout[1] == "t")
 
-    for tensor in (a, b):
+    assert a.shape == (m, k)
+    assert b.shape == (k, n)
+    for tensor, is_t in zip(
+        (a, b),
+        (layout[0] == "t", layout[1] == "t"),
+    ):
         assert not tensor.is_contiguous()
-        assert tensor.stride(1) == 1
-        assert tensor.stride(0) > tensor.shape[1]
+        if is_t:
+            assert tensor.stride(0) == 1
+            assert tensor.stride(1) > tensor.shape[0]
+            leading_stride = tensor.stride(1)
+        else:
+            assert tensor.stride(1) == 1
+            assert tensor.stride(0) > tensor.shape[1]
+            leading_stride = tensor.stride(0)
         assert tensor.storage_offset() > 0
         assert tensor.data_ptr() % 16 == 0
-        assert tensor.stride(0) * tensor.element_size() % 16 == 0
+        assert leading_stride * tensor.element_size() % 16 == 0
 
     bias = torch.empty((n,), dtype=dtype, device="cuda").uniform_(-1, 1)
     out = torch.empty((m, n), dtype=dtype, device="cuda")
@@ -471,9 +493,9 @@ def test_hgemm_padded_stride_and_storage_offset(
         out,
         bias=bias,
         user_kwargs=kwargs,
-        b_layout=b_layout,
+        layout=layout,
     )
-    ref_func(a, b, bias, ref, b_layout)
+    ref_func(a, b, bias, ref, layout)
 
     assert result.data_ptr() == out.data_ptr()
     torch.testing.assert_close(
@@ -488,7 +510,7 @@ def test_hgemm_padded_stride_and_storage_offset(
 # =========================================== benchmark ===========================================
 
 
-@pytest.mark.parametrize("b_layout", ["nt", "nn"])
+@pytest.mark.parametrize("layout", ["nn", "nt", "tn"])
 @pytest.mark.parametrize("dtype", ["bf16"])
 @pytest.mark.parametrize(
     "m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, group_m, has_bias, is_hti",
@@ -516,7 +538,7 @@ def test_hgemm_padded_stride_and_storage_offset(
     ],
 )
 def test_hgemm_benchmark_smoke(
-    b_layout: str,
+    layout: str,
     dtype: str,
     m: int,
     n: int,
@@ -546,7 +568,7 @@ def test_hgemm_benchmark_smoke(
         group_m,
         has_bias,
         is_hti,
-        b_layout,
+        layout,
     )
     benchmark(args)
 
