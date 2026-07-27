@@ -1,3 +1,6 @@
+import os
+os.environ.setdefault("KINETO_LOG_LEVEL", "6")
+
 import json
 import torch
 import itertools
@@ -10,7 +13,7 @@ from pathlib import Path
 from dataclasses import dataclass
 from flydsl.runtime.device import get_rocm_arch
 
-from kernels.hgemm_layout_gfx950 import hgemm, make_hgemm_gfx950_param
+from kernels.hgemm_layout_gfx950 import hgemm, make_hgemm_param_and_validate
 
 gpu_arch = get_rocm_arch()
 base_dir = Path(__file__).resolve().parent
@@ -25,6 +28,7 @@ class Args:
     n: int
     k: int
     layout: str
+    enable_split_k: bool = False
 
 
 @dataclass
@@ -78,7 +82,7 @@ def tuning_benchmark(args, kwargs={}, niters=50):
     c_ref = create_outputs(args)[0]
     torch.addmm(bias, a, b, out=c_ref)
     hgemm(a, b, c, bias=bias, user_kwargs=kwargs, layout=args.layout)
-    tol = float(args.k) / 2048 * 6e-1
+    tol = float(args.k) / 2048 * 6e-1 * kwargs.get("split_k", 1)
     is_allclose = torch.allclose(c, c_ref, atol=tol, rtol=tol)
     assert is_allclose
     # performance bench
@@ -107,12 +111,96 @@ def tuning_benchmark(args, kwargs={}, niters=50):
     return duration
 
 
-def hgemm_get_configs():
+def _ceil_div(a, b):
+    return (a + b - 1) // b
+
+
+def _hgemm_split_k_padded(k, block_k, split_k):
+    working_k = _ceil_div(k, split_k)
+    padded_k = 0
+    for split_idx in range(split_k):
+        remaining_k = max(k - split_idx * working_k, 0)
+        part_k = min(working_k, remaining_k)
+        if part_k > 0:
+            padded_k += _ceil_div(part_k, block_k) * block_k
+    return padded_k
+
+
+def _hgemm_tile_iou(m, n, k, block_m, block_n, block_k, split_k):
+    padded_m = _ceil_div(m, block_m) * block_m
+    padded_n = _ceil_div(n, block_n) * block_n
+    padded_k = _hgemm_split_k_padded(k, block_k, split_k)
+    return (m * n * k) / (padded_m * padded_n * padded_k)
+
+
+def _hgemm_tile_iou_threshold(selections, m, n, k, keep_ratio):
+    best_iou = 0.0
+    for block_m, block_n, block_k, split_k in itertools.product(
+        selections["block_m"],
+        selections["block_n"],
+        selections["block_k"],
+        selections["split_k"],
+    ):
+        best_iou = max(
+            best_iou,
+            _hgemm_tile_iou(
+                m,
+                n,
+                k,
+                block_m,
+                block_n,
+                block_k,
+                split_k,
+            ),
+        )
+    return best_iou * keep_ratio
+
+
+def _hgemm_config_tile_iou(m, n, k, config):
+    return _hgemm_tile_iou(
+        m,
+        n,
+        k,
+        config["block_m"],
+        config["block_n"],
+        config["block_k"],
+        config["split_k"],
+    )
+
+
+def _hgemm_has_smaller_supported_split_k(
+    config,
+    supported_split_k,
+    m,
+    n,
+):
+    bm = _ceil_div(m, config["block_m"])
+    bn = _ceil_div(n, config["block_n"])
+    block_count = bm * bn * config["split_k"]
+    if block_count <= 1024:
+        return False
+    return any(
+        smaller_split_k < config["split_k"]
+        and bm * bn * smaller_split_k > 1024
+        for smaller_split_k in supported_split_k
+    )
+
+
+def hgemm_get_configs(args):
+    split_k_candidates = [1]
+    if args.enable_split_k:
+        split_k_candidates.extend(
+            split_k
+            for split_k in range(2, 10)
+            if args.k % split_k == 0
+            and (args.k // split_k) % 32 == 0
+        )
     selections = {
         "block_m": [16, 32, 48, 64, 80, 96, 128, 256],
         "block_n": [16, 32, 64, 80, 96, 128, 256],
         "block_k": [64, 128, 256],
         "stages": [i for i in range(2, 10)],
+        "split_k": split_k_candidates,
         "m_waves": [1, 2, 4],
         "n_waves": [1, 2, 4],
         "group_m": [0, 4],
@@ -121,23 +209,54 @@ def hgemm_get_configs():
     keys = selections.keys()
     values = selections.values()
     configs = [dict(zip(keys, combo)) for combo in itertools.product(*values)]
+    if args.m <= 32:
+        keep_ratio = 0.75
+    elif args.m <= 128:
+        keep_ratio = 0.85
+    else:
+        keep_ratio = 0.95
+    tile_iou_threshold = _hgemm_tile_iou_threshold(
+        selections,
+        args.m,
+        args.n,
+        args.k,
+        keep_ratio,
+    )
     valid_configs = []
     for config in configs:
+        if _hgemm_has_smaller_supported_split_k(
+            config,
+            selections["split_k"],
+            args.m,
+            args.n,
+        ):
+            continue
+        if (
+            _hgemm_config_tile_iou(args.m, args.n, args.k, config)
+            < tile_iou_threshold
+        ):
+            continue
         if not config["use_half_tile_interleaved"]:
             mma_m_iters = config["block_m"] // config["m_waves"] // 16
             mma_n_iters = config["block_n"] // config["n_waves"] // 16
             if mma_m_iters > 4 or mma_n_iters > 4:
                 continue
         try:
-            make_hgemm_gfx950_param(**config)
-            valid_configs.append(config)
+            param = make_hgemm_param_and_validate(
+                args.m,
+                args.n,
+                args.k,
+                config,
+            )
+            if param is not None:
+                valid_configs.append(config)
         except Exception:
             pass
     return valid_configs
 
 
 def tune_single(args):
-    configs = hgemm_get_configs()
+    configs = hgemm_get_configs(args)
     best_duration = float(1e10)
     best_idx = 0
     pbar = tqdm(total=len(configs), desc=f"{args}")
@@ -171,6 +290,7 @@ def tune_all(
     dtype,
     out_prefix,
     layout,
+    enable_split_k=False,
 ):
     mnks = [
         (8, 4096, 4096),
@@ -201,6 +321,7 @@ def tune_all(
                 n=mnk[1],
                 k=mnk[2],
                 layout=layout,
+                enable_split_k=enable_split_k,
             )
             result = tune_single(args)
             result = vars(result)
@@ -219,6 +340,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--single", action="store_true")
     parser.add_argument("--tune_all", action="store_true")
+    parser.add_argument(
+        "--enable_split_k",
+        "--enable-split-k",
+        action="store_true",
+        help="include valid split_k values greater than 1 in tuning",
+    )
     parser.add_argument("--m", type=int, default=4096)
     parser.add_argument("--n", type=int, default=4096)
     parser.add_argument("--k", type=int, default=4096)
@@ -229,7 +356,12 @@ if __name__ == "__main__":
     if args.single:
         tune_single(args)
     elif args.tune_all:
-        tune_all(args.dtype, args.out, args.layout)
+        tune_all(
+            args.dtype,
+            args.out,
+            args.layout,
+            enable_split_k=args.enable_split_k,
+        )
 
     # rm -rf ~/.flydsl/ ; python3 gemm_tune.py --single --dtype bf16 --m 1024 --n 1024 --k 1024
     # rm -rf ~/.flydsl/ ; python3 gemm_tune.py --single --dtype bf16 --m 2048 --n 2048 --k 2048
