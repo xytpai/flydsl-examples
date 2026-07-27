@@ -356,16 +356,24 @@ def hgemm_gfx950_kernel(
             fx.make_ordered_layout((rows, block_k), (1, 0)),
         )
 
+    def make_transposed_lds_layout(rows):
+        return fx.make_composed_layout(
+            swizzle,
+            fx.make_ordered_layout((rows, block_k), (0, 1)),
+        )
+
     # T-layout A[M, K] is M-contiguous; N-layout B[K, N] is N-contiguous.
     # Keep those physical orders in LDS and use the gfx950 transpose read to
-    # form the K-contiguous MFMA register fragments.
+    # form the K-contiguous MFMA register fragments. Swizzle the vector groups
+    # in the contiguous dimension to reduce LDS bank conflicts while preserving
+    # each 16-byte direct global-to-LDS transfer.
     a_lds_layout = (
-        fx.make_ordered_layout((block_m, block_k), (0, 1))
+        make_transposed_lds_layout(block_m)
         if const_expr(param.a_is_transposed)
         else make_lds_layout(block_m)
     )
     b_lds_layout = (
-        fx.make_ordered_layout((block_n, block_k), (0, 1))
+        make_transposed_lds_layout(block_n)
         if const_expr(not param.b_is_transposed)
         else make_lds_layout(block_n)
     )
@@ -451,16 +459,26 @@ def hgemm_gfx950_kernel(
         )
         return elem_offset % block_k
 
+    def swizzled_row_idx(row, col, layout, rows):
+        elem_offset = fx.get_scalar(fx.crd2idx((row, col), layout))
+        return elem_offset % rows
+
     def async_load_a_to_lds(k_tile, stage):
         lds_ptr = make_wave_lds_ptr(smem_a + stage * block_m * block_k)
         for i in range_constexpr(ldg_a_iters):
             global_tid = block_threads * i + tid
             if const_expr(param.a_is_transposed):
                 ldg_a_x_threads = block_m // async_load_vec_size
-                m_local_idx = (
+                m_lds_idx = (
                     global_tid % ldg_a_x_threads * async_load_vec_size
                 )
                 k_local_idx = global_tid // ldg_a_x_threads
+                m_local_idx = swizzled_row_idx(
+                    m_lds_idx,
+                    k_local_idx,
+                    a_lds_layout,
+                    block_m,
+                )
                 global_m_idx = bid_m * block_m + m_local_idx
                 global_k_idx = k_tile * block_k + k_local_idx
             else:
@@ -495,10 +513,16 @@ def hgemm_gfx950_kernel(
             global_tid = block_threads * i + tid
             if const_expr(not param.b_is_transposed):
                 ldg_b_x_threads = block_n // async_load_vec_size
-                n_local_idx = (
+                n_lds_idx = (
                     global_tid % ldg_b_x_threads * async_load_vec_size
                 )
                 k_local_idx = global_tid // ldg_b_x_threads
+                n_local_idx = swizzled_row_idx(
+                    n_lds_idx,
+                    k_local_idx,
+                    b_lds_layout,
+                    block_n,
+                )
                 global_n_idx = bid_n * block_n + n_local_idx
                 global_k_idx = k_tile * block_k + k_local_idx
             else:
@@ -703,13 +727,19 @@ def hgemm_hti_gfx950_kernel(
             fx.make_ordered_layout((rows, block_k), (1, 0)),
         )
 
+    def make_transposed_lds_layout(rows):
+        return fx.make_composed_layout(
+            swizzle,
+            fx.make_ordered_layout((rows, block_k), (0, 1)),
+        )
+
     a_lds_layout = (
-        fx.make_ordered_layout((half_block_m, block_k), (0, 1))
+        make_transposed_lds_layout(half_block_m)
         if const_expr(param.a_is_transposed)
         else make_lds_layout(half_block_m)
     )
     b_lds_layout = (
-        fx.make_ordered_layout((half_block_n, block_k), (0, 1))
+        make_transposed_lds_layout(half_block_n)
         if const_expr(not param.b_is_transposed)
         else make_lds_layout(half_block_n)
     )
@@ -727,6 +757,10 @@ def hgemm_hti_gfx950_kernel(
         elem_offset = fx.get_scalar(fx.crd2idx((row, col), layout))
         return elem_offset % block_k
 
+    def swizzled_row_idx(row, col, layout, rows):
+        elem_offset = fx.get_scalar(fx.crd2idx((row, col), layout))
+        return elem_offset % rows
+
     def half_a_base(stage, m_part):
         return smem_a + (stage * block_m + m_part * half_block_m) * block_k
 
@@ -739,10 +773,16 @@ def hgemm_hti_gfx950_kernel(
             global_tid = block_threads * i + tid
             if const_expr(param.a_is_transposed):
                 ldg_a_x_threads = half_block_m // async_load_vec_size
-                m_local_idx = (
+                m_lds_idx = (
                     global_tid % ldg_a_x_threads * async_load_vec_size
                 )
                 k_local_idx = global_tid // ldg_a_x_threads
+                m_local_idx = swizzled_row_idx(
+                    m_lds_idx,
+                    k_local_idx,
+                    a_lds_layout,
+                    half_block_m,
+                )
                 global_m_idx = (
                     bid_m * block_m + m_part * half_block_m + m_local_idx
                 )
@@ -781,10 +821,16 @@ def hgemm_hti_gfx950_kernel(
             global_tid = block_threads * i + tid
             if const_expr(not param.b_is_transposed):
                 ldg_b_x_threads = half_block_n // async_load_vec_size
-                n_local_idx = (
+                n_lds_idx = (
                     global_tid % ldg_b_x_threads * async_load_vec_size
                 )
                 k_local_idx = global_tid // ldg_b_x_threads
+                n_local_idx = swizzled_row_idx(
+                    n_lds_idx,
+                    k_local_idx,
+                    b_lds_layout,
+                    half_block_n,
+                )
                 global_n_idx = (
                     bid_n * block_n + n_part * half_block_n + n_local_idx
                 )
