@@ -28,7 +28,6 @@ HGEMM_DTYPE_FP16 = 3
 class SplitKProtocol:
     def __init__(
         self,
-        SPLIT_K,
         BLOCK_M,
         BLOCK_N,
         STG_VEC_SIZE,
@@ -36,7 +35,6 @@ class SplitKProtocol:
         BLOCK_THREADS,
         HAS_BIAS,
     ):
-        self.SPLIT_K = SPLIT_K
         self.BLOCK_M = BLOCK_M
         self.BLOCK_N = BLOCK_N
         self.STG_VEC_SIZE = STG_VEC_SIZE
@@ -148,7 +146,7 @@ class SplitKProtocol:
         self.signal_buf[self.signal_idx] = 0
 
     @flyc.jit
-    def split_k_barrier(self):
+    def split_k_barrier(self, split_k):
         if self.tid == 0:
             cur = fx.Int32(0)
             while cur == 0:
@@ -183,7 +181,7 @@ class SplitKProtocol:
                 syncscope="agent",
                 alignment=4,
             ).result
-            if arrive_idx == self.SPLIT_K - 1:
+            if arrive_idx == split_k - 1:
                 self.reset_sync_state()
         gpu.barrier()
 
@@ -195,7 +193,7 @@ class HGemmGfx950Param:
     block_n: fx.Constexpr[int]
     block_k: fx.Constexpr[int]
     stages: fx.Constexpr[int]
-    split_k: fx.Constexpr[int]
+    is_split_k: fx.Constexpr[bool]
     m_waves: fx.Constexpr[int]
     n_waves: fx.Constexpr[int]
     k_waves: fx.Constexpr[int]
@@ -377,7 +375,7 @@ def make_hgemm_gfx950_param(
         block_n=block_n,
         block_k=block_k,
         stages=stages,
-        split_k=split_k,
+        is_split_k=split_k > 1,
         m_waves=m_waves,
         n_waves=n_waves,
         k_waves=k_waves,
@@ -403,7 +401,7 @@ def make_hgemm_gfx950_param(
 def make_hgemm_gfx950_kernel_name(param: HGemmGfx950Param):
     dtype_str = "fp16" if param.dtype_id == HGEMM_DTYPE_FP16 else "bf16"
     name = f"hgemm_{dtype_str}_t{param.block_m}x{param.block_n}x{param.block_k}x{param.stages}"
-    name += f"_ks{param.split_k}"
+    name += "_ksd" if param.is_split_k else "_ks1"
     name += f"_w{param.m_waves}x{param.n_waves}x{param.k_waves}"
     name += f"_gm{param.group_m}"
     name += f"_bias{int(param.has_bias)}"
@@ -462,13 +460,14 @@ def hgemm_gfx950_kernel(
     m: fx.Int32,
     n: fx.Int32,
     k: fx.Int32,
+    split_k: fx.Int32,
     working_k: fx.Int32,
     a_leading_stride: fx.Int32,
     b_leading_stride: fx.Int32,
     tiled_mma: fx.TiledMma,
     param: HGemmGfx950Param,
 ):
-    is_split_k = param.split_k > 1
+    is_split_k = param.is_split_k
     is_slice_k = param.k_waves > 1
     block_m = param.block_m
     block_n = param.block_n
@@ -491,7 +490,6 @@ def hgemm_gfx950_kernel(
     )
     if const_expr(is_split_k):
         splitk_protocol = SplitKProtocol(
-            param.split_k,
             block_m,
             block_n,
             cshuffle_vec_size,
@@ -909,7 +907,7 @@ def hgemm_gfx950_kernel(
 
     fx.gpu.barrier()
     if const_expr(is_split_k):
-        splitk_protocol.split_k_barrier()
+        splitk_protocol.split_k_barrier(split_k)
         cshuffle_iters = (
             block_m * block_n // block_threads // cshuffle_vec_size
         )
@@ -973,13 +971,14 @@ def hgemm_hti_gfx950_kernel(
     m: fx.Int32,
     n: fx.Int32,
     k: fx.Int32,
+    split_k: fx.Int32,
     working_k: fx.Int32,
     a_leading_stride: fx.Int32,
     b_leading_stride: fx.Int32,
     tiled_mma: fx.TiledMma,
     param: HGemmGfx950Param,
 ):
-    is_split_k = param.split_k > 1
+    is_split_k = param.is_split_k
     block_m = param.block_m
     block_n = param.block_n
     block_k = param.block_k
@@ -1001,7 +1000,6 @@ def hgemm_hti_gfx950_kernel(
     )
     if const_expr(is_split_k):
         splitk_protocol = SplitKProtocol(
-            param.split_k,
             block_m,
             block_n,
             cshuffle_vec_size,
@@ -1583,7 +1581,7 @@ def hgemm_hti_gfx950_kernel(
         compute_double_tile(main_loop_end, False)
 
     if const_expr(is_split_k):
-        splitk_protocol.split_k_barrier()
+        splitk_protocol.split_k_barrier(split_k)
 
     store_half_tile(0, 0, c00)
     store_half_tile(0, 1, c01)
@@ -1599,6 +1597,7 @@ def launch_hgemm_gfx950(
     bias: fx.Tensor,
     semaphore: fx.Tensor,
     signal: fx.Tensor,
+    split_k: fx.Int32,
     param: HGemmGfx950Param,
     stream: fx.Stream = fx.Stream(None),
 ):
@@ -1637,7 +1636,7 @@ def launch_hgemm_gfx950(
             ),
         ),
     )
-    working_k = (k + param.split_k - 1) // param.split_k
+    working_k = (k + split_k - 1) // split_k
     num_pid_m = (m + param.block_m - 1) // param.block_m
     num_pid_n = (n + param.block_n - 1) // param.block_n
     hgemm_kernel_impl = (
@@ -1657,13 +1656,14 @@ def launch_hgemm_gfx950(
         m,
         n,
         k,
+        split_k,
         working_k,
         a_leading_stride,
         b_leading_stride,
         tiled_mma,
         param,
     ).launch(
-        grid=(num_pid_m * num_pid_n, param.split_k, 1),
+        grid=(num_pid_m * num_pid_n, split_k, 1),
         block=(param.block_threads, 1, 1),
         stream=stream,
     )
@@ -1675,8 +1675,9 @@ def make_hgemm_param_and_validate(m, n, k, kwargs):
         result = make_hgemm_gfx950_param(**kwargs)
     except Exception:
         return None
-    working_k = (k + result.split_k - 1) // result.split_k
-    last_working_k = k - (result.split_k - 1) * working_k
+    split_k = kwargs.get("split_k", 1)
+    working_k = (k + split_k - 1) // split_k
+    last_working_k = k - (split_k - 1) * working_k
     cshuffle_vec_size = GFX950_DMA_BYTES // result.out_data_bytes
     async_load_vec_size = GFX950_DMA_BYTES // result.in_data_bytes
     if (
@@ -1687,7 +1688,7 @@ def make_hgemm_param_and_validate(m, n, k, kwargs):
         return None
     num_pid_m = (m + result.block_m - 1) // result.block_m
     num_pid_n = (n + result.block_n - 1) // result.block_n
-    if result.split_k > 1:
+    if split_k > 1:
         c_elements_per_iteration = result.block_threads * cshuffle_vec_size
         if (
             num_pid_m * num_pid_n > SPLIT_K_SEMAPHORE_MAX_LEN
@@ -1839,9 +1840,10 @@ def hgemm(
         HGEMM_DTYPE_FP16 if a.dtype is torch.float16 else HGEMM_DTYPE_BF16
     )
     kwargs["has_bias"] = False if bias is None else True
-    has_k_tail = infer_has_k_tail(
+    split_k = kwargs["split_k"]
+    has_k_tail = split_k > 1 or infer_has_k_tail(
         k=k,
-        split_k=kwargs["split_k"],
+        split_k=split_k,
         block_k=kwargs["block_k"],
         stages=kwargs["stages"],
         use_half_tile_interleaved=kwargs["use_half_tile_interleaved"],
@@ -1863,6 +1865,7 @@ def hgemm(
         bias_tensor,
         semaphore,
         signal,
+        split_k,
         param,
         stream,
     )
