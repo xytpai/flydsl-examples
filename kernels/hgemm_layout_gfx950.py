@@ -7,7 +7,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
-from flydsl.runtime.device import get_rocm_arch, is_rdna_arch
+from flydsl.runtime.device import get_rocm_arch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 
@@ -17,32 +17,12 @@ from .hgemm_wmma_gfx950_utils import (
     get_llvm_ptr,
 )
 
+
 GFX950_DMA_BYTES = 16
 GFX950_WAVE_SIZE = 64
 SPLIT_K_SEMAPHORE_MAX_LEN = 256
 HGEMM_DTYPE_BF16 = 2
 HGEMM_DTYPE_FP16 = 3
-
-
-def make_buffer_rsrc(tensor):
-    """Build a ROCDL buffer resource over a global tensor's base address."""
-    addr = fx.ptrtoint(fx.get_iter(tensor))
-    base = llvm.IntToPtrOp(
-        ir.Type.parse("!llvm.ptr"), fx.as_ir_value(addr)
-    ).result
-    num_records = fx.Int64(0xFFFFFFFF)
-    flags = (7 << 12) | (4 << 15)
-    if is_rdna_arch(get_rocm_arch()):
-        flags |= 1 << 24
-        flags |= 2 << 28
-
-    return rocdl.MakeBufferRsrcOp(
-        ir.Type.parse("!llvm.ptr<8>"),
-        base,
-        fx.Int16(0).ir_value(),
-        num_records.ir_value(),
-        fx.Int32(flags).ir_value(),
-    ).result
 
 
 class SplitKProtocol:
@@ -243,6 +223,7 @@ def make_hgemm_gfx950_param(
     block_n: int = 256,
     block_k: int = 64,
     stages: int = 2,
+    split_k: int = 1,
     m_waves: int = 2,
     n_waves: int = 4,
     group_m: int = 0,
@@ -254,7 +235,6 @@ def make_hgemm_gfx950_param(
     mma_m: int = 16,
     mma_n: int = 16,
     mma_k: int = 32,
-    split_k: int = 1,
 ) -> HGemmGfx950Param:
     if dtype_id not in (HGEMM_DTYPE_BF16, HGEMM_DTYPE_FP16):
         raise ValueError(f"unsupported dtype_id={dtype_id}")
@@ -416,7 +396,7 @@ def make_hgemm_gfx950_kernel_name(param: HGemmGfx950Param):
     name += f"_ktail{int(param.has_k_tail)}"
     a_layout = "t" if param.a_is_transposed else "n"
     b_layout = "t" if param.b_is_transposed else "n"
-    name += f"_layout{a_layout}{b_layout}"
+    name += f"_l{a_layout}{b_layout}"
     name += "_phti" if param.use_half_tile_interleaved else "_pft"
     return name
 
@@ -558,8 +538,10 @@ def hgemm_gfx950_kernel(
             n,
         )
 
-    a_rsrc = make_buffer_rsrc(a)
-    b_rsrc = make_buffer_rsrc(b)
+    a_buf = fx.rocdl.make_buffer_tensor(a, max_size=True)
+    b_buf = fx.rocdl.make_buffer_tensor(b, max_size=True)
+    a_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(a_buf))
+    b_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(b_buf))
 
     s2r_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), elem_dtype)
     g2r_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_dtype)
@@ -1029,8 +1011,10 @@ def hgemm_hti_gfx950_kernel(
             n,
         )
 
-    a_rsrc = make_buffer_rsrc(a)
-    b_rsrc = make_buffer_rsrc(b)
+    a_buf = fx.rocdl.make_buffer_tensor(a, max_size=True)
+    b_buf = fx.rocdl.make_buffer_tensor(b, max_size=True)
+    a_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(a_buf))
+    b_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(b_buf))
 
     s2r_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), elem_dtype)
     g2r_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_dtype)
