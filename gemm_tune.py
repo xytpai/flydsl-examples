@@ -4,7 +4,6 @@ import itertools
 import argparse
 
 import numpy as np
-import torch.nn.functional as F
 from tqdm import tqdm
 from torch.profiler import profile, ProfilerActivity
 from pathlib import Path
@@ -25,12 +24,14 @@ class Args:
     m: int
     n: int
     k: int
+    layout: str
 
 
 @dataclass
 class TunedArgs:
     arch: str
     dtype: str
+    layout: str
     m: int
     n: int
     k: int
@@ -39,10 +40,26 @@ class TunedArgs:
     tflops: float
 
 
+def empty_layout_matrix(rows, cols, dtype, is_t):
+    if is_t:
+        return torch.empty((cols, rows), dtype=dtype, device="cuda").t()
+    return torch.empty((rows, cols), dtype=dtype, device="cuda")
+
+
 def create_inputs(args):
-    a = torch.empty((args.m, args.k), dtype=args.dtype, device="cuda")
+    a = empty_layout_matrix(
+        args.m,
+        args.k,
+        args.dtype,
+        args.layout[0] == "t",
+    )
     a.uniform_(-1, 1)
-    b = torch.empty((args.n, args.k), dtype=args.dtype, device="cuda")
+    b = empty_layout_matrix(
+        args.k,
+        args.n,
+        args.dtype,
+        args.layout[1] == "t",
+    )
     b.uniform_(-1, 1)
     bias = torch.empty((args.n,), dtype=args.dtype, device="cuda")
     bias.uniform_(10, 20)
@@ -59,8 +76,8 @@ def tuning_benchmark(args, kwargs={}, niters=50):
     a, b, bias = create_inputs(args)
     c = create_outputs(args)[0]
     c_ref = create_outputs(args)[0]
-    F.linear(a, b, out=c_ref, bias=bias)
-    hgemm(a, b, c, bias=bias, user_kwargs=kwargs)
+    torch.addmm(bias, a, b, out=c_ref)
+    hgemm(a, b, c, bias=bias, user_kwargs=kwargs, layout=args.layout)
     tol = float(args.k) / 2048 * 6e-1
     is_allclose = torch.allclose(c, c_ref, atol=tol, rtol=tol)
     assert is_allclose
@@ -77,6 +94,7 @@ def tuning_benchmark(args, kwargs={}, niters=50):
                 outputs[i][0],
                 bias=inputs[i][2],
                 user_kwargs=kwargs,
+                layout=args.layout,
             )
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
@@ -136,6 +154,7 @@ def tune_single(args):
     result = TunedArgs(
         arch=gpu_arch,
         dtype=str(args.dtype),
+        layout=args.layout,
         m=args.m,
         n=args.n,
         k=args.k,
@@ -151,6 +170,7 @@ def tune_single(args):
 def tune_all(
     dtype,
     out_prefix,
+    layout,
 ):
     mnks = [
         (8, 4096, 4096),
@@ -175,7 +195,13 @@ def tune_all(
     ]
     with open(f"{out_prefix}.jsonl", "w", encoding="utf-8") as f:
         for mnk in mnks:
-            args = Args(dtype=dtype, m=mnk[0], n=mnk[1], k=mnk[2])
+            args = Args(
+                dtype=dtype,
+                m=mnk[0],
+                n=mnk[1],
+                k=mnk[2],
+                layout=layout,
+            )
             result = tune_single(args)
             result = vars(result)
             f.write(json.dumps(result, ensure_ascii=False) + "\n")
@@ -186,6 +212,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Examples")
     parser.add_argument("--out", type=str, default="temp/hgemm_tuned")
     parser.add_argument("--dtype", type=str, default="bf16")
+    parser.add_argument(
+        "--layout",
+        choices=("nn", "nt", "tn", "tt"),
+        default="nt",
+    )
     parser.add_argument("--single", action="store_true")
     parser.add_argument("--tune_all", action="store_true")
     parser.add_argument("--m", type=int, default=4096)
@@ -198,7 +229,7 @@ if __name__ == "__main__":
     if args.single:
         tune_single(args)
     elif args.tune_all:
-        tune_all(args.dtype, args.out)
+        tune_all(args.dtype, args.out, args.layout)
 
     # rm -rf ~/.flydsl/ ; python3 gemm_tune.py --single --dtype bf16 --m 1024 --n 1024 --k 1024
     # rm -rf ~/.flydsl/ ; python3 gemm_tune.py --single --dtype bf16 --m 2048 --n 2048 --k 2048
