@@ -357,16 +357,25 @@ def hgemm_gfx950_kernel(
         )
 
     def make_transposed_lds_layout(rows):
-        return fx.make_composed_layout(
-            swizzle,
-            fx.make_ordered_layout((rows, block_k), (0, 1)),
-        )
+        # ds_read_tr16 transposes within 16-element groups. Preserve those
+        # groups and XOR two K bits into contiguous-dimension bits [4:6]:
+        # contiguous_idx ^ ((k_idx & 3) << 4).
+        base_layout = fx.make_ordered_layout((rows, block_k), (0, 1))
+        if const_expr(rows == 64):
+            trans_swizzle = fx.static(fx.SwizzleType.get(2, 4, 2))
+            return fx.make_composed_layout(trans_swizzle, base_layout)
+        if const_expr(rows == 128):
+            trans_swizzle = fx.static(fx.SwizzleType.get(2, 4, 3))
+            return fx.make_composed_layout(trans_swizzle, base_layout)
+        if const_expr(rows == 256):
+            trans_swizzle = fx.static(fx.SwizzleType.get(2, 4, 4))
+            return fx.make_composed_layout(trans_swizzle, base_layout)
+        return base_layout
 
     # T-layout A[M, K] is M-contiguous; N-layout B[K, N] is N-contiguous.
     # Keep those physical orders in LDS and use the gfx950 transpose read to
-    # form the K-contiguous MFMA register fragments. Swizzle the vector groups
-    # in the contiguous dimension to reduce LDS bank conflicts while preserving
-    # each 16-byte direct global-to-LDS transfer.
+    # form the K-contiguous MFMA register fragments. The compatible swizzle
+    # preserves the transpose atom's 16-element lane grouping.
     a_lds_layout = (
         make_transposed_lds_layout(block_m)
         if const_expr(param.a_is_transposed)
@@ -459,8 +468,11 @@ def hgemm_gfx950_kernel(
         )
         return elem_offset % block_k
 
-    def swizzled_row_idx(row, col, layout, rows):
-        elem_offset = fx.get_scalar(fx.crd2idx((row, col), layout))
+    def transposed_contiguous_idx(idx, k_idx, layout, rows):
+        # The XOR swizzle is self-inverse. Given the physical contiguous
+        # position written by direct-to-LDS DMA, select the logical global
+        # vector that belongs at that position.
+        elem_offset = fx.get_scalar(fx.crd2idx((idx, k_idx), layout))
         return elem_offset % rows
 
     def async_load_a_to_lds(k_tile, stage):
@@ -473,7 +485,7 @@ def hgemm_gfx950_kernel(
                     global_tid % ldg_a_x_threads * async_load_vec_size
                 )
                 k_local_idx = global_tid // ldg_a_x_threads
-                m_local_idx = swizzled_row_idx(
+                m_local_idx = transposed_contiguous_idx(
                     m_lds_idx,
                     k_local_idx,
                     a_lds_layout,
@@ -517,7 +529,7 @@ def hgemm_gfx950_kernel(
                     global_tid % ldg_b_x_threads * async_load_vec_size
                 )
                 k_local_idx = global_tid // ldg_b_x_threads
-                n_local_idx = swizzled_row_idx(
+                n_local_idx = transposed_contiguous_idx(
                     n_lds_idx,
                     k_local_idx,
                     b_lds_layout,
@@ -728,10 +740,19 @@ def hgemm_hti_gfx950_kernel(
         )
 
     def make_transposed_lds_layout(rows):
-        return fx.make_composed_layout(
-            swizzle,
-            fx.make_ordered_layout((rows, block_k), (0, 1)),
-        )
+        # Keep the 16-element groups required by ds_read_tr16 intact while
+        # spreading the groups across LDS banks with two low K bits.
+        base_layout = fx.make_ordered_layout((rows, block_k), (0, 1))
+        if const_expr(rows == 64):
+            trans_swizzle = fx.static(fx.SwizzleType.get(2, 4, 2))
+            return fx.make_composed_layout(trans_swizzle, base_layout)
+        if const_expr(rows == 128):
+            trans_swizzle = fx.static(fx.SwizzleType.get(2, 4, 3))
+            return fx.make_composed_layout(trans_swizzle, base_layout)
+        if const_expr(rows == 256):
+            trans_swizzle = fx.static(fx.SwizzleType.get(2, 4, 4))
+            return fx.make_composed_layout(trans_swizzle, base_layout)
+        return base_layout
 
     a_lds_layout = (
         make_transposed_lds_layout(half_block_m)
@@ -757,8 +778,8 @@ def hgemm_hti_gfx950_kernel(
         elem_offset = fx.get_scalar(fx.crd2idx((row, col), layout))
         return elem_offset % block_k
 
-    def swizzled_row_idx(row, col, layout, rows):
-        elem_offset = fx.get_scalar(fx.crd2idx((row, col), layout))
+    def transposed_contiguous_idx(idx, k_idx, layout, rows):
+        elem_offset = fx.get_scalar(fx.crd2idx((idx, k_idx), layout))
         return elem_offset % rows
 
     def half_a_base(stage, m_part):
@@ -777,7 +798,7 @@ def hgemm_hti_gfx950_kernel(
                     global_tid % ldg_a_x_threads * async_load_vec_size
                 )
                 k_local_idx = global_tid // ldg_a_x_threads
-                m_local_idx = swizzled_row_idx(
+                m_local_idx = transposed_contiguous_idx(
                     m_lds_idx,
                     k_local_idx,
                     a_lds_layout,
@@ -825,7 +846,7 @@ def hgemm_hti_gfx950_kernel(
                     global_tid % ldg_b_x_threads * async_load_vec_size
                 )
                 k_local_idx = global_tid // ldg_b_x_threads
-                n_local_idx = swizzled_row_idx(
+                n_local_idx = transposed_contiguous_idx(
                     n_lds_idx,
                     k_local_idx,
                     b_lds_layout,

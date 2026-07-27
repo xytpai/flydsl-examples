@@ -510,7 +510,7 @@ def test_hgemm_padded_stride_and_storage_offset(
 # =========================================== benchmark ===========================================
 
 
-@pytest.mark.parametrize("layout", ["nn", "nt", "tn"])
+@pytest.mark.parametrize("layout", ["nn", "nt", "tn", "tt"])
 @pytest.mark.parametrize("dtype", ["bf16"])
 @pytest.mark.parametrize(
     "m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, group_m, has_bias, is_hti",
