@@ -1,7 +1,14 @@
 import flydsl
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import (
+    arith,
+    const_expr,
+    gpu,
+    range_constexpr,
+    rocdl,
+    vector,
+)
 from flydsl.expr.typing import T
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly, llvm, scf
@@ -19,6 +26,73 @@ def get_llvm_ptr(ptr, offset, dtype_bytes, ptr_type):
     llvm_ptr = llvm.IntToPtrOp(ptr_type, llvm_ptr).result
     ptr_v = llvm_ptr._value if const_expr(hasattr(llvm_ptr, "_value")) else llvm_ptr
     return ptr_v
+
+
+def cast_vec_to_global_dtype(
+    vec,
+    vec_size,
+    global_dtype_,
+    is_same_dtype,
+    is_global_f32,
+):
+    if const_expr(is_same_dtype):
+        return vec
+    elems = [arith.constant(0.0, type=global_dtype_)] * vec_size
+    for elem_idx in range_constexpr(vec_size):
+        elem = vector.extract(
+            vec, static_position=[elem_idx], dynamic_position=[]
+        ).extf(T.f32)
+        if const_expr(not is_global_f32):
+            elem = elem.truncf(global_dtype_)
+        elems[elem_idx] = elem
+    return vector.from_elements(T.vec(vec_size, global_dtype_), elems)
+
+
+def atomic_add_f32_vec(c_ptr, global_offset, vec, vec_size):
+    # gfx950 has no packed 2xf32 global/buffer atomic-add instruction.
+    for elem_idx in range_constexpr(vec_size):
+        elem = vector.extract(vec, static_position=[elem_idx], dynamic_position=[])
+        elem_v = elem._value if const_expr(hasattr(elem, "_value")) else elem
+        elem_ptr_v = get_llvm_ptr(
+            c_ptr,
+            global_offset + elem_idx,
+            4,
+            ir.Type.parse("!llvm.ptr<1>"),
+        )
+        llvm.AtomicRMWOp(
+            llvm.AtomicBinOp.fadd,
+            elem_ptr_v,
+            elem_v,
+            llvm.AtomicOrdering.monotonic,
+            syncscope="agent",
+            alignment=4,
+        )
+
+
+def store_global_f32_vec(c_ptr, global_offset, vec, vec_size):
+    rocdl.s_waitcnt(0)
+    for vec_idx in range_constexpr(vec_size // 4):
+        vals = [arith.constant(0.0, type=T.f32)] * 4
+        for elem_idx in range_constexpr(4):
+            vals[elem_idx] = vector.extract(
+                vec,
+                static_position=[vec_idx * 4 + elem_idx],
+                dynamic_position=[],
+            )
+        chunk = vector.from_elements(T.f32x4, vals)
+        chunk_ptr = get_llvm_ptr(
+            c_ptr,
+            global_offset + vec_idx * 4,
+            4,
+            ir.Type.parse("!llvm.ptr<1>"),
+        )
+        llvm.InlineAsmOp(
+            None,
+            [chunk_ptr, chunk],
+            "global_store_dwordx4 $0, $1, off sc0 sc1",
+            "v,v",
+            has_side_effects=True,
+        )
 
 
 class BlockSwizzle:
@@ -117,12 +191,6 @@ class SplitKProtocol:
     @flyc.jit
     def zero_c(self):
         if self.ks_idx == 0:
-            if const_expr(self.STG_VEC_SIZE == 4):
-                store_asm = "global_store_dwordx2 $0, $1, off sc0 sc1"
-            elif const_expr(self.STG_VEC_SIZE == 8):
-                store_asm = "global_store_dwordx4 $0, $1, off sc0 sc1"
-            else:
-                raise NotImplementedError(f"STG_VEC_SIZE={self.STG_VEC_SIZE}")
             zero_vec = fx.full(self.STG_VEC_SIZE, 0.0, self.out_dtype_)
             for i in range_constexpr(self.STG_C_ITERS):
                 global_tid = self.BLOCK_THREADS * i + self.tid
@@ -135,23 +203,41 @@ class SplitKProtocol:
                     init_vec = self.bias_vecs[
                         None, safe_global_n_idx // self.STG_VEC_SIZE
                     ].load()
+                    if const_expr(self.C_DTYPE_BYTES == 4):
+                        init_vec = init_vec.to(self.out_dtype_)
                 else:
                     init_vec = zero_vec
                 if global_m_idx < self.m and global_n_idx < self.n:
                     c_offset = global_m_idx * self.c_stride + global_n_idx
-                    c_ptr = get_llvm_ptr(
-                        self.c_ptr,
-                        c_offset,
-                        self.C_DTYPE_BYTES,
-                        ir.Type.parse("!llvm.ptr<1>"),
-                    )
-                    llvm.InlineAsmOp(
-                        None,
-                        [c_ptr, init_vec],
-                        store_asm,
-                        "v,v",
-                        has_side_effects=True,
-                    )
+                    if const_expr(self.C_DTYPE_BYTES == 4):
+                        store_global_f32_vec(
+                            self.c_ptr,
+                            c_offset,
+                            fx.as_ir_value(init_vec),
+                            self.STG_VEC_SIZE,
+                        )
+                    else:
+                        if const_expr(self.STG_VEC_SIZE == 4):
+                            store_asm = "global_store_dwordx2 $0, $1, off sc0 sc1"
+                        elif const_expr(self.STG_VEC_SIZE == 8):
+                            store_asm = "global_store_dwordx4 $0, $1, off sc0 sc1"
+                        else:
+                            raise NotImplementedError(
+                                f"STG_VEC_SIZE={self.STG_VEC_SIZE}"
+                            )
+                        c_ptr = get_llvm_ptr(
+                            self.c_ptr,
+                            c_offset,
+                            self.C_DTYPE_BYTES,
+                            ir.Type.parse("!llvm.ptr<1>"),
+                        )
+                        llvm.InlineAsmOp(
+                            None,
+                            [c_ptr, init_vec],
+                            store_asm,
+                            "v,v",
+                            has_side_effects=True,
+                        )
             gpu.barrier()
             if self.tid == 0:
                 signal_ptr = get_llvm_ptr(

@@ -16,15 +16,19 @@ from .hgemm_layout_gfx950_utils import (
     SplitKProtocol,
     __barrier,
     __waitcnt,
+    atomic_add_f32_vec,
     buffer_load_lds_inline,
+    cast_vec_to_global_dtype,
     get_wave_lds_offset,
     make_lds_layout,
     make_transposed_lds_layout,
     make_wave_lds_ptr,
+    store_global_f32_vec,
     swizzled_col_idx,
     transposed_contiguous_idx,
 )
 
+HGEMM_DTYPE_FP32 = 1
 HGEMM_DTYPE_BF16 = 2
 HGEMM_DTYPE_FP16 = 3
 
@@ -32,6 +36,7 @@ HGEMM_DTYPE_FP16 = 3
 @fx.struct
 class HGemmGfx950Param:
     dtype_id: fx.Constexpr[int]
+    out_dtype_id: fx.Constexpr[int]
     block_m: fx.Constexpr[int]
     block_n: fx.Constexpr[int]
     block_k: fx.Constexpr[int]
@@ -78,9 +83,16 @@ def make_hgemm_gfx950_param(
     mma_m: int = 16,
     mma_n: int = 16,
     mma_k: int = 32,
+    out_dtype_id: Optional[int] = None,
 ) -> HGemmGfx950Param:
     if dtype_id not in (HGEMM_DTYPE_BF16, HGEMM_DTYPE_FP16):
         raise ValueError(f"unsupported dtype_id={dtype_id}")
+    if out_dtype_id is None:
+        out_dtype_id = dtype_id
+    if out_dtype_id not in (dtype_id, HGEMM_DTYPE_FP32):
+        raise ValueError(
+            f"unsupported out_dtype_id={out_dtype_id} for dtype_id={dtype_id}"
+        )
     if block_m <= 0 or block_n <= 0 or block_k <= 0 or stages <= 0 or split_k <= 0:
         raise ValueError(
             "block_m, block_n, block_k, stages, and split_k must be positive"
@@ -95,7 +107,8 @@ def make_hgemm_gfx950_param(
         raise ValueError("the workgroup cannot contain more than 16 waves")
     if group_m < 0:
         raise ValueError("group_m must be non-negative")
-    in_dbytes = out_dbytes = 2  # for hgemm
+    in_dbytes = 2  # C-shuffle remains in the 16-bit input dtype.
+    out_dbytes = 4 if out_dtype_id == HGEMM_DTYPE_FP32 else 2
     cshuffle_vec_size = 16 // in_dbytes
     if use_half_tile_interleaved:
         if k_waves != 1:
@@ -114,7 +127,7 @@ def make_hgemm_gfx950_param(
     else:
         assert block_n % cshuffle_vec_size == 0
     smem_bytes = stages * (block_m + block_n) * block_k * in_dbytes
-    smem_bytes = max(smem_bytes, k_waves * block_m * block_n * out_dbytes)
+    smem_bytes = max(smem_bytes, k_waves * block_m * block_n * in_dbytes)
     arch = get_rocm_arch()
     SMEM_CAPACITY_MAP = {
         "gfx942": 65536,
@@ -206,6 +219,7 @@ def make_hgemm_gfx950_param(
         )
     return HGemmGfx950Param(
         dtype_id=dtype_id,
+        out_dtype_id=out_dtype_id,
         block_m=block_m,
         block_n=block_n,
         block_k=block_k,
@@ -235,7 +249,8 @@ def make_hgemm_gfx950_param(
 
 def make_hgemm_gfx950_kernel_name(param: HGemmGfx950Param):
     dtype_str = "fp16" if param.dtype_id == HGEMM_DTYPE_FP16 else "bf16"
-    name = f"hgemm_{dtype_str}_t{param.block_m}x{param.block_n}x{param.block_k}x{param.stages}"
+    out_suffix = "_fp32" if param.out_dtype_id == HGEMM_DTYPE_FP32 else ""
+    name = f"hgemm_{dtype_str}{out_suffix}_t{param.block_m}x{param.block_n}x{param.block_k}x{param.stages}"
     name += "_ksd" if param.is_split_k else "_ks1"
     name += f"_w{param.m_waves}x{param.n_waves}x{param.k_waves}"
     name += f"_gm{param.group_m}"
@@ -388,9 +403,12 @@ def hgemm_gfx950_kernel(
     ldg_a_iters = param.ldg_a_iters
     ldg_b_iters = param.ldg_b_iters
     ldg_wait_count = ldg_a_iters + ldg_b_iters
-    cshuffle_vec_size = GFX950_DMA_BYTES // param.out_data_bytes
+    cshuffle_vec_size = GFX950_DMA_BYTES // param.in_data_bytes
     elem_dtype = (
         fx.Float16 if const_expr(param.dtype_id == HGEMM_DTYPE_FP16) else fx.BFloat16
+    )
+    global_output_dtype = (
+        fx.Float32 if const_expr(param.out_dtype_id == HGEMM_DTYPE_FP32) else elem_dtype
     )
     if const_expr(is_split_k):
         splitk_protocol = SplitKProtocol(
@@ -458,14 +476,14 @@ def hgemm_gfx950_kernel(
             n,
             block_m_offset,
             block_n_offset,
-            elem_dtype,
+            global_output_dtype,
             fx.block_idx.x,
             n,
         )
 
     uni_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), elem_dtype)
     buffer_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_dtype)
-    if const_expr(is_split_k):
+    if const_expr(is_split_k and param.out_dtype_id != HGEMM_DTYPE_FP32):
         atomic_copy_atom = fx.make_copy_atom(
             fx.rocdl.BufferAtomicPkAdd(elem_dtype), elem_dtype
         )
@@ -714,39 +732,70 @@ def hgemm_gfx950_kernel(
 
     if const_expr(is_split_k):
         splitk_protocol.split_k_barrier(split_k)
-        cshuffle_iters = block_m * block_n // block_threads // cshuffle_vec_size
-        for i in range_constexpr(cshuffle_iters):
-            global_tid = block_threads * i + tid
-            local_row = global_tid // cshuffle_x_threads
-            local_col = global_tid % cshuffle_x_threads * cshuffle_vec_size
-            global_row = block_m_offset + local_row
-            global_col = block_n_offset + local_col
-            if (global_row < m) and (global_col < n):
-                c_vec = fx.ptr_load(
-                    smem_c + local_row * block_n + local_col,
-                    result_type=fx.Vector.make_type(cshuffle_vec_size, elem_dtype),
-                )
-                for k_slice in range_constexpr(1, k_waves):
-                    peer_c_vec = fx.ptr_load(
-                        smem_c
-                        + k_slice * block_m * block_n
-                        + local_row * block_n
-                        + local_col,
-                        result_type=fx.Vector.make_type(cshuffle_vec_size, elem_dtype),
-                    )
-                    c_vec = c_vec + peer_c_vec
-                buffer_atomic_pk_add_vec(
-                    atomic_copy_atom,
-                    atomic_pair_frag,
-                    atomic_pair_layout,
-                    atomic_pair_type,
-                    out_buf,
-                    global_row * n + global_col,
-                    c_vec.ir_value(),
-                    cshuffle_vec_size,
-                )
     else:
         gpu.barrier()
+
+    if const_expr(is_split_k or param.out_dtype_id == HGEMM_DTYPE_FP32):
+        cshuffle_vectors = block_m * block_n // cshuffle_vec_size
+        cshuffle_iters = (cshuffle_vectors + block_threads - 1) // block_threads
+        for i in range_constexpr(cshuffle_iters):
+            vector_idx = block_threads * i + tid
+            if vector_idx < cshuffle_vectors:
+                local_row = vector_idx // cshuffle_x_threads
+                local_col = vector_idx % cshuffle_x_threads * cshuffle_vec_size
+                global_row = block_m_offset + local_row
+                global_col = block_n_offset + local_col
+                if (global_row < m) and (global_col < n):
+                    c_vec = fx.ptr_load(
+                        smem_c + local_row * block_n + local_col,
+                        result_type=fx.Vector.make_type(cshuffle_vec_size, elem_dtype),
+                    )
+                    for k_slice in range_constexpr(1, k_waves):
+                        peer_c_vec = fx.ptr_load(
+                            smem_c
+                            + k_slice * block_m * block_n
+                            + local_row * block_n
+                            + local_col,
+                            result_type=fx.Vector.make_type(
+                                cshuffle_vec_size, elem_dtype
+                            ),
+                        )
+                        c_vec = c_vec + peer_c_vec
+                    global_offset = global_row * n + global_col
+                    if const_expr(param.out_dtype_id == HGEMM_DTYPE_FP32):
+                        c_vec_global = cast_vec_to_global_dtype(
+                            c_vec.ir_value(),
+                            cshuffle_vec_size,
+                            global_output_dtype.ir_type,
+                            False,
+                            True,
+                        )
+                        if const_expr(is_split_k):
+                            atomic_add_f32_vec(
+                                out,
+                                global_offset,
+                                c_vec_global,
+                                cshuffle_vec_size,
+                            )
+                        else:
+                            store_global_f32_vec(
+                                out,
+                                global_offset,
+                                c_vec_global,
+                                cshuffle_vec_size,
+                            )
+                    else:
+                        buffer_atomic_pk_add_vec(
+                            atomic_copy_atom,
+                            atomic_pair_frag,
+                            atomic_pair_layout,
+                            atomic_pair_type,
+                            out_buf,
+                            global_offset,
+                            c_vec.ir_value(),
+                            cshuffle_vec_size,
+                        )
+    else:
         fx.copy(uni_copy_atom, thr_sC, frag_C_cshuffle)
         for k_slice in range_constexpr(1, k_waves):
             peer_sC = fx.make_view(smem_c + k_slice * block_m * block_n, c_lds_layout)
@@ -791,9 +840,12 @@ def hgemm_hti_gfx950_kernel(
     n_waves = param.n_waves
     half_ldg_a_iters = param.ldg_a_iters // 2
     half_ldg_b_iters = param.ldg_b_iters // 2
-    cshuffle_vec_size = GFX950_DMA_BYTES // param.out_data_bytes
+    cshuffle_vec_size = GFX950_DMA_BYTES // param.in_data_bytes
     elem_dtype = (
         fx.Float16 if const_expr(param.dtype_id == HGEMM_DTYPE_FP16) else fx.BFloat16
+    )
+    global_output_dtype = (
+        fx.Float32 if const_expr(param.out_dtype_id == HGEMM_DTYPE_FP32) else elem_dtype
     )
     if const_expr(is_split_k):
         splitk_protocol = SplitKProtocol(
@@ -859,14 +911,14 @@ def hgemm_hti_gfx950_kernel(
             n,
             block_m_offset,
             block_n_offset,
-            elem_dtype,
+            global_output_dtype,
             fx.block_idx.x,
             n,
         )
 
     uni_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), elem_dtype)
     buffer_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_dtype)
-    if const_expr(is_split_k):
+    if const_expr(is_split_k and param.out_dtype_id != HGEMM_DTYPE_FP32):
         atomic_copy_atom = fx.make_copy_atom(
             fx.rocdl.BufferAtomicPkAdd(elem_dtype), elem_dtype
         )
@@ -1109,7 +1161,7 @@ def hgemm_hti_gfx950_kernel(
                 & (col_idx < n)
             )
 
-        if const_expr(is_split_k):
+        if const_expr(is_split_k or param.out_dtype_id == HGEMM_DTYPE_FP32):
             cshuffle_vectors = half_block_m * half_block_n // cshuffle_vec_size
             cshuffle_iters = (cshuffle_vectors + block_threads - 1) // block_threads
             for i in range_constexpr(cshuffle_iters):
@@ -1126,16 +1178,40 @@ def hgemm_hti_gfx950_kernel(
                                 cshuffle_vec_size, elem_dtype
                             ),
                         )
-                        buffer_atomic_pk_add_vec(
-                            atomic_copy_atom,
-                            atomic_pair_frag,
-                            atomic_pair_layout,
-                            atomic_pair_type,
-                            out_buf,
-                            global_row * n + global_col,
-                            c_vec.ir_value(),
-                            cshuffle_vec_size,
-                        )
+                        global_offset = global_row * n + global_col
+                        if const_expr(param.out_dtype_id == HGEMM_DTYPE_FP32):
+                            c_vec_global = cast_vec_to_global_dtype(
+                                c_vec.ir_value(),
+                                cshuffle_vec_size,
+                                global_output_dtype.ir_type,
+                                False,
+                                True,
+                            )
+                            if const_expr(is_split_k):
+                                atomic_add_f32_vec(
+                                    out,
+                                    global_offset,
+                                    c_vec_global,
+                                    cshuffle_vec_size,
+                                )
+                            else:
+                                store_global_f32_vec(
+                                    out,
+                                    global_offset,
+                                    c_vec_global,
+                                    cshuffle_vec_size,
+                                )
+                        else:
+                            buffer_atomic_pk_add_vec(
+                                atomic_copy_atom,
+                                atomic_pair_frag,
+                                atomic_pair_layout,
+                                atomic_pair_type,
+                                out_buf,
+                                global_offset,
+                                c_vec.ir_value(),
+                                cshuffle_vec_size,
+                            )
         else:
             fx.copy(uni_copy_atom, thr_sC, frag_C_cshuffle)
             fx.copy(buffer_copy_atom, frag_C_cshuffle, thr_gC, pred=pred_C)
@@ -1171,7 +1247,7 @@ def hgemm_hti_gfx950_kernel(
         c11.fill(0.0)
 
     def final_tile_epilogue(k_tile, a1, b0, b1):
-        if const_expr(is_split_k):
+        if const_expr(is_split_k or param.out_dtype_id == HGEMM_DTYPE_FP32):
             consume(k_tile, c10, a1, b0, True)
             rocdl.s_barrier()
             consume(k_tile, c11, a1, b1, True)
@@ -1314,6 +1390,10 @@ def hgemm_hti_gfx950_kernel(
 
     if const_expr(is_split_k):
         splitk_protocol.split_k_barrier(split_k)
+    elif const_expr(param.out_dtype_id == HGEMM_DTYPE_FP32):
+        gpu.barrier()
+
+    if const_expr(is_split_k or param.out_dtype_id == HGEMM_DTYPE_FP32):
         store_half_tile_to_global(0, 0)
         store_half_tile_to_global(0, 1)
         store_half_tile_to_global(1, 0)
@@ -1405,7 +1485,7 @@ def make_hgemm_param_and_validate(m, n, k, kwargs):
     split_k = kwargs.get("split_k", 1)
     working_k = (k + split_k - 1) // split_k
     last_working_k = k - (split_k - 1) * working_k
-    cshuffle_vec_size = GFX950_DMA_BYTES // result.out_data_bytes
+    cshuffle_vec_size = GFX950_DMA_BYTES // result.in_data_bytes
     async_load_vec_size = GFX950_DMA_BYTES // result.in_data_bytes
     if (
         n % cshuffle_vec_size != 0
@@ -1466,6 +1546,7 @@ def hgemm(
     user_kwargs: dict = {},
     stream: Optional[torch.cuda.Stream] = None,
     layout: str = "nt",
+    out_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     """Compute C[M, N] = A[M, K] @ B[K, N].
 
@@ -1473,6 +1554,7 @@ def hgemm(
     N is row-major and T is column-major. Logical tensor shapes never change.
     Set ``user_kwargs["split_k"]`` above 1 to atomically reduce K partitions.
     Set ``user_kwargs["k_waves"]`` above 1 for full-tile workgroup-local slice-K.
+    ``out_dtype`` may be the input dtype or ``torch.float32``.
     """
     if stream is None:
         stream = torch.cuda.current_stream()
@@ -1530,15 +1612,21 @@ def hgemm(
             or b.stride(0) * b.element_size() % GFX950_DMA_BYTES != 0
         ):
             b = b.contiguous()
+    if out_dtype is None:
+        out_dtype = a.dtype if out is None else out.dtype
+    if out_dtype not in (a.dtype, torch.float32):
+        raise ValueError(
+            f"unsupported output dtype {out_dtype}; expected {a.dtype} or torch.float32"
+        )
     if out is None:
-        out = torch.empty((m, n), dtype=a.dtype, device=a.device)
+        out = torch.empty((m, n), dtype=out_dtype, device=a.device)
     else:
-        assert out.dtype == a.dtype
+        assert out.dtype == out_dtype
         assert out.device == device
         assert out.is_contiguous()
     out = out.view(-1, n)
     assert out.shape[0] == m
-    assert out.dtype == a.dtype
+    assert out.dtype == out_dtype
 
     if bias is not None and not bias.is_contiguous():
         bias = bias.contiguous()
@@ -1561,6 +1649,9 @@ def hgemm(
     kwargs["b_is_transposed"] = b_is_transposed
     kwargs["dtype_id"] = (
         HGEMM_DTYPE_FP16 if a.dtype is torch.float16 else HGEMM_DTYPE_BF16
+    )
+    kwargs["out_dtype_id"] = (
+        HGEMM_DTYPE_FP32 if out.dtype is torch.float32 else kwargs["dtype_id"]
     )
     kwargs["has_bias"] = False if bias is None else True
     split_k = kwargs["split_k"]

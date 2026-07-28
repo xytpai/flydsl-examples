@@ -27,6 +27,7 @@ class _TestArgs:
     use_half_tile_interleaved: bool = False
     layout: str = "nt"
     split_k: int = 1
+    out_dtype: torch.dtype | None = None
 
 
 def empty_layout_matrix(rows: int, cols: int, dtype: torch.dtype, is_t: bool):
@@ -59,16 +60,24 @@ def create_inputs(args: _TestArgs):
 
 
 def create_outputs(args: _TestArgs):
-    c = torch.randn((args.m, args.n), dtype=args.dtype, device="cuda")
+    dtype = args.dtype if args.out_dtype is None else args.out_dtype
+    c = torch.randn((args.m, args.n), dtype=dtype, device="cuda")
     return (c,)
 
 
 def ref_func(*args):
     a, b, bias, c, _layout = args
-    if bias is None:
-        torch.mm(a, b, out=c)
+    if c.dtype == a.dtype:
+        if bias is None:
+            torch.mm(a, b, out=c)
+        else:
+            torch.addmm(bias, a, b, out=c)
     else:
-        torch.addmm(bias, a, b, out=c)
+        if bias is None:
+            ref = torch.mm(a.float(), b.float())
+        else:
+            ref = torch.addmm(bias.float(), a.float(), b.float())
+        c.copy_(ref)
 
 
 def make_triton_maxautotune_func():
@@ -399,6 +408,35 @@ def test_hgemm_acc_split_k(
         use_half_tile_interleaved=use_half_tile_interleaved,
         layout=layout,
         split_k=split_k,
+    )
+    check_acc(args)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("split_k", [1, 3])
+@pytest.mark.parametrize("use_half_tile_interleaved", [False, True])
+def test_hgemm_acc_fp32_output(
+    dtype: torch.dtype,
+    split_k: int,
+    use_half_tile_interleaved: bool,
+):
+    args = _TestArgs(
+        dtype=dtype,
+        m=64,
+        n=64,
+        k=480,
+        block_m=64,
+        block_n=64,
+        block_k=64,
+        stages=2,
+        m_waves=2,
+        n_waves=2,
+        k_waves=1,
+        group_m=0,
+        has_bias=True,
+        use_half_tile_interleaved=use_half_tile_interleaved,
+        split_k=split_k,
+        out_dtype=torch.float32,
     )
     check_acc(args)
 
