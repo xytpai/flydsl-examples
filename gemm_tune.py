@@ -1,4 +1,5 @@
 import os
+
 os.environ.setdefault("KINETO_LOG_LEVEL", "6")
 
 import json
@@ -137,8 +138,24 @@ def hgemm_get_configs(args):
     values = selections.values()
     configs = [dict(zip(keys, combo)) for combo in itertools.product(*values)]
     valid_configs = []
+    is_large_gemm = args.m >= 4096 and args.n >= 4096 and args.k >= 4096
     for config in configs:
-        if not config["use_half_tile_interleaved"]:
+        if is_large_gemm:
+            if not (
+                config["use_half_tile_interleaved"]
+                and config["block_m"] == 256
+                and config["block_n"] == 256
+                and config["block_k"] == 64
+                and config["split_k"] == 1
+                and config["stages"] == 2
+                and config["m_waves"] == 2
+                and config["n_waves"] == 4
+                and config["k_waves"] == 1
+            ):
+                continue
+        else:
+            if config["use_half_tile_interleaved"]:
+                continue
             mma_m_iters = config["block_m"] // config["m_waves"] // 16
             mma_n_iters = config["block_n"] // config["n_waves"] // 16
             if mma_m_iters > 4 or mma_n_iters > 4:
@@ -195,6 +212,15 @@ def tune_all(
     enable_split_k=False,
 ):
     mnks = [
+        # splitk
+        # (32, 384, 7168),
+        # (32, 384, 16384),
+        # (800, 384, 7168),
+        # (32, 7168, 2048),
+        # (8, 7168, 2048),
+        # (8, 5120, 2880),
+        # (32, 2880, 2048),
+        # normal
         (8, 4096, 4096),
         (16, 4096, 4096),
         (32, 4096, 4096),
@@ -277,3 +303,4 @@ if __name__ == "__main__":
     # rm -rf ~/.flydsl/ ; python3 gemm_tune.py --single --dtype bf16 --m 32 --n 384 --k 7168
 
     # rm -rf ~/.flydsl/ ; python3 gemm_tune.py --tune_all
+    # rm -rf ~/.flydsl/ ; python3 gemm_tune.py --tune_all --enable_split_k
