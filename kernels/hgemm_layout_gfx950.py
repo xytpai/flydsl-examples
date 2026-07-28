@@ -8,6 +8,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.runtime.device import get_rocm_arch
 from flydsl._mlir.dialects import llvm, vector
 
+from .common import run_cached
 from .hgemm_layout_gfx950_utils import (
     BlockSwizzle,
     GFX950_DMA_BYTES,
@@ -1538,6 +1539,10 @@ def get_split_k_buffers(stream, device):
     return semaphore, signal
 
 
+def _dynamic_tensor_arg(tensor, leading_dim):
+    return flyc.from_dlpack(tensor).mark_layout_dynamic(leading_dim=leading_dim)
+
+
 def hgemm(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -1663,7 +1668,6 @@ def hgemm(
         use_half_tile_interleaved=kwargs["use_half_tile_interleaved"],
     )
     kwargs["has_k_tail"] = has_k_tail
-    bias_tensor = a if bias is None else bias
 
     if bias is not None:
         assert bias.shape[0] == n
@@ -1672,15 +1676,26 @@ def hgemm(
     param = make_hgemm_param_and_validate(m, n, k, kwargs)
     assert param is not None, "unsupported hgemm_layout_gfx950 shape/config"
     semaphore, signal = get_split_k_buffers(stream, device)
-    hgemm_gfx950(
-        out,
-        a,
-        b,
-        bias_tensor,
+    a_arg = _dynamic_tensor_arg(a, 0 if a_is_transposed else 1)
+    b_arg = _dynamic_tensor_arg(b, 0 if b_is_transposed else 1)
+    out_arg = _dynamic_tensor_arg(out, 1)
+    bias_arg = a_arg if bias is None else _dynamic_tensor_arg(bias, 0)
+    dispatch_args = (
+        out_arg,
+        a_arg,
+        b_arg,
+        bias_arg,
         semaphore,
         signal,
         split_k,
         param,
         stream,
+    )
+    run_cached(
+        hgemm_gfx950,
+        *dispatch_args,
+        constexpr_param=param,
+        compiler=flyc.compile,
+        dispatch_args=dispatch_args,
     )
     return out

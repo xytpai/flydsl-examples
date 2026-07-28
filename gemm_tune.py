@@ -45,6 +45,45 @@ class TunedArgs:
     tflops: float
 
 
+@dataclass(frozen=True)
+class GemmTileIoUPruner:
+    m: int
+    n: int
+    k: int
+    keep_ratio: float
+
+    @staticmethod
+    def _ceil_div(value, divisor):
+        return (value + divisor - 1) // divisor
+
+    def _split_k_padded(self, block_k, split_k):
+        working_k = self._ceil_div(self.k, split_k)
+        padded_k = 0
+        for split_idx in range(split_k):
+            remaining_k = max(self.k - split_idx * working_k, 0)
+            part_k = min(working_k, remaining_k)
+            if part_k > 0:
+                padded_k += self._ceil_div(part_k, block_k) * block_k
+        return padded_k
+
+    def _config_iou(self, config):
+        padded_m = self._ceil_div(self.m, config["block_m"]) * config["block_m"]
+        padded_n = self._ceil_div(self.n, config["block_n"]) * config["block_n"]
+        padded_k = self._split_k_padded(config["block_k"], config["split_k"])
+        return (self.m * self.n * self.k) / (padded_m * padded_n * padded_k)
+
+    def prune(self, configs):
+        if not configs:
+            return configs
+        config_ious = [self._config_iou(config) for config in configs]
+        threshold = max(config_ious) * self.keep_ratio
+        return [
+            config
+            for config, iou in zip(configs, config_ious)
+            if iou >= threshold
+        ]
+
+
 def empty_layout_matrix(rows, cols, dtype, is_t):
     if is_t:
         return torch.empty((cols, rows), dtype=dtype, device="cuda").t()
@@ -121,7 +160,9 @@ def tuning_benchmark(args, kwargs={}, niters=50):
 def hgemm_get_configs(args):
     split_k_candidates = [1]
     if args.enable_split_k:
-        split_k_candidates.extend(range(2, 10))
+        split_k_candidates.extend(
+            split_k for split_k in range(2, 10) if args.k % split_k == 0
+        )
     selections = {
         "block_m": [16, 32, 48, 64, 80, 96, 128, 256],
         "block_n": [16, 32, 64, 80, 96, 128, 256],
@@ -137,6 +178,13 @@ def hgemm_get_configs(args):
     keys = selections.keys()
     values = selections.values()
     configs = [dict(zip(keys, combo)) for combo in itertools.product(*values)]
+    keep_ratio = 0.75 if args.m <= 32 else 0.85 if args.m <= 128 else 0.95
+    configs = GemmTileIoUPruner(
+        args.m,
+        args.n,
+        args.k,
+        keep_ratio,
+    ).prune(configs)
     valid_configs = []
     is_large_gemm = args.m >= 4096 and args.n >= 4096 and args.k >= 4096
     for config in configs:
@@ -146,20 +194,19 @@ def hgemm_get_configs(args):
                 and config["block_m"] == 256
                 and config["block_n"] == 256
                 and config["block_k"] == 64
-                and config["split_k"] == 1
                 and config["stages"] == 2
+                and config["split_k"] == 1
                 and config["m_waves"] == 2
                 and config["n_waves"] == 4
                 and config["k_waves"] == 1
             ):
                 continue
         else:
-            if config["use_half_tile_interleaved"]:
-                continue
-            mma_m_iters = config["block_m"] // config["m_waves"] // 16
-            mma_n_iters = config["block_n"] // config["n_waves"] // 16
-            if mma_m_iters > 4 or mma_n_iters > 4:
-                continue
+            if not config["use_half_tile_interleaved"]:
+                mma_m_iters = config["block_m"] // config["m_waves"] // 16
+                mma_n_iters = config["block_n"] // config["n_waves"] // 16
+                if mma_m_iters > 4 or mma_n_iters > 4:
+                    continue
         try:
             param = make_hgemm_param_and_validate(
                 args.m,
