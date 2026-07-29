@@ -7,11 +7,10 @@ from flydsl.expr import (
     gpu,
     range_constexpr,
     rocdl,
-    vector,
 )
 from flydsl.expr.typing import T
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import fly, llvm, scf
+from flydsl._mlir.dialects import fly, llvm, scf, vector
 
 GFX950_DMA_BYTES = 16
 GFX950_WAVE_SIZE = 64

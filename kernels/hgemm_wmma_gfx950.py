@@ -10,7 +10,6 @@ from flydsl.expr import (
     range_constexpr,
     const_expr,
     arith,
-    vector,
     gpu,
     rocdl,
     buffer_ops,
@@ -19,7 +18,7 @@ from flydsl._mlir import ir
 from flydsl.runtime.device import get_rocm_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr, SMEM_CAPACITY_MAP
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl._mlir.dialects import llvm, memref
+from flydsl._mlir.dialects import llvm, memref, vector
 
 from .hgemm_wmma_gfx950_utils import (
     _run_compiled,

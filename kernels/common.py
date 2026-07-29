@@ -12,8 +12,16 @@ def run_cached(
     dispatch_args: tuple[Any, ...],
 ) -> Any:
     """Cache a layout-dynamic FlyDSL dispatcher by constexpr param."""
+    cache_key = constexpr_param.__cache_signature__()
+    compiled_cache = getattr(jit_func, "_compiled_cache", None)
+    if compiled_cache is not None:
+        compiled = compiled_cache.get(cache_key)
+        if compiled is not None:
+            compiled(*dispatch_args)
+            return compiled
+
+    dispatch_after_wait = False
     with _compiled_cache_lock:
-        cache_key = constexpr_param.__cache_signature__()
         compiled_cache = getattr(jit_func, "_compiled_cache", None)
         if compiled_cache is None:
             compiled_cache = {}
@@ -24,5 +32,8 @@ def run_cached(
             compiled = compiler(jit_func, *compile_args)
             compiled_cache[cache_key] = compiled
         else:
-            compiled(*dispatch_args)
-        return compiled
+            dispatch_after_wait = True
+
+    if dispatch_after_wait:
+        compiled(*dispatch_args)
+    return compiled

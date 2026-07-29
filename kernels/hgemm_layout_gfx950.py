@@ -394,6 +394,8 @@ def hgemm_gfx950_kernel(
     block_k = param.block_k
     k_waves = param.k_waves
     k_mma_iters_per_wave = block_k // (k_waves * param.mma_k)
+    mma_m_iters = block_m // (param.m_waves * param.mma_m)
+    mma_n_iters = block_n // (param.n_waves * param.mma_n)
     stages = param.stages
     has_k_tail = param.has_k_tail
     async_load_bytes = param.async_load_bytes
@@ -704,6 +706,15 @@ def hgemm_gfx950_kernel(
         async_load_a_to_lds(stage, stage)
     rocdl.sched_barrier(0)
 
+    def hot_loop_scheduler():
+        rocdl.sched_vmem(ldg_b_iters + ldg_a_iters)
+        for _ in range_constexpr(k_mma_iters_per_wave):
+            rocdl.sched_dsrd(mma_n_iters)
+            rocdl.sched_dsrd(mma_m_iters)
+            for _ in range_constexpr(mma_m_iters):
+                rocdl.sched_mfma(mma_n_iters)
+        rocdl.sched_barrier(0)
+
     if const_expr(has_k_tail):
         main_loop_end = (k_tiles > stages - 1).select(k_tiles - (stages - 1), 0)
     else:
@@ -715,6 +726,7 @@ def hgemm_gfx950_kernel(
         async_load_b_to_lds(k_tile + (stages - 1), write_stage)
         async_load_a_to_lds(k_tile + (stages - 1), write_stage)
         compute_stage(current_stage, k_tile)
+        hot_loop_scheduler()
 
     current_stage = main_loop_end % stages
     for s in range_constexpr(0, stages - 1):
@@ -1660,7 +1672,7 @@ def hgemm(
     )
     kwargs["has_bias"] = False if bias is None else True
     split_k = kwargs["split_k"]
-    has_k_tail = split_k > 1 or infer_has_k_tail(
+    has_k_tail = infer_has_k_tail(
         k=k,
         split_k=split_k,
         block_k=kwargs["block_k"],
