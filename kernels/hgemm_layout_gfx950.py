@@ -1271,22 +1271,20 @@ def hgemm_hti_gfx950_kernel(
             store_half_tile_to_lds(1, 1, c11)
         else:
             rocdl.s_barrier()
-            rocdl.sched_barrier(0)
+            consume(k_tile, c10, a1, b0, True)
+            rocdl.s_barrier()
+            consume(k_tile, c11, a1, b1, True)
+            __barrier(0)
             store_half_tile_to_lds(0, 0, c00)
             store_half_tile_to_lds(0, 1, c01)
-            consume(k_tile, c10, a1, b0, False)
-            rocdl.sched_barrier(0)
-            rocdl.s_barrier()
-            rocdl.sched_barrier(0)
+            __barrier(0)
             store_half_tile_to_global(0, 0)
             store_half_tile_to_global(0, 1)
+            __barrier(0)
             store_half_tile_to_lds(1, 0, c10)
-            consume(k_tile, c11, a1, b1, False)
-            rocdl.sched_barrier(0)
-            rocdl.s_barrier()
-            store_half_tile_to_global(1, 0)
             store_half_tile_to_lds(1, 1, c11)
-            rocdl.s_barrier()
+            __barrier(0)
+            store_half_tile_to_global(1, 0)
             store_half_tile_to_global(1, 1)
 
     def compute_loaded_tile(k_tile, read_stage, is_final):
@@ -1456,7 +1454,9 @@ def hgemm_gfx950(
             ),
         ),
     )
+    split_alignment = GFX950_DMA_BYTES // param.in_data_bytes
     working_k = (k + split_k - 1) // split_k
+    working_k = (working_k + split_alignment - 1) // split_alignment * split_alignment
     num_pid_m = (m + param.block_m - 1) // param.block_m
     num_pid_n = (n + param.block_n - 1) // param.block_n
     hgemm_kernel_impl = (
@@ -1496,15 +1496,16 @@ def make_hgemm_param_and_validate(m, n, k, kwargs):
     except Exception:
         return None
     split_k = kwargs.get("split_k", 1)
+    async_load_vec_size = GFX950_DMA_BYTES // result.in_data_bytes
     working_k = (k + split_k - 1) // split_k
+    working_k = (
+        (working_k + async_load_vec_size - 1)
+        // async_load_vec_size
+        * async_load_vec_size
+    )
     last_working_k = k - (split_k - 1) * working_k
     cshuffle_vec_size = GFX950_DMA_BYTES // result.in_data_bytes
-    async_load_vec_size = GFX950_DMA_BYTES // result.in_data_bytes
-    if (
-        n % cshuffle_vec_size != 0
-        or k % async_load_vec_size != 0
-        or last_working_k <= 0
-    ):
+    if n % cshuffle_vec_size != 0 or k % async_load_vec_size != 0 or last_working_k < 0:
         return None
     num_pid_m = (m + result.block_m - 1) // result.block_m
     num_pid_n = (n + result.block_n - 1) // result.block_n
@@ -1525,7 +1526,13 @@ def infer_has_k_tail(
     stages: int,
     use_half_tile_interleaved: bool,
 ):
+    async_load_vec_size = GFX950_DMA_BYTES // 2
     working_k = (k + split_k - 1) // split_k
+    working_k = (
+        (working_k + async_load_vec_size - 1)
+        // async_load_vec_size
+        * async_load_vec_size
+    )
     last_working_k = k - (split_k - 1) * working_k
     working_k_tiles = (working_k + block_k - 1) // block_k
     last_working_k_tiles = (last_working_k + block_k - 1) // block_k
