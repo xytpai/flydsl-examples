@@ -4,7 +4,9 @@ from typing import Optional
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl._mlir import ir
+from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch
 from flydsl._mlir.dialects import llvm, vector
 
@@ -20,6 +22,7 @@ from .hgemm_universal_gfx950_utils import (
     atomic_add_f32_vec,
     buffer_load_lds_inline,
     cast_vec_to_global_dtype,
+    get_llvm_ptr,
     get_wave_lds_offset,
     make_lds_layout,
     make_transposed_lds_layout,
@@ -1215,12 +1218,26 @@ def hgemm_hti_gfx950_kernel(
                                     cshuffle_vec_size,
                                 )
                             else:
-                                store_global_f32_vec(
-                                    out,
-                                    global_offset,
-                                    c_vec_global,
-                                    cshuffle_vec_size,
-                                )
+                                for vec_idx in range_constexpr(cshuffle_vec_size // 4):
+                                    vals = [arith.constant(0.0, type=T.f32)] * 4
+                                    for elem_idx in range_constexpr(4):
+                                        vals[elem_idx] = vector.extract(
+                                            c_vec_global,
+                                            static_position=[vec_idx * 4 + elem_idx],
+                                            dynamic_position=[],
+                                        )
+                                    chunk = vector.from_elements(T.f32x4, vals)
+                                    chunk_ptr = get_llvm_ptr(
+                                        out,
+                                        global_offset + vec_idx * 4,
+                                        4,
+                                        ir.Type.parse("!llvm.ptr<1>"),
+                                    )
+                                    llvm.StoreOp(
+                                        chunk,
+                                        chunk_ptr,
+                                        alignment=16,
+                                    )
                         else:
                             buffer_atomic_pk_add_vec(
                                 atomic_copy_atom,
@@ -1414,6 +1431,7 @@ def hgemm_hti_gfx950_kernel(
     if const_expr(is_split_k or param.out_dtype_id == HGEMM_DTYPE_FP32):
         store_half_tile_to_global(0, 0)
         store_half_tile_to_global(0, 1)
+        rocdl.s_barrier()
         store_half_tile_to_global(1, 0)
         store_half_tile_to_global(1, 1)
 
