@@ -8,6 +8,8 @@ scratch in Python while keeping tiling, data movement, LDS usage, scheduling,
 and MFMA execution explicit. The programming model is similar in spirit
 to CUDA/CuTeDSL, but targets AMD GPUs through FlyDSL and ROCDL.
 
+![HGEMM BF16 benchmark versus Torch hipBLAS](images/hgemm_benchmark.svg)
+
 > This is an experimental kernel repository, not a general-purpose BLAS
 > library. Kernel configurations and constraints are intentionally exposed for
 > performance analysis and tuning.
@@ -171,16 +173,6 @@ python torch_benchmark.py \
 ```
 
 Use `--shape-index` to run a single built-in shape.
-
-## Results
-
-### FlyDSL versus Torch hipBLAS
-
-![HGEMM BF16 benchmark versus Torch hipBLAS](images/hgemm_benchmark.svg)
-
-### Three-way comparison
-
-![HGEMM benchmark across FlyDSL, Triton, and Torch](images/hgemm_ft_benchmark_3way.svg)
 
 ## Repository Structure
 
