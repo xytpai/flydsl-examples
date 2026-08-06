@@ -6,13 +6,9 @@ Unofficial, hardware-oriented GEMM implementations built with
 This repository demonstrates how to write high-performance GPU kernels from
 scratch in Python while keeping tiling, data movement, LDS usage, scheduling,
 and MFMA execution explicit. The programming model is similar in spirit
-to CUDA/CuTeDSL, but targets AMD GPUs through FlyDSL and ROCDL.
+to CUDA/CuTeDSL, but targets AMD GPUs through FlyDSL.
 
 ![HGEMM BF16 benchmark versus Torch hipBLAS](images/hgemm_benchmark.svg)
-
-> This is an experimental kernel repository, not a general-purpose BLAS
-> library. Kernel configurations and constraints are intentionally exposed for
-> performance analysis and tuning.
 
 ## Highlights
 
