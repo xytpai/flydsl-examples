@@ -1,46 +1,202 @@
-# FlyDSL Examples
+# FlyDSL GEMM Examples
 
-Unofficial GEMM kernel examples built with [FlyDSL](https://github.com/ROCm/FlyDSL) for AMD GPUs.
+Unofficial, hardware-oriented GEMM implementations built with
+[FlyDSL](https://github.com/ROCm/FlyDSL) for AMD gfx950 GPUs.
 
-The goal of this repository is to show how to write high-performance GEMM kernels from scratch in Python, while keeping the implementation close enough to the hardware to reason about tiling, memory movement, and WMMA/MFMA execution. The programming style is similar in spirit to CUDA/CuteDSL, but targets AMD GPUs through FlyDSL.
+This repository demonstrates how to write high-performance GPU kernels from
+scratch in Python while keeping tiling, data movement, LDS usage, scheduling,
+and MFMA execution explicit. The programming model is similar in spirit
+to CUDA/CuTeDSL, but targets AMD GPUs through FlyDSL and ROCDL.
 
-## Kernels
+> This is an experimental kernel repository, not a general-purpose BLAS
+> library. Kernel configurations and constraints are intentionally exposed for
+> performance analysis and tuning.
 
-- [x] FP16/BF16 GEMM WMMA for MI355
-- [x] FP8 PTPC GEMM WMMA for MI355
+## Highlights
 
-## Results
+### A16W16 universal GEMM
 
-![HGEMM BF16 benchmark vs Torch hipBLAS](images/hgemm_benchmark.svg)
+`kernels/hgemm_universal_gfx950.py` provides a layout-dynamic FP16/BF16 GEMM with:
 
-## FlyDSL install from source
+- `NN`, `NT`, `TN`, and `TT` matrix layouts
+- FP16 and BF16 inputs
+- Input-dtype or FP32 output
+- Optional bias
+- Workgroup-local slice-K via `k_waves`
+- Cross-workgroup split-K with atomic reduction
+- K-tail and boundary-tile handling
+- Small-M configurations
+- Half-tile interleaved (HTI) scheduling
+- Dynamic leading strides, padded strides, and storage offsets
+- Configurable tiles, stages, wave decomposition, and XCD block swizzle
+
+HTI currently requires `stages=2`, `m_waves=2`, and `k_waves=1`.
+Inputs and dimensions must satisfy the kernel's vector-alignment constraints.
+
+## Layout Convention
+
+Layout characters describe physical tensor strides without changing logical
+shapes:
+
+- `N`: row-major storage
+- `T`: column-major storage
+
+For example, `layout="nt"` expects logical shapes `A[M, K]` and `B[K, N]`,
+with A stored row-major and B stored column-major.
+
+## Quick Start
+
+```python
+import torch
+
+from kernels.hgemm_universal_gfx950 import hgemm
+
+m, n, k = 2048, 4096, 4096
+a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16).t()
+
+c = hgemm(
+    a,
+    b,
+    layout="nt",
+    user_kwargs={
+        "block_m": 128,
+        "block_n": 256,
+        "block_k": 64,
+        "stages": 3,
+        "split_k": 1,
+        "m_waves": 4,
+        "n_waves": 4,
+        "k_waves": 1,
+        "group_m": 4,
+        "use_half_tile_interleaved": False,
+    },
+)
+```
+
+## Requirements
+
+- Linux with ROCm
+- AMD gfx950-class GPU
+- ROCm-enabled PyTorch
+- FlyDSL built from source
+
+## Install FlyDSL from Source
+
+The following revision is the version used by this repository:
 
 ```bash
 pip uninstall -y flydsl
 git clone git@github.com:ROCm/FlyDSL.git
-cd FlyDSL ; git checkout 9a5c08e77355f915ad35965bea8ea88f0af33bf3
-git submodule sync && git submodule update --init --recursive
+cd FlyDSL
+git checkout 9a5c08e77355f915ad35965bea8ea88f0af33bf3
+git submodule sync
+git submodule update --init --recursive
 bash scripts/build_llvm.sh -j64
 bash scripts/build.sh -j64
 pip install -e .
 ```
 
-## Run Tests And Benchmarks
+## Tests
+
+Run the universal GEMM correctness suite:
 
 ```bash
-rm -rf ~/.flydsl/ ; pytest -sv test_hgemm.py
+pytest -sv test_hgemm_universal.py
 ```
 
-## Use code agent to scale the kernel to your hardware
+Run a focused layout test:
 
 ```bash
-python agent/agent.py --input=agent/instructions/flydsl_gemm_mi308_support.txt
+pytest -sv test_hgemm_universal.py -k "main_loop and nt"
+```
+
+After changing FlyDSL compiler or kernel sources, clear the JIT cache when
+needed:
+
+```bash
+rm -rf ~/.flydsl/cache
+```
+
+## Policy Tuning
+
+Tune one shape:
+
+```bash
+python gemm_tune.py \
+  --single \
+  --dtype bf16 \
+  --layout nt \
+  --m 2048 \
+  --n 4096 \
+  --k 4096
+```
+
+Include split-K policies:
+
+```bash
+python gemm_tune.py \
+  --single \
+  --dtype bf16 \
+  --layout nt \
+  --m 32 \
+  --n 384 \
+  --k 7168 \
+  --enable-split-k
+```
+
+Tune the built-in shape collection:
+
+```bash
+python gemm_tune.py \
+  --tune_all \
+  --dtype bf16 \
+  --layout nt \
+  --out temp/hgemm_tuned
+```
+
+The tuner validates each policy, compiles policies in parallel, benchmarks
+successful candidates, and writes the selected configurations to JSONL.
+Use `--compile-workers` to control policy compilation concurrency.
+
+## PyTorch Backend Comparison
+
+Compare ATen/hipBLAS, Triton, and FlyDSL through `torch.compile`:
+
+```bash
+python torch_benchmark.py \
+  --backend all \
+  --dtype bfloat16 \
+  --output temp/torch_benchmark.jsonl
+```
+
+Use `--shape-index` to run a single built-in shape.
+
+## Results
+
+### FlyDSL versus Torch hipBLAS
+
+![HGEMM BF16 benchmark versus Torch hipBLAS](images/hgemm_benchmark.svg)
+
+### Three-way comparison
+
+![HGEMM benchmark across FlyDSL, Triton, and Torch](images/hgemm_ft_benchmark_3way.svg)
+
+## Repository Structure
+
+```text
+kernels/
+  hgemm_universal_gfx950.py        # A16W16 universal GEMM
+  hgemm_universal_gfx950_utils.py  # Layout, LDS, split-K, and store helpers
+test_hgemm_universal.py            # Universal GEMM correctness and benchmarks
+gemm_tune.py                    # Policy search and tuning
+torch_benchmark.py              # torch.compile backend comparison
 ```
 
 ## References
 
 - [FlyDSL](https://github.com/ROCm/FlyDSL)
-- [MLIR docs](https://mlir.llvm.org/docs/)
+- [MLIR documentation](https://mlir.llvm.org/docs/)
 - [ROCm blog: Accelerating LLM inference on AMD GPUs with low-latency GEMMs](https://rocm.blogs.amd.com/software-tools-optimization/accelerating-llm-inference-on-amd-gpus-with-low-latency-gemms/README.html)
 
 Contact: xytpai@gmail.com

@@ -4,7 +4,7 @@ import itertools
 from torch.profiler import profile, ProfilerActivity
 from dataclasses import dataclass
 
-from kernels.hgemm_layout_gfx950 import hgemm, make_hgemm_gfx950_param
+from kernels.hgemm_universal_gfx950 import hgemm, make_hgemm_gfx950_param
 
 ROTARY_INPUTS_TARGET_BYTES = 8 * 1024**3
 
@@ -528,6 +528,7 @@ def test_hgemm_acc_small_m(
         (2048, 2048, 2048, 128, 128, 64, 3, 4, 2, 0, True, False),
         (4096, 4096, 4096, 256, 256, 64, 2, 2, 4, 4, True, True),
         (4096, 4096, 8192, 256, 256, 64, 2, 2, 4, 4, True, True),
+        (8160, 8160, 8160, 256, 256, 64, 2, 2, 4, 0, True, True),
         (8192, 8192, 8192, 256, 256, 64, 2, 2, 4, 0, True, True),
         (16384, 16384, 16384, 256, 256, 64, 2, 2, 4, 4, True, True),
         (8, 7168, 2048, 16, 16, 128, 8, 1, 1, 4, True, False),
@@ -673,6 +674,7 @@ def test_hgemm_padded_stride_and_storage_offset(
         (2048, 2048, 2048, 128, 128, 64, 3, 4, 2, 0, True, False),
         (4096, 4096, 4096, 256, 256, 64, 2, 2, 4, 4, True, True),
         (4096, 4096, 8192, 256, 256, 64, 2, 2, 4, 4, True, True),
+        (8160, 8160, 8160, 256, 256, 64, 2, 2, 4, 0, True, True),
         (8192, 8192, 8192, 256, 256, 64, 2, 2, 4, 0, True, True),
         (16384, 16384, 16384, 256, 256, 64, 2, 2, 4, 4, True, True),
         (8, 7168, 2048, 16, 16, 128, 8, 1, 1, 4, True, False),

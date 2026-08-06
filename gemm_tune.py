@@ -16,7 +16,7 @@ from pathlib import Path
 from dataclasses import dataclass
 from flydsl.runtime.device import get_rocm_arch
 
-from kernels.hgemm_layout_gfx950 import hgemm, make_hgemm_param_and_validate
+from kernels.hgemm_universal_gfx950 import hgemm, make_hgemm_param_and_validate
 
 DEFAULT_COMPILE_WORKERS = 32
 _COMPILE_TENSORS = None

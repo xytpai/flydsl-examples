@@ -9,7 +9,7 @@ from flydsl.runtime.device import get_rocm_arch
 from flydsl._mlir.dialects import llvm, vector
 
 from .common import run_cached
-from .hgemm_layout_gfx950_utils import (
+from .hgemm_universal_gfx950_utils import (
     BlockSwizzle,
     GFX950_DMA_BYTES,
     GFX950_WAVE_SIZE,
@@ -650,7 +650,7 @@ def hgemm_gfx950_kernel(
             async_load_context,
         )
 
-    def compute_stage(read_stage, k_tile):
+    def compute_stage(read_stage, k_tile, mask_k_tail=False):
         thr_sA_s2r = thr_copy_A.partition_S(
             fx.make_view(smem_a + read_stage * block_m * block_k, a_lds_layout)
         )
@@ -670,7 +670,7 @@ def hgemm_gfx950_kernel(
                 thr_sA_s2r[None, None, block_k_iter],
                 frag_A_retile[None, None, block_k_iter],
             )
-            if const_expr(has_k_tail):
+            if const_expr(mask_k_tail):
                 frag_a_k_coords = thr_mma_aK[None, None, block_k_iter]
                 for i in range_constexpr(fx.size(frag_A_chunk.shape).unpack()):
                     local_k_idx = fx.get_scalar(frag_a_k_coords[i])
@@ -690,7 +690,7 @@ def hgemm_gfx950_kernel(
             if k_wave_idx == k_slice:
                 for block_k_iter in range_constexpr(k_mma_iters_per_wave):
                     k_iter = k_slice * k_mma_iters_per_wave + block_k_iter
-                    if const_expr(has_k_tail):
+                    if const_expr(mask_k_tail):
                         global_k_iter = (
                             ks_begin + k_tile * block_k + k_iter * param.mma_k
                         )
@@ -731,7 +731,7 @@ def hgemm_gfx950_kernel(
     current_stage = main_loop_end % stages
     for s in range_constexpr(0, stages - 1):
         __barrier((stages - 2 - s) * ldg_wait_count)
-        compute_stage(current_stage, main_loop_end + s)
+        compute_stage(current_stage, main_loop_end + s, has_k_tail)
         current_stage = (current_stage + 1) % stages
 
     frag_C_out = fx.make_fragment_like(frag_C, elem_dtype)
@@ -1040,7 +1040,7 @@ def hgemm_hti_gfx950_kernel(
         gC = make_gC(m_part, n_part)
         return thr_mma.make_fragment_C(gC)
 
-    def load_a_fragment(m_part, read_stage, k_tile):
+    def load_a_fragment(m_part, read_stage, k_tile, mask_k_tail=False):
         sA = fx.make_view(half_a_base(read_stage, m_part), a_lds_layout)
         frag_A = thr_mma.make_fragment_A(sA)
         frag_A_retile = thr_copy_A.retile(frag_A)
@@ -1053,7 +1053,7 @@ def hgemm_hti_gfx950_kernel(
                 thr_sA_s2r[None, None, block_k_iter],
                 frag_A_retile[None, None, block_k_iter],
             )
-            if const_expr(has_k_tail):
+            if const_expr(mask_k_tail):
                 frag_a_k_coords = thr_mma_aK[None, None, block_k_iter]
                 global_k_base = ks_begin + k_tile * block_k
                 for i in range_constexpr(fx.size(frag_A_chunk.shape).unpack()):
@@ -1062,7 +1062,7 @@ def hgemm_hti_gfx950_kernel(
                     frag_A_chunk[i] = valid_k.select(frag_A_chunk[i], elem_dtype(0.0))
 
         for block_k_iter in range_constexpr(block_k // param.mma_k):
-            if const_expr(has_k_tail):
+            if const_expr(mask_k_tail):
                 global_k_iter = ks_begin + k_tile * block_k + block_k_iter * param.mma_k
                 if global_k_iter < ks_end:
                     copy_k_chunk(block_k_iter)
@@ -1070,14 +1070,14 @@ def hgemm_hti_gfx950_kernel(
                 copy_k_chunk(block_k_iter)
         return frag_A
 
-    def load_b_fragment(n_part, read_stage, k_tile):
+    def load_b_fragment(n_part, read_stage, k_tile, mask_k_tail=False):
         sB = fx.make_view(half_b_base(read_stage, n_part), b_lds_layout)
         frag_B = thr_mma.make_fragment_B(sB)
         frag_B_retile = thr_copy_B.retile(frag_B)
         thr_sB_s2r = thr_copy_B.partition_S(sB)
 
         for block_k_iter in range_constexpr(block_k // param.mma_k):
-            if const_expr(has_k_tail):
+            if const_expr(mask_k_tail):
                 global_k_iter = ks_begin + k_tile * block_k + block_k_iter * param.mma_k
                 if global_k_iter < ks_end:
                     fx.copy(
@@ -1093,11 +1093,18 @@ def hgemm_hti_gfx950_kernel(
                 )
         return frag_B
 
-    def consume(k_tile, frag_C, frag_A, frag_B, emit_sched_barrier):
+    def consume(
+        k_tile,
+        frag_C,
+        frag_A,
+        frag_B,
+        emit_sched_barrier,
+        mask_k_tail=False,
+    ):
         if const_expr(emit_sched_barrier):
             rocdl.sched_barrier(0)
         for block_k_iter in range_constexpr(block_k // param.mma_k):
-            if const_expr(has_k_tail):
+            if const_expr(mask_k_tail):
                 global_k_iter = ks_begin + k_tile * block_k + block_k_iter * param.mma_k
                 if global_k_iter < ks_end:
                     fx.gemm(
@@ -1259,11 +1266,11 @@ def hgemm_hti_gfx950_kernel(
         c10.fill(0.0)
         c11.fill(0.0)
 
-    def final_tile_epilogue(k_tile, a1, b0, b1):
+    def final_tile_epilogue(k_tile, a1, b0, b1, mask_k_tail):
         if const_expr(is_split_k or param.out_dtype_id == HGEMM_DTYPE_FP32):
-            consume(k_tile, c10, a1, b0, True)
+            consume(k_tile, c10, a1, b0, True, mask_k_tail)
             rocdl.s_barrier()
-            consume(k_tile, c11, a1, b1, True)
+            consume(k_tile, c11, a1, b1, True, mask_k_tail)
             gpu.barrier()
             store_half_tile_to_lds(0, 0, c00)
             store_half_tile_to_lds(0, 1, c01)
@@ -1271,9 +1278,9 @@ def hgemm_hti_gfx950_kernel(
             store_half_tile_to_lds(1, 1, c11)
         else:
             rocdl.s_barrier()
-            consume(k_tile, c10, a1, b0, True)
+            consume(k_tile, c10, a1, b0, True, mask_k_tail)
             rocdl.s_barrier()
-            consume(k_tile, c11, a1, b1, True)
+            consume(k_tile, c11, a1, b1, True, mask_k_tail)
             __barrier(0)
             store_half_tile_to_lds(0, 0, c00)
             store_half_tile_to_lds(0, 1, c01)
@@ -1288,80 +1295,80 @@ def hgemm_hti_gfx950_kernel(
             store_half_tile_to_global(1, 1)
 
     def compute_loaded_tile(k_tile, read_stage, is_final):
-        b0 = load_b_fragment(0, read_stage, k_tile)
-        a0 = load_a_fragment(0, read_stage, k_tile)
-        consume(k_tile, c00, a0, b0, True)
+        b0 = load_b_fragment(0, read_stage, k_tile, has_k_tail)
+        a0 = load_a_fragment(0, read_stage, k_tile, has_k_tail)
+        consume(k_tile, c00, a0, b0, True, has_k_tail)
 
-        b1 = load_b_fragment(1, read_stage, k_tile)
-        consume(k_tile, c01, a0, b1, True)
+        b1 = load_b_fragment(1, read_stage, k_tile, has_k_tail)
+        consume(k_tile, c01, a0, b1, True, has_k_tail)
 
-        a1 = load_a_fragment(1, read_stage, k_tile)
+        a1 = load_a_fragment(1, read_stage, k_tile, has_k_tail)
         if const_expr(is_final):
-            final_tile_epilogue(k_tile, a1, b0, b1)
+            final_tile_epilogue(k_tile, a1, b0, b1, has_k_tail)
         else:
-            consume(k_tile, c10, a1, b0, True)
-            consume(k_tile, c11, a1, b1, True)
+            consume(k_tile, c10, a1, b0, True, has_k_tail)
+            consume(k_tile, c11, a1, b1, True, has_k_tail)
 
-    def compute_double_tile(k_tile, prefetch_next):
+    def compute_double_tile(k_tile, prefetch_next, mask_k_tail):
         next_k_tile = k_tile + 2
 
-        b0 = load_b_fragment(0, 0, k_tile)
-        a0 = load_a_fragment(0, 0, k_tile)
+        b0 = load_b_fragment(0, 0, k_tile, mask_k_tail)
+        a0 = load_a_fragment(0, 0, k_tile, mask_k_tail)
         async_load_a_to_lds(1, k_tile + 1, 1)
         rocdl.s_barrier()
-        consume(k_tile, c00, a0, b0, True)
+        consume(k_tile, c00, a0, b0, True, mask_k_tail)
         rocdl.s_barrier()
 
-        b1 = load_b_fragment(1, 0, k_tile)
+        b1 = load_b_fragment(1, 0, k_tile, mask_k_tail)
         if const_expr(prefetch_next):
             async_load_b_to_lds(0, next_k_tile, 0)
             rocdl.s_barrier()
-        consume(k_tile, c01, a0, b1, True)
+        consume(k_tile, c01, a0, b1, True, mask_k_tail)
         rocdl.s_barrier()
 
-        a1 = load_a_fragment(1, 0, k_tile)
+        a1 = load_a_fragment(1, 0, k_tile, mask_k_tail)
         if const_expr(prefetch_next):
             async_load_a_to_lds(0, next_k_tile, 0)
             rocdl.s_barrier()
-        consume(k_tile, c10, a1, b0, True)
+        consume(k_tile, c10, a1, b0, True, mask_k_tail)
         rocdl.s_barrier()
 
-        b0 = load_b_fragment(0, 1, k_tile + 1)
+        b0 = load_b_fragment(0, 1, k_tile + 1, mask_k_tail)
         if const_expr(prefetch_next):
             async_load_b_to_lds(1, next_k_tile, 0)
             __barrier(2 * half_ldg_b_iters + half_ldg_a_iters)
-        consume(k_tile, c11, a1, b1, True)
+        consume(k_tile, c11, a1, b1, True, mask_k_tail)
         if const_expr(not prefetch_next):
             __waitcnt(0)
         rocdl.s_barrier()
 
-        a0 = load_a_fragment(0, 1, k_tile + 1)
+        a0 = load_a_fragment(0, 1, k_tile + 1, mask_k_tail)
         if const_expr(prefetch_next):
             async_load_a_to_lds(1, next_k_tile, 0)
             rocdl.s_barrier()
-        consume(k_tile + 1, c00, a0, b0, True)
+        consume(k_tile + 1, c00, a0, b0, True, mask_k_tail)
         rocdl.s_barrier()
 
-        b1 = load_b_fragment(1, 1, k_tile + 1)
+        b1 = load_b_fragment(1, 1, k_tile + 1, mask_k_tail)
         if const_expr(prefetch_next):
             async_load_b_to_lds(0, next_k_tile + 1, 1)
             rocdl.s_barrier()
-        consume(k_tile + 1, c01, a0, b1, True)
+        consume(k_tile + 1, c01, a0, b1, True, mask_k_tail)
         rocdl.s_barrier()
 
-        a1 = load_a_fragment(1, 1, k_tile + 1)
+        a1 = load_a_fragment(1, 1, k_tile + 1, mask_k_tail)
         if const_expr(prefetch_next):
             async_load_a_to_lds(0, next_k_tile + 1, 1)
             rocdl.s_barrier()
-            consume(k_tile + 1, c10, a1, b0, True)
+            consume(k_tile + 1, c10, a1, b0, True, mask_k_tail)
             rocdl.s_barrier()
 
             async_load_b_to_lds(1, next_k_tile + 1, 1)
             __barrier(half_ldg_b_iters + half_ldg_a_iters)
-            consume(k_tile + 1, c11, a1, b1, True)
+            consume(k_tile + 1, c11, a1, b1, True, mask_k_tail)
             rocdl.s_barrier()
         else:
-            final_tile_epilogue(k_tile + 1, a1, b0, b1)
+            final_tile_epilogue(k_tile + 1, a1, b0, b1, mask_k_tail)
 
     if k_tiles == 2:
         async_load_b_to_lds(0, 0, 0)
@@ -1395,9 +1402,9 @@ def hgemm_hti_gfx950_kernel(
         final_double_tile = ((k_tiles % 2) == 0).select(k_tiles - 2, k_tiles - 1)
         main_loop_end = (k_tiles > 2).select(final_double_tile, 0)
         for k_tile in range(0, main_loop_end, 2):
-            compute_double_tile(k_tile, True)
+            compute_double_tile(k_tile, True, False)
 
-        compute_double_tile(main_loop_end, False)
+        compute_double_tile(main_loop_end, False, has_k_tail)
 
     if const_expr(is_split_k):
         splitk_protocol.split_k_barrier(split_k)
@@ -1693,7 +1700,7 @@ def hgemm(
         assert bias.dtype == a.dtype
 
     param = make_hgemm_param_and_validate(m, n, k, kwargs)
-    assert param is not None, "unsupported hgemm_layout_gfx950 shape/config"
+    assert param is not None, "unsupported hgemm_universal_gfx950 shape/config"
     semaphore, signal = get_split_k_buffers(stream, device)
     a_arg = _dynamic_tensor_arg(a, 0 if a_is_transposed else 1)
     b_arg = _dynamic_tensor_arg(b, 0 if b_is_transposed else 1)
