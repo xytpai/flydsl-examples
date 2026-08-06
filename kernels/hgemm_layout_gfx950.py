@@ -1,17 +1,35 @@
+import functools
 import torch
 from typing import Optional
 
-import flydsl
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import const_expr, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.runtime.device import get_rocm_arch
-from flydsl._mlir.dialects import llvm
+from flydsl._mlir.dialects import llvm, vector
 
-from .hgemm_wmma_gfx950_utils import BlockSwizzle
+from .common import run_cached
+from .hgemm_layout_gfx950_utils import (
+    BlockSwizzle,
+    GFX950_DMA_BYTES,
+    GFX950_WAVE_SIZE,
+    SPLIT_K_SEMAPHORE_MAX_LEN,
+    SplitKProtocol,
+    __barrier,
+    __waitcnt,
+    atomic_add_f32_vec,
+    buffer_load_lds_inline,
+    cast_vec_to_global_dtype,
+    get_wave_lds_offset,
+    make_lds_layout,
+    make_transposed_lds_layout,
+    make_wave_lds_ptr,
+    store_global_f32_vec,
+    swizzled_col_idx,
+    transposed_contiguous_idx,
+)
 
-GFX950_DMA_BYTES = 16
-GFX950_WAVE_SIZE = 64
+HGEMM_DTYPE_FP32 = 1
 HGEMM_DTYPE_BF16 = 2
 HGEMM_DTYPE_FP16 = 3
 
@@ -19,12 +37,15 @@ HGEMM_DTYPE_FP16 = 3
 @fx.struct
 class HGemmGfx950Param:
     dtype_id: fx.Constexpr[int]
+    out_dtype_id: fx.Constexpr[int]
     block_m: fx.Constexpr[int]
     block_n: fx.Constexpr[int]
     block_k: fx.Constexpr[int]
     stages: fx.Constexpr[int]
+    is_split_k: fx.Constexpr[bool]
     m_waves: fx.Constexpr[int]
     n_waves: fx.Constexpr[int]
+    k_waves: fx.Constexpr[int]
     group_m: fx.Constexpr[int]
     use_half_tile_interleaved: fx.Constexpr[bool]
     a_is_transposed: fx.Constexpr[bool]
@@ -50,8 +71,10 @@ def make_hgemm_gfx950_param(
     block_n: int = 256,
     block_k: int = 64,
     stages: int = 2,
+    split_k: int = 1,
     m_waves: int = 2,
     n_waves: int = 4,
+    k_waves: int = 1,
     group_m: int = 0,
     use_half_tile_interleaved: bool = False,
     a_is_transposed: bool = False,
@@ -61,22 +84,36 @@ def make_hgemm_gfx950_param(
     mma_m: int = 16,
     mma_n: int = 16,
     mma_k: int = 32,
+    out_dtype_id: Optional[int] = None,
 ) -> HGemmGfx950Param:
     if dtype_id not in (HGEMM_DTYPE_BF16, HGEMM_DTYPE_FP16):
         raise ValueError(f"unsupported dtype_id={dtype_id}")
-    if block_m <= 0 or block_n <= 0 or block_k <= 0 or stages <= 0:
-        raise ValueError("block_m, block_n, block_k, and stages must be positive")
+    if out_dtype_id is None:
+        out_dtype_id = dtype_id
+    if out_dtype_id not in (dtype_id, HGEMM_DTYPE_FP32):
+        raise ValueError(
+            f"unsupported out_dtype_id={out_dtype_id} for dtype_id={dtype_id}"
+        )
+    if block_m <= 0 or block_n <= 0 or block_k <= 0 or stages <= 0 or split_k <= 0:
+        raise ValueError(
+            "block_m, block_n, block_k, stages, and split_k must be positive"
+        )
     if (mma_m, mma_n, mma_k) != (16, 16, 32):
         raise ValueError("the gfx950 layout kernel currently requires mma=16x16x32")
     if stages < 2:
         raise ValueError("stages must be at least 2 for the staged LDS pipeline")
-    if m_waves <= 0 or n_waves <= 0:
-        raise ValueError("m_waves, and n_waves must be positive")
+    if m_waves <= 0 or n_waves <= 0 or k_waves <= 0:
+        raise ValueError("m_waves, n_waves, and k_waves must be positive")
+    if m_waves * n_waves * k_waves > 16:
+        raise ValueError("the workgroup cannot contain more than 16 waves")
     if group_m < 0:
         raise ValueError("group_m must be non-negative")
-    in_dbytes = out_dbytes = 2  # for hgemm
+    in_dbytes = 2  # C-shuffle remains in the 16-bit input dtype.
+    out_dbytes = 4 if out_dtype_id == HGEMM_DTYPE_FP32 else 2
     cshuffle_vec_size = 16 // in_dbytes
     if use_half_tile_interleaved:
+        if k_waves != 1:
+            raise ValueError("half-tile interleaved does not support slice-K")
         half_block_m = block_m // 2
         half_block_n = block_n // 2
         assert stages == 2
@@ -91,7 +128,7 @@ def make_hgemm_gfx950_param(
     else:
         assert block_n % cshuffle_vec_size == 0
     smem_bytes = stages * (block_m + block_n) * block_k * in_dbytes
-    smem_bytes = max(smem_bytes, block_m * block_n * in_dbytes)
+    smem_bytes = max(smem_bytes, k_waves * block_m * block_n * in_dbytes)
     arch = get_rocm_arch()
     SMEM_CAPACITY_MAP = {
         "gfx942": 65536,
@@ -106,6 +143,11 @@ def make_hgemm_gfx950_param(
             f"capacity={smem_capacity} for arch={arch}"
         )
     async_load_vec_size = GFX950_DMA_BYTES // in_dbytes
+    if block_k % (k_waves * mma_k) != 0:
+        raise ValueError(
+            "block_k must be divisible by k_waves * mma_k: "
+            f"block_k={block_k}, k_waves={k_waves}, mma_k={mma_k}"
+        )
     ldg_x_threads = block_k // async_load_vec_size
     if ldg_x_threads * async_load_vec_size != block_k:
         raise ValueError(
@@ -113,7 +155,7 @@ def make_hgemm_gfx950_param(
             f"block_k={block_k}, async_load_vec_size={async_load_vec_size}, "
             f"covered_k={ldg_x_threads * async_load_vec_size}"
         )
-    block_threads = m_waves * n_waves * GFX950_WAVE_SIZE
+    block_threads = m_waves * n_waves * k_waves * GFX950_WAVE_SIZE
     ldg_a_iters = (block_m * block_k) // (block_threads * async_load_vec_size)
     ldg_b_iters = (block_n * block_k) // (block_threads * async_load_vec_size)
     if use_half_tile_interleaved:
@@ -178,12 +220,15 @@ def make_hgemm_gfx950_param(
         )
     return HGemmGfx950Param(
         dtype_id=dtype_id,
+        out_dtype_id=out_dtype_id,
         block_m=block_m,
         block_n=block_n,
         block_k=block_k,
         stages=stages,
+        is_split_k=split_k > 1,
         m_waves=m_waves,
         n_waves=n_waves,
+        k_waves=k_waves,
         group_m=group_m,
         use_half_tile_interleaved=use_half_tile_interleaved,
         a_is_transposed=a_is_transposed,
@@ -205,52 +250,123 @@ def make_hgemm_gfx950_param(
 
 def make_hgemm_gfx950_kernel_name(param: HGemmGfx950Param):
     dtype_str = "fp16" if param.dtype_id == HGEMM_DTYPE_FP16 else "bf16"
-    name = f"hgemm_{dtype_str}_t{param.block_m}x{param.block_n}x{param.block_k}x{param.stages}"
-    name += f"_w{param.m_waves}x{param.n_waves}"
+    out_suffix = "_fp32" if param.out_dtype_id == HGEMM_DTYPE_FP32 else ""
+    name = f"hgemm_{dtype_str}{out_suffix}_t{param.block_m}x{param.block_n}x{param.block_k}x{param.stages}"
+    name += "_ksd" if param.is_split_k else "_ks1"
+    name += f"_w{param.m_waves}x{param.n_waves}x{param.k_waves}"
     name += f"_gm{param.group_m}"
     name += f"_bias{int(param.has_bias)}"
     name += f"_ktail{int(param.has_k_tail)}"
     a_layout = "t" if param.a_is_transposed else "n"
     b_layout = "t" if param.b_is_transposed else "n"
-    name += f"_{a_layout}{b_layout}"
-    name += "_hti" if param.use_half_tile_interleaved else "_ft"
+    name += f"_l{a_layout}{b_layout}"
+    name += "_phti" if param.use_half_tile_interleaved else "_pft"
     return name
 
 
-def __barrier(vmcnt=0):
-    llvm.InlineAsmOp(
-        None,
-        [],
-        f"s_waitcnt vmcnt({vmcnt})\n\ts_barrier",
-        "",
-        has_side_effects=True,
-    )
+def async_load_to_lds(
+    lds_base,
+    rsrc,
+    lds_layout,
+    outer_tile_size,
+    outer_bound,
+    global_outer_offset,
+    leading_stride,
+    load_iters,
+    is_k_major,
+    k_tile,
+    context,
+):
+    (
+        wave_offset,
+        tid,
+        block_threads,
+        async_load_vec_size,
+        ldg_x_threads,
+        ks_begin,
+        block_k,
+        has_k_tail,
+        ks_end,
+        in_data_bytes,
+        async_load_bytes,
+    ) = context
+    lds_ptr = make_wave_lds_ptr(lds_base, wave_offset)
+    for i in range_constexpr(load_iters):
+        global_tid = block_threads * i + tid
+        if const_expr(is_k_major):
+            outer_x_threads = outer_tile_size // async_load_vec_size
+            outer_lds_idx = global_tid % outer_x_threads * async_load_vec_size
+            k_local_idx = global_tid // outer_x_threads
+            outer_local_idx = transposed_contiguous_idx(
+                outer_lds_idx,
+                k_local_idx,
+                lds_layout,
+                outer_tile_size,
+            )
+            global_k_idx = ks_begin + k_tile * block_k + k_local_idx
+        else:
+            outer_local_idx = global_tid // ldg_x_threads
+            k_local_idx = global_tid % ldg_x_threads * async_load_vec_size
+            global_k_idx = (
+                ks_begin
+                + k_tile * block_k
+                + swizzled_col_idx(
+                    outer_local_idx,
+                    k_local_idx,
+                    lds_layout,
+                    block_k,
+                )
+            )
+        global_outer_idx = global_outer_offset + outer_local_idx
+        safe_global_outer_idx = (global_outer_idx < outer_bound).select(
+            global_outer_idx, 0
+        )
+        if const_expr(has_k_tail):
+            safe_global_k_idx = (global_k_idx < ks_end).select(global_k_idx, 0)
+        else:
+            safe_global_k_idx = global_k_idx
+        if const_expr(is_k_major):
+            global_offset = (
+                safe_global_k_idx * leading_stride + safe_global_outer_idx
+            ) * in_data_bytes
+        else:
+            global_offset = (
+                safe_global_outer_idx * leading_stride + safe_global_k_idx
+            ) * in_data_bytes
+        buffer_load_lds_inline(rsrc, lds_ptr, global_offset, async_load_bytes)
+        if i < load_iters - 1:
+            lds_ptr = lds_ptr + block_threads * async_load_bytes
 
 
-def __waitcnt(vmcnt=0):
-    llvm.InlineAsmOp(None, [], f"s_waitcnt vmcnt({vmcnt})", "", has_side_effects=True)
-
-
-def buffer_load_lds_inline(rsrc, lds_ptr, global_offset, DMA_BYTES):
-    buffer_load_asm_dict = {
-        16: "buffer_load_dwordx4",
-        8: "buffer_load_dwordx2",
-        4: "buffer_load_dword",
-    }
-    llvm.InlineAsmOp(
-        None,
-        [
-            llvm.IntToPtrOp(
-                flydsl._mlir.ir.Type.parse("!llvm.ptr<3>"),
-                fx.as_ir_value(fx.ptrtoint(lds_ptr)),
-            ).result,
-            fx.as_ir_value(global_offset),
-            fx.as_ir_value(rsrc),
-        ],
-        f"s_mov_b32 m0, $0\n\t{buffer_load_asm_dict[DMA_BYTES]} $1, $2, 0 offen sc0 lds",
-        "s,v,s",
-        has_side_effects=True,
-    )
+def buffer_atomic_pk_add_vec(
+    atomic_atom,
+    pair_frag,
+    pair_layout,
+    pair_type,
+    out_buf,
+    global_offset,
+    vec,
+    vec_size,
+):
+    for pair_idx in range_constexpr(vec_size // 2):
+        elem0 = vector.extract(
+            vec,
+            static_position=[pair_idx * 2],
+            dynamic_position=[],
+        )
+        elem1 = vector.extract(
+            vec,
+            static_position=[pair_idx * 2 + 1],
+            dynamic_position=[],
+        )
+        pair = vector.from_elements(pair_type, [elem0, elem1])
+        pair_value = pair._value if const_expr(hasattr(pair, "_value")) else pair
+        fx.memref_store_vec(pair_value, pair_frag)
+        pair_dst = fx.make_view(
+            fx.get_iter(out_buf) + global_offset + pair_idx * 2,
+            pair_layout,
+        )
+        fx.copy_atom_call(atomic_atom, pair_frag, pair_dst)
 
 
 @flyc.kernel
@@ -259,17 +375,27 @@ def hgemm_gfx950_kernel(
     a: fx.Tensor,
     b: fx.Tensor,
     bias: fx.Tensor,
+    semaphore: fx.Tensor,
+    signal: fx.Tensor,
     m: fx.Int32,
     n: fx.Int32,
     k: fx.Int32,
+    split_k: fx.Int32,
+    working_k: fx.Int32,
     a_leading_stride: fx.Int32,
     b_leading_stride: fx.Int32,
     tiled_mma: fx.TiledMma,
     param: HGemmGfx950Param,
 ):
+    is_split_k = param.is_split_k
+    is_slice_k = param.k_waves > 1
     block_m = param.block_m
     block_n = param.block_n
     block_k = param.block_k
+    k_waves = param.k_waves
+    k_mma_iters_per_wave = block_k // (k_waves * param.mma_k)
+    mma_m_iters = block_m // (param.m_waves * param.mma_m)
+    mma_n_iters = block_n // (param.n_waves * param.mma_n)
     stages = param.stages
     has_k_tail = param.has_k_tail
     async_load_bytes = param.async_load_bytes
@@ -280,18 +406,40 @@ def hgemm_gfx950_kernel(
     ldg_a_iters = param.ldg_a_iters
     ldg_b_iters = param.ldg_b_iters
     ldg_wait_count = ldg_a_iters + ldg_b_iters
+    cshuffle_vec_size = GFX950_DMA_BYTES // param.in_data_bytes
     elem_dtype = (
         fx.Float16 if const_expr(param.dtype_id == HGEMM_DTYPE_FP16) else fx.BFloat16
     )
+    global_output_dtype = (
+        fx.Float32 if const_expr(param.out_dtype_id == HGEMM_DTYPE_FP32) else elem_dtype
+    )
+    if const_expr(is_split_k):
+        splitk_protocol = SplitKProtocol(
+            block_m,
+            block_n,
+            cshuffle_vec_size,
+            param.out_data_bytes,
+            block_threads,
+            param.has_bias,
+        )
 
     tid = fx.thread_idx.x
+    threads_per_k_slice = param.m_waves * param.n_waves * GFX950_WAVE_SIZE
+    tid_in_k_slice = tid % threads_per_k_slice
+    k_wave_idx = tid // threads_per_k_slice
     num_pid_m = (m + block_m - 1) // block_m
     num_pid_n = (n + block_n - 1) // block_n
     block_swizzle = BlockSwizzle(
         NUM_XCDS=8, NUM_PIDS_THRESHOLD=256, GROUP_M=param.group_m
     )
     bid_m, bid_n = block_swizzle.swizzle(num_pid_m, num_pid_n, fx.block_idx.x)
-    k_tiles = (k + block_k - 1) // block_k
+    ks_idx = fx.block_idx.y
+    ks_begin = ks_idx * working_k
+    ks_end = ks_begin + working_k
+    ks_end = (ks_end < k).select(ks_end, k)
+    k_tiles = (ks_end - ks_begin + block_k - 1) // block_k
+    block_m_offset = bid_m * block_m
+    block_n_offset = bid_n * block_n
 
     @fx.struct
     class SharedABStorage:
@@ -301,15 +449,13 @@ def hgemm_gfx950_kernel(
     @fx.union
     class SharedStorage:
         ab: SharedABStorage
-        c: fx.Array[elem_dtype, block_m * block_n, 16]
+        c: fx.Array[elem_dtype, k_waves * block_m * block_n, 16]
 
     storage = fx.SharedAllocator().allocate(SharedStorage)
     smem_a = storage.ab.a.peek().ptr
     smem_b = storage.ab.b.peek().ptr
     smem_c = storage.c.peek().ptr
 
-    # Wrap tensor arguments as ROCDL buffer tensors so later code can use
-    # buffer resources/copy atoms while preserving the original tensor layout.
     a_buf = fx.rocdl.make_buffer_tensor(a, max_size=True)
     b_buf = fx.rocdl.make_buffer_tensor(b, max_size=True)
     out_buf = fx.rocdl.make_buffer_tensor(out, max_size=True)
@@ -318,79 +464,79 @@ def hgemm_gfx950_kernel(
     else:
         bias_buf = None
 
-    # Extract raw buffer descriptors for the inline global-to-LDS load path.
     a_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(a_buf))
     b_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(b_buf))
 
-    s2r_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), elem_dtype)
-    g2r_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_dtype)
-    r2g_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_dtype)
+    if const_expr(is_split_k):
+        splitk_protocol.init(
+            semaphore,
+            signal,
+            out,
+            bias,
+            tid,
+            ks_idx,
+            m,
+            n,
+            block_m_offset,
+            block_n_offset,
+            global_output_dtype,
+            fx.block_idx.x,
+            n,
+        )
+
+    uni_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), elem_dtype)
+    buffer_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_dtype)
+    if const_expr(is_split_k and param.out_dtype_id != HGEMM_DTYPE_FP32):
+        atomic_copy_atom = fx.make_copy_atom(
+            fx.rocdl.BufferAtomicPkAdd(elem_dtype), elem_dtype
+        )
+        atomic_pair_layout = fx.make_layout(2, 1)
+        atomic_pair_frag = fx.make_rmem_tensor(atomic_pair_layout, elem_dtype)
+        atomic_pair_type = fx.Vector.make_type(2, elem_dtype)
+
     if const_expr(param.a_is_transposed):
         a_s2r_copy_atom = fx.make_copy_atom(
             fx.rocdl.cdna4.LDSReadTrans16_64b(), elem_dtype
         )
         a_tiled_copy_atom = a_s2r_copy_atom
     else:
-        a_tiled_copy_atom = g2r_copy_atom
-        a_s2r_copy_atom = s2r_copy_atom
+        a_s2r_copy_atom = uni_copy_atom
+        a_tiled_copy_atom = buffer_copy_atom
     if const_expr(not param.b_is_transposed):
         b_s2r_copy_atom = fx.make_copy_atom(
             fx.rocdl.cdna4.LDSReadTrans16_64b(), elem_dtype
         )
         b_tiled_copy_atom = b_s2r_copy_atom
     else:
-        b_tiled_copy_atom = g2r_copy_atom
-        b_s2r_copy_atom = s2r_copy_atom
+        b_s2r_copy_atom = uni_copy_atom
+        b_tiled_copy_atom = buffer_copy_atom
 
     gC = fx.flat_divide(out_buf, (block_m, block_n))[None, None, bid_m, bid_n]
 
-    thr_mma = tiled_mma.thr_slice(tid)
-    thr_copy_A = fx.make_tiled_copy_A(a_tiled_copy_atom, tiled_mma).get_slice(tid)
-    thr_copy_B = fx.make_tiled_copy_B(b_tiled_copy_atom, tiled_mma).get_slice(tid)
+    thr_mma = tiled_mma.thr_slice(tid_in_k_slice)
+    thr_copy_A = fx.make_tiled_copy_A(a_tiled_copy_atom, tiled_mma).get_slice(
+        tid_in_k_slice
+    )
+    thr_copy_B = fx.make_tiled_copy_B(b_tiled_copy_atom, tiled_mma).get_slice(
+        tid_in_k_slice
+    )
 
-    swizzle = fx.static(fx.SwizzleType.get(3, 3, 3))
-
-    def make_lds_layout(rows):
-        return fx.make_composed_layout(
-            swizzle,
-            fx.make_ordered_layout((rows, block_k), (1, 0)),
-        )
-
-    def make_transposed_lds_layout(rows):
-        # ds_read_tr16 transposes within 16-element groups. Preserve those
-        # groups and XOR two K bits into contiguous-dimension bits [4:6]:
-        # contiguous_idx ^ ((k_idx & 3) << 4).
-        base_layout = fx.make_ordered_layout((rows, block_k), (0, 1))
-        if const_expr(rows == 64):
-            trans_swizzle = fx.static(fx.SwizzleType.get(2, 4, 2))
-            return fx.make_composed_layout(trans_swizzle, base_layout)
-        if const_expr(rows == 128):
-            trans_swizzle = fx.static(fx.SwizzleType.get(2, 4, 3))
-            return fx.make_composed_layout(trans_swizzle, base_layout)
-        if const_expr(rows == 256):
-            trans_swizzle = fx.static(fx.SwizzleType.get(2, 4, 4))
-            return fx.make_composed_layout(trans_swizzle, base_layout)
-        return base_layout
-
-    # T-layout A[M, K] is M-contiguous; N-layout B[K, N] is N-contiguous.
-    # Keep those physical orders in LDS and use the gfx950 transpose read to
-    # form the K-contiguous MFMA register fragments. The compatible swizzle
-    # preserves the transpose atom's 16-element lane grouping.
     a_lds_layout = (
-        make_transposed_lds_layout(block_m)
+        make_transposed_lds_layout(block_m, block_k)
         if const_expr(param.a_is_transposed)
-        else make_lds_layout(block_m)
+        else make_lds_layout(block_m, block_k)
     )
     b_lds_layout = (
-        make_transposed_lds_layout(block_n)
+        make_transposed_lds_layout(block_n, block_k)
         if const_expr(not param.b_is_transposed)
-        else make_lds_layout(block_n)
+        else make_lds_layout(block_n, block_k)
     )
     c_lds_layout = fx.make_layout((block_m, block_n), (block_n, 1))
 
     sA = fx.make_view(smem_a, a_lds_layout)
     sB = fx.make_view(smem_b, b_lds_layout)
     sC = fx.make_view(smem_c, c_lds_layout)
+    sC_write = fx.make_view(smem_c + k_wave_idx * block_m * block_n, c_lds_layout)
 
     frag_A = thr_mma.make_fragment_A(sA)
     frag_B = thr_mma.make_fragment_B(sB)
@@ -403,10 +549,11 @@ def hgemm_gfx950_kernel(
 
     row_coords = fx.make_view(0, fx.make_layout((block_m, block_n), (1, 0)))
     col_coords = fx.make_view(0, fx.make_layout((block_m, block_n), (0, 1)))
+    a_k_coords = fx.make_view(0, fx.make_layout((block_m, block_k), (0, 1)))
     thr_mma_cRow = thr_mma.partition_C(row_coords)
     thr_mma_cCol = thr_mma.partition_C(col_coords)
+    thr_mma_aK = thr_mma.partition_A(a_k_coords)
 
-    cshuffle_vec_size = GFX950_DMA_BYTES // param.out_data_bytes
     cshuffle_x_threads = block_n // cshuffle_vec_size
     cshuffle_thr_layout = fx.make_layout(
         (block_threads // cshuffle_x_threads, cshuffle_x_threads),
@@ -418,7 +565,7 @@ def hgemm_gfx950_kernel(
         cshuffle_val_layout,
     )
     tiled_copy_cshuffle = fx.make_tiled_copy(
-        r2g_copy_atom,
+        buffer_copy_atom,
         cshuffle_tv_layout,
         cshuffle_tile,
     )
@@ -430,14 +577,21 @@ def hgemm_gfx950_kernel(
     frag_C_cshuffle = fx.make_fragment_like(thr_sC)
     pred_C = fx.make_fragment_like(thr_cRow, dtype=fx.Boolean)
 
-    frag_C.fill(0.0)
-    if const_expr(param.has_bias):
+    if const_expr(is_split_k):
+        frag_C.fill(0.0)
+        splitk_protocol.zero_c()
+    elif const_expr(param.has_bias):
         for i in range_constexpr(fx.size(frag_C.shape).unpack()):
             col_idx = fx.get_scalar(thr_mma_cCol[i])
-            global_n_idx = bid_n * block_n + col_idx
+            global_n_idx = block_n_offset + col_idx
             safe_global_n_idx = (global_n_idx < n).select(global_n_idx, 0)
             bias_val = bias_buf[safe_global_n_idx].to(fx.Float32)
+            if const_expr(is_slice_k):
+                is_first_k_slice = k_wave_idx == 0
+                bias_val = is_first_k_slice.select(bias_val, fx.Float32(0.0))
             frag_C[i] = bias_val
+    else:
+        frag_C.fill(0.0)
 
     for i in range_constexpr(fx.size(pred_C.shape).unpack()):
         local_row = fx.get_scalar(thr_cRow[i])
@@ -451,117 +605,50 @@ def hgemm_gfx950_kernel(
             & (col_idx < n)
         )
 
-    wave_offset = rocdl.readfirstlane(
-        fx.Int64.ir_type,
-        fx.Int64(tid // GFX950_WAVE_SIZE * GFX950_WAVE_SIZE * async_load_bytes),
+    wave_offset = get_wave_lds_offset(tid, async_load_bytes)
+    async_load_context = (
+        wave_offset,
+        tid,
+        block_threads,
+        async_load_vec_size,
+        ldg_x_threads,
+        ks_begin,
+        block_k,
+        has_k_tail,
+        ks_end,
+        in_data_bytes,
+        async_load_bytes,
     )
 
-    def make_wave_lds_ptr(ptr):
-        return fx.recast_iter(fx.Int8, ptr) + fx.Int32(wave_offset)
-
-    def swizzled_col_idx(row, col, layout):
-        elem_offset = fx.get_scalar(
-            fx.crd2idx(
-                (row, col),
-                layout,
-            )
-        )
-        return elem_offset % block_k
-
-    def transposed_contiguous_idx(idx, k_idx, layout, rows):
-        # The XOR swizzle is self-inverse. Given the physical contiguous
-        # position written by direct-to-LDS DMA, select the logical global
-        # vector that belongs at that position.
-        elem_offset = fx.get_scalar(fx.crd2idx((idx, k_idx), layout))
-        return elem_offset % rows
-
     def async_load_a_to_lds(k_tile, stage):
-        lds_ptr = make_wave_lds_ptr(smem_a + stage * block_m * block_k)
-        for i in range_constexpr(ldg_a_iters):
-            global_tid = block_threads * i + tid
-            if const_expr(param.a_is_transposed):
-                ldg_a_x_threads = block_m // async_load_vec_size
-                m_lds_idx = (
-                    global_tid % ldg_a_x_threads * async_load_vec_size
-                )
-                k_local_idx = global_tid // ldg_a_x_threads
-                m_local_idx = transposed_contiguous_idx(
-                    m_lds_idx,
-                    k_local_idx,
-                    a_lds_layout,
-                    block_m,
-                )
-                global_m_idx = bid_m * block_m + m_local_idx
-                global_k_idx = k_tile * block_k + k_local_idx
-            else:
-                m_local_idx = global_tid // ldg_x_threads
-                k_local_idx = global_tid % ldg_x_threads * async_load_vec_size
-                global_m_idx = bid_m * block_m + m_local_idx
-                global_k_idx = k_tile * block_k + swizzled_col_idx(
-                    m_local_idx,
-                    k_local_idx,
-                    a_lds_layout,
-                )
-            safe_global_m_idx = (global_m_idx < m).select(global_m_idx, 0)
-            if const_expr(has_k_tail):
-                safe_global_k_idx = (global_k_idx < k).select(global_k_idx, 0)
-            else:
-                safe_global_k_idx = global_k_idx
-            if const_expr(param.a_is_transposed):
-                global_offset = (
-                    safe_global_k_idx * a_leading_stride + safe_global_m_idx
-                ) * in_data_bytes
-            else:
-                global_offset = (
-                    safe_global_m_idx * a_leading_stride + safe_global_k_idx
-                ) * in_data_bytes
-            buffer_load_lds_inline(a_rsrc, lds_ptr, global_offset, async_load_bytes)
-            if i < ldg_a_iters - 1:
-                lds_ptr = lds_ptr + block_threads * async_load_bytes
+        async_load_to_lds(
+            smem_a + stage * block_m * block_k,
+            a_rsrc,
+            a_lds_layout,
+            block_m,
+            m,
+            block_m_offset,
+            a_leading_stride,
+            ldg_a_iters,
+            param.a_is_transposed,
+            k_tile,
+            async_load_context,
+        )
 
     def async_load_b_to_lds(k_tile, stage):
-        lds_ptr = make_wave_lds_ptr(smem_b + stage * block_n * block_k)
-        for i in range_constexpr(ldg_b_iters):
-            global_tid = block_threads * i + tid
-            if const_expr(not param.b_is_transposed):
-                ldg_b_x_threads = block_n // async_load_vec_size
-                n_lds_idx = (
-                    global_tid % ldg_b_x_threads * async_load_vec_size
-                )
-                k_local_idx = global_tid // ldg_b_x_threads
-                n_local_idx = transposed_contiguous_idx(
-                    n_lds_idx,
-                    k_local_idx,
-                    b_lds_layout,
-                    block_n,
-                )
-                global_n_idx = bid_n * block_n + n_local_idx
-                global_k_idx = k_tile * block_k + k_local_idx
-            else:
-                n_local_idx = global_tid // ldg_x_threads
-                k_local_idx = global_tid % ldg_x_threads * async_load_vec_size
-                global_n_idx = bid_n * block_n + n_local_idx
-                global_k_idx = k_tile * block_k + swizzled_col_idx(
-                    n_local_idx,
-                    k_local_idx,
-                    b_lds_layout,
-                )
-            safe_global_n_idx = (global_n_idx < n).select(global_n_idx, 0)
-            if const_expr(has_k_tail):
-                safe_global_k_idx = (global_k_idx < k).select(global_k_idx, 0)
-            else:
-                safe_global_k_idx = global_k_idx
-            if const_expr(not param.b_is_transposed):
-                global_offset = (
-                    safe_global_k_idx * b_leading_stride + safe_global_n_idx
-                ) * in_data_bytes
-            else:
-                global_offset = (
-                    safe_global_n_idx * b_leading_stride + safe_global_k_idx
-                ) * in_data_bytes
-            buffer_load_lds_inline(b_rsrc, lds_ptr, global_offset, async_load_bytes)
-            if i < ldg_b_iters - 1:
-                lds_ptr = lds_ptr + block_threads * async_load_bytes
+        async_load_to_lds(
+            smem_b + stage * block_n * block_k,
+            b_rsrc,
+            b_lds_layout,
+            block_n,
+            n,
+            block_n_offset,
+            b_leading_stride,
+            ldg_b_iters,
+            not param.b_is_transposed,
+            k_tile,
+            async_load_context,
+        )
 
     def compute_stage(read_stage, k_tile):
         thr_sA_s2r = thr_copy_A.partition_S(
@@ -572,6 +659,7 @@ def hgemm_gfx950_kernel(
         )
 
         def compute_k_chunk(block_k_iter):
+            frag_A_chunk = frag_A[None, None, block_k_iter]
             fx.copy(
                 b_s2r_copy_atom,
                 thr_sB_s2r[None, None, block_k_iter],
@@ -582,22 +670,34 @@ def hgemm_gfx950_kernel(
                 thr_sA_s2r[None, None, block_k_iter],
                 frag_A_retile[None, None, block_k_iter],
             )
+            if const_expr(has_k_tail):
+                frag_a_k_coords = thr_mma_aK[None, None, block_k_iter]
+                for i in range_constexpr(fx.size(frag_A_chunk.shape).unpack()):
+                    local_k_idx = fx.get_scalar(frag_a_k_coords[i])
+                    global_k_idx = ks_begin + k_tile * block_k + local_k_idx
+                    valid_k = global_k_idx < ks_end
+                    frag_A_chunk[i] = valid_k.select(frag_A_chunk[i], elem_dtype(0.0))
             fx.gemm(
                 tiled_mma,
                 frag_C,
-                frag_A[None, None, block_k_iter],
+                frag_A_chunk,
                 frag_B[None, None, block_k_iter],
                 frag_C,
                 traversal_order=fx.GemmTraversalOrder.KNM,
             )
 
-        for block_k_iter in range_constexpr(block_k // param.mma_k):
-            if const_expr(has_k_tail):
-                global_k_iter = k_tile * block_k + block_k_iter * param.mma_k
-                if global_k_iter < k:
-                    compute_k_chunk(block_k_iter)
-            else:
-                compute_k_chunk(block_k_iter)
+        for k_slice in range_constexpr(k_waves):
+            if k_wave_idx == k_slice:
+                for block_k_iter in range_constexpr(k_mma_iters_per_wave):
+                    k_iter = k_slice * k_mma_iters_per_wave + block_k_iter
+                    if const_expr(has_k_tail):
+                        global_k_iter = (
+                            ks_begin + k_tile * block_k + k_iter * param.mma_k
+                        )
+                        if global_k_iter < ks_end:
+                            compute_k_chunk(k_iter)
+                    else:
+                        compute_k_chunk(k_iter)
 
     # Prime the staged LDS pipeline: preload the first `stages - 1` K tiles
     # before entering the main loop that overlaps async loads with compute.
@@ -605,6 +705,15 @@ def hgemm_gfx950_kernel(
         async_load_b_to_lds(stage, stage)
         async_load_a_to_lds(stage, stage)
     rocdl.sched_barrier(0)
+
+    def hot_loop_scheduler():
+        rocdl.sched_vmem(ldg_b_iters + ldg_a_iters)
+        for _ in range_constexpr(k_mma_iters_per_wave):
+            rocdl.sched_dsrd(mma_n_iters)
+            rocdl.sched_dsrd(mma_m_iters)
+            for _ in range_constexpr(mma_m_iters):
+                rocdl.sched_mfma(mma_n_iters)
+        rocdl.sched_barrier(0)
 
     if const_expr(has_k_tail):
         main_loop_end = (k_tiles > stages - 1).select(k_tiles - (stages - 1), 0)
@@ -617,6 +726,7 @@ def hgemm_gfx950_kernel(
         async_load_b_to_lds(k_tile + (stages - 1), write_stage)
         async_load_a_to_lds(k_tile + (stages - 1), write_stage)
         compute_stage(current_stage, k_tile)
+        hot_loop_scheduler()
 
     current_stage = main_loop_end % stages
     for s in range_constexpr(0, stages - 1):
@@ -627,15 +737,86 @@ def hgemm_gfx950_kernel(
     frag_C_out = fx.make_fragment_like(frag_C, elem_dtype)
     frag_C_out.store(frag_C.load().to(elem_dtype))
 
-    fx.gpu.barrier()
+    gpu.barrier()
     for i in range_constexpr(fx.size(frag_C_out.shape).unpack()):
         row = fx.get_scalar(thr_mma_cRow[i])
         col = fx.get_scalar(thr_mma_cCol[i])
-        sC[row, col] = frag_C_out[i]
+        sC_write[row, col] = frag_C_out[i]
 
-    fx.gpu.barrier()
-    fx.copy(s2r_copy_atom, thr_sC, frag_C_cshuffle)
-    fx.copy(r2g_copy_atom, frag_C_cshuffle, thr_gC, pred=pred_C)
+    if const_expr(is_split_k):
+        splitk_protocol.split_k_barrier(split_k)
+    else:
+        gpu.barrier()
+
+    if const_expr(is_split_k or param.out_dtype_id == HGEMM_DTYPE_FP32):
+        cshuffle_vectors = block_m * block_n // cshuffle_vec_size
+        cshuffle_iters = (cshuffle_vectors + block_threads - 1) // block_threads
+        for i in range_constexpr(cshuffle_iters):
+            vector_idx = block_threads * i + tid
+            if vector_idx < cshuffle_vectors:
+                local_row = vector_idx // cshuffle_x_threads
+                local_col = vector_idx % cshuffle_x_threads * cshuffle_vec_size
+                global_row = block_m_offset + local_row
+                global_col = block_n_offset + local_col
+                if (global_row < m) and (global_col < n):
+                    c_vec = fx.ptr_load(
+                        smem_c + local_row * block_n + local_col,
+                        result_type=fx.Vector.make_type(cshuffle_vec_size, elem_dtype),
+                    )
+                    for k_slice in range_constexpr(1, k_waves):
+                        peer_c_vec = fx.ptr_load(
+                            smem_c
+                            + k_slice * block_m * block_n
+                            + local_row * block_n
+                            + local_col,
+                            result_type=fx.Vector.make_type(
+                                cshuffle_vec_size, elem_dtype
+                            ),
+                        )
+                        c_vec = c_vec + peer_c_vec
+                    global_offset = global_row * n + global_col
+                    if const_expr(param.out_dtype_id == HGEMM_DTYPE_FP32):
+                        c_vec_global = cast_vec_to_global_dtype(
+                            c_vec.ir_value(),
+                            cshuffle_vec_size,
+                            global_output_dtype.ir_type,
+                            False,
+                            True,
+                        )
+                        if const_expr(is_split_k):
+                            atomic_add_f32_vec(
+                                out,
+                                global_offset,
+                                c_vec_global,
+                                cshuffle_vec_size,
+                            )
+                        else:
+                            store_global_f32_vec(
+                                out,
+                                global_offset,
+                                c_vec_global,
+                                cshuffle_vec_size,
+                            )
+                    else:
+                        buffer_atomic_pk_add_vec(
+                            atomic_copy_atom,
+                            atomic_pair_frag,
+                            atomic_pair_layout,
+                            atomic_pair_type,
+                            out_buf,
+                            global_offset,
+                            c_vec.ir_value(),
+                            cshuffle_vec_size,
+                        )
+    else:
+        fx.copy(uni_copy_atom, thr_sC, frag_C_cshuffle)
+        for k_slice in range_constexpr(1, k_waves):
+            peer_sC = fx.make_view(smem_c + k_slice * block_m * block_n, c_lds_layout)
+            thr_peer_sC = thr_copy_cshuffle.partition_S(peer_sC)
+            peer_frag_C = fx.make_fragment_like(thr_peer_sC)
+            fx.copy(uni_copy_atom, thr_peer_sC, peer_frag_C)
+            frag_C_cshuffle.store(frag_C_cshuffle.load() + peer_frag_C.load())
+        fx.copy(buffer_copy_atom, frag_C_cshuffle, thr_gC, pred=pred_C)
 
 
 @flyc.kernel
@@ -644,14 +825,19 @@ def hgemm_hti_gfx950_kernel(
     a: fx.Tensor,
     b: fx.Tensor,
     bias: fx.Tensor,
+    semaphore: fx.Tensor,
+    signal: fx.Tensor,
     m: fx.Int32,
     n: fx.Int32,
     k: fx.Int32,
+    split_k: fx.Int32,
+    working_k: fx.Int32,
     a_leading_stride: fx.Int32,
     b_leading_stride: fx.Int32,
     tiled_mma: fx.TiledMma,
     param: HGemmGfx950Param,
 ):
+    is_split_k = param.is_split_k
     block_m = param.block_m
     block_n = param.block_n
     block_k = param.block_k
@@ -667,9 +853,22 @@ def hgemm_hti_gfx950_kernel(
     n_waves = param.n_waves
     half_ldg_a_iters = param.ldg_a_iters // 2
     half_ldg_b_iters = param.ldg_b_iters // 2
+    cshuffle_vec_size = GFX950_DMA_BYTES // param.in_data_bytes
     elem_dtype = (
         fx.Float16 if const_expr(param.dtype_id == HGEMM_DTYPE_FP16) else fx.BFloat16
     )
+    global_output_dtype = (
+        fx.Float32 if const_expr(param.out_dtype_id == HGEMM_DTYPE_FP32) else elem_dtype
+    )
+    if const_expr(is_split_k):
+        splitk_protocol = SplitKProtocol(
+            block_m,
+            block_n,
+            cshuffle_vec_size,
+            param.out_data_bytes,
+            block_threads,
+            param.has_bias,
+        )
 
     tid = fx.thread_idx.x
     wid = tid // GFX950_WAVE_SIZE
@@ -679,7 +878,13 @@ def hgemm_hti_gfx950_kernel(
         NUM_XCDS=8, NUM_PIDS_THRESHOLD=256, GROUP_M=param.group_m
     )
     bid_m, bid_n = block_swizzle.swizzle(num_pid_m, num_pid_n, fx.block_idx.x)
-    k_tiles = (k + block_k - 1) // block_k
+    ks_idx = fx.block_idx.y
+    ks_begin = ks_idx * working_k
+    ks_end = ks_begin + working_k
+    ks_end = (ks_end < k).select(ks_end, k)
+    k_tiles = (ks_end - ks_begin + block_k - 1) // block_k
+    block_m_offset = bid_m * block_m
+    block_n_offset = bid_n * block_n
 
     @fx.struct
     class SharedABStorage:
@@ -698,7 +903,7 @@ def hgemm_hti_gfx950_kernel(
 
     a_buf = fx.rocdl.make_buffer_tensor(a, max_size=True)
     b_buf = fx.rocdl.make_buffer_tensor(b, max_size=True)
-    out = fx.rocdl.make_buffer_tensor(out, max_size=False)
+    out_buf = fx.rocdl.make_buffer_tensor(out, max_size=False)
     if const_expr(param.has_bias):
         bias_buf = fx.rocdl.make_buffer_tensor(bias, max_size=True)
     else:
@@ -707,80 +912,69 @@ def hgemm_hti_gfx950_kernel(
     a_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(a_buf))
     b_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(b_buf))
 
-    s2r_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), elem_dtype)
-    g2r_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_dtype)
-    r2g_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_dtype)
+    if const_expr(is_split_k):
+        splitk_protocol.init(
+            semaphore,
+            signal,
+            out,
+            bias,
+            tid,
+            ks_idx,
+            m,
+            n,
+            block_m_offset,
+            block_n_offset,
+            global_output_dtype,
+            fx.block_idx.x,
+            n,
+        )
+
+    uni_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), elem_dtype)
+    buffer_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_dtype)
+    if const_expr(is_split_k and param.out_dtype_id != HGEMM_DTYPE_FP32):
+        atomic_copy_atom = fx.make_copy_atom(
+            fx.rocdl.BufferAtomicPkAdd(elem_dtype), elem_dtype
+        )
+        atomic_pair_layout = fx.make_layout(2, 1)
+        atomic_pair_frag = fx.make_rmem_tensor(atomic_pair_layout, elem_dtype)
+        atomic_pair_type = fx.Vector.make_type(2, elem_dtype)
+
     if const_expr(param.a_is_transposed):
         a_s2r_copy_atom = fx.make_copy_atom(
             fx.rocdl.cdna4.LDSReadTrans16_64b(), elem_dtype
         )
         a_tiled_copy_atom = a_s2r_copy_atom
     else:
-        a_tiled_copy_atom = g2r_copy_atom
-        a_s2r_copy_atom = s2r_copy_atom
+        a_s2r_copy_atom = uni_copy_atom
+        a_tiled_copy_atom = buffer_copy_atom
     if const_expr(not param.b_is_transposed):
         b_s2r_copy_atom = fx.make_copy_atom(
             fx.rocdl.cdna4.LDSReadTrans16_64b(), elem_dtype
         )
         b_tiled_copy_atom = b_s2r_copy_atom
     else:
-        b_tiled_copy_atom = g2r_copy_atom
-        b_s2r_copy_atom = s2r_copy_atom
+        b_s2r_copy_atom = uni_copy_atom
+        b_tiled_copy_atom = buffer_copy_atom
 
     thr_mma = tiled_mma.thr_slice(tid)
     thr_copy_A = fx.make_tiled_copy_A(a_tiled_copy_atom, tiled_mma).get_slice(tid)
     thr_copy_B = fx.make_tiled_copy_B(b_tiled_copy_atom, tiled_mma).get_slice(tid)
 
-    swizzle = fx.static(fx.SwizzleType.get(3, 3, 3))
-
-    def make_lds_layout(rows):
-        return fx.make_composed_layout(
-            swizzle,
-            fx.make_ordered_layout((rows, block_k), (1, 0)),
-        )
-
-    def make_transposed_lds_layout(rows):
-        # Keep the 16-element groups required by ds_read_tr16 intact while
-        # spreading the groups across LDS banks with two low K bits.
-        base_layout = fx.make_ordered_layout((rows, block_k), (0, 1))
-        if const_expr(rows == 64):
-            trans_swizzle = fx.static(fx.SwizzleType.get(2, 4, 2))
-            return fx.make_composed_layout(trans_swizzle, base_layout)
-        if const_expr(rows == 128):
-            trans_swizzle = fx.static(fx.SwizzleType.get(2, 4, 3))
-            return fx.make_composed_layout(trans_swizzle, base_layout)
-        if const_expr(rows == 256):
-            trans_swizzle = fx.static(fx.SwizzleType.get(2, 4, 4))
-            return fx.make_composed_layout(trans_swizzle, base_layout)
-        return base_layout
-
     a_lds_layout = (
-        make_transposed_lds_layout(half_block_m)
+        make_transposed_lds_layout(half_block_m, block_k)
         if const_expr(param.a_is_transposed)
-        else make_lds_layout(half_block_m)
+        else make_lds_layout(half_block_m, block_k)
     )
     b_lds_layout = (
-        make_transposed_lds_layout(half_block_n)
+        make_transposed_lds_layout(half_block_n, block_k)
         if const_expr(not param.b_is_transposed)
-        else make_lds_layout(half_block_n)
+        else make_lds_layout(half_block_n, block_k)
     )
     c_lds_layout = fx.make_layout((half_block_m, half_block_n), (half_block_n, 1))
+    a_k_coords = fx.make_view(0, fx.make_layout((half_block_m, block_k), (0, 1)))
+    thr_mma_aK = thr_mma.partition_A(a_k_coords)
 
-    wave_offset = rocdl.readfirstlane(
-        fx.Int64.ir_type,
-        fx.Int64(tid // GFX950_WAVE_SIZE * GFX950_WAVE_SIZE * async_load_bytes),
-    )
-
-    def make_wave_lds_ptr(ptr):
-        return fx.recast_iter(fx.Int8, ptr) + fx.Int32(wave_offset)
-
-    def swizzled_col_idx(row, col, layout):
-        elem_offset = fx.get_scalar(fx.crd2idx((row, col), layout))
-        return elem_offset % block_k
-
-    def transposed_contiguous_idx(idx, k_idx, layout, rows):
-        elem_offset = fx.get_scalar(fx.crd2idx((idx, k_idx), layout))
-        return elem_offset % rows
+    wave_offset = get_wave_lds_offset(tid, async_load_bytes)
 
     def half_a_base(stage, m_part):
         return smem_a + (stage * block_m + m_part * half_block_m) * block_k
@@ -788,112 +982,63 @@ def hgemm_hti_gfx950_kernel(
     def half_b_base(stage, n_part):
         return smem_b + (stage * block_n + n_part * half_block_n) * block_k
 
+    async_load_context = (
+        wave_offset,
+        tid,
+        block_threads,
+        async_load_vec_size,
+        ldg_x_threads,
+        ks_begin,
+        block_k,
+        has_k_tail,
+        ks_end,
+        in_data_bytes,
+        async_load_bytes,
+    )
+
     def async_load_a_to_lds(m_part, k_tile, stage):
-        lds_ptr = make_wave_lds_ptr(half_a_base(stage, m_part))
-        for i in range_constexpr(half_ldg_a_iters):
-            global_tid = block_threads * i + tid
-            if const_expr(param.a_is_transposed):
-                ldg_a_x_threads = half_block_m // async_load_vec_size
-                m_lds_idx = (
-                    global_tid % ldg_a_x_threads * async_load_vec_size
-                )
-                k_local_idx = global_tid // ldg_a_x_threads
-                m_local_idx = transposed_contiguous_idx(
-                    m_lds_idx,
-                    k_local_idx,
-                    a_lds_layout,
-                    half_block_m,
-                )
-                global_m_idx = (
-                    bid_m * block_m + m_part * half_block_m + m_local_idx
-                )
-                global_k_idx = k_tile * block_k + k_local_idx
-            else:
-                m_local_idx = global_tid // ldg_x_threads
-                k_local_idx = global_tid % ldg_x_threads * async_load_vec_size
-                global_m_idx = (
-                    bid_m * block_m + m_part * half_block_m + m_local_idx
-                )
-                global_k_idx = k_tile * block_k + swizzled_col_idx(
-                    m_local_idx,
-                    k_local_idx,
-                    a_lds_layout,
-                )
-            safe_global_m_idx = (global_m_idx < m).select(global_m_idx, 0)
-            if const_expr(has_k_tail):
-                safe_global_k_idx = (global_k_idx < k).select(global_k_idx, 0)
-            else:
-                safe_global_k_idx = global_k_idx
-            if const_expr(param.a_is_transposed):
-                global_offset = (
-                    safe_global_k_idx * a_leading_stride + safe_global_m_idx
-                ) * in_data_bytes
-            else:
-                global_offset = (
-                    safe_global_m_idx * a_leading_stride + safe_global_k_idx
-                ) * in_data_bytes
-            buffer_load_lds_inline(a_rsrc, lds_ptr, global_offset, async_load_bytes)
-            if i < half_ldg_a_iters - 1:
-                lds_ptr = lds_ptr + block_threads * async_load_bytes
+        async_load_to_lds(
+            half_a_base(stage, m_part),
+            a_rsrc,
+            a_lds_layout,
+            half_block_m,
+            m,
+            block_m_offset + m_part * half_block_m,
+            a_leading_stride,
+            half_ldg_a_iters,
+            param.a_is_transposed,
+            k_tile,
+            async_load_context,
+        )
 
     def async_load_b_to_lds(n_part, k_tile, stage):
-        lds_ptr = make_wave_lds_ptr(half_b_base(stage, n_part))
-        for i in range_constexpr(half_ldg_b_iters):
-            global_tid = block_threads * i + tid
-            if const_expr(not param.b_is_transposed):
-                ldg_b_x_threads = half_block_n // async_load_vec_size
-                n_lds_idx = (
-                    global_tid % ldg_b_x_threads * async_load_vec_size
-                )
-                k_local_idx = global_tid // ldg_b_x_threads
-                n_local_idx = transposed_contiguous_idx(
-                    n_lds_idx,
-                    k_local_idx,
-                    b_lds_layout,
-                    half_block_n,
-                )
-                global_n_idx = (
-                    bid_n * block_n + n_part * half_block_n + n_local_idx
-                )
-                global_k_idx = k_tile * block_k + k_local_idx
-            else:
-                n_local_idx = global_tid // ldg_x_threads
-                k_local_idx = global_tid % ldg_x_threads * async_load_vec_size
-                global_n_idx = (
-                    bid_n * block_n + n_part * half_block_n + n_local_idx
-                )
-                global_k_idx = k_tile * block_k + swizzled_col_idx(
-                    n_local_idx,
-                    k_local_idx,
-                    b_lds_layout,
-                )
-            safe_global_n_idx = (global_n_idx < n).select(global_n_idx, 0)
-            if const_expr(has_k_tail):
-                safe_global_k_idx = (global_k_idx < k).select(global_k_idx, 0)
-            else:
-                safe_global_k_idx = global_k_idx
-            if const_expr(not param.b_is_transposed):
-                global_offset = (
-                    safe_global_k_idx * b_leading_stride + safe_global_n_idx
-                ) * in_data_bytes
-            else:
-                global_offset = (
-                    safe_global_n_idx * b_leading_stride + safe_global_k_idx
-                ) * in_data_bytes
-            buffer_load_lds_inline(b_rsrc, lds_ptr, global_offset, async_load_bytes)
-            if i < half_ldg_b_iters - 1:
-                lds_ptr = lds_ptr + block_threads * async_load_bytes
+        async_load_to_lds(
+            half_b_base(stage, n_part),
+            b_rsrc,
+            b_lds_layout,
+            half_block_n,
+            n,
+            block_n_offset + n_part * half_block_n,
+            b_leading_stride,
+            half_ldg_b_iters,
+            not param.b_is_transposed,
+            k_tile,
+            async_load_context,
+        )
 
     def make_gC(m_part, n_part):
-        return fx.flat_divide(out, (half_block_m, half_block_n))[
+        return fx.flat_divide(out_buf, (half_block_m, half_block_n))[
             None, None, bid_m * 2 + m_part, bid_n * 2 + n_part
         ]
 
+    row_coords = fx.make_view(0, fx.make_layout((half_block_m, half_block_n), (1, 0)))
+    col_coords = fx.make_view(0, fx.make_layout((half_block_m, half_block_n), (0, 1)))
+    thr_mma_cRow = thr_mma.partition_C(row_coords)
+    thr_mma_cCol = thr_mma.partition_C(col_coords)
+
     def make_c_fragment(m_part, n_part):
         gC = make_gC(m_part, n_part)
-        frag_C = thr_mma.make_fragment_C(gC)
-        frag_C.fill(0.0)
-        return frag_C
+        return thr_mma.make_fragment_C(gC)
 
     def load_a_fragment(m_part, read_stage, k_tile):
         sA = fx.make_view(half_a_base(read_stage, m_part), a_lds_layout)
@@ -901,21 +1046,28 @@ def hgemm_hti_gfx950_kernel(
         frag_A_retile = thr_copy_A.retile(frag_A)
         thr_sA_s2r = thr_copy_A.partition_S(sA)
 
+        def copy_k_chunk(block_k_iter):
+            frag_A_chunk = frag_A[None, None, block_k_iter]
+            fx.copy(
+                a_s2r_copy_atom,
+                thr_sA_s2r[None, None, block_k_iter],
+                frag_A_retile[None, None, block_k_iter],
+            )
+            if const_expr(has_k_tail):
+                frag_a_k_coords = thr_mma_aK[None, None, block_k_iter]
+                global_k_base = ks_begin + k_tile * block_k
+                for i in range_constexpr(fx.size(frag_A_chunk.shape).unpack()):
+                    local_k_idx = fx.get_scalar(frag_a_k_coords[i])
+                    valid_k = global_k_base + local_k_idx < ks_end
+                    frag_A_chunk[i] = valid_k.select(frag_A_chunk[i], elem_dtype(0.0))
+
         for block_k_iter in range_constexpr(block_k // param.mma_k):
             if const_expr(has_k_tail):
-                global_k_iter = k_tile * block_k + block_k_iter * param.mma_k
-                if global_k_iter < k:
-                    fx.copy(
-                        a_s2r_copy_atom,
-                        thr_sA_s2r[None, None, block_k_iter],
-                        frag_A_retile[None, None, block_k_iter],
-                    )
+                global_k_iter = ks_begin + k_tile * block_k + block_k_iter * param.mma_k
+                if global_k_iter < ks_end:
+                    copy_k_chunk(block_k_iter)
             else:
-                fx.copy(
-                    a_s2r_copy_atom,
-                    thr_sA_s2r[None, None, block_k_iter],
-                    frag_A_retile[None, None, block_k_iter],
-                )
+                copy_k_chunk(block_k_iter)
         return frag_A
 
     def load_b_fragment(n_part, read_stage, k_tile):
@@ -926,8 +1078,8 @@ def hgemm_hti_gfx950_kernel(
 
         for block_k_iter in range_constexpr(block_k // param.mma_k):
             if const_expr(has_k_tail):
-                global_k_iter = k_tile * block_k + block_k_iter * param.mma_k
-                if global_k_iter < k:
+                global_k_iter = ks_begin + k_tile * block_k + block_k_iter * param.mma_k
+                if global_k_iter < ks_end:
                     fx.copy(
                         b_s2r_copy_atom,
                         thr_sB_s2r[None, None, block_k_iter],
@@ -946,8 +1098,8 @@ def hgemm_hti_gfx950_kernel(
             rocdl.sched_barrier(0)
         for block_k_iter in range_constexpr(block_k // param.mma_k):
             if const_expr(has_k_tail):
-                global_k_iter = k_tile * block_k + block_k_iter * param.mma_k
-                if global_k_iter < k:
+                global_k_iter = ks_begin + k_tile * block_k + block_k_iter * param.mma_k
+                if global_k_iter < ks_end:
                     fx.gemm(
                         tiled_mma,
                         frag_C,
@@ -968,22 +1120,25 @@ def hgemm_hti_gfx950_kernel(
         if const_expr(emit_sched_barrier):
             rocdl.sched_barrier(0)
 
-    def store_half_tile(m_part, n_part, frag_C):
-        gC = fx.flat_divide(out, (half_block_m, half_block_n))[
-            None, None, bid_m * 2 + m_part, bid_n * 2 + n_part
-        ]
-        sC = fx.make_view(smem_c, c_lds_layout)
+    def half_c_base(m_part, n_part):
+        tile_idx = m_part * 2 + n_part
+        return smem_c + tile_idx * half_block_m * half_block_n
 
-        row_coords = fx.make_view(
-            0, fx.make_layout((half_block_m, half_block_n), (1, 0))
-        )
-        col_coords = fx.make_view(
-            0, fx.make_layout((half_block_m, half_block_n), (0, 1))
-        )
-        thr_mma_cRow = thr_mma.partition_C(row_coords)
-        thr_mma_cCol = thr_mma.partition_C(col_coords)
+    def store_half_tile_to_lds(m_part, n_part, frag_C):
+        sC = fx.make_view(half_c_base(m_part, n_part), c_lds_layout)
+        frag_C_out = fx.make_fragment_like(frag_C, elem_dtype)
+        frag_C_out.store(frag_C.load().to(elem_dtype))
 
-        cshuffle_vec_size = GFX950_DMA_BYTES // param.out_data_bytes
+        for i in range_constexpr(fx.size(frag_C_out.shape).unpack()):
+            row = fx.get_scalar(thr_mma_cRow[i])
+            col = fx.get_scalar(thr_mma_cCol[i])
+            sC[row, col] = frag_C_out[i]
+
+    def store_half_tile_to_global(m_part, n_part):
+        gC = make_gC(m_part, n_part)
+        sC_base = half_c_base(m_part, n_part)
+        sC = fx.make_view(sC_base, c_lds_layout)
+
         cshuffle_x_threads = half_block_n // cshuffle_vec_size
         cshuffle_thr_layout = fx.make_layout(
             (block_threads // cshuffle_x_threads, cshuffle_x_threads),
@@ -995,7 +1150,7 @@ def hgemm_hti_gfx950_kernel(
             cshuffle_val_layout,
         )
         tiled_copy_cshuffle = fx.make_tiled_copy(
-            r2g_copy_atom,
+            buffer_copy_atom,
             cshuffle_tv_layout,
             cshuffle_tile,
         )
@@ -1010,8 +1165,8 @@ def hgemm_hti_gfx950_kernel(
         for i in range_constexpr(fx.size(pred_C.shape).unpack()):
             local_row = fx.get_scalar(thr_cRow[i])
             local_col = fx.get_scalar(thr_cCol[i])
-            row_idx = bid_m * block_m + m_part * half_block_m + local_row
-            col_idx = bid_n * block_n + n_part * half_block_n + local_col
+            row_idx = block_m_offset + m_part * half_block_m + local_row
+            col_idx = block_n_offset + n_part * half_block_n + local_col
             pred_C[i] = (
                 (local_row < half_block_m)
                 & (local_col < half_block_n)
@@ -1019,33 +1174,120 @@ def hgemm_hti_gfx950_kernel(
                 & (col_idx < n)
             )
 
-        frag_C_out = fx.make_fragment_like(frag_C, elem_dtype)
-        for i in range_constexpr(fx.size(frag_C.shape).unpack()):
-            val = frag_C[i]
-            if const_expr(param.has_bias):
-                col = fx.get_scalar(thr_mma_cCol[i])
-                global_n_idx = bid_n * block_n + n_part * half_block_n + col
-                safe_global_n_idx = (global_n_idx < n).select(global_n_idx, 0)
-                val = val + bias_buf[safe_global_n_idx].to(fx.Float32)
-            frag_C_out[i] = val.to(elem_dtype)
-
-        fx.gpu.barrier()
-        for i in range_constexpr(fx.size(frag_C_out.shape).unpack()):
-            row = fx.get_scalar(thr_mma_cRow[i])
-            col = fx.get_scalar(thr_mma_cCol[i])
-            sC[row, col] = frag_C_out[i]
-
-        fx.gpu.barrier()
-        fx.copy(s2r_copy_atom, thr_sC, frag_C_cshuffle)
-        fx.copy(r2g_copy_atom, frag_C_cshuffle, thr_gC, pred=pred_C)
-        fx.gpu.barrier()
+        if const_expr(is_split_k or param.out_dtype_id == HGEMM_DTYPE_FP32):
+            cshuffle_vectors = half_block_m * half_block_n // cshuffle_vec_size
+            cshuffle_iters = (cshuffle_vectors + block_threads - 1) // block_threads
+            for i in range_constexpr(cshuffle_iters):
+                vector_idx = block_threads * i + tid
+                if vector_idx < cshuffle_vectors:
+                    local_row = vector_idx // cshuffle_x_threads
+                    local_col = vector_idx % cshuffle_x_threads * cshuffle_vec_size
+                    global_row = block_m_offset + m_part * half_block_m + local_row
+                    global_col = block_n_offset + n_part * half_block_n + local_col
+                    if (global_row < m) and (global_col < n):
+                        c_vec = fx.ptr_load(
+                            sC_base + local_row * half_block_n + local_col,
+                            result_type=fx.Vector.make_type(
+                                cshuffle_vec_size, elem_dtype
+                            ),
+                        )
+                        global_offset = global_row * n + global_col
+                        if const_expr(param.out_dtype_id == HGEMM_DTYPE_FP32):
+                            c_vec_global = cast_vec_to_global_dtype(
+                                c_vec.ir_value(),
+                                cshuffle_vec_size,
+                                global_output_dtype.ir_type,
+                                False,
+                                True,
+                            )
+                            if const_expr(is_split_k):
+                                atomic_add_f32_vec(
+                                    out,
+                                    global_offset,
+                                    c_vec_global,
+                                    cshuffle_vec_size,
+                                )
+                            else:
+                                store_global_f32_vec(
+                                    out,
+                                    global_offset,
+                                    c_vec_global,
+                                    cshuffle_vec_size,
+                                )
+                        else:
+                            buffer_atomic_pk_add_vec(
+                                atomic_copy_atom,
+                                atomic_pair_frag,
+                                atomic_pair_layout,
+                                atomic_pair_type,
+                                out_buf,
+                                global_offset,
+                                c_vec.ir_value(),
+                                cshuffle_vec_size,
+                            )
+        else:
+            fx.copy(uni_copy_atom, thr_sC, frag_C_cshuffle)
+            fx.copy(buffer_copy_atom, frag_C_cshuffle, thr_gC, pred=pred_C)
 
     c00 = make_c_fragment(0, 0)
     c01 = make_c_fragment(0, 1)
     c10 = make_c_fragment(1, 0)
     c11 = make_c_fragment(1, 1)
 
-    def compute_loaded_tile(k_tile, read_stage):
+    if const_expr(is_split_k):
+        c00.fill(0.0)
+        c01.fill(0.0)
+        c10.fill(0.0)
+        c11.fill(0.0)
+        splitk_protocol.zero_c()
+    elif const_expr(param.has_bias):
+        for i in range_constexpr(fx.size(c00.shape).unpack()):
+            col_idx = fx.get_scalar(thr_mma_cCol[i])
+            global_n0_idx = block_n_offset + col_idx
+            global_n1_idx = global_n0_idx + half_block_n
+            safe_global_n0_idx = (global_n0_idx < n).select(global_n0_idx, 0)
+            safe_global_n1_idx = (global_n1_idx < n).select(global_n1_idx, 0)
+            bias0 = bias_buf[safe_global_n0_idx].to(fx.Float32)
+            bias1 = bias_buf[safe_global_n1_idx].to(fx.Float32)
+            c00[i] = bias0
+            c01[i] = bias1
+            c10[i] = bias0
+            c11[i] = bias1
+    else:
+        c00.fill(0.0)
+        c01.fill(0.0)
+        c10.fill(0.0)
+        c11.fill(0.0)
+
+    def final_tile_epilogue(k_tile, a1, b0, b1):
+        if const_expr(is_split_k or param.out_dtype_id == HGEMM_DTYPE_FP32):
+            consume(k_tile, c10, a1, b0, True)
+            rocdl.s_barrier()
+            consume(k_tile, c11, a1, b1, True)
+            gpu.barrier()
+            store_half_tile_to_lds(0, 0, c00)
+            store_half_tile_to_lds(0, 1, c01)
+            store_half_tile_to_lds(1, 0, c10)
+            store_half_tile_to_lds(1, 1, c11)
+        else:
+            rocdl.s_barrier()
+            consume(k_tile, c10, a1, b0, True)
+            rocdl.s_barrier()
+            consume(k_tile, c11, a1, b1, True)
+            __barrier(0)
+            store_half_tile_to_lds(0, 0, c00)
+            store_half_tile_to_lds(0, 1, c01)
+            __barrier(0)
+            store_half_tile_to_global(0, 0)
+            store_half_tile_to_global(0, 1)
+            __barrier(0)
+            store_half_tile_to_lds(1, 0, c10)
+            store_half_tile_to_lds(1, 1, c11)
+            __barrier(0)
+            store_half_tile_to_global(1, 0)
+            store_half_tile_to_global(1, 1)
+
+    def compute_loaded_tile(k_tile, read_stage, is_final):
         b0 = load_b_fragment(0, read_stage, k_tile)
         a0 = load_a_fragment(0, read_stage, k_tile)
         consume(k_tile, c00, a0, b0, True)
@@ -1054,8 +1296,11 @@ def hgemm_hti_gfx950_kernel(
         consume(k_tile, c01, a0, b1, True)
 
         a1 = load_a_fragment(1, read_stage, k_tile)
-        consume(k_tile, c10, a1, b0, True)
-        consume(k_tile, c11, a1, b1, True)
+        if const_expr(is_final):
+            final_tile_epilogue(k_tile, a1, b0, b1)
+        else:
+            consume(k_tile, c10, a1, b0, True)
+            consume(k_tile, c11, a1, b1, True)
 
     def compute_double_tile(k_tile, prefetch_next):
         next_k_tile = k_tile + 2
@@ -1084,7 +1329,7 @@ def hgemm_hti_gfx950_kernel(
         b0 = load_b_fragment(0, 1, k_tile + 1)
         if const_expr(prefetch_next):
             async_load_b_to_lds(1, next_k_tile, 0)
-            __barrier(2 * half_ldg_b_iters + 1 * half_ldg_a_iters)
+            __barrier(2 * half_ldg_b_iters + half_ldg_a_iters)
         consume(k_tile, c11, a1, b1, True)
         if const_expr(not prefetch_next):
             __waitcnt(0)
@@ -1108,19 +1353,17 @@ def hgemm_hti_gfx950_kernel(
         if const_expr(prefetch_next):
             async_load_a_to_lds(0, next_k_tile + 1, 1)
             rocdl.s_barrier()
-        consume(k_tile + 1, c10, a1, b0, True)
-        rocdl.s_barrier()
+            consume(k_tile + 1, c10, a1, b0, True)
+            rocdl.s_barrier()
 
-        if const_expr(prefetch_next):
             async_load_b_to_lds(1, next_k_tile + 1, 1)
-            __barrier(1 * half_ldg_b_iters + 1 * half_ldg_a_iters)
-        consume(k_tile + 1, c11, a1, b1, True)
-        rocdl.s_barrier()
+            __barrier(half_ldg_b_iters + half_ldg_a_iters)
+            consume(k_tile + 1, c11, a1, b1, True)
+            rocdl.s_barrier()
+        else:
+            final_tile_epilogue(k_tile + 1, a1, b0, b1)
 
     if k_tiles == 2:
-        # The interleaved pipeline below intentionally staggers wave barriers
-        # while prefetching later double tiles. With no later tile, use a
-        # symmetric preload path so all four A/B halves are visible before use.
         async_load_b_to_lds(0, 0, 0)
         async_load_a_to_lds(0, 0, 0)
         async_load_b_to_lds(1, 0, 0)
@@ -1131,9 +1374,8 @@ def hgemm_hti_gfx950_kernel(
         async_load_a_to_lds(1, 1, 1)
         __waitcnt(0)
         rocdl.s_barrier()
-
-        compute_loaded_tile(0, 0)
-        compute_loaded_tile(1, 1)
+        compute_loaded_tile(0, 0, False)
+        compute_loaded_tile(1, 1, True)
     else:
         async_load_b_to_lds(0, 0, 0)
         async_load_a_to_lds(0, 0, 0)
@@ -1148,7 +1390,7 @@ def hgemm_hti_gfx950_kernel(
         async_load_b_to_lds(0, 1, 1)
         async_load_a_to_lds(0, 1, 1)
         async_load_b_to_lds(1, 1, 1)
-        __barrier(1 * half_ldg_b_iters + 1 * half_ldg_a_iters)
+        __barrier(half_ldg_b_iters + half_ldg_a_iters)
 
         final_double_tile = ((k_tiles % 2) == 0).select(k_tiles - 2, k_tiles - 1)
         main_loop_end = (k_tiles > 2).select(final_double_tile, 0)
@@ -1157,18 +1399,27 @@ def hgemm_hti_gfx950_kernel(
 
         compute_double_tile(main_loop_end, False)
 
-    store_half_tile(0, 0, c00)
-    store_half_tile(0, 1, c01)
-    store_half_tile(1, 0, c10)
-    store_half_tile(1, 1, c11)
+    if const_expr(is_split_k):
+        splitk_protocol.split_k_barrier(split_k)
+    elif const_expr(param.out_dtype_id == HGEMM_DTYPE_FP32):
+        gpu.barrier()
+
+    if const_expr(is_split_k or param.out_dtype_id == HGEMM_DTYPE_FP32):
+        store_half_tile_to_global(0, 0)
+        store_half_tile_to_global(0, 1)
+        store_half_tile_to_global(1, 0)
+        store_half_tile_to_global(1, 1)
 
 
 @flyc.jit
-def launch_hgemm_gfx950(
+def hgemm_gfx950(
     out: fx.Tensor,
     a: fx.Tensor,
     b: fx.Tensor,
     bias: fx.Tensor,
+    semaphore: fx.Tensor,
+    signal: fx.Tensor,
+    split_k: fx.Int32,
     param: HGemmGfx950Param,
     stream: fx.Stream = fx.Stream(None),
 ):
@@ -1176,14 +1427,10 @@ def launch_hgemm_gfx950(
     n = fx.Int32(fx.get_scalar(b.shape[1]))
     k = fx.Int32(fx.get_scalar(a.shape[1]))
     a_leading_stride = fx.Int32(
-        fx.get_scalar(
-            a.stride[1] if const_expr(param.a_is_transposed) else a.stride[0]
-        )
+        fx.get_scalar(a.stride[1] if const_expr(param.a_is_transposed) else a.stride[0])
     )
     b_leading_stride = fx.Int32(
-        fx.get_scalar(
-            b.stride[1] if const_expr(param.b_is_transposed) else b.stride[0]
-        )
+        fx.get_scalar(b.stride[1] if const_expr(param.b_is_transposed) else b.stride[0])
     )
     elem_dtype = (
         fx.Float16 if const_expr(param.dtype_id == HGEMM_DTYPE_FP16) else fx.BFloat16
@@ -1207,6 +1454,9 @@ def launch_hgemm_gfx950(
             ),
         ),
     )
+    split_alignment = GFX950_DMA_BYTES // param.in_data_bytes
+    working_k = (k + split_k - 1) // split_k
+    working_k = (working_k + split_alignment - 1) // split_alignment * split_alignment
     num_pid_m = (m + param.block_m - 1) // param.block_m
     num_pid_n = (n + param.block_n - 1) // param.block_n
     hgemm_kernel_impl = (
@@ -1221,15 +1471,19 @@ def launch_hgemm_gfx950(
         a,
         b,
         bias,
+        semaphore,
+        signal,
         m,
         n,
         k,
+        split_k,
+        working_k,
         a_leading_stride,
         b_leading_stride,
         tiled_mma,
         param,
     ).launch(
-        grid=(num_pid_m * num_pid_n, 1, 1),
+        grid=(num_pid_m * num_pid_n, split_k, 1),
         block=(param.block_threads, 1, 1),
         stream=stream,
     )
@@ -1241,18 +1495,71 @@ def make_hgemm_param_and_validate(m, n, k, kwargs):
         result = make_hgemm_gfx950_param(**kwargs)
     except Exception:
         return None
-    if not ((n % 32 == 0) and (k % result.mma_k == 0)):
+    split_k = kwargs.get("split_k", 1)
+    async_load_vec_size = GFX950_DMA_BYTES // result.in_data_bytes
+    working_k = (k + split_k - 1) // split_k
+    working_k = (
+        (working_k + async_load_vec_size - 1)
+        // async_load_vec_size
+        * async_load_vec_size
+    )
+    last_working_k = k - (split_k - 1) * working_k
+    cshuffle_vec_size = GFX950_DMA_BYTES // result.in_data_bytes
+    if n % cshuffle_vec_size != 0 or k % async_load_vec_size != 0 or last_working_k < 0:
         return None
-    if result.use_half_tile_interleaved:
-        k_tiles = (k + result.block_k - 1) // result.block_k
-        if k_tiles < 2:
+    num_pid_m = (m + result.block_m - 1) // result.block_m
+    num_pid_n = (n + result.block_n - 1) // result.block_n
+    if split_k > 1:
+        c_elements_per_iteration = result.block_threads * cshuffle_vec_size
+        if (
+            num_pid_m * num_pid_n > SPLIT_K_SEMAPHORE_MAX_LEN
+            or result.block_m * result.block_n % c_elements_per_iteration != 0
+        ):
             return None
     return result
 
 
-def infer_has_k_tail(k: int, block_k: int, stages: int):
-    k_tiles = (k + block_k - 1) // block_k
-    return (k % block_k != 0) or (k_tiles < stages - 1)
+def infer_has_k_tail(
+    k: int,
+    split_k: int,
+    block_k: int,
+    stages: int,
+    use_half_tile_interleaved: bool,
+):
+    async_load_vec_size = GFX950_DMA_BYTES // 2
+    working_k = (k + split_k - 1) // split_k
+    working_k = (
+        (working_k + async_load_vec_size - 1)
+        // async_load_vec_size
+        * async_load_vec_size
+    )
+    last_working_k = k - (split_k - 1) * working_k
+    working_k_tiles = (working_k + block_k - 1) // block_k
+    last_working_k_tiles = (last_working_k + block_k - 1) // block_k
+    has_k_tail = (
+        working_k % block_k != 0
+        or last_working_k % block_k != 0
+        or working_k_tiles < stages - 1
+        or last_working_k_tiles < stages - 1
+    )
+    if use_half_tile_interleaved:
+        has_k_tail = (
+            has_k_tail or working_k_tiles % 2 != 0 or last_working_k_tiles % 2 != 0
+        )
+    return has_k_tail
+
+
+@functools.lru_cache(maxsize=128)
+def get_split_k_buffers(stream, device):
+    semaphore = torch.zeros(
+        (SPLIT_K_SEMAPHORE_MAX_LEN,), dtype=torch.int32, device=device
+    )
+    signal = torch.zeros((SPLIT_K_SEMAPHORE_MAX_LEN,), dtype=torch.int32, device=device)
+    return semaphore, signal
+
+
+def _dynamic_tensor_arg(tensor, leading_dim):
+    return flyc.from_dlpack(tensor).mark_layout_dynamic(leading_dim=leading_dim)
 
 
 def hgemm(
@@ -1263,11 +1570,15 @@ def hgemm(
     user_kwargs: dict = {},
     stream: Optional[torch.cuda.Stream] = None,
     layout: str = "nt",
+    out_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     """Compute C[M, N] = A[M, K] @ B[K, N].
 
     Each layout character controls only the corresponding tensor stride:
     N is row-major and T is column-major. Logical tensor shapes never change.
+    Set ``user_kwargs["split_k"]`` above 1 to atomically reduce K partitions.
+    Set ``user_kwargs["k_waves"]`` above 1 for full-tile workgroup-local slice-K.
+    ``out_dtype`` may be the input dtype or ``torch.float32``.
     """
     if stream is None:
         stream = torch.cuda.current_stream()
@@ -1325,15 +1636,21 @@ def hgemm(
             or b.stride(0) * b.element_size() % GFX950_DMA_BYTES != 0
         ):
             b = b.contiguous()
+    if out_dtype is None:
+        out_dtype = a.dtype if out is None else out.dtype
+    if out_dtype not in (a.dtype, torch.float32):
+        raise ValueError(
+            f"unsupported output dtype {out_dtype}; expected {a.dtype} or torch.float32"
+        )
     if out is None:
-        out = torch.empty((m, n), dtype=a.dtype, device=a.device)
+        out = torch.empty((m, n), dtype=out_dtype, device=a.device)
     else:
-        assert out.dtype == a.dtype
+        assert out.dtype == out_dtype
         assert out.device == device
         assert out.is_contiguous()
     out = out.view(-1, n)
     assert out.shape[0] == m
-    assert out.dtype == a.dtype
+    assert out.dtype == out_dtype
 
     if bias is not None and not bias.is_contiguous():
         bias = bias.contiguous()
@@ -1343,8 +1660,10 @@ def hgemm(
         "block_n": 256,
         "block_k": 64,
         "stages": 2,
+        "split_k": 1,
         "m_waves": 2,
         "n_waves": 4,
+        "k_waves": 1,
         "group_m": 0,
         "use_half_tile_interleaved": True,
     }
@@ -1355,17 +1674,19 @@ def hgemm(
     kwargs["dtype_id"] = (
         HGEMM_DTYPE_FP16 if a.dtype is torch.float16 else HGEMM_DTYPE_BF16
     )
+    kwargs["out_dtype_id"] = (
+        HGEMM_DTYPE_FP32 if out.dtype is torch.float32 else kwargs["dtype_id"]
+    )
     kwargs["has_bias"] = False if bias is None else True
+    split_k = kwargs["split_k"]
     has_k_tail = infer_has_k_tail(
         k=k,
+        split_k=split_k,
         block_k=kwargs["block_k"],
         stages=kwargs["stages"],
+        use_half_tile_interleaved=kwargs["use_half_tile_interleaved"],
     )
-    if kwargs["use_half_tile_interleaved"]:
-        k_tiles = (k + kwargs["block_k"] - 1) // kwargs["block_k"]
-        has_k_tail = has_k_tail or (k_tiles % 2 != 0)
     kwargs["has_k_tail"] = has_k_tail
-    bias_tensor = a if bias is None else bias
 
     if bias is not None:
         assert bias.shape[0] == n
@@ -1373,5 +1694,27 @@ def hgemm(
 
     param = make_hgemm_param_and_validate(m, n, k, kwargs)
     assert param is not None, "unsupported hgemm_layout_gfx950 shape/config"
-    launch_hgemm_gfx950(out, a, b, bias_tensor, param, stream)
+    semaphore, signal = get_split_k_buffers(stream, device)
+    a_arg = _dynamic_tensor_arg(a, 0 if a_is_transposed else 1)
+    b_arg = _dynamic_tensor_arg(b, 0 if b_is_transposed else 1)
+    out_arg = _dynamic_tensor_arg(out, 1)
+    bias_arg = a_arg if bias is None else _dynamic_tensor_arg(bias, 0)
+    dispatch_args = (
+        out_arg,
+        a_arg,
+        b_arg,
+        bias_arg,
+        semaphore,
+        signal,
+        split_k,
+        param,
+        stream,
+    )
+    run_cached(
+        hgemm_gfx950,
+        *dispatch_args,
+        constexpr_param=param,
+        compiler=flyc.compile,
+        dispatch_args=dispatch_args,
+    )
     return out

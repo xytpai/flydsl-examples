@@ -13,6 +13,18 @@ The goal of this repository is to show how to write high-performance GEMM kernel
 
 ![HGEMM BF16 benchmark vs Torch hipBLAS](images/hgemm_benchmark.svg)
 
+## FlyDSL install from source
+
+```bash
+pip uninstall -y flydsl
+git clone git@github.com:ROCm/FlyDSL.git
+cd FlyDSL ; git checkout 9a5c08e77355f915ad35965bea8ea88f0af33bf3
+git submodule sync && git submodule update --init --recursive
+bash scripts/build_llvm.sh -j64
+bash scripts/build.sh -j64
+pip install -e .
+```
+
 ## Run Tests And Benchmarks
 
 ```bash

@@ -21,10 +21,13 @@ class _TestArgs:
     stages: int
     m_waves: int
     n_waves: int
+    k_waves: int
     group_m: int
     has_bias: bool
     use_half_tile_interleaved: bool = False
     layout: str = "nt"
+    split_k: int = 1
+    out_dtype: torch.dtype | None = None
 
 
 def empty_layout_matrix(rows: int, cols: int, dtype: torch.dtype, is_t: bool):
@@ -57,16 +60,24 @@ def create_inputs(args: _TestArgs):
 
 
 def create_outputs(args: _TestArgs):
-    c = torch.randn((args.m, args.n), dtype=args.dtype, device="cuda")
+    dtype = args.dtype if args.out_dtype is None else args.out_dtype
+    c = torch.randn((args.m, args.n), dtype=dtype, device="cuda")
     return (c,)
 
 
 def ref_func(*args):
     a, b, bias, c, _layout = args
-    if bias is None:
-        torch.mm(a, b, out=c)
+    if c.dtype == a.dtype:
+        if bias is None:
+            torch.mm(a, b, out=c)
+        else:
+            torch.addmm(bias, a, b, out=c)
     else:
-        torch.addmm(bias, a, b, out=c)
+        if bias is None:
+            ref = torch.mm(a.float(), b.float())
+        else:
+            ref = torch.addmm(bias.float(), a.float(), b.float())
+        c.copy_(ref)
 
 
 def make_triton_maxautotune_func():
@@ -110,8 +121,10 @@ def check_acc(args: _TestArgs):
         "stages": args.stages,
         "m_waves": args.m_waves,
         "n_waves": args.n_waves,
+        "k_waves": args.k_waves,
         "group_m": args.group_m,
         "use_half_tile_interleaved": args.use_half_tile_interleaved,
+        "split_k": args.split_k,
     }
     inputs = create_inputs(args)
     outputs = create_outputs(args)
@@ -122,6 +135,7 @@ def check_acc(args: _TestArgs):
 
     def get_tol(args):
         k_scale = (args.k / 8192) ** 0.5
+        k_scale *= args.split_k * args.k_waves
         if args.dtype is torch.bfloat16:
             return 2e-1 * k_scale, 2e-1
         return 5e-2 * k_scale, 5e-2
@@ -152,8 +166,10 @@ def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
         "stages": args.stages,
         "m_waves": args.m_waves,
         "n_waves": args.n_waves,
+        "k_waves": args.k_waves,
         "group_m": args.group_m,
         "use_half_tile_interleaved": args.use_half_tile_interleaved,
+        "split_k": args.split_k,
     }
     sample_inputs = create_inputs(args)
     sample_outputs = create_outputs(args)
@@ -290,10 +306,137 @@ def test_hgemm_acc_main_loop(
         stages,
         m_waves,
         n_waves,
+        1,
         group_m,
         has_bias,
         is_hti,
         layout,
+    )
+    check_acc(args)
+
+
+@pytest.mark.parametrize("layout", ["nn", "nt", "tn", "tt"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "m, n, k, block_m, block_n, block_k, stages, split_k, "
+    "m_waves, n_waves, k_waves, has_bias, group_m, "
+    "use_half_tile_interleaved",
+    [
+        # Layout-kernel split-K smoke cases.
+        (64, 64, 480, 64, 64, 64, 2, 3, 2, 2, 1, True, 0, False),
+        (64, 64, 480, 64, 64, 64, 2, 3, 2, 2, 1, True, 0, True),
+        # test_hgemm_acc_ft_stage_split_k
+        (32, 384, 7168, 32, 64, 64, 5, 8, 2, 2, 1, True, 0, False),
+        (32, 384, 7168, 32, 64, 64, 5, 8, 2, 2, 1, False, 0, False),
+        (32, 384, 7168, 32, 64, 64, 5, 8, 2, 2, 1, True, 4, False),
+        (32, 384, 7168, 32, 64, 64, 5, 8, 2, 2, 1, False, 4, False),
+        # test_hgemm_acc_ht_split_k
+        (64, 384, 7168, 64, 64, 64, 2, 8, 2, 2, 1, True, 0, True),
+        (64, 384, 7168, 64, 64, 64, 2, 8, 2, 2, 1, False, 0, True),
+        (64, 384, 7168, 64, 64, 64, 2, 8, 2, 2, 1, True, 4, True),
+        (64, 384, 7168, 64, 64, 64, 2, 8, 2, 2, 1, False, 4, True),
+        (2048, 2048, 2048, 128, 128, 64, 2, 4, 2, 2, 1, True, 0, True),
+        (2048, 2048, 2048, 128, 128, 64, 2, 4, 2, 2, 1, False, 0, True),
+        (2048, 2048, 2048, 128, 128, 64, 2, 4, 2, 2, 1, True, 4, True),
+        (2048, 2048, 2048, 128, 128, 64, 2, 4, 2, 2, 1, False, 4, True),
+        # test_hgemm_acc_small_m
+        (3, 5120, 2880, 64, 64, 64, 5, 3, 2, 2, 1, True, 0, False),
+        (3, 5120, 2880, 64, 64, 64, 5, 3, 2, 2, 1, False, 0, False),
+        (3, 5120, 2880, 64, 64, 64, 2, 3, 2, 2, 1, True, 0, True),
+        (3, 5120, 2880, 64, 64, 64, 2, 3, 2, 2, 1, False, 0, True),
+        (3, 5120, 2880, 64, 64, 64, 2, 3, 2, 2, 1, True, 4, True),
+        # test_hgemm_acc_small_mnk
+        (3, 16, 16, 64, 64, 64, 2, 3, 2, 2, 1, False, 0, False),
+        (3, 16, 16, 64, 64, 64, 2, 3, 2, 2, 1, True, 0, False),
+        (3, 16, 48, 64, 64, 64, 2, 3, 2, 2, 1, True, 0, False),
+        (3, 16, 80, 64, 64, 64, 2, 3, 2, 2, 1, True, 0, False),
+        (3, 16, 144, 64, 64, 64, 2, 3, 2, 2, 1, True, 0, False),
+        (3, 16, 144, 64, 64, 64, 3, 3, 2, 2, 1, True, 0, False),
+        (3, 16, 16, 64, 64, 64, 4, 3, 2, 2, 1, True, 0, False),
+        (3, 16, 16, 64, 64, 64, 2, 3, 2, 2, 1, False, 0, True),
+        (3, 16, 16, 64, 64, 64, 2, 3, 2, 2, 1, True, 0, True),
+        (3, 16, 48, 64, 64, 64, 2, 3, 2, 2, 1, True, 0, True),
+        (3, 16, 80, 64, 64, 64, 2, 3, 2, 2, 1, True, 0, True),
+        (3, 16, 144, 64, 64, 64, 2, 3, 2, 2, 1, True, 0, True),
+        (3, 16, 144, 64, 64, 64, 2, 3, 2, 2, 1, False, 4, True),
+        # test_hgemm_acc_ft_slice_k
+        (800, 384, 7168, 32, 64, 128, 6, 1, 1, 2, 2, True, 0, False),
+        (800, 384, 7168, 32, 64, 128, 6, 1, 1, 2, 2, False, 0, False),
+        (800, 384, 7168, 32, 64, 128, 6, 2, 1, 2, 2, True, 0, False),
+        (800, 384, 7168, 32, 64, 128, 6, 2, 1, 2, 2, False, 0, False),
+        (800, 384, 7168, 32, 64, 128, 6, 2, 1, 2, 2, False, 4, False),
+        # test_hgemm_acc_ft_special
+        (16, 2880, 512, 16, 128, 128, 4, 2, 1, 1, 4, True, 0, False),
+        (48, 128, 2880, 80, 64, 64, 4, 12, 1, 1, 2, True, 0, False),
+        (48, 640, 2880, 96, 64, 64, 5, 2, 1, 1, 1, True, 0, False),
+    ],
+)
+def test_hgemm_acc_split_k(
+    layout: str,
+    dtype: torch.dtype,
+    m: int,
+    n: int,
+    k: int,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    stages: int,
+    split_k: int,
+    m_waves: int,
+    n_waves: int,
+    k_waves: int,
+    has_bias: bool,
+    group_m: int,
+    use_half_tile_interleaved: bool,
+):
+    assert k_waves > 0
+    assert split_k > 1 or k_waves > 1
+    args = _TestArgs(
+        dtype=dtype,
+        m=m,
+        n=n,
+        k=k,
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        stages=stages,
+        m_waves=m_waves,
+        n_waves=n_waves,
+        k_waves=k_waves,
+        group_m=group_m,
+        has_bias=has_bias,
+        use_half_tile_interleaved=use_half_tile_interleaved,
+        layout=layout,
+        split_k=split_k,
+    )
+    check_acc(args)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("split_k", [1, 3])
+@pytest.mark.parametrize("use_half_tile_interleaved", [False, True])
+def test_hgemm_acc_fp32_output(
+    dtype: torch.dtype,
+    split_k: int,
+    use_half_tile_interleaved: bool,
+):
+    args = _TestArgs(
+        dtype=dtype,
+        m=64,
+        n=64,
+        k=480,
+        block_m=64,
+        block_n=64,
+        block_k=64,
+        stages=2,
+        m_waves=2,
+        n_waves=2,
+        k_waves=1,
+        group_m=0,
+        has_bias=True,
+        use_half_tile_interleaved=use_half_tile_interleaved,
+        split_k=split_k,
+        out_dtype=torch.float32,
     )
     check_acc(args)
 
@@ -352,6 +495,7 @@ def test_hgemm_acc_small_m(
         stages,
         m_waves,
         n_waves,
+        1,
         group_m,
         has_bias,
         is_hti,
@@ -421,6 +565,7 @@ def test_hgemm_acc_bench(
         stages,
         m_waves,
         n_waves,
+        1,
         group_m,
         has_bias,
         is_hti,
@@ -565,6 +710,7 @@ def test_hgemm_benchmark_smoke(
         stages,
         m_waves,
         n_waves,
+        1,
         group_m,
         has_bias,
         is_hti,
