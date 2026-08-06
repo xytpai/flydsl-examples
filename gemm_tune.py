@@ -19,6 +19,8 @@ from flydsl.runtime.device import get_rocm_arch
 from kernels.hgemm_layout_gfx950 import hgemm, make_hgemm_param_and_validate
 
 DEFAULT_COMPILE_WORKERS = 32
+_COMPILE_TENSORS = None
+_COMPILE_LAYOUT = "nt"
 
 gpu_arch = get_rocm_arch()
 base_dir = Path(__file__).resolve().parent
@@ -116,24 +118,32 @@ def create_outputs(args):
     return (c,)
 
 
-def _init_compile_worker():
+def _init_compile_worker(dtype, m, n, k, layout):
+    global _COMPILE_TENSORS, _COMPILE_LAYOUT
     os.environ["FLYDSL_RUNTIME_ENABLE_CACHE"] = "1"
     torch.set_num_threads(1)
     torch.cuda.set_device(0)
+    _COMPILE_TENSORS = (
+        empty_layout_matrix(m, k, dtype, layout[0] == "t"),
+        empty_layout_matrix(k, n, dtype, layout[1] == "t"),
+        torch.empty((m, n), dtype=dtype, device="cuda"),
+        torch.empty(n, dtype=dtype, device="cuda"),
+    )
+    _COMPILE_LAYOUT = layout
 
 
 def _compile_policy_worker(job):
-    index, dtype, m, n, k, layout, config = job
+    index, config = job
     try:
-        a = empty_layout_matrix(m, k, dtype, layout[0] == "t")
-        b = empty_layout_matrix(k, n, dtype, layout[1] == "t")
+        assert _COMPILE_TENSORS is not None
+        a, b, out, bias = _COMPILE_TENSORS
         hgemm(
             a,
             b,
-            torch.empty((m, n), dtype=dtype, device="cuda"),
-            bias=torch.empty(n, dtype=dtype, device="cuda"),
+            out,
+            bias=bias,
             user_kwargs=config,
-            layout=layout,
+            layout=_COMPILE_LAYOUT,
         )
         torch.cuda.synchronize()
         return index, None
@@ -148,14 +158,12 @@ def parallel_compile_policies(args, configs, max_workers=DEFAULT_COMPILE_WORKERS
     os.environ["FLYDSL_RUNTIME_ENABLE_CACHE"] = "1"
     os.environ.setdefault("ARCH", gpu_arch)
     workers = max(1, min(max_workers or DEFAULT_COMPILE_WORKERS, len(configs)))
-    jobs = [
-        (i, args.dtype, args.m, args.n, args.k, args.layout, config)
-        for i, config in enumerate(configs)
-    ]
+    jobs = list(enumerate(configs))
     with ProcessPoolExecutor(
         max_workers=workers,
         mp_context=mp.get_context("spawn"),
         initializer=_init_compile_worker,
+        initargs=(args.dtype, args.m, args.n, args.k, args.layout),
     ) as executor:
         results = list(
             tqdm(
