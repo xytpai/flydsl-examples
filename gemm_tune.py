@@ -6,15 +6,19 @@ import json
 import torch
 import itertools
 import argparse
+import multiprocessing as mp
 
 import numpy as np
 from tqdm import tqdm
+from concurrent.futures import ProcessPoolExecutor
 from torch.profiler import profile, ProfilerActivity
 from pathlib import Path
 from dataclasses import dataclass
 from flydsl.runtime.device import get_rocm_arch
 
 from kernels.hgemm_layout_gfx950 import hgemm, make_hgemm_param_and_validate
+
+DEFAULT_COMPILE_WORKERS = 32
 
 gpu_arch = get_rocm_arch()
 base_dir = Path(__file__).resolve().parent
@@ -30,6 +34,7 @@ class Args:
     k: int
     layout: str
     enable_split_k: bool = False
+    compile_workers: int = DEFAULT_COMPILE_WORKERS
 
 
 @dataclass
@@ -77,17 +82,13 @@ class GemmTileIoUPruner:
             return configs
         config_ious = [self._config_iou(config) for config in configs]
         threshold = max(config_ious) * self.keep_ratio
-        return [
-            config
-            for config, iou in zip(configs, config_ious)
-            if iou >= threshold
-        ]
+        return [config for config, iou in zip(configs, config_ious) if iou >= threshold]
 
 
-def empty_layout_matrix(rows, cols, dtype, is_t):
+def empty_layout_matrix(rows, cols, dtype, is_t, device="cuda"):
     if is_t:
-        return torch.empty((cols, rows), dtype=dtype, device="cuda").t()
-    return torch.empty((rows, cols), dtype=dtype, device="cuda")
+        return torch.empty((cols, rows), dtype=dtype, device=device).t()
+    return torch.empty((rows, cols), dtype=dtype, device=device)
 
 
 def create_inputs(args):
@@ -113,6 +114,61 @@ def create_inputs(args):
 def create_outputs(args):
     c = torch.randn((args.m, args.n), dtype=args.dtype, device="cuda")
     return (c,)
+
+
+def _init_compile_worker():
+    os.environ["FLYDSL_RUNTIME_ENABLE_CACHE"] = "1"
+    torch.set_num_threads(1)
+    torch.cuda.set_device(0)
+
+
+def _compile_policy_worker(job):
+    index, dtype, m, n, k, layout, config = job
+    try:
+        a = empty_layout_matrix(m, k, dtype, layout[0] == "t")
+        b = empty_layout_matrix(k, n, dtype, layout[1] == "t")
+        hgemm(
+            a,
+            b,
+            torch.empty((m, n), dtype=dtype, device="cuda"),
+            bias=torch.empty(n, dtype=dtype, device="cuda"),
+            user_kwargs=config,
+            layout=layout,
+        )
+        torch.cuda.synchronize()
+        return index, None
+    except Exception as error:
+        return index, str(error)
+
+
+def parallel_compile_policies(args, configs, max_workers=DEFAULT_COMPILE_WORKERS):
+    if not configs:
+        return []
+
+    os.environ["FLYDSL_RUNTIME_ENABLE_CACHE"] = "1"
+    os.environ.setdefault("ARCH", gpu_arch)
+    workers = max(1, min(max_workers or DEFAULT_COMPILE_WORKERS, len(configs)))
+    jobs = [
+        (i, args.dtype, args.m, args.n, args.k, args.layout, config)
+        for i, config in enumerate(configs)
+    ]
+    with ProcessPoolExecutor(
+        max_workers=workers,
+        mp_context=mp.get_context("spawn"),
+        initializer=_init_compile_worker,
+    ) as executor:
+        results = list(
+            tqdm(
+                executor.map(_compile_policy_worker, jobs),
+                total=len(jobs),
+                desc=f"compile policies ({workers} workers)",
+            )
+        )
+
+    failures = {index: error for index, error in results if error}
+    for index, error in list(failures.items())[:3]:
+        print(f"compile failed: {configs[index]}: {error}", flush=True)
+    return [config for i, config in enumerate(configs) if i not in failures]
 
 
 def tuning_benchmark(args, kwargs={}, niters=50):
@@ -223,6 +279,13 @@ def hgemm_get_configs(args):
 
 def tune_single(args):
     configs = hgemm_get_configs(args)
+    configs = parallel_compile_policies(
+        args,
+        configs,
+        max_workers=args.compile_workers,
+    )
+    if not configs:
+        raise RuntimeError(f"no policies compiled successfully for {args}")
     best_duration = float(1e10)
     best_idx = 0
     pbar = tqdm(total=len(configs), desc=f"{args}")
@@ -257,6 +320,7 @@ def tune_all(
     out_prefix,
     layout,
     enable_split_k=False,
+    compile_workers=DEFAULT_COMPILE_WORKERS,
 ):
     mnks = [
         # splitk
@@ -297,6 +361,7 @@ def tune_all(
                 k=mnk[2],
                 layout=layout,
                 enable_split_k=enable_split_k,
+                compile_workers=compile_workers,
             )
             result = tune_single(args)
             result = vars(result)
@@ -321,6 +386,12 @@ if __name__ == "__main__":
         action="store_true",
         help="include valid split_k values greater than 1 in tuning",
     )
+    parser.add_argument(
+        "--compile-workers",
+        type=int,
+        default=DEFAULT_COMPILE_WORKERS,
+        help="parallel policy compiler processes (default: 32)",
+    )
     parser.add_argument("--m", type=int, default=4096)
     parser.add_argument("--n", type=int, default=4096)
     parser.add_argument("--k", type=int, default=4096)
@@ -336,6 +407,7 @@ if __name__ == "__main__":
             args.out,
             args.layout,
             enable_split_k=args.enable_split_k,
+            compile_workers=args.compile_workers,
         )
 
     # rm -rf ~/.flydsl/ ; python3 gemm_tune.py --single --dtype bf16 --m 1024 --n 1024 --k 1024
