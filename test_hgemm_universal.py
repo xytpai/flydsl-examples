@@ -1,10 +1,9 @@
 import torch
 import pytest
-import itertools
 from torch.profiler import profile, ProfilerActivity
 from dataclasses import dataclass
 
-from kernels.hgemm_universal_gfx950 import hgemm, make_hgemm_gfx950_param
+from kernels.hgemm_universal_gfx950 import hgemm
 
 ROTARY_INPUTS_TARGET_BYTES = 8 * 1024**3
 
@@ -251,12 +250,8 @@ def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
         (8160, 8160, 8192, 256, 256, 64, 2, 2, 4, 0, True, False),
         (8192, 8192, 8192 + 64, 256, 256, 64, 2, 2, 4, 0, False, False),
         (8192, 8192, 8192 + 64, 256, 256, 64, 2, 2, 4, 0, True, False),
-        (8192, 8192, 8192 + 32, 256, 256, 64, 2, 2, 4, 0, False, False),
-        (8192, 8192, 8192 + 32, 256, 256, 64, 2, 2, 4, 0, True, False),
         (8160, 8160, 8192 + 64, 256, 256, 64, 2, 2, 4, 0, False, False),
         (8160, 8160, 8192 + 64, 256, 256, 64, 2, 2, 4, 0, True, False),
-        (8160, 8160, 8192 + 32, 256, 256, 64, 2, 2, 4, 0, False, False),
-        (8160, 8160, 8192 + 32, 256, 256, 64, 2, 2, 4, 0, True, False),
         (2048, 2048, 2048, 128, 128, 64, 2, 4, 4, 0, False, False),
         (2048, 2048, 2048, 128, 128, 64, 4, 4, 4, 0, True, False),
         (2048, 2048, 2048 - 64, 128, 128, 64, 2, 4, 4, 0, False, False),
@@ -266,16 +261,7 @@ def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
         (8192, 8192, 8192, 256, 256, 64, 2, 2, 4, 4, True, True),
         (8160, 8160, 8192, 256, 256, 64, 2, 2, 4, 0, False, True),
         (8160, 8160, 8192, 256, 256, 64, 2, 2, 4, 0, True, True),
-        (8192, 8192, 8192 + 64, 256, 256, 64, 2, 2, 4, 0, False, True),
-        (8192, 8192, 8192 + 64, 256, 256, 64, 2, 2, 4, 0, True, True),
-        (8192, 8192, 8192 + 32, 256, 256, 64, 2, 2, 4, 0, False, True),
-        (8192, 8192, 8192 + 32, 256, 256, 64, 2, 2, 4, 0, True, True),
-        (8160, 8160, 8192 + 64, 256, 256, 64, 2, 2, 4, 0, False, True),
-        (8160, 8160, 8192 + 64, 256, 256, 64, 2, 2, 4, 0, True, True),
-        (8160, 8160, 8192 + 32, 256, 256, 64, 2, 2, 4, 0, False, True),
-        (8160, 8160, 8192 + 32, 256, 256, 64, 2, 2, 4, 0, True, True),
         (2048, 2048, 2048, 128, 128, 64, 2, 2, 2, 0, False, True),
-        (2048, 2048, 2048 - 64, 128, 128, 64, 2, 2, 2, 0, False, True),
     ],
 )
 def test_hgemm_acc_main_loop(
@@ -322,9 +308,6 @@ def test_hgemm_acc_main_loop(
     "m_waves, n_waves, k_waves, has_bias, group_m, "
     "use_half_tile_interleaved",
     [
-        # Layout-kernel split-K smoke cases.
-        (64, 64, 480, 64, 64, 64, 2, 3, 2, 2, 1, True, 0, False),
-        (64, 64, 480, 64, 64, 64, 2, 3, 2, 2, 1, True, 0, True),
         # test_hgemm_acc_ft_stage_split_k
         (32, 384, 7168, 32, 64, 64, 5, 8, 2, 2, 1, True, 0, False),
         (32, 384, 7168, 32, 64, 64, 5, 8, 2, 2, 1, False, 0, False),
@@ -342,33 +325,12 @@ def test_hgemm_acc_main_loop(
         # test_hgemm_acc_small_m
         (3, 5120, 2880, 64, 64, 64, 5, 3, 2, 2, 1, True, 0, False),
         (3, 5120, 2880, 64, 64, 64, 5, 3, 2, 2, 1, False, 0, False),
-        (3, 5120, 2880, 64, 64, 64, 2, 3, 2, 2, 1, True, 0, True),
-        (3, 5120, 2880, 64, 64, 64, 2, 3, 2, 2, 1, False, 0, True),
-        (3, 5120, 2880, 64, 64, 64, 2, 3, 2, 2, 1, True, 4, True),
-        # test_hgemm_acc_small_mnk
-        (3, 16, 16, 64, 64, 64, 2, 3, 2, 2, 1, False, 0, False),
-        (3, 16, 16, 64, 64, 64, 2, 3, 2, 2, 1, True, 0, False),
-        (3, 16, 48, 64, 64, 64, 2, 3, 2, 2, 1, True, 0, False),
-        (3, 16, 80, 64, 64, 64, 2, 3, 2, 2, 1, True, 0, False),
-        (3, 16, 144, 64, 64, 64, 2, 3, 2, 2, 1, True, 0, False),
-        (3, 16, 144, 64, 64, 64, 3, 3, 2, 2, 1, True, 0, False),
-        (3, 16, 16, 64, 64, 64, 4, 3, 2, 2, 1, True, 0, False),
-        (3, 16, 16, 64, 64, 64, 2, 3, 2, 2, 1, False, 0, True),
-        (3, 16, 16, 64, 64, 64, 2, 3, 2, 2, 1, True, 0, True),
-        (3, 16, 48, 64, 64, 64, 2, 3, 2, 2, 1, True, 0, True),
-        (3, 16, 80, 64, 64, 64, 2, 3, 2, 2, 1, True, 0, True),
-        (3, 16, 144, 64, 64, 64, 2, 3, 2, 2, 1, True, 0, True),
-        (3, 16, 144, 64, 64, 64, 2, 3, 2, 2, 1, False, 4, True),
         # test_hgemm_acc_ft_slice_k
         (800, 384, 7168, 32, 64, 128, 6, 1, 1, 2, 2, True, 0, False),
         (800, 384, 7168, 32, 64, 128, 6, 1, 1, 2, 2, False, 0, False),
         (800, 384, 7168, 32, 64, 128, 6, 2, 1, 2, 2, True, 0, False),
         (800, 384, 7168, 32, 64, 128, 6, 2, 1, 2, 2, False, 0, False),
         (800, 384, 7168, 32, 64, 128, 6, 2, 1, 2, 2, False, 4, False),
-        # test_hgemm_acc_ft_special
-        (16, 2880, 512, 16, 128, 128, 4, 2, 1, 1, 4, True, 0, False),
-        (48, 128, 2880, 80, 64, 64, 4, 12, 1, 1, 2, True, 0, False),
-        (48, 640, 2880, 96, 64, 64, 5, 2, 1, 1, 1, True, 0, False),
     ],
 )
 def test_hgemm_acc_split_k(
@@ -424,7 +386,7 @@ def test_hgemm_acc_fp32_output(
         dtype=dtype,
         m=64,
         n=64,
-        k=480,
+        k=768,
         block_m=64,
         block_n=64,
         block_k=64,
@@ -457,14 +419,6 @@ def test_hgemm_acc_fp32_output(
         (3, 5120, 2880, 64, 64, 64, 2, 2, 2, 0, True, False),
         (3, 5120, 2880, 64, 64, 64, 2, 2, 2, 0, False, False),
         (3, 32, 128 + 64, 128, 128, 64, 3, 2, 2, 4, True, False),
-        (3, 32, 128 - 64, 128, 128, 64, 3, 2, 2, 0, False, False),
-        # hti
-        (3, 5120, 2880, 64, 64, 64, 2, 2, 2, 4, True, True),
-        (3, 5120, 2880, 64, 64, 64, 2, 2, 2, 0, False, True),
-        (3, 5120, 2880, 64, 64, 64, 2, 2, 2, 0, True, True),
-        (3, 5120, 2880, 64, 64, 64, 2, 2, 2, 0, False, True),
-        (3, 32, 128 + 64, 128, 128, 64, 2, 2, 2, 4, True, True),
-        (3, 32, 128 + 64 * 3, 128, 128, 64, 2, 2, 2, 4, True, True),
     ],
 )
 def test_hgemm_acc_small_m(
@@ -528,7 +482,6 @@ def test_hgemm_acc_small_m(
         (2048, 2048, 2048, 128, 128, 64, 3, 4, 2, 0, True, False),
         (4096, 4096, 4096, 256, 256, 64, 2, 2, 4, 4, True, True),
         (4096, 4096, 8192, 256, 256, 64, 2, 2, 4, 4, True, True),
-        (8160, 8160, 8160, 256, 256, 64, 2, 2, 4, 0, True, True),
         (8192, 8192, 8192, 256, 256, 64, 2, 2, 4, 0, True, True),
         (16384, 16384, 16384, 256, 256, 64, 2, 2, 4, 4, True, True),
         (8, 7168, 2048, 16, 16, 128, 8, 1, 1, 4, True, False),
@@ -582,7 +535,7 @@ def test_hgemm_padded_stride_and_storage_offset(
     use_half_tile_interleaved: bool,
 ):
     m = n = 64
-    k = 128
+    k = 256
     dtype = torch.bfloat16
     column_offset = 8
 
@@ -674,7 +627,6 @@ def test_hgemm_padded_stride_and_storage_offset(
         (2048, 2048, 2048, 128, 128, 64, 3, 4, 2, 0, True, False),
         (4096, 4096, 4096, 256, 256, 64, 2, 2, 4, 4, True, True),
         (4096, 4096, 8192, 256, 256, 64, 2, 2, 4, 4, True, True),
-        (8160, 8160, 8160, 256, 256, 64, 2, 2, 4, 0, True, True),
         (8192, 8192, 8192, 256, 256, 64, 2, 2, 4, 0, True, True),
         (16384, 16384, 16384, 256, 256, 64, 2, 2, 4, 4, True, True),
         (8, 7168, 2048, 16, 16, 128, 8, 1, 1, 4, True, False),
@@ -719,35 +671,3 @@ def test_hgemm_benchmark_smoke(
         layout,
     )
     benchmark(args)
-
-
-def hgemm_get_configs():
-    selections = {
-        "block_m": [16, 32, 48, 64, 80, 96, 128, 256],
-        "block_n": [16, 32, 64, 80, 96, 128, 256],
-        "block_k": [64, 128, 256],
-        "stages": [i for i in range(2, 10)],
-        "m_waves": [1, 2, 4],
-        "n_waves": [1, 2, 4],
-        "group_m": [0, 4],
-    }
-    keys = selections.keys()
-    values = selections.values()
-    configs = [dict(zip(keys, combo)) for combo in itertools.product(*values)]
-    valid_configs = []
-    for config in configs:
-        mma_m_iters = config["block_m"] // config["m_waves"] // 16
-        mma_n_iters = config["block_n"] // config["n_waves"] // 16
-        if mma_m_iters > 4 or mma_n_iters > 4:
-            continue
-        try:
-            make_hgemm_gfx950_param(**config)
-            valid_configs.append(config)
-        except Exception:
-            pass
-    return valid_configs
-
-
-if __name__ == "__main__":
-    configs = hgemm_get_configs()
-    print(len(configs))

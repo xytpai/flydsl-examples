@@ -16,7 +16,12 @@ from pathlib import Path
 from dataclasses import dataclass
 from flydsl.runtime.device import get_rocm_arch
 
-from kernels.hgemm_universal_gfx950 import hgemm, make_hgemm_param_and_validate
+from kernels.hgemm_universal_gfx950 import (
+    HGEMM_DTYPE_BF16,
+    HGEMM_DTYPE_FP16,
+    hgemm,
+    make_hgemm_param_and_validate,
+)
 
 DEFAULT_COMPILE_WORKERS = 32
 _COMPILE_TENSORS = None
@@ -251,6 +256,7 @@ def hgemm_get_configs(args):
     ).prune(configs)
     valid_configs = []
     is_large_gemm = args.m >= 4096 and args.n >= 4096 and args.k >= 4096
+    in_dtype_id = HGEMM_DTYPE_FP16 if args.dtype is torch.float16 else HGEMM_DTYPE_BF16
     for config in configs:
         if is_large_gemm:
             if not (
@@ -272,11 +278,16 @@ def hgemm_get_configs(args):
                 if mma_m_iters > 4 or mma_n_iters > 4:
                     continue
         try:
+            validation_config = {
+                **config,
+                "in_dtype_id": in_dtype_id,
+                "out_dtype_id": in_dtype_id,
+            }
             param = make_hgemm_param_and_validate(
                 args.m,
                 args.n,
                 args.k,
-                config,
+                validation_config,
             )
             if param is not None:
                 valid_configs.append(config)

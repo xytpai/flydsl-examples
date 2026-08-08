@@ -27,47 +27,6 @@ def get_llvm_ptr(ptr, offset, dtype_bytes, ptr_type):
     return ptr_v
 
 
-def cast_vec_to_global_dtype(
-    vec,
-    vec_size,
-    global_dtype_,
-    is_same_dtype,
-    is_global_f32,
-):
-    if const_expr(is_same_dtype):
-        return vec
-    elems = [arith.constant(0.0, type=global_dtype_)] * vec_size
-    for elem_idx in range_constexpr(vec_size):
-        elem = vector.extract(
-            vec, static_position=[elem_idx], dynamic_position=[]
-        ).extf(T.f32)
-        if const_expr(not is_global_f32):
-            elem = elem.truncf(global_dtype_)
-        elems[elem_idx] = elem
-    return vector.from_elements(T.vec(vec_size, global_dtype_), elems)
-
-
-def atomic_add_f32_vec(c_ptr, global_offset, vec, vec_size):
-    # gfx950 has no packed 2xf32 global/buffer atomic-add instruction.
-    for elem_idx in range_constexpr(vec_size):
-        elem = vector.extract(vec, static_position=[elem_idx], dynamic_position=[])
-        elem_v = elem._value if const_expr(hasattr(elem, "_value")) else elem
-        elem_ptr_v = get_llvm_ptr(
-            c_ptr,
-            global_offset + elem_idx,
-            4,
-            ir.Type.parse("!llvm.ptr<1>"),
-        )
-        llvm.AtomicRMWOp(
-            llvm.AtomicBinOp.fadd,
-            elem_ptr_v,
-            elem_v,
-            llvm.AtomicOrdering.monotonic,
-            syncscope="agent",
-            alignment=4,
-        )
-
-
 def store_global_f32_vec(c_ptr, global_offset, vec, vec_size):
     rocdl.s_waitcnt(0)
     for vec_idx in range_constexpr(vec_size // 4):
