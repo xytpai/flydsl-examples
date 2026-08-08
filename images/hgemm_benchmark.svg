@@ -1,7 +1,7 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="700" viewBox="0 0 1200 700" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="620" viewBox="0 0 1200 620" role="img" aria-labelledby="title desc">
   <title id="title">HGEMM BF16 Benchmark</title>
   <desc id="desc">Bar chart comparing HGEMM and Torch hipBLAS BF16 throughput in TFLOPS for six GEMM benchmark shapes.</desc>
-  <rect width="1200" height="700" fill="#ffffff"/>
+  <rect width="1200" height="620" fill="#ffffff"/>
   <text x="64" y="46" font-family="Arial, sans-serif" font-size="26" font-weight="700" fill="#111827">HGEMM BF16 Benchmark</text>
   <text x="64" y="76" font-family="Arial, sans-serif" font-size="14" fill="#4b5563">TFLOPS computed from Self CUDA total / 100 profiled calls, warmup=500, niters=600</text>
 

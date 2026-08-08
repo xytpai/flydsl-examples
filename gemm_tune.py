@@ -16,7 +16,12 @@ from pathlib import Path
 from dataclasses import dataclass
 from flydsl.runtime.device import get_rocm_arch
 
-from kernels.hgemm_layout_gfx950 import hgemm, make_hgemm_param_and_validate
+from kernels.hgemm_universal_gfx950 import (
+    HGEMM_DTYPE_BF16,
+    HGEMM_DTYPE_FP16,
+    hgemm,
+    make_hgemm_param_and_validate,
+)
 
 DEFAULT_COMPILE_WORKERS = 32
 _COMPILE_TENSORS = None
@@ -251,6 +256,7 @@ def hgemm_get_configs(args):
     ).prune(configs)
     valid_configs = []
     is_large_gemm = args.m >= 4096 and args.n >= 4096 and args.k >= 4096
+    in_dtype_id = HGEMM_DTYPE_FP16 if args.dtype is torch.float16 else HGEMM_DTYPE_BF16
     for config in configs:
         if is_large_gemm:
             if not (
@@ -272,11 +278,16 @@ def hgemm_get_configs(args):
                 if mma_m_iters > 4 or mma_n_iters > 4:
                     continue
         try:
+            validation_config = {
+                **config,
+                "in_dtype_id": in_dtype_id,
+                "out_dtype_id": in_dtype_id,
+            }
             param = make_hgemm_param_and_validate(
                 args.m,
                 args.n,
                 args.k,
-                config,
+                validation_config,
             )
             if param is not None:
                 valid_configs.append(config)
@@ -331,13 +342,27 @@ def tune_all(
     compile_workers=DEFAULT_COMPILE_WORKERS,
 ):
     mnks = [
+        # HTI split-K winners; tune with --enable-split-k.
+        # (4096, 128, 6144),  # splitK=2: 22.1980 us
+        # (512, 2560, 6144),  # splitK=3: 34.5343 us
+        # (576, 256, 4096),  # splitK=4: 10.4404 us
+        # (1024, 128, 6144),  # splitK=6: 11.1767 us
+        # (1216, 64, 7168),  # splitK=7: 10.4065 us
+        # (1280, 64, 4096),  # splitK=8: 8.5128 us
+        # splitk-regresiion-test
+        # (1, 5120, 2880),     # AITER FlyDSL: 7.7863 us
+        # (2, 5120, 2880),     # AITER FlyDSL: 7.9572 us
+        # (4, 5120, 2880),     # AITER FlyDSL: 7.9943 us
+        # (8, 5120, 2880),     # AITER FlyDSL: 8.1986 us
+        # (16, 5120, 2880),    # AITER FlyDSL: 8.6447 us
+        # (32, 5120, 2880),    # AITER FlyDSL: 10.4444 us
+        # (48, 5120, 2880),    # AITER FlyDSL: 12.2810 us
         # splitk
         # (32, 384, 7168),
         # (32, 384, 16384),
         # (800, 384, 7168),
         # (32, 7168, 2048),
         # (8, 7168, 2048),
-        # (8, 5120, 2880),
         # (32, 2880, 2048),
         # normal
         (8, 4096, 4096),

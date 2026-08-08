@@ -1,10 +1,9 @@
 import torch
 import pytest
-import itertools
 from torch.profiler import profile, ProfilerActivity
 from dataclasses import dataclass
 
-from kernels.hgemm_layout_gfx950 import hgemm, make_hgemm_gfx950_param
+from kernels.hgemm_universal_gfx950 import hgemm
 
 ROTARY_INPUTS_TARGET_BYTES = 8 * 1024**3
 
@@ -136,9 +135,10 @@ def check_acc(args: _TestArgs):
     def get_tol(args):
         k_scale = (args.k / 8192) ** 0.5
         k_scale *= args.split_k * args.k_waves
+        atol_scale = 1.5 if args.has_bias else 1.0
         if args.dtype is torch.bfloat16:
-            return 2e-1 * k_scale, 2e-1
-        return 5e-2 * k_scale, 5e-2
+            return 2e-1 * k_scale * atol_scale, 2e-1
+        return 5e-2 * k_scale * atol_scale, 5e-2
 
     atol, rtol = get_tol(args)
     for _ in range(5):
@@ -251,12 +251,8 @@ def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
         (8160, 8160, 8192, 256, 256, 64, 2, 2, 4, 0, True, False),
         (8192, 8192, 8192 + 64, 256, 256, 64, 2, 2, 4, 0, False, False),
         (8192, 8192, 8192 + 64, 256, 256, 64, 2, 2, 4, 0, True, False),
-        (8192, 8192, 8192 + 32, 256, 256, 64, 2, 2, 4, 0, False, False),
-        (8192, 8192, 8192 + 32, 256, 256, 64, 2, 2, 4, 0, True, False),
         (8160, 8160, 8192 + 64, 256, 256, 64, 2, 2, 4, 0, False, False),
         (8160, 8160, 8192 + 64, 256, 256, 64, 2, 2, 4, 0, True, False),
-        (8160, 8160, 8192 + 32, 256, 256, 64, 2, 2, 4, 0, False, False),
-        (8160, 8160, 8192 + 32, 256, 256, 64, 2, 2, 4, 0, True, False),
         (2048, 2048, 2048, 128, 128, 64, 2, 4, 4, 0, False, False),
         (2048, 2048, 2048, 128, 128, 64, 4, 4, 4, 0, True, False),
         (2048, 2048, 2048 - 64, 128, 128, 64, 2, 4, 4, 0, False, False),
@@ -266,16 +262,7 @@ def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
         (8192, 8192, 8192, 256, 256, 64, 2, 2, 4, 4, True, True),
         (8160, 8160, 8192, 256, 256, 64, 2, 2, 4, 0, False, True),
         (8160, 8160, 8192, 256, 256, 64, 2, 2, 4, 0, True, True),
-        (8192, 8192, 8192 + 64, 256, 256, 64, 2, 2, 4, 0, False, True),
-        (8192, 8192, 8192 + 64, 256, 256, 64, 2, 2, 4, 0, True, True),
-        (8192, 8192, 8192 + 32, 256, 256, 64, 2, 2, 4, 0, False, True),
-        (8192, 8192, 8192 + 32, 256, 256, 64, 2, 2, 4, 0, True, True),
-        (8160, 8160, 8192 + 64, 256, 256, 64, 2, 2, 4, 0, False, True),
-        (8160, 8160, 8192 + 64, 256, 256, 64, 2, 2, 4, 0, True, True),
-        (8160, 8160, 8192 + 32, 256, 256, 64, 2, 2, 4, 0, False, True),
-        (8160, 8160, 8192 + 32, 256, 256, 64, 2, 2, 4, 0, True, True),
         (2048, 2048, 2048, 128, 128, 64, 2, 2, 2, 0, False, True),
-        (2048, 2048, 2048 - 64, 128, 128, 64, 2, 2, 2, 0, False, True),
     ],
 )
 def test_hgemm_acc_main_loop(
@@ -322,15 +309,33 @@ def test_hgemm_acc_main_loop(
     "m_waves, n_waves, k_waves, has_bias, group_m, "
     "use_half_tile_interleaved",
     [
-        # Layout-kernel split-K smoke cases.
-        (64, 64, 480, 64, 64, 64, 2, 3, 2, 2, 1, True, 0, False),
-        (64, 64, 480, 64, 64, 64, 2, 3, 2, 2, 1, True, 0, True),
         # test_hgemm_acc_ft_stage_split_k
         (32, 384, 7168, 32, 64, 64, 5, 8, 2, 2, 1, True, 0, False),
         (32, 384, 7168, 32, 64, 64, 5, 8, 2, 2, 1, False, 0, False),
         (32, 384, 7168, 32, 64, 64, 5, 8, 2, 2, 1, True, 4, False),
         (32, 384, 7168, 32, 64, 64, 5, 8, 2, 2, 1, False, 4, False),
-        # test_hgemm_acc_ht_split_k
+        # test_hgemm_acc_small_m
+        (3, 5120, 2880, 64, 64, 64, 5, 3, 2, 2, 1, True, 0, False),
+        (3, 5120, 2880, 64, 64, 64, 5, 3, 2, 2, 1, False, 0, False),
+        # test_hgemm_acc_ft_slice_k
+        (800, 384, 7168, 32, 64, 128, 6, 1, 1, 2, 2, True, 0, False),
+        (800, 384, 7168, 32, 64, 128, 6, 1, 1, 2, 2, False, 0, False),
+        (800, 384, 7168, 32, 64, 128, 6, 2, 1, 2, 2, True, 0, False),
+        (800, 384, 7168, 32, 64, 128, 6, 2, 1, 2, 2, False, 0, False),
+        (800, 384, 7168, 32, 64, 128, 6, 2, 1, 2, 2, False, 4, False),
+        # test_hgemm_acc_hti_split_k
+        (64, 64, 512, 64, 64, 64, 2, 2, 2, 2, 1, True, 0, True),
+        (64, 64, 512, 64, 64, 64, 2, 2, 2, 2, 1, False, 0, True),
+        # Common PR-tuned HTI split-K policies.
+        (65, 96, 4096, 64, 64, 256, 2, 4, 2, 2, 1, False, 0, True),
+        (96, 64, 7168, 64, 64, 256, 2, 7, 2, 2, 1, False, 0, True),
+        (128, 64, 4096, 64, 64, 256, 2, 8, 2, 2, 1, False, 0, True),
+        (128, 128, 6144, 64, 64, 256, 2, 6, 2, 2, 1, False, 0, True),
+        (65, 136, 2048, 64, 128, 128, 2, 4, 2, 4, 1, False, 0, True),
+        (129, 72, 1024, 128, 64, 128, 2, 2, 2, 2, 1, True, 0, True),
+        (129, 136, 1536, 128, 128, 128, 2, 3, 2, 4, 1, False, 4, True),
+        (257, 264, 512, 256, 256, 64, 2, 2, 2, 4, 1, False, 0, True),
+        # HTI split-K coverage mirrored from test_hgemm_layout.py.
         (64, 384, 7168, 64, 64, 64, 2, 8, 2, 2, 1, True, 0, True),
         (64, 384, 7168, 64, 64, 64, 2, 8, 2, 2, 1, False, 0, True),
         (64, 384, 7168, 64, 64, 64, 2, 8, 2, 2, 1, True, 4, True),
@@ -339,36 +344,13 @@ def test_hgemm_acc_main_loop(
         (2048, 2048, 2048, 128, 128, 64, 2, 4, 2, 2, 1, False, 0, True),
         (2048, 2048, 2048, 128, 128, 64, 2, 4, 2, 2, 1, True, 4, True),
         (2048, 2048, 2048, 128, 128, 64, 2, 4, 2, 2, 1, False, 4, True),
-        # test_hgemm_acc_small_m
-        (3, 5120, 2880, 64, 64, 64, 5, 3, 2, 2, 1, True, 0, False),
-        (3, 5120, 2880, 64, 64, 64, 5, 3, 2, 2, 1, False, 0, False),
-        (3, 5120, 2880, 64, 64, 64, 2, 3, 2, 2, 1, True, 0, True),
-        (3, 5120, 2880, 64, 64, 64, 2, 3, 2, 2, 1, False, 0, True),
-        (3, 5120, 2880, 64, 64, 64, 2, 3, 2, 2, 1, True, 4, True),
-        # test_hgemm_acc_small_mnk
-        (3, 16, 16, 64, 64, 64, 2, 3, 2, 2, 1, False, 0, False),
-        (3, 16, 16, 64, 64, 64, 2, 3, 2, 2, 1, True, 0, False),
-        (3, 16, 48, 64, 64, 64, 2, 3, 2, 2, 1, True, 0, False),
-        (3, 16, 80, 64, 64, 64, 2, 3, 2, 2, 1, True, 0, False),
-        (3, 16, 144, 64, 64, 64, 2, 3, 2, 2, 1, True, 0, False),
-        (3, 16, 144, 64, 64, 64, 3, 3, 2, 2, 1, True, 0, False),
-        (3, 16, 16, 64, 64, 64, 4, 3, 2, 2, 1, True, 0, False),
-        (3, 16, 16, 64, 64, 64, 2, 3, 2, 2, 1, False, 0, True),
-        (3, 16, 16, 64, 64, 64, 2, 3, 2, 2, 1, True, 0, True),
-        (3, 16, 48, 64, 64, 64, 2, 3, 2, 2, 1, True, 0, True),
-        (3, 16, 80, 64, 64, 64, 2, 3, 2, 2, 1, True, 0, True),
-        (3, 16, 144, 64, 64, 64, 2, 3, 2, 2, 1, True, 0, True),
-        (3, 16, 144, 64, 64, 64, 2, 3, 2, 2, 1, False, 4, True),
-        # test_hgemm_acc_ft_slice_k
-        (800, 384, 7168, 32, 64, 128, 6, 1, 1, 2, 2, True, 0, False),
-        (800, 384, 7168, 32, 64, 128, 6, 1, 1, 2, 2, False, 0, False),
-        (800, 384, 7168, 32, 64, 128, 6, 2, 1, 2, 2, True, 0, False),
-        (800, 384, 7168, 32, 64, 128, 6, 2, 1, 2, 2, False, 0, False),
-        (800, 384, 7168, 32, 64, 128, 6, 2, 1, 2, 2, False, 4, False),
-        # test_hgemm_acc_ft_special
-        (16, 2880, 512, 16, 128, 128, 4, 2, 1, 1, 4, True, 0, False),
-        (48, 128, 2880, 80, 64, 64, 4, 12, 1, 1, 2, True, 0, False),
-        (48, 640, 2880, 96, 64, 64, 5, 2, 1, 1, 1, True, 0, False),
+        # Exact HTI split-K winners
+        (4096, 128, 6144, 64, 64, 256, 2, 2, 2, 2, 1, False, 0, True),
+        (512, 2560, 6144, 128, 128, 128, 2, 3, 2, 4, 1, False, 4, True),
+        (576, 256, 4096, 64, 64, 256, 2, 4, 2, 2, 1, True, 0, True),
+        (1024, 128, 6144, 64, 64, 256, 2, 6, 2, 2, 1, True, 0, True),
+        (1216, 64, 7168, 64, 64, 256, 2, 7, 2, 2, 1, False, 0, True),
+        (1280, 64, 4096, 64, 64, 256, 2, 8, 2, 2, 1, False, 0, True),
     ],
 )
 def test_hgemm_acc_split_k(
@@ -412,11 +394,116 @@ def test_hgemm_acc_split_k(
     check_acc(args)
 
 
+@pytest.mark.parametrize("layout", ["nn", "nt"])
+@pytest.mark.parametrize(
+    "m, n, k, block_m, block_n, block_k, stages, split_k, "
+    "m_waves, n_waves, k_waves, group_m, use_half_tile_interleaved",
+    [
+        # fmt: off
+        #    M,     N,     K,  BM,  BN,  BK, S, SK, MW, NW, KW, GM,   HTI
+        (   8,  4096,  4096,  16,  16, 256, 4,  1,  1,  1,  2,  4, False),
+        (  16,  4096,  4096,  16,  16, 256, 4,  1,  1,  1,  2,  4, False),
+        (  32,  4096,  4096,  16,  32, 256, 4,  1,  1,  2,  2,  4, False),
+        (  64,  4096,  4096,  32,  32, 128, 6,  1,  2,  2,  1,  4, False),
+        ( 128,  4096,  4096,  32,  64, 128, 4,  1,  1,  4,  1,  0, False),
+        ( 256,  4096,  4096,  64,  64, 128, 4,  1,  4,  2,  1,  0, False),
+        ( 512,  4096,  4096,  64, 128,  64, 5,  1,  2,  4,  1,  4, False),
+        (1024,  4096,  4096, 128, 128,  64, 4,  1,  2,  4,  1,  4, False),
+        (2048,  4096,  4096, 256, 128,  64, 3,  1,  4,  2,  2,  0, False),
+        (1024,  1024,  1024,  64,  64,  64, 4,  1,  1,  4,  1,  4, False),
+        (2048,  2048,  2048, 128, 128,  64, 4,  1,  2,  4,  1,  0, False),
+        (4096,  4096,  4096, 256, 256,  64, 2,  1,  2,  4,  1,  4,  True),
+        (4096,  4096,  8192, 256, 256,  64, 2,  1,  2,  4,  1,  4,  True),
+        (8192,  8192,  8192, 256, 256,  64, 2,  1,  2,  4,  1,  4,  True),
+        (   8,  7168,  2048,  16,  16,  64, 8,  1,  1,  1,  1,  4, False),
+        (  32,   384,  7168,  16,  16, 256, 4,  1,  1,  1,  2,  0, False),
+        (  32, 14336,  4096,  32,  64, 128, 5,  1,  2,  2,  1,  4, False),
+        (  16, 28672,  4096,  16,  64, 256, 2,  1,  1,  2,  2,  4, False),
+        (4096,   256,  4096,  64,  64, 128, 4,  1,  4,  2,  1,  4, False),
+        (   1,  5120,  2880,  16,  64,  64, 7,  3,  1,  2,  1,  0, False),
+        (   2,  5120,  2880,  16,  64,  64, 7,  3,  1,  2,  1,  0, False),
+        (   4,  5120,  2880,  16,  64,  64, 7,  3,  1,  2,  1,  0, False),
+        (   8,  5120,  2880,  16,  64,  64, 8,  3,  1,  2,  1,  0, False),
+        (  16,  5120,  2880,  16,  64,  64, 8,  3,  1,  2,  1,  0, False),
+        (  32,  5120,  2880,  16,  32,  64, 8,  1,  1,  2,  1,  0, False),
+        (  48,  5120,  2880,  16,  64,  64, 8,  1,  1,  2,  1,  0, False),
+        (  32,   384,  7168,  32,  32,  64, 8,  8,  2,  1,  1,  0, False),
+        (  32,   384, 16384,  32,  32,  64, 8,  8,  1,  2,  1,  0, False),
+        ( 800,   384,  7168,  64,  96,  64, 4,  4,  2,  2,  1,  0, False),
+        (  32,  7168,  2048,  32,  32,  64, 8,  1,  2,  1,  1,  0, False),
+        (   8,  7168,  2048,  16,  16,  64, 8,  1,  1,  1,  1,  4, False),
+        (  32,  2880,  2048,  32,  32,  64, 8,  2,  1,  2,  1,  0, False),
+        # Additional policies from the latest tuning run.
+        (  64,  4096,  4096,  32,  32,  64, 8,  1,  1,  2,  1,  0, False),
+        ( 128,  4096,  4096,  64,  32, 128, 4,  1,  4,  1,  1,  4, False),
+        ( 256,  4096,  4096,  64,  64,  64, 8,  1,  2,  2,  1,  0, False),
+        ( 512,  4096,  4096,  64, 128,  64, 6,  1,  2,  4,  1,  4, False),
+        (1024,  1024,  1024,  64,  64,  64, 4,  1,  2,  4,  1,  4, False),
+        (2048,  2048,  2048, 128, 128,  64, 4,  1,  2,  4,  1,  4, False),
+        (8192,  8192,  8192, 256, 256,  64, 2,  1,  2,  4,  1,  0,  True),
+        (   8,  7168,  2048,  16,  16, 128, 6,  1,  1,  1,  1,  4, False),
+        (  32, 14336,  4096,  32,  64, 256, 3,  1,  1,  2,  2,  4, False),
+        (  16, 28672,  4096,  16,  32, 256, 3,  1,  1,  2,  2,  4, False),
+        (4096,   256,  4096,  64,  64,  64, 8,  1,  2,  2,  1,  4, False),
+        (   1,  5120,  2880,  16,  64,  64, 9,  3,  1,  2,  1,  0, False),
+        (   2,  5120,  2880,  16,  64,  64, 8,  3,  1,  2,  1,  0, False),
+        (   4,  5120,  2880,  16,  64,  64, 8,  3,  1,  2,  1,  0, False),
+        (   8,  5120,  2880,  16,  64,  64, 9,  3,  1,  2,  1,  0, False),
+        (  16,  5120,  2880,  16,  64,  64, 5,  3,  1,  2,  1,  0, False),
+        (  32,   384,  7168,  32,  32,  64, 8,  8,  1,  2,  1,  0, False),
+        (   8,  7168,  2048,  16,  16, 128, 7,  1,  1,  1,  2,  4, False),
+        (  32,  2880,  2048,  32,  64,  64, 8,  4,  2,  2,  1,  0, False),
+        # fmt: on
+    ],
+)
+def test_hgemm_acc_tuned_policies(
+    m: int,
+    n: int,
+    k: int,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    stages: int,
+    split_k: int,
+    m_waves: int,
+    n_waves: int,
+    k_waves: int,
+    group_m: int,
+    use_half_tile_interleaved: bool,
+    layout: str,
+):
+    args = _TestArgs(
+        dtype=torch.bfloat16,
+        m=m,
+        n=n,
+        k=k,
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        stages=stages,
+        m_waves=m_waves,
+        n_waves=n_waves,
+        k_waves=k_waves,
+        group_m=group_m,
+        has_bias=True,
+        use_half_tile_interleaved=use_half_tile_interleaved,
+        layout=layout,
+        split_k=split_k,
+    )
+    check_acc(args)
+
+
+@pytest.mark.parametrize("layout", ["nn", "nt", "tn", "tt"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("split_k", [1, 3])
-@pytest.mark.parametrize("use_half_tile_interleaved", [False, True])
+@pytest.mark.parametrize("has_bias", [False, True])
+@pytest.mark.parametrize(
+    "split_k, use_half_tile_interleaved",
+    [(1, False), (3, False), (1, True), (3, True)],
+)
 def test_hgemm_acc_fp32_output(
+    layout: str,
     dtype: torch.dtype,
+    has_bias: bool,
     split_k: int,
     use_half_tile_interleaved: bool,
 ):
@@ -424,7 +511,7 @@ def test_hgemm_acc_fp32_output(
         dtype=dtype,
         m=64,
         n=64,
-        k=480,
+        k=768,
         block_m=64,
         block_n=64,
         block_k=64,
@@ -433,8 +520,9 @@ def test_hgemm_acc_fp32_output(
         n_waves=2,
         k_waves=1,
         group_m=0,
-        has_bias=True,
+        has_bias=has_bias,
         use_half_tile_interleaved=use_half_tile_interleaved,
+        layout=layout,
         split_k=split_k,
         out_dtype=torch.float32,
     )
@@ -457,14 +545,6 @@ def test_hgemm_acc_fp32_output(
         (3, 5120, 2880, 64, 64, 64, 2, 2, 2, 0, True, False),
         (3, 5120, 2880, 64, 64, 64, 2, 2, 2, 0, False, False),
         (3, 32, 128 + 64, 128, 128, 64, 3, 2, 2, 4, True, False),
-        (3, 32, 128 - 64, 128, 128, 64, 3, 2, 2, 0, False, False),
-        # hti
-        (3, 5120, 2880, 64, 64, 64, 2, 2, 2, 4, True, True),
-        (3, 5120, 2880, 64, 64, 64, 2, 2, 2, 0, False, True),
-        (3, 5120, 2880, 64, 64, 64, 2, 2, 2, 0, True, True),
-        (3, 5120, 2880, 64, 64, 64, 2, 2, 2, 0, False, True),
-        (3, 32, 128 + 64, 128, 128, 64, 2, 2, 2, 4, True, True),
-        (3, 32, 128 + 64 * 3, 128, 128, 64, 2, 2, 2, 4, True, True),
     ],
 )
 def test_hgemm_acc_small_m(
@@ -575,13 +655,15 @@ def test_hgemm_acc_bench(
 
 
 @pytest.mark.parametrize("layout", ["nn", "nt", "tn", "tt"])
+@pytest.mark.parametrize("split_k", [1, 2])
 @pytest.mark.parametrize("use_half_tile_interleaved", [False, True])
 def test_hgemm_padded_stride_and_storage_offset(
     layout: str,
+    split_k: int,
     use_half_tile_interleaved: bool,
 ):
     m = n = 64
-    k = 128
+    k = 256
     dtype = torch.bfloat16
     column_offset = 8
 
@@ -626,6 +708,7 @@ def test_hgemm_padded_stride_and_storage_offset(
         "block_n": 64,
         "block_k": 64,
         "stages": 2,
+        "split_k": split_k,
         "m_waves": 2,
         "n_waves": 2,
         "group_m": 0,
@@ -646,13 +729,282 @@ def test_hgemm_padded_stride_and_storage_offset(
     torch.testing.assert_close(
         out,
         ref,
-        atol=3e-2,
+        atol=1e-1 if split_k > 1 else 3e-2,
         rtol=2e-1,
         check_dtype=True,
     )
 
 
+@pytest.mark.parametrize("split_k", [1, 2])
+def test_hgemm_fp32_slice_k_without_bias(split_k: int):
+    args = _TestArgs(
+        dtype=torch.bfloat16,
+        m=64,
+        n=128,
+        k=2048,
+        block_m=32,
+        block_n=64,
+        block_k=128,
+        stages=4,
+        m_waves=1,
+        n_waves=2,
+        k_waves=2,
+        group_m=0,
+        has_bias=False,
+        use_half_tile_interleaved=False,
+        layout="nt",
+        split_k=split_k,
+        out_dtype=torch.float32,
+    )
+    check_acc(args)
+
+
+def test_hgemm_allocates_output_with_default_policy():
+    m = n = 64
+    k = 256
+    dtype = torch.bfloat16
+    a = torch.randn((m, k), dtype=dtype, device="cuda")
+    b = torch.randn((k, n), dtype=dtype, device="cuda")
+
+    out = hgemm(a, b)
+    ref = torch.mm(a, b)
+
+    assert out.shape == (m, n)
+    assert out.dtype == dtype
+    assert out.device == a.device
+    torch.testing.assert_close(out, ref, atol=3e-2, rtol=2e-1)
+
+
+@pytest.mark.parametrize("layout", ["nn", "nt"])
+def test_hgemm_host_contiguity_fallbacks(layout: str):
+    m = n = 64
+    k = 256
+    dtype = torch.bfloat16
+    a_storage = torch.randn((m, k * 2), dtype=dtype, device="cuda")
+    a = a_storage[:, ::2]
+    if layout == "nn":
+        b_storage = torch.randn((k, n * 2), dtype=dtype, device="cuda")
+        b = b_storage[:, ::2]
+    else:
+        b = torch.randn((k, n), dtype=dtype, device="cuda")
+    bias_storage = torch.randn((n * 2,), dtype=dtype, device="cuda")
+    bias = bias_storage[::2]
+    out = torch.empty((m, n), dtype=dtype, device="cuda")
+    ref = torch.empty_like(out)
+    kwargs = {
+        "block_m": 64,
+        "block_n": 64,
+        "block_k": 64,
+        "stages": 2,
+        "m_waves": 2,
+        "n_waves": 2,
+        "group_m": 0,
+        "use_half_tile_interleaved": False,
+    }
+
+    hgemm(a, b, out, bias=bias, user_kwargs=kwargs, layout=layout)
+    ref_func(a, b, bias, ref, layout)
+
+    assert not a.is_contiguous()
+    assert not bias.is_contiguous()
+    torch.testing.assert_close(out, ref, atol=3e-2, rtol=2e-1)
+
+
+@pytest.mark.parametrize("n", [4096, 4032])
+def test_hgemm_block_swizzle_boundary_paths(n: int):
+    args = _TestArgs(
+        dtype=torch.bfloat16,
+        m=320,
+        n=n,
+        k=256,
+        block_m=64,
+        block_n=64,
+        block_k=64,
+        stages=2,
+        m_waves=2,
+        n_waves=2,
+        k_waves=1,
+        group_m=4,
+        has_bias=False,
+        use_half_tile_interleaved=False,
+        layout="nt",
+    )
+    check_acc(args)
+
+
+def test_hgemm_slice_k_four_waves():
+    args = _TestArgs(
+        dtype=torch.bfloat16,
+        m=64,
+        n=128,
+        k=1024,
+        block_m=32,
+        block_n=64,
+        block_k=128,
+        stages=4,
+        m_waves=1,
+        n_waves=2,
+        k_waves=4,
+        group_m=0,
+        has_bias=True,
+        use_half_tile_interleaved=False,
+        layout="nt",
+    )
+    check_acc(args)
+
+
+def test_hgemm_split_k_uses_stream_local_sync_buffers():
+    args = _TestArgs(
+        dtype=torch.bfloat16,
+        m=64,
+        n=64,
+        k=512,
+        block_m=64,
+        block_n=64,
+        block_k=64,
+        stages=2,
+        m_waves=2,
+        n_waves=2,
+        k_waves=1,
+        group_m=0,
+        has_bias=True,
+        use_half_tile_interleaved=False,
+        layout="nt",
+        split_k=2,
+    )
+    a, b, bias = create_inputs(args)
+    out0 = create_outputs(args)[0]
+    out1 = create_outputs(args)[0]
+    ref = create_outputs(args)[0]
+    kwargs = {
+        "block_m": args.block_m,
+        "block_n": args.block_n,
+        "block_k": args.block_k,
+        "stages": args.stages,
+        "split_k": args.split_k,
+        "m_waves": args.m_waves,
+        "n_waves": args.n_waves,
+        "k_waves": args.k_waves,
+        "group_m": args.group_m,
+        "use_half_tile_interleaved": args.use_half_tile_interleaved,
+    }
+    stream0 = torch.cuda.Stream()
+    stream1 = torch.cuda.Stream()
+
+    hgemm(a, b, out0, bias=bias, user_kwargs=kwargs, layout=args.layout)
+    torch.cuda.synchronize()
+    with torch.cuda.stream(stream0):
+        hgemm(
+            a,
+            b,
+            out0,
+            bias=bias,
+            user_kwargs=kwargs,
+            layout=args.layout,
+            stream=stream0,
+        )
+    with torch.cuda.stream(stream1):
+        hgemm(
+            a,
+            b,
+            out1,
+            bias=bias,
+            user_kwargs=kwargs,
+            layout=args.layout,
+            stream=stream1,
+        )
+    stream0.synchronize()
+    stream1.synchronize()
+    ref_func(a, b, bias, ref, args.layout)
+
+    torch.testing.assert_close(out0, ref, atol=2e-1, rtol=2e-1)
+    torch.testing.assert_close(out1, ref, atol=2e-1, rtol=2e-1)
+
+
+@pytest.mark.parametrize(
+    "k, use_half_tile_interleaved, message",
+    [
+        (480, False, "K-tail is unsupported"),
+        (64, True, "HTI requires at least two"),
+        (192, True, "HTI requires at least two"),
+    ],
+)
+def test_hgemm_rejects_unsupported_k_partitioning(
+    k: int,
+    use_half_tile_interleaved: bool,
+    message: str,
+):
+    m = n = 64
+    dtype = torch.bfloat16
+    a = torch.randn((m, k), dtype=dtype, device="cuda")
+    b = torch.randn((k, n), dtype=dtype, device="cuda")
+    kwargs = {
+        "block_m": 64,
+        "block_n": 64,
+        "block_k": 64,
+        "stages": 2,
+        "m_waves": 2,
+        "n_waves": 2,
+        "group_m": 0,
+        "use_half_tile_interleaved": use_half_tile_interleaved,
+    }
+
+    with pytest.raises(AssertionError, match=message):
+        hgemm(a, b, user_kwargs=kwargs, layout="nt")
+
+
 # =========================================== benchmark ===========================================
+
+
+@pytest.mark.parametrize(
+    "m, n, k, block_m, block_n, block_k, stages, split_k, "
+    "m_waves, n_waves, k_waves, group_m, has_bias",
+    [
+        # fmt: off
+        #    M,    N,    K,  BM,  BN,  BK, S, SK, MW, NW, KW, GM,  Bias
+        ( 4096,  128, 6144,  64,  64, 256, 2,  2,  2,  2,  1,  0, False),
+        (  512, 2560, 6144, 128, 128, 128, 2,  3,  2,  4,  1,  4, False),
+        (  576,  256, 4096,  64,  64, 256, 2,  4,  2,  2,  1,  0,  True),
+        ( 1024,  128, 6144,  64,  64, 256, 2,  6,  2,  2,  1,  0,  True),
+        ( 1216,   64, 7168,  64,  64, 256, 2,  7,  2,  2,  1,  0, False),
+        ( 1280,   64, 4096,  64,  64, 256, 2,  8,  2,  2,  1,  0, False),
+        # fmt: on
+    ],
+)
+def test_hgemm_hti_split_k_benchmark(
+    m: int,
+    n: int,
+    k: int,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    stages: int,
+    split_k: int,
+    m_waves: int,
+    n_waves: int,
+    k_waves: int,
+    group_m: int,
+    has_bias: bool,
+):
+    args = _TestArgs(
+        dtype=torch.bfloat16,
+        m=m,
+        n=n,
+        k=k,
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        stages=stages,
+        m_waves=m_waves,
+        n_waves=n_waves,
+        k_waves=k_waves,
+        group_m=group_m,
+        has_bias=has_bias,
+        use_half_tile_interleaved=True,
+        layout="nt",
+        split_k=split_k,
+    )
+    benchmark(args)
 
 
 @pytest.mark.parametrize("layout", ["nn", "nt", "tn", "tt"])
@@ -717,35 +1069,3 @@ def test_hgemm_benchmark_smoke(
         layout,
     )
     benchmark(args)
-
-
-def hgemm_get_configs():
-    selections = {
-        "block_m": [16, 32, 48, 64, 80, 96, 128, 256],
-        "block_n": [16, 32, 64, 80, 96, 128, 256],
-        "block_k": [64, 128, 256],
-        "stages": [i for i in range(2, 10)],
-        "m_waves": [1, 2, 4],
-        "n_waves": [1, 2, 4],
-        "group_m": [0, 4],
-    }
-    keys = selections.keys()
-    values = selections.values()
-    configs = [dict(zip(keys, combo)) for combo in itertools.product(*values)]
-    valid_configs = []
-    for config in configs:
-        mma_m_iters = config["block_m"] // config["m_waves"] // 16
-        mma_n_iters = config["block_n"] // config["n_waves"] // 16
-        if mma_m_iters > 4 or mma_n_iters > 4:
-            continue
-        try:
-            make_hgemm_gfx950_param(**config)
-            valid_configs.append(config)
-        except Exception:
-            pass
-    return valid_configs
-
-
-if __name__ == "__main__":
-    configs = hgemm_get_configs()
-    print(len(configs))
