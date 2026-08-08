@@ -374,6 +374,60 @@ def test_hgemm_acc_split_k(
     check_acc(args)
 
 
+@pytest.mark.parametrize("layout", ["nn", "nt"])
+@pytest.mark.parametrize(
+    "m, n, k, block_m, block_n, block_k, stages, split_k, "
+    "m_waves, n_waves, k_waves, group_m, has_bias, "
+    "use_half_tile_interleaved",
+    [
+        (32, 384, 7168, 32, 32, 64, 8, 8, 2, 1, 1, 0, True, False),
+        (32, 384, 16384, 32, 32, 256, 3, 8, 1, 1, 2, 0, True, False),
+        (800, 384, 7168, 64, 96, 64, 4, 4, 2, 2, 1, 0, True, False),
+        (32, 7168, 2048, 32, 32, 128, 4, 1, 2, 1, 1, 0, True, False),
+        (8, 7168, 2048, 16, 16, 128, 6, 1, 1, 1, 1, 4, True, False),
+        (8, 5120, 2880, 16, 64, 64, 4, 5, 1, 2, 1, 0, True, False),
+        (32, 2880, 2048, 32, 64, 64, 9, 4, 2, 2, 1, 0, True, False),
+        (128, 384, 7168, 128, 128, 64, 2, 8, 2, 2, 1, 0, True, True),
+    ],
+)
+def test_hgemm_acc_tuned_policies(
+    m: int,
+    n: int,
+    k: int,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    stages: int,
+    split_k: int,
+    m_waves: int,
+    n_waves: int,
+    k_waves: int,
+    group_m: int,
+    has_bias: bool,
+    use_half_tile_interleaved: bool,
+    layout: str,
+):
+    args = _TestArgs(
+        dtype=torch.bfloat16,
+        m=m,
+        n=n,
+        k=k,
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        stages=stages,
+        m_waves=m_waves,
+        n_waves=n_waves,
+        k_waves=k_waves,
+        group_m=group_m,
+        has_bias=has_bias,
+        use_half_tile_interleaved=use_half_tile_interleaved,
+        layout=layout,
+        split_k=split_k,
+    )
+    check_acc(args)
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("split_k", [1, 3])
 @pytest.mark.parametrize("use_half_tile_interleaved", [False, True])
