@@ -105,6 +105,8 @@ def make_hgemm_gfx950_param(
     # LDS read width varies because shared C remains in the 16-bit input dtype.
     cshuffle_r2g_vec_size = 16 // out_dbytes
     if use_half_tile_interleaved:
+        if split_k != 1:
+            raise ValueError("half-tile interleaved does not support split-K")
         if k_waves != 1:
             raise ValueError("half-tile interleaved does not support slice-K")
         half_block_m = block_m // 2
@@ -760,7 +762,6 @@ def hgemm_hti_gfx950_kernel(
     tiled_mma: fx.TiledMma,
     param: HGemmGfx950Param,
 ):
-    is_split_k = param.is_split_k
     block_m = param.block_m
     block_n = param.block_n
     block_k = param.block_k
@@ -779,18 +780,6 @@ def hgemm_hti_gfx950_kernel(
     elem_dtype = (
         fx.Float16 if const_expr(param.in_dtype_id == HGEMM_DTYPE_FP16) else fx.BFloat16
     )
-    global_output_dtype = (
-        fx.Float32 if const_expr(param.out_dtype_id == HGEMM_DTYPE_FP32) else elem_dtype
-    )
-    if const_expr(is_split_k):
-        splitk_protocol = SplitKProtocol(
-            block_m,
-            block_n,
-            cshuffle_r2g_vec_size,
-            param.out_data_bytes,
-            block_threads,
-            param.has_bias,
-        )
 
     tid = fx.thread_idx.x
     wid = tid // GFX950_WAVE_SIZE
@@ -800,11 +789,8 @@ def hgemm_hti_gfx950_kernel(
         NUM_XCDS=8, NUM_PIDS_THRESHOLD=256, GROUP_M=param.group_m
     )
     bid_m, bid_n = block_swizzle.swizzle(num_pid_m, num_pid_n, fx.block_idx.x)
-    ks_idx = fx.block_idx.y
-    ks_begin = ks_idx * working_k
-    ks_end = ks_begin + working_k
-    ks_end = (ks_end < k).select(ks_end, k)
-    k_tiles = (ks_end - ks_begin) // block_k
+    ks_begin = fx.Int32(0)
+    k_tiles = k // block_k
     block_m_offset = bid_m * block_m
     block_n_offset = bid_n * block_n
 
@@ -833,23 +819,6 @@ def hgemm_hti_gfx950_kernel(
 
     a_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(a_buf))
     b_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(b_buf))
-
-    if const_expr(is_split_k):
-        splitk_protocol.init(
-            semaphore,
-            signal,
-            out,
-            bias,
-            tid,
-            ks_idx,
-            m,
-            n,
-            block_m_offset,
-            block_n_offset,
-            global_output_dtype,
-            fx.block_idx.x,
-            n,
-        )
 
     uni_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), elem_dtype)
     buffer_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_dtype)
@@ -1031,7 +1000,7 @@ def hgemm_hti_gfx950_kernel(
                         out_buf,
                         global_offset,
                         c_vec,
-                        is_split_k,
+                        False,
                         param.out_dtype_id == HGEMM_DTYPE_FP32,
                     )
 
@@ -1040,13 +1009,7 @@ def hgemm_hti_gfx950_kernel(
     c10 = make_c_fragment(1, 0)
     c11 = make_c_fragment(1, 1)
 
-    if const_expr(is_split_k):
-        c00.fill(0.0)
-        c01.fill(0.0)
-        c10.fill(0.0)
-        c11.fill(0.0)
-        splitk_protocol.zero_c()
-    elif const_expr(param.has_bias):
+    if const_expr(param.has_bias):
         for i in range_constexpr(fx.size(c00.shape).unpack()):
             col_idx = fx.get_scalar(thr_mma_cCol[i])
             global_n0_idx = block_n_offset + col_idx
@@ -1166,36 +1129,17 @@ def hgemm_hti_gfx950_kernel(
     consume(k_tile + 1, c11, a1, b1, True)
     __barrier(0)
 
-    if const_expr(is_split_k or param.out_dtype_id == HGEMM_DTYPE_FP32):
-        store_half_tile_to_lds(0, 0, c00)
-        store_half_tile_to_lds(0, 1, c01)
-        __barrier(0)
-        store_half_tile_to_lds(1, 0, c10)
-        store_half_tile_to_lds(1, 1, c11)
-    else:
-        store_half_tile_to_lds(0, 0, c00)
-        store_half_tile_to_lds(0, 1, c01)
-        __barrier(0)
-        store_half_tile_to_global(0, 0)
-        store_half_tile_to_global(0, 1)
-        __barrier(0)
-        store_half_tile_to_lds(1, 0, c10)
-        store_half_tile_to_lds(1, 1, c11)
-        __barrier(0)
-        store_half_tile_to_global(1, 0)
-        store_half_tile_to_global(1, 1)
-
-    if const_expr(is_split_k):
-        splitk_protocol.split_k_barrier(split_k)
-    elif const_expr(param.out_dtype_id == HGEMM_DTYPE_FP32):
-        gpu.barrier()
-
-    if const_expr(is_split_k or param.out_dtype_id == HGEMM_DTYPE_FP32):
-        store_half_tile_to_global(0, 0)
-        store_half_tile_to_global(0, 1)
-        __barrier(0)
-        store_half_tile_to_global(1, 0)
-        store_half_tile_to_global(1, 1)
+    store_half_tile_to_lds(0, 0, c00)
+    store_half_tile_to_lds(0, 1, c01)
+    __barrier(0)
+    store_half_tile_to_global(0, 0)
+    store_half_tile_to_global(0, 1)
+    __barrier(0)
+    store_half_tile_to_lds(1, 0, c10)
+    store_half_tile_to_lds(1, 1, c11)
+    __barrier(0)
+    store_half_tile_to_global(1, 0)
+    store_half_tile_to_global(1, 1)
 
 
 @flyc.jit

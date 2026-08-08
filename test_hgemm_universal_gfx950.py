@@ -313,15 +313,6 @@ def test_hgemm_acc_main_loop(
         (32, 384, 7168, 32, 64, 64, 5, 8, 2, 2, 1, False, 0, False),
         (32, 384, 7168, 32, 64, 64, 5, 8, 2, 2, 1, True, 4, False),
         (32, 384, 7168, 32, 64, 64, 5, 8, 2, 2, 1, False, 4, False),
-        # test_hgemm_acc_ht_split_k
-        (64, 384, 7168, 64, 64, 64, 2, 8, 2, 2, 1, True, 0, True),
-        (64, 384, 7168, 64, 64, 64, 2, 8, 2, 2, 1, False, 0, True),
-        (64, 384, 7168, 64, 64, 64, 2, 8, 2, 2, 1, True, 4, True),
-        (64, 384, 7168, 64, 64, 64, 2, 8, 2, 2, 1, False, 4, True),
-        (2048, 2048, 2048, 128, 128, 64, 2, 4, 2, 2, 1, True, 0, True),
-        (2048, 2048, 2048, 128, 128, 64, 2, 4, 2, 2, 1, False, 0, True),
-        (2048, 2048, 2048, 128, 128, 64, 2, 4, 2, 2, 1, True, 4, True),
-        (2048, 2048, 2048, 128, 128, 64, 2, 4, 2, 2, 1, False, 4, True),
         # test_hgemm_acc_small_m
         (3, 5120, 2880, 64, 64, 64, 5, 3, 2, 2, 1, True, 0, False),
         (3, 5120, 2880, 64, 64, 64, 5, 3, 2, 2, 1, False, 0, False),
@@ -387,7 +378,6 @@ def test_hgemm_acc_split_k(
         (8, 7168, 2048, 16, 16, 128, 6, 1, 1, 1, 1, 4, True, False),
         (8, 5120, 2880, 16, 64, 64, 4, 5, 1, 2, 1, 0, True, False),
         (32, 2880, 2048, 32, 64, 64, 9, 4, 2, 2, 1, 0, True, False),
-        (128, 384, 7168, 128, 128, 64, 2, 8, 2, 2, 1, 0, True, True),
         (1, 5120, 2880, 16, 64, 64, 8, 3, 1, 2, 1, 0, True, False),
         (2, 5120, 2880, 16, 64, 64, 7, 3, 1, 2, 1, 0, True, False),
         (4, 5120, 2880, 16, 64, 64, 8, 3, 1, 2, 1, 0, True, False),
@@ -436,8 +426,10 @@ def test_hgemm_acc_tuned_policies(
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("split_k", [1, 3])
-@pytest.mark.parametrize("use_half_tile_interleaved", [False, True])
+@pytest.mark.parametrize(
+    "split_k, use_half_tile_interleaved",
+    [(1, False), (3, False), (1, True)],
+)
 def test_hgemm_acc_fp32_output(
     dtype: torch.dtype,
     split_k: int,
@@ -881,6 +873,31 @@ def test_hgemm_rejects_unsupported_k_partitioning(
     }
 
     with pytest.raises(AssertionError, match=message):
+        hgemm(a, b, user_kwargs=kwargs, layout="nt")
+
+
+def test_hgemm_rejects_hti_split_k():
+    m = n = 64
+    k = 512
+    dtype = torch.bfloat16
+    a = torch.randn((m, k), dtype=dtype, device="cuda")
+    b = torch.randn((k, n), dtype=dtype, device="cuda")
+    kwargs = {
+        "block_m": 64,
+        "block_n": 64,
+        "block_k": 64,
+        "stages": 2,
+        "split_k": 2,
+        "m_waves": 2,
+        "n_waves": 2,
+        "group_m": 0,
+        "use_half_tile_interleaved": True,
+    }
+
+    with pytest.raises(
+        AssertionError,
+        match="unsupported hgemm_universal_gfx950 shape/config",
+    ):
         hgemm(a, b, user_kwargs=kwargs, layout="nt")
 
 
