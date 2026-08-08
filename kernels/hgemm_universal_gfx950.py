@@ -1171,6 +1171,7 @@ def hgemm_hti_gfx950_kernel(
     if const_expr(is_split_k or param.out_dtype_id == HGEMM_DTYPE_FP32):
         store_half_tile_to_lds(0, 0, c00)
         store_half_tile_to_lds(0, 1, c01)
+        __barrier(0)
         store_half_tile_to_lds(1, 0, c10)
         store_half_tile_to_lds(1, 1, c11)
     else:
@@ -1194,6 +1195,7 @@ def hgemm_hti_gfx950_kernel(
     if const_expr(is_split_k or param.out_dtype_id == HGEMM_DTYPE_FP32):
         store_half_tile_to_global(0, 0)
         store_half_tile_to_global(0, 1)
+        __barrier(0)
         store_half_tile_to_global(1, 0)
         store_half_tile_to_global(1, 1)
 

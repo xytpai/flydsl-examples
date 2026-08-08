@@ -342,6 +342,27 @@ def tune_all(
     compile_workers=DEFAULT_COMPILE_WORKERS,
 ):
     mnks = [
+        # splitk-regresiion-test
+        # (1, 5120, 2880),     # AITER FlyDSL: 7.7863 us
+        # (2, 5120, 2880),     # AITER FlyDSL: 7.9572 us
+        # (4, 5120, 2880),     # AITER FlyDSL: 7.9943 us
+        # (8, 5120, 2880),     # AITER FlyDSL: 8.1986 us
+        # (16, 5120, 2880),    # AITER FlyDSL: 8.6447 us
+        # (32, 5120, 2880),    # AITER FlyDSL: 10.4444 us
+        # (48, 5120, 2880),    # AITER FlyDSL: 12.2810 us
+        # (64, 5120, 2880),    # AITER FlyDSL: 12.2022 us
+        # (80, 5120, 2880),    # AITER FlyDSL: 12.3860 us
+        # (96, 5120, 2880),    # AITER FlyDSL: 13.1754 us
+        # (112, 5120, 2880),   # AITER FlyDSL: 14.6942 us
+        # (128, 5120, 2880),   # AITER FlyDSL: 14.4701 us
+        # (192, 5120, 2880),   # AITER FlyDSL: 15.8942 us
+        # (256, 5120, 2880),   # AITER FlyDSL: 17.8572 us
+        # (320, 5120, 2880),   # AITER FlyDSL: 19.9781 us
+        # (512, 5120, 2880),   # AITER FlyDSL: 27.0753 us
+        # (1024, 5120, 2880),  # AITER FlyDSL: 45.3827 us
+        # (2048, 5120, 2880),  # AITER FlyDSL: 88.1229 us
+        # (4096, 5120, 2880),  # AITER FlyDSL: 140.9515 us
+        # (8192, 5120, 2880),  # AITER FlyDSL: 240.8619 us
         # splitk
         # (32, 384, 7168),
         # (32, 384, 16384),
