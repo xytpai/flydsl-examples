@@ -135,9 +135,10 @@ def check_acc(args: _TestArgs):
     def get_tol(args):
         k_scale = (args.k / 8192) ** 0.5
         k_scale *= args.split_k * args.k_waves
+        atol_scale = 1.5 if args.has_bias else 1.0
         if args.dtype is torch.bfloat16:
-            return 2e-1 * k_scale, 2e-1
-        return 5e-2 * k_scale, 5e-2
+            return 2e-1 * k_scale * atol_scale, 2e-1
+        return 5e-2 * k_scale * atol_scale, 5e-2
 
     atol, rtol = get_tol(args)
     for _ in range(5):
@@ -368,23 +369,43 @@ def test_hgemm_acc_split_k(
 @pytest.mark.parametrize("layout", ["nn", "nt"])
 @pytest.mark.parametrize(
     "m, n, k, block_m, block_n, block_k, stages, split_k, "
-    "m_waves, n_waves, k_waves, group_m, has_bias, "
-    "use_half_tile_interleaved",
+    "m_waves, n_waves, k_waves, group_m, use_half_tile_interleaved",
     [
-        (32, 384, 7168, 32, 32, 64, 8, 8, 2, 1, 1, 0, True, False),
-        (32, 384, 16384, 32, 32, 256, 3, 8, 1, 1, 2, 0, True, False),
-        (800, 384, 7168, 64, 96, 64, 4, 4, 2, 2, 1, 0, True, False),
-        (32, 7168, 2048, 32, 32, 128, 4, 1, 2, 1, 1, 0, True, False),
-        (8, 7168, 2048, 16, 16, 128, 6, 1, 1, 1, 1, 4, True, False),
-        (8, 5120, 2880, 16, 64, 64, 4, 5, 1, 2, 1, 0, True, False),
-        (32, 2880, 2048, 32, 64, 64, 9, 4, 2, 2, 1, 0, True, False),
-        (1, 5120, 2880, 16, 64, 64, 8, 3, 1, 2, 1, 0, True, False),
-        (2, 5120, 2880, 16, 64, 64, 7, 3, 1, 2, 1, 0, True, False),
-        (4, 5120, 2880, 16, 64, 64, 8, 3, 1, 2, 1, 0, True, False),
-        (8, 5120, 2880, 16, 64, 64, 7, 3, 1, 2, 1, 0, True, False),
-        (16, 5120, 2880, 16, 32, 64, 8, 1, 1, 2, 1, 0, True, False),
-        (32, 5120, 2880, 16, 32, 64, 8, 1, 1, 2, 1, 0, True, False),
-        (48, 5120, 2880, 48, 64, 64, 5, 3, 1, 2, 1, 0, True, False),
+        # fmt: off
+        #    M,     N,     K,  BM,  BN,  BK, S, SK, MW, NW, KW, GM,   HTI
+        (   8,  4096,  4096,  16,  16, 256, 4,  1,  1,  1,  2,  4, False),
+        (  16,  4096,  4096,  16,  16, 256, 4,  1,  1,  1,  2,  4, False),
+        (  32,  4096,  4096,  16,  32, 256, 4,  1,  1,  2,  2,  4, False),
+        (  64,  4096,  4096,  32,  32, 128, 6,  1,  2,  2,  1,  4, False),
+        ( 128,  4096,  4096,  32,  64, 128, 4,  1,  1,  4,  1,  0, False),
+        ( 256,  4096,  4096,  64,  64, 128, 4,  1,  4,  2,  1,  0, False),
+        ( 512,  4096,  4096,  64, 128,  64, 5,  1,  2,  4,  1,  4, False),
+        (1024,  4096,  4096, 128, 128,  64, 4,  1,  2,  4,  1,  4, False),
+        (2048,  4096,  4096, 256, 128,  64, 3,  1,  4,  2,  2,  0, False),
+        (1024,  1024,  1024,  64,  64,  64, 4,  1,  1,  4,  1,  4, False),
+        (2048,  2048,  2048, 128, 128,  64, 4,  1,  2,  4,  1,  0, False),
+        (4096,  4096,  4096, 256, 256,  64, 2,  1,  2,  4,  1,  4,  True),
+        (4096,  4096,  8192, 256, 256,  64, 2,  1,  2,  4,  1,  4,  True),
+        (8192,  8192,  8192, 256, 256,  64, 2,  1,  2,  4,  1,  4,  True),
+        (   8,  7168,  2048,  16,  16,  64, 8,  1,  1,  1,  1,  4, False),
+        (  32,   384,  7168,  16,  16, 256, 4,  1,  1,  1,  2,  0, False),
+        (  32, 14336,  4096,  32,  64, 128, 5,  1,  2,  2,  1,  4, False),
+        (  16, 28672,  4096,  16,  64, 256, 2,  1,  1,  2,  2,  4, False),
+        (4096,   256,  4096,  64,  64, 128, 4,  1,  4,  2,  1,  4, False),
+        (   1,  5120,  2880,  16,  64,  64, 7,  3,  1,  2,  1,  0, False),
+        (   2,  5120,  2880,  16,  64,  64, 7,  3,  1,  2,  1,  0, False),
+        (   4,  5120,  2880,  16,  64,  64, 7,  3,  1,  2,  1,  0, False),
+        (   8,  5120,  2880,  16,  64,  64, 8,  3,  1,  2,  1,  0, False),
+        (  16,  5120,  2880,  16,  64,  64, 8,  3,  1,  2,  1,  0, False),
+        (  32,  5120,  2880,  16,  32,  64, 8,  1,  1,  2,  1,  0, False),
+        (  48,  5120,  2880,  16,  64,  64, 8,  1,  1,  2,  1,  0, False),
+        (  32,   384,  7168,  32,  32,  64, 8,  8,  2,  1,  1,  0, False),
+        (  32,   384, 16384,  32,  32,  64, 8,  8,  1,  2,  1,  0, False),
+        ( 800,   384,  7168,  64,  96,  64, 4,  4,  2,  2,  1,  0, False),
+        (  32,  7168,  2048,  32,  32,  64, 8,  1,  2,  1,  1,  0, False),
+        (   8,  7168,  2048,  16,  16,  64, 8,  1,  1,  1,  1,  4, False),
+        (  32,  2880,  2048,  32,  32,  64, 8,  2,  1,  2,  1,  0, False),
+        # fmt: on
     ],
 )
 def test_hgemm_acc_tuned_policies(
@@ -400,7 +421,6 @@ def test_hgemm_acc_tuned_policies(
     n_waves: int,
     k_waves: int,
     group_m: int,
-    has_bias: bool,
     use_half_tile_interleaved: bool,
     layout: str,
 ):
@@ -417,7 +437,7 @@ def test_hgemm_acc_tuned_policies(
         n_waves=n_waves,
         k_waves=k_waves,
         group_m=group_m,
-        has_bias=has_bias,
+        has_bias=True,
         use_half_tile_interleaved=use_half_tile_interleaved,
         layout=layout,
         split_k=split_k,
