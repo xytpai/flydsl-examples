@@ -426,6 +426,26 @@ def test_hgemm_acc_split_k(
         (  32,  7168,  2048,  32,  32,  64, 8,  1,  2,  1,  1,  0, False),
         (   8,  7168,  2048,  16,  16,  64, 8,  1,  1,  1,  1,  4, False),
         (  32,  2880,  2048,  32,  32,  64, 8,  2,  1,  2,  1,  0, False),
+        # Additional policies from the latest tuning run.
+        (  64,  4096,  4096,  32,  32,  64, 8,  1,  1,  2,  1,  0, False),
+        ( 128,  4096,  4096,  64,  32, 128, 4,  1,  4,  1,  1,  4, False),
+        ( 256,  4096,  4096,  64,  64,  64, 8,  1,  2,  2,  1,  0, False),
+        ( 512,  4096,  4096,  64, 128,  64, 6,  1,  2,  4,  1,  4, False),
+        (1024,  1024,  1024,  64,  64,  64, 4,  1,  2,  4,  1,  4, False),
+        (2048,  2048,  2048, 128, 128,  64, 4,  1,  2,  4,  1,  4, False),
+        (8192,  8192,  8192, 256, 256,  64, 2,  1,  2,  4,  1,  0,  True),
+        (   8,  7168,  2048,  16,  16, 128, 6,  1,  1,  1,  1,  4, False),
+        (  32, 14336,  4096,  32,  64, 256, 3,  1,  1,  2,  2,  4, False),
+        (  16, 28672,  4096,  16,  32, 256, 3,  1,  1,  2,  2,  4, False),
+        (4096,   256,  4096,  64,  64,  64, 8,  1,  2,  2,  1,  4, False),
+        (   1,  5120,  2880,  16,  64,  64, 9,  3,  1,  2,  1,  0, False),
+        (   2,  5120,  2880,  16,  64,  64, 8,  3,  1,  2,  1,  0, False),
+        (   4,  5120,  2880,  16,  64,  64, 8,  3,  1,  2,  1,  0, False),
+        (   8,  5120,  2880,  16,  64,  64, 9,  3,  1,  2,  1,  0, False),
+        (  16,  5120,  2880,  16,  64,  64, 5,  3,  1,  2,  1,  0, False),
+        (  32,   384,  7168,  32,  32,  64, 8,  8,  1,  2,  1,  0, False),
+        (   8,  7168,  2048,  16,  16, 128, 7,  1,  1,  1,  2,  4, False),
+        (  32,  2880,  2048,  32,  64,  64, 8,  4,  2,  2,  1,  0, False),
         # fmt: on
     ],
 )
@@ -466,7 +486,7 @@ def test_hgemm_acc_tuned_policies(
     check_acc(args)
 
 
-@pytest.mark.parametrize("layout", ["nn", "nt"])
+@pytest.mark.parametrize("layout", ["nn", "nt", "tn", "tt"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("has_bias", [False, True])
 @pytest.mark.parametrize(
@@ -628,9 +648,11 @@ def test_hgemm_acc_bench(
 
 
 @pytest.mark.parametrize("layout", ["nn", "nt", "tn", "tt"])
+@pytest.mark.parametrize("split_k", [1, 2])
 @pytest.mark.parametrize("use_half_tile_interleaved", [False, True])
 def test_hgemm_padded_stride_and_storage_offset(
     layout: str,
+    split_k: int,
     use_half_tile_interleaved: bool,
 ):
     m = n = 64
@@ -679,6 +701,7 @@ def test_hgemm_padded_stride_and_storage_offset(
         "block_n": 64,
         "block_k": 64,
         "stages": 2,
+        "split_k": split_k,
         "m_waves": 2,
         "n_waves": 2,
         "group_m": 0,
