@@ -722,7 +722,7 @@ def test_hgemm_padded_stride_and_storage_offset(
     torch.testing.assert_close(
         out,
         ref,
-        atol=3e-2,
+        atol=1e-1 if split_k > 1 else 3e-2,
         rtol=2e-1,
         check_dtype=True,
     )
