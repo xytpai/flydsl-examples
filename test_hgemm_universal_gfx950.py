@@ -323,6 +323,27 @@ def test_hgemm_acc_main_loop(
         (800, 384, 7168, 32, 64, 128, 6, 2, 1, 2, 2, True, 0, False),
         (800, 384, 7168, 32, 64, 128, 6, 2, 1, 2, 2, False, 0, False),
         (800, 384, 7168, 32, 64, 128, 6, 2, 1, 2, 2, False, 4, False),
+        # test_hgemm_acc_hti_split_k
+        (64, 64, 512, 64, 64, 64, 2, 2, 2, 2, 1, True, 0, True),
+        (64, 64, 512, 64, 64, 64, 2, 2, 2, 2, 1, False, 0, True),
+        # Common PR-tuned HTI split-K policies.
+        (65, 96, 4096, 64, 64, 256, 2, 4, 2, 2, 1, False, 0, True),
+        (96, 64, 7168, 64, 64, 256, 2, 7, 2, 2, 1, False, 0, True),
+        (128, 64, 4096, 64, 64, 256, 2, 8, 2, 2, 1, False, 0, True),
+        (128, 128, 6144, 64, 64, 256, 2, 6, 2, 2, 1, False, 0, True),
+        (65, 136, 2048, 64, 128, 128, 2, 4, 2, 4, 1, False, 0, True),
+        (129, 72, 1024, 128, 64, 128, 2, 2, 2, 2, 1, True, 0, True),
+        (129, 136, 1536, 128, 128, 128, 2, 3, 2, 4, 1, False, 4, True),
+        (257, 264, 512, 256, 256, 64, 2, 2, 2, 4, 1, False, 0, True),
+        # HTI split-K coverage mirrored from test_hgemm_layout.py.
+        (64, 384, 7168, 64, 64, 64, 2, 8, 2, 2, 1, True, 0, True),
+        (64, 384, 7168, 64, 64, 64, 2, 8, 2, 2, 1, False, 0, True),
+        (64, 384, 7168, 64, 64, 64, 2, 8, 2, 2, 1, True, 4, True),
+        (64, 384, 7168, 64, 64, 64, 2, 8, 2, 2, 1, False, 4, True),
+        (2048, 2048, 2048, 128, 128, 64, 2, 4, 2, 2, 1, True, 0, True),
+        (2048, 2048, 2048, 128, 128, 64, 2, 4, 2, 2, 1, False, 0, True),
+        (2048, 2048, 2048, 128, 128, 64, 2, 4, 2, 2, 1, True, 4, True),
+        (2048, 2048, 2048, 128, 128, 64, 2, 4, 2, 2, 1, False, 4, True),
     ],
 )
 def test_hgemm_acc_split_k(
@@ -445,13 +466,17 @@ def test_hgemm_acc_tuned_policies(
     check_acc(args)
 
 
+@pytest.mark.parametrize("layout", ["nn", "nt"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("has_bias", [False, True])
 @pytest.mark.parametrize(
     "split_k, use_half_tile_interleaved",
-    [(1, False), (3, False), (1, True)],
+    [(1, False), (3, False), (1, True), (3, True)],
 )
 def test_hgemm_acc_fp32_output(
+    layout: str,
     dtype: torch.dtype,
+    has_bias: bool,
     split_k: int,
     use_half_tile_interleaved: bool,
 ):
@@ -468,8 +493,9 @@ def test_hgemm_acc_fp32_output(
         n_waves=2,
         k_waves=1,
         group_m=0,
-        has_bias=True,
+        has_bias=has_bias,
         use_half_tile_interleaved=use_half_tile_interleaved,
+        layout=layout,
         split_k=split_k,
         out_dtype=torch.float32,
     )
@@ -869,7 +895,8 @@ def test_hgemm_split_k_uses_stream_local_sync_buffers():
     "k, use_half_tile_interleaved, message",
     [
         (480, False, "K-tail is unsupported"),
-        (128, True, "HTI requires more than two"),
+        (64, True, "HTI requires at least two"),
+        (192, True, "HTI requires at least two"),
     ],
 )
 def test_hgemm_rejects_unsupported_k_partitioning(
@@ -893,31 +920,6 @@ def test_hgemm_rejects_unsupported_k_partitioning(
     }
 
     with pytest.raises(AssertionError, match=message):
-        hgemm(a, b, user_kwargs=kwargs, layout="nt")
-
-
-def test_hgemm_rejects_hti_split_k():
-    m = n = 64
-    k = 512
-    dtype = torch.bfloat16
-    a = torch.randn((m, k), dtype=dtype, device="cuda")
-    b = torch.randn((k, n), dtype=dtype, device="cuda")
-    kwargs = {
-        "block_m": 64,
-        "block_n": 64,
-        "block_k": 64,
-        "stages": 2,
-        "split_k": 2,
-        "m_waves": 2,
-        "n_waves": 2,
-        "group_m": 0,
-        "use_half_tile_interleaved": True,
-    }
-
-    with pytest.raises(
-        AssertionError,
-        match="unsupported hgemm_universal_gfx950 shape/config",
-    ):
         hgemm(a, b, user_kwargs=kwargs, layout="nt")
 
 
