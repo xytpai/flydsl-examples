@@ -329,10 +329,6 @@ def __barrier(vmcnt=0):
     )
 
 
-def __waitcnt(vmcnt=0):
-    llvm.InlineAsmOp(None, [], f"s_waitcnt vmcnt({vmcnt})", "", has_side_effects=True)
-
-
 def buffer_load_lds_inline(rsrc, lds_ptr, global_offset, DMA_BYTES):
     buffer_load_asm_dict = {
         16: "buffer_load_dwordx4",

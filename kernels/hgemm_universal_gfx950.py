@@ -15,7 +15,6 @@ from .hgemm_universal_gfx950_utils import (
     SPLIT_K_SEMAPHORE_MAX_LEN,
     SplitKProtocol,
     __barrier,
-    __waitcnt,
     buffer_load_lds_inline,
     get_wave_lds_offset,
     make_lds_layout,
@@ -1151,8 +1150,7 @@ def hgemm_hti_gfx950_kernel(
 
     b0 = load_b_fragment(0, 1, k_tile + 1)
     consume(k_tile, c11, a1, b1, True)
-    __waitcnt(0)
-    rocdl.s_barrier()
+    __barrier(0)
 
     a0 = load_a_fragment(0, 1, k_tile + 1)
     consume(k_tile + 1, c00, a0, b0, True)

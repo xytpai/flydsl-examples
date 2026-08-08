@@ -100,13 +100,13 @@ pip install -e .
 Run the universal GEMM correctness suite:
 
 ```bash
-pytest -sv test_hgemm_universal.py
+pytest -sv test_hgemm_universal_gfx950.py
 ```
 
 Run a focused layout test:
 
 ```bash
-pytest -sv test_hgemm_universal.py -k "main_loop and nt"
+pytest -sv test_hgemm_universal_gfx950.py -k "main_loop and nt"
 ```
 
 After changing FlyDSL compiler or kernel sources, clear the JIT cache when
@@ -176,7 +176,7 @@ Use `--shape-index` to run a single built-in shape.
 kernels/
   hgemm_universal_gfx950.py        # A16W16 universal GEMM
   hgemm_universal_gfx950_utils.py  # Layout, LDS, split-K, and store helpers
-test_hgemm_universal.py            # Universal GEMM correctness and benchmarks
+test_hgemm_universal_gfx950.py     # Universal GEMM correctness and benchmarks
 gemm_tune.py                    # Policy search and tuning
 torch_benchmark.py              # torch.compile backend comparison
 ```
