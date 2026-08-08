@@ -667,6 +667,223 @@ def test_hgemm_padded_stride_and_storage_offset(
     )
 
 
+@pytest.mark.parametrize("split_k", [1, 2])
+def test_hgemm_fp32_slice_k_without_bias(split_k: int):
+    args = _TestArgs(
+        dtype=torch.bfloat16,
+        m=64,
+        n=128,
+        k=2048,
+        block_m=32,
+        block_n=64,
+        block_k=128,
+        stages=4,
+        m_waves=1,
+        n_waves=2,
+        k_waves=2,
+        group_m=0,
+        has_bias=False,
+        use_half_tile_interleaved=False,
+        layout="nt",
+        split_k=split_k,
+        out_dtype=torch.float32,
+    )
+    check_acc(args)
+
+
+def test_hgemm_allocates_output_with_default_policy():
+    m = n = 64
+    k = 256
+    dtype = torch.bfloat16
+    a = torch.randn((m, k), dtype=dtype, device="cuda")
+    b = torch.randn((k, n), dtype=dtype, device="cuda")
+
+    out = hgemm(a, b)
+    ref = torch.mm(a, b)
+
+    assert out.shape == (m, n)
+    assert out.dtype == dtype
+    assert out.device == a.device
+    torch.testing.assert_close(out, ref, atol=3e-2, rtol=2e-1)
+
+
+@pytest.mark.parametrize("layout", ["nn", "nt"])
+def test_hgemm_host_contiguity_fallbacks(layout: str):
+    m = n = 64
+    k = 256
+    dtype = torch.bfloat16
+    a_storage = torch.randn((m, k * 2), dtype=dtype, device="cuda")
+    a = a_storage[:, ::2]
+    if layout == "nn":
+        b_storage = torch.randn((k, n * 2), dtype=dtype, device="cuda")
+        b = b_storage[:, ::2]
+    else:
+        b = torch.randn((k, n), dtype=dtype, device="cuda")
+    bias_storage = torch.randn((n * 2,), dtype=dtype, device="cuda")
+    bias = bias_storage[::2]
+    out = torch.empty((m, n), dtype=dtype, device="cuda")
+    ref = torch.empty_like(out)
+    kwargs = {
+        "block_m": 64,
+        "block_n": 64,
+        "block_k": 64,
+        "stages": 2,
+        "m_waves": 2,
+        "n_waves": 2,
+        "group_m": 0,
+        "use_half_tile_interleaved": False,
+    }
+
+    hgemm(a, b, out, bias=bias, user_kwargs=kwargs, layout=layout)
+    ref_func(a, b, bias, ref, layout)
+
+    assert not a.is_contiguous()
+    assert not bias.is_contiguous()
+    torch.testing.assert_close(out, ref, atol=3e-2, rtol=2e-1)
+
+
+@pytest.mark.parametrize("n", [4096, 4032])
+def test_hgemm_block_swizzle_boundary_paths(n: int):
+    args = _TestArgs(
+        dtype=torch.bfloat16,
+        m=320,
+        n=n,
+        k=256,
+        block_m=64,
+        block_n=64,
+        block_k=64,
+        stages=2,
+        m_waves=2,
+        n_waves=2,
+        k_waves=1,
+        group_m=4,
+        has_bias=False,
+        use_half_tile_interleaved=False,
+        layout="nt",
+    )
+    check_acc(args)
+
+
+def test_hgemm_slice_k_four_waves():
+    args = _TestArgs(
+        dtype=torch.bfloat16,
+        m=64,
+        n=128,
+        k=1024,
+        block_m=32,
+        block_n=64,
+        block_k=128,
+        stages=4,
+        m_waves=1,
+        n_waves=2,
+        k_waves=4,
+        group_m=0,
+        has_bias=True,
+        use_half_tile_interleaved=False,
+        layout="nt",
+    )
+    check_acc(args)
+
+
+def test_hgemm_split_k_uses_stream_local_sync_buffers():
+    args = _TestArgs(
+        dtype=torch.bfloat16,
+        m=64,
+        n=64,
+        k=512,
+        block_m=64,
+        block_n=64,
+        block_k=64,
+        stages=2,
+        m_waves=2,
+        n_waves=2,
+        k_waves=1,
+        group_m=0,
+        has_bias=True,
+        use_half_tile_interleaved=False,
+        layout="nt",
+        split_k=2,
+    )
+    a, b, bias = create_inputs(args)
+    out0 = create_outputs(args)[0]
+    out1 = create_outputs(args)[0]
+    ref = create_outputs(args)[0]
+    kwargs = {
+        "block_m": args.block_m,
+        "block_n": args.block_n,
+        "block_k": args.block_k,
+        "stages": args.stages,
+        "split_k": args.split_k,
+        "m_waves": args.m_waves,
+        "n_waves": args.n_waves,
+        "k_waves": args.k_waves,
+        "group_m": args.group_m,
+        "use_half_tile_interleaved": args.use_half_tile_interleaved,
+    }
+    stream0 = torch.cuda.Stream()
+    stream1 = torch.cuda.Stream()
+
+    hgemm(a, b, out0, bias=bias, user_kwargs=kwargs, layout=args.layout)
+    torch.cuda.synchronize()
+    with torch.cuda.stream(stream0):
+        hgemm(
+            a,
+            b,
+            out0,
+            bias=bias,
+            user_kwargs=kwargs,
+            layout=args.layout,
+            stream=stream0,
+        )
+    with torch.cuda.stream(stream1):
+        hgemm(
+            a,
+            b,
+            out1,
+            bias=bias,
+            user_kwargs=kwargs,
+            layout=args.layout,
+            stream=stream1,
+        )
+    stream0.synchronize()
+    stream1.synchronize()
+    ref_func(a, b, bias, ref, args.layout)
+
+    torch.testing.assert_close(out0, ref, atol=2e-1, rtol=2e-1)
+    torch.testing.assert_close(out1, ref, atol=2e-1, rtol=2e-1)
+
+
+@pytest.mark.parametrize(
+    "k, use_half_tile_interleaved, message",
+    [
+        (480, False, "K-tail is unsupported"),
+        (128, True, "HTI requires more than two"),
+    ],
+)
+def test_hgemm_rejects_unsupported_k_partitioning(
+    k: int,
+    use_half_tile_interleaved: bool,
+    message: str,
+):
+    m = n = 64
+    dtype = torch.bfloat16
+    a = torch.randn((m, k), dtype=dtype, device="cuda")
+    b = torch.randn((k, n), dtype=dtype, device="cuda")
+    kwargs = {
+        "block_m": 64,
+        "block_n": 64,
+        "block_k": 64,
+        "stages": 2,
+        "m_waves": 2,
+        "n_waves": 2,
+        "group_m": 0,
+        "use_half_tile_interleaved": use_half_tile_interleaved,
+    }
+
+    with pytest.raises(AssertionError, match=message):
+        hgemm(a, b, user_kwargs=kwargs, layout="nt")
+
+
 # =========================================== benchmark ===========================================
 
 
