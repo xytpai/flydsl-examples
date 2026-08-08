@@ -53,6 +53,7 @@ class HGemmGfx950Param:
     async_load_bytes: fx.Constexpr[int]
     in_data_bytes: fx.Constexpr[int]
     out_data_bytes: fx.Constexpr[int]
+    cshuffle_r2g_vec_size: fx.Constexpr[int]
     ldg_x_threads: fx.Constexpr[int]
     block_threads: fx.Constexpr[int]
     ldg_a_iters: fx.Constexpr[int]
@@ -101,9 +102,8 @@ def make_hgemm_gfx950_param(
         raise ValueError("group_m must be non-negative")
     in_dbytes = 2  # Shared C remains in the 16-bit input dtype.
     out_dbytes = 4 if out_dtype_id == HGEMM_DTYPE_FP32 else 2
-    # Keep each global C-shuffle transaction at 16 bytes. The corresponding
-    # LDS read width varies because shared C remains in the 16-bit input dtype.
-    cshuffle_r2g_vec_size = 16 // out_dbytes
+    block_threads = m_waves * n_waves * k_waves * GFX950_WAVE_SIZE
+    max_cshuffle_r2g_vec_size = 16 // out_dbytes
     if use_half_tile_interleaved:
         if k_waves != 1:
             raise ValueError("half-tile interleaved does not support slice-K")
@@ -117,8 +117,15 @@ def make_hgemm_gfx950_param(
         mma_n_half_repeat = half_block_n // n_waves // mma_n
         assert mma_m_half_repeat * m_waves * mma_m == half_block_m
         assert mma_n_half_repeat * n_waves * mma_n == half_block_n
+        stg_size_per_m_step = m_waves * mma_m * half_block_n
+        assert stg_size_per_m_step % block_threads == 0
+        stg_work_size_per_m_step = stg_size_per_m_step // block_threads
+        cshuffle_r2g_vec_size = min(max_cshuffle_r2g_vec_size, stg_work_size_per_m_step)
+        assert cshuffle_r2g_vec_size in (4, 8)
+        assert stg_work_size_per_m_step % cshuffle_r2g_vec_size == 0
         assert half_block_n % cshuffle_r2g_vec_size == 0
     else:
+        cshuffle_r2g_vec_size = max_cshuffle_r2g_vec_size
         assert block_n % cshuffle_r2g_vec_size == 0
     smem_bytes = stages * (block_m + block_n) * block_k * in_dbytes
     smem_bytes = max(smem_bytes, k_waves * block_m * block_n * in_dbytes)
@@ -144,7 +151,6 @@ def make_hgemm_gfx950_param(
             f"block_k={block_k}, async_load_vec_size={async_load_vec_size}, "
             f"covered_k={ldg_x_threads * async_load_vec_size}"
         )
-    block_threads = m_waves * n_waves * k_waves * GFX950_WAVE_SIZE
     ldg_y_threads = block_threads // ldg_x_threads
     if ldg_y_threads * ldg_x_threads != block_threads:
         raise ValueError(
@@ -241,6 +247,7 @@ def make_hgemm_gfx950_param(
         async_load_bytes=GFX950_DMA_BYTES,
         in_data_bytes=in_dbytes,
         out_data_bytes=out_dbytes,
+        cshuffle_r2g_vec_size=cshuffle_r2g_vec_size,
         ldg_x_threads=ldg_x_threads,
         block_threads=block_threads,
         ldg_a_iters=ldg_a_iters,
@@ -427,7 +434,7 @@ def hgemm_gfx950_kernel(
     ldg_a_iters = param.ldg_a_iters
     ldg_b_iters = param.ldg_b_iters
     ldg_wait_count = ldg_a_iters + ldg_b_iters
-    cshuffle_r2g_vec_size = GFX950_DMA_BYTES // param.out_data_bytes
+    cshuffle_r2g_vec_size = param.cshuffle_r2g_vec_size
     elem_dtype = (
         fx.Float16 if const_expr(param.in_dtype_id == HGEMM_DTYPE_FP16) else fx.BFloat16
     )
@@ -775,7 +782,7 @@ def hgemm_hti_gfx950_kernel(
     n_waves = param.n_waves
     half_ldg_a_iters = param.ldg_a_iters // 2
     half_ldg_b_iters = param.ldg_b_iters // 2
-    cshuffle_r2g_vec_size = GFX950_DMA_BYTES // param.out_data_bytes
+    cshuffle_r2g_vec_size = param.cshuffle_r2g_vec_size
     elem_dtype = (
         fx.Float16 if const_expr(param.in_dtype_id == HGEMM_DTYPE_FP16) else fx.BFloat16
     )
@@ -1158,26 +1165,25 @@ def hgemm_hti_gfx950_kernel(
     rocdl.s_barrier()
     a1 = load_a_fragment(1, 1, k_tile + 1)
     rocdl.s_barrier()
-    consume(k_tile + 1, c10, a1, b0, True)
+    rocdl.sched_barrier(0)
+    store_half_tile_to_lds(0, 0, c00)
+    consume(k_tile + 1, c10, a1, b0, False)
+    rocdl.sched_barrier(0)
     rocdl.s_barrier()
-    consume(k_tile + 1, c11, a1, b1, True)
+    rocdl.sched_barrier(0)
+    store_half_tile_to_lds(0, 1, c01)
+    consume(k_tile + 1, c11, a1, b1, False)
+    rocdl.sched_barrier(0)
     if const_expr(is_split_k):
-        __barrier(0)
-        store_half_tile_to_lds(0, 0, c00)
-        store_half_tile_to_lds(0, 1, c01)
-        __barrier(0)
+        rocdl.s_barrier()
         store_half_tile_to_lds(1, 0, c10)
         store_half_tile_to_lds(1, 1, c11)
         splitk_protocol.split_k_barrier(split_k)
         store_half_tile_to_global(0, 0)
         store_half_tile_to_global(0, 1)
-        __barrier(0)
         store_half_tile_to_global(1, 0)
         store_half_tile_to_global(1, 1)
     else:
-        __barrier(0)
-        store_half_tile_to_lds(0, 0, c00)
-        store_half_tile_to_lds(0, 1, c01)
         __barrier(0)
         store_half_tile_to_global(0, 0)
         store_half_tile_to_global(0, 1)
@@ -1278,7 +1284,7 @@ def make_hgemm_param_and_validate(m, n, k, kwargs):
         assert_no_k_tail(k, kwargs)
     except AssertionError:
         return None
-    cshuffle_r2g_vec_size = GFX950_DMA_BYTES // result.out_data_bytes
+    cshuffle_r2g_vec_size = result.cshuffle_r2g_vec_size
     if n % cshuffle_r2g_vec_size != 0:
         return None
     num_pid_m = (m + result.block_m - 1) // result.block_m

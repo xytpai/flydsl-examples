@@ -956,6 +956,57 @@ def test_hgemm_rejects_unsupported_k_partitioning(
 # =========================================== benchmark ===========================================
 
 
+@pytest.mark.parametrize(
+    "m, n, k, block_m, block_n, block_k, stages, split_k, "
+    "m_waves, n_waves, k_waves, group_m, has_bias",
+    [
+        # fmt: off
+        #    M,    N,    K,  BM,  BN,  BK, S, SK, MW, NW, KW, GM,  Bias
+        ( 4096,  128, 6144,  64,  64, 256, 2,  2,  2,  2,  1,  0, False),
+        (  512, 2560, 6144, 128, 128, 128, 2,  3,  2,  4,  1,  4, False),
+        (  576,  256, 4096,  64,  64, 256, 2,  4,  2,  2,  1,  0,  True),
+        ( 1024,  128, 6144,  64,  64, 256, 2,  6,  2,  2,  1,  0,  True),
+        ( 1216,   64, 7168,  64,  64, 256, 2,  7,  2,  2,  1,  0, False),
+        ( 1280,   64, 4096,  64,  64, 256, 2,  8,  2,  2,  1,  0, False),
+        # fmt: on
+    ],
+)
+def test_hgemm_hti_split_k_benchmark(
+    m: int,
+    n: int,
+    k: int,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    stages: int,
+    split_k: int,
+    m_waves: int,
+    n_waves: int,
+    k_waves: int,
+    group_m: int,
+    has_bias: bool,
+):
+    args = _TestArgs(
+        dtype=torch.bfloat16,
+        m=m,
+        n=n,
+        k=k,
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        stages=stages,
+        m_waves=m_waves,
+        n_waves=n_waves,
+        k_waves=k_waves,
+        group_m=group_m,
+        has_bias=has_bias,
+        use_half_tile_interleaved=True,
+        layout="nt",
+        split_k=split_k,
+    )
+    benchmark(args)
+
+
 @pytest.mark.parametrize("layout", ["nn", "nt", "tn", "tt"])
 @pytest.mark.parametrize("dtype", ["bf16"])
 @pytest.mark.parametrize(
