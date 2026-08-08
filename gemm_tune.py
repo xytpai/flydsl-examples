@@ -342,6 +342,13 @@ def tune_all(
     compile_workers=DEFAULT_COMPILE_WORKERS,
 ):
     mnks = [
+        # HTI split-K winners; tune with --enable-split-k.
+        # (4096, 128, 6144),  # splitK=2: 22.1980 us
+        # (512, 2560, 6144),  # splitK=3: 34.5343 us
+        # (576, 256, 4096),  # splitK=4: 10.4404 us
+        # (1024, 128, 6144),  # splitK=6: 11.1767 us
+        # (1216, 64, 7168),  # splitK=7: 10.4065 us
+        # (1280, 64, 4096),  # splitK=8: 8.5128 us
         # splitk-regresiion-test
         # (1, 5120, 2880),     # AITER FlyDSL: 7.7863 us
         # (2, 5120, 2880),     # AITER FlyDSL: 7.9572 us
