@@ -8,7 +8,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.runtime.device import get_rocm_arch
 
 from .common import run_cached
-from .hgemm_universal_gfx950_utils import (
+from .gemm_a16w16_gfx950_utils import (
     BlockSwizzle,
     GFX950_DMA_BYTES,
     GFX950_WAVE_SIZE,
@@ -24,13 +24,13 @@ from .hgemm_universal_gfx950_utils import (
     transposed_contiguous_idx,
 )
 
-HGEMM_DTYPE_FP32 = 1
-HGEMM_DTYPE_BF16 = 2
-HGEMM_DTYPE_FP16 = 3
+GEMM_A16W16_DTYPE_FP32 = 1
+GEMM_A16W16_DTYPE_BF16 = 2
+GEMM_A16W16_DTYPE_FP16 = 3
 
 
 @fx.struct
-class HGemmGfx950Param:
+class GemmA16W16Gfx950Param:
     in_dtype_id: fx.Constexpr[int]
     out_dtype_id: fx.Constexpr[int]
     block_m: fx.Constexpr[int]
@@ -60,7 +60,7 @@ class HGemmGfx950Param:
     ldg_b_iters: fx.Constexpr[int]
 
 
-def make_hgemm_gfx950_param(
+def make_gemm_a16w16_gfx950_param(
     in_dtype_id: int,
     out_dtype_id: int,
     block_m: int = 256,
@@ -79,10 +79,10 @@ def make_hgemm_gfx950_param(
     mma_m: int = 16,
     mma_n: int = 16,
     mma_k: int = 32,
-) -> HGemmGfx950Param:
-    if in_dtype_id not in (HGEMM_DTYPE_BF16, HGEMM_DTYPE_FP16):
+) -> GemmA16W16Gfx950Param:
+    if in_dtype_id not in (GEMM_A16W16_DTYPE_BF16, GEMM_A16W16_DTYPE_FP16):
         raise ValueError(f"unsupported in_dtype_id={in_dtype_id}")
-    if out_dtype_id not in (in_dtype_id, HGEMM_DTYPE_FP32):
+    if out_dtype_id not in (in_dtype_id, GEMM_A16W16_DTYPE_FP32):
         raise ValueError(
             f"unsupported out_dtype_id={out_dtype_id} " f"for in_dtype_id={in_dtype_id}"
         )
@@ -101,7 +101,7 @@ def make_hgemm_gfx950_param(
     if group_m < 0:
         raise ValueError("group_m must be non-negative")
     in_dbytes = 2  # Shared C remains in the 16-bit input dtype.
-    out_dbytes = 4 if out_dtype_id == HGEMM_DTYPE_FP32 else 2
+    out_dbytes = 4 if out_dtype_id == GEMM_A16W16_DTYPE_FP32 else 2
     block_threads = m_waves * n_waves * k_waves * GFX950_WAVE_SIZE
     max_cshuffle_r2g_vec_size = 16 // out_dbytes
     if use_half_tile_interleaved:
@@ -228,7 +228,7 @@ def make_hgemm_gfx950_param(
             f"mma_k_repeat={mma_k_repeat}, "
             f"covered_k={mma_k_repeat * k_waves * mma_k}"
         )
-    return HGemmGfx950Param(
+    return GemmA16W16Gfx950Param(
         in_dtype_id=in_dtype_id,
         out_dtype_id=out_dtype_id,
         block_m=block_m,
@@ -258,9 +258,9 @@ def make_hgemm_gfx950_param(
     )
 
 
-def make_hgemm_gfx950_kernel_name(param: HGemmGfx950Param):
-    dtype_str = "fp16" if param.in_dtype_id == HGEMM_DTYPE_FP16 else "bf16"
-    out_suffix = "_fp32" if param.out_dtype_id == HGEMM_DTYPE_FP32 else ""
+def make_gemm_a16w16_gfx950_kernel_name(param: GemmA16W16Gfx950Param):
+    dtype_str = "fp16" if param.in_dtype_id == GEMM_A16W16_DTYPE_FP16 else "bf16"
+    out_suffix = "_fp32" if param.out_dtype_id == GEMM_A16W16_DTYPE_FP32 else ""
     name = f"hgemm_{dtype_str}{out_suffix}_t{param.block_m}x{param.block_n}x{param.block_k}x{param.stages}"
     name += "_ksd" if param.is_split_k else "_ks1"
     name += f"_w{param.m_waves}x{param.n_waves}x{param.k_waves}"
@@ -399,7 +399,7 @@ def write_cshuffle_vec_to_global(
 
 
 @flyc.kernel
-def hgemm_gfx950_kernel(
+def gemm_a16w16_gfx950_kernel(
     out: fx.Tensor,
     a: fx.Tensor,
     b: fx.Tensor,
@@ -414,7 +414,7 @@ def hgemm_gfx950_kernel(
     a_leading_stride: fx.Int32,
     b_leading_stride: fx.Int32,
     tiled_mma: fx.TiledMma,
-    param: HGemmGfx950Param,
+    param: GemmA16W16Gfx950Param,
 ):
     is_split_k = param.is_split_k
     is_slice_k = param.k_waves > 1
@@ -436,10 +436,14 @@ def hgemm_gfx950_kernel(
     ldg_wait_count = ldg_a_iters + ldg_b_iters
     cshuffle_r2g_vec_size = param.cshuffle_r2g_vec_size
     elem_dtype = (
-        fx.Float16 if const_expr(param.in_dtype_id == HGEMM_DTYPE_FP16) else fx.BFloat16
+        fx.Float16
+        if const_expr(param.in_dtype_id == GEMM_A16W16_DTYPE_FP16)
+        else fx.BFloat16
     )
     global_output_dtype = (
-        fx.Float32 if const_expr(param.out_dtype_id == HGEMM_DTYPE_FP32) else elem_dtype
+        fx.Float32
+        if const_expr(param.out_dtype_id == GEMM_A16W16_DTYPE_FP32)
+        else elem_dtype
     )
     if const_expr(is_split_k):
         splitk_protocol = SplitKProtocol(
@@ -745,12 +749,12 @@ def hgemm_gfx950_kernel(
                     global_offset,
                     c_vec,
                     is_split_k,
-                    param.out_dtype_id == HGEMM_DTYPE_FP32,
+                    param.out_dtype_id == GEMM_A16W16_DTYPE_FP32,
                 )
 
 
 @flyc.kernel
-def hgemm_hti_gfx950_kernel(
+def gemm_a16w16_hti_gfx950_kernel(
     out: fx.Tensor,
     a: fx.Tensor,
     b: fx.Tensor,
@@ -765,7 +769,7 @@ def hgemm_hti_gfx950_kernel(
     a_leading_stride: fx.Int32,
     b_leading_stride: fx.Int32,
     tiled_mma: fx.TiledMma,
-    param: HGemmGfx950Param,
+    param: GemmA16W16Gfx950Param,
 ):
     is_split_k = param.is_split_k
     block_m = param.block_m
@@ -784,10 +788,14 @@ def hgemm_hti_gfx950_kernel(
     half_ldg_b_iters = param.ldg_b_iters // 2
     cshuffle_r2g_vec_size = param.cshuffle_r2g_vec_size
     elem_dtype = (
-        fx.Float16 if const_expr(param.in_dtype_id == HGEMM_DTYPE_FP16) else fx.BFloat16
+        fx.Float16
+        if const_expr(param.in_dtype_id == GEMM_A16W16_DTYPE_FP16)
+        else fx.BFloat16
     )
     global_output_dtype = (
-        fx.Float32 if const_expr(param.out_dtype_id == HGEMM_DTYPE_FP32) else elem_dtype
+        fx.Float32
+        if const_expr(param.out_dtype_id == GEMM_A16W16_DTYPE_FP32)
+        else elem_dtype
     )
     if const_expr(is_split_k):
         splitk_protocol = SplitKProtocol(
@@ -1039,7 +1047,7 @@ def hgemm_hti_gfx950_kernel(
                         global_offset,
                         c_vec,
                         is_split_k,
-                        param.out_dtype_id == HGEMM_DTYPE_FP32,
+                        param.out_dtype_id == GEMM_A16W16_DTYPE_FP32,
                     )
 
     c00 = make_c_fragment(0, 0)
@@ -1196,7 +1204,7 @@ def hgemm_hti_gfx950_kernel(
 
 
 @flyc.jit
-def hgemm_gfx950(
+def gemm_a16w16_gfx950(
     out: fx.Tensor,
     a: fx.Tensor,
     b: fx.Tensor,
@@ -1204,7 +1212,7 @@ def hgemm_gfx950(
     semaphore: fx.Tensor,
     signal: fx.Tensor,
     split_k: fx.Int32,
-    param: HGemmGfx950Param,
+    param: GemmA16W16Gfx950Param,
     stream: fx.Stream = fx.Stream(None),
 ):
     m = fx.Int32(fx.get_scalar(a.shape[0]))
@@ -1217,7 +1225,9 @@ def hgemm_gfx950(
         fx.get_scalar(b.stride[1] if const_expr(param.b_is_transposed) else b.stride[0])
     )
     elem_dtype = (
-        fx.Float16 if const_expr(param.in_dtype_id == HGEMM_DTYPE_FP16) else fx.BFloat16
+        fx.Float16
+        if const_expr(param.in_dtype_id == GEMM_A16W16_DTYPE_FP16)
+        else fx.BFloat16
     )
     mma_atom = fx.make_mma_atom(
         fx.rocdl.MFMA(param.mma_m, param.mma_n, param.mma_k, elem_dtype)
@@ -1243,14 +1253,14 @@ def hgemm_gfx950(
     working_k = (working_k + split_alignment - 1) // split_alignment * split_alignment
     num_pid_m = (m + param.block_m - 1) // param.block_m
     num_pid_n = (n + param.block_n - 1) // param.block_n
-    hgemm_kernel_impl = (
-        hgemm_hti_gfx950_kernel
+    gemm_a16w16_kernel_impl = (
+        gemm_a16w16_hti_gfx950_kernel
         if param.use_half_tile_interleaved
-        else hgemm_gfx950_kernel
+        else gemm_a16w16_gfx950_kernel
     )
-    hgemm_kernel_impl._known_block_size = [param.block_threads, 1, 1]
-    hgemm_kernel_impl._func.__name__ = make_hgemm_gfx950_kernel_name(param)
-    hgemm_kernel_impl(
+    gemm_a16w16_kernel_impl._known_block_size = [param.block_threads, 1, 1]
+    gemm_a16w16_kernel_impl._func.__name__ = make_gemm_a16w16_gfx950_kernel_name(param)
+    gemm_a16w16_kernel_impl(
         out,
         a,
         b,
@@ -1273,10 +1283,10 @@ def hgemm_gfx950(
     )
 
 
-def make_hgemm_param_and_validate(m, n, k, kwargs):
+def make_gemm_a16w16_param_and_validate(m, n, k, kwargs):
     result = None
     try:
-        result = make_hgemm_gfx950_param(**kwargs)
+        result = make_gemm_a16w16_gfx950_param(**kwargs)
     except Exception:
         return None
     split_k = kwargs.get("split_k", 1)
@@ -1357,7 +1367,7 @@ def _dynamic_tensor_arg(tensor, leading_dim):
     return flyc.from_dlpack(tensor).mark_layout_dynamic(leading_dim=leading_dim)
 
 
-def hgemm(
+def gemm_a16w16(
     a: torch.Tensor,
     b: torch.Tensor,
     out: Optional[torch.Tensor] = None,
@@ -1481,10 +1491,10 @@ def hgemm(
     kwargs["a_is_transposed"] = a_is_transposed
     kwargs["b_is_transposed"] = b_is_transposed
     kwargs["in_dtype_id"] = (
-        HGEMM_DTYPE_FP16 if a.dtype is torch.float16 else HGEMM_DTYPE_BF16
+        GEMM_A16W16_DTYPE_FP16 if a.dtype is torch.float16 else GEMM_A16W16_DTYPE_BF16
     )
     kwargs["out_dtype_id"] = (
-        HGEMM_DTYPE_FP32 if out.dtype is torch.float32 else kwargs["in_dtype_id"]
+        GEMM_A16W16_DTYPE_FP32 if out.dtype is torch.float32 else kwargs["in_dtype_id"]
     )
     kwargs["has_bias"] = False if bias is None else True
     split_k = kwargs["split_k"]
@@ -1494,8 +1504,8 @@ def hgemm(
         assert bias.shape[0] == n
         assert bias.dtype == a.dtype
 
-    param = make_hgemm_param_and_validate(m, n, k, kwargs)
-    assert param is not None, "unsupported hgemm_universal_gfx950 shape/config"
+    param = make_gemm_a16w16_param_and_validate(m, n, k, kwargs)
+    assert param is not None, "unsupported gemm_a16w16_gfx950 shape/config"
     semaphore, signal = get_split_k_buffers(stream, device)
     a_arg = _dynamic_tensor_arg(a, 0 if a_is_transposed else 1)
     b_arg = _dynamic_tensor_arg(b, 0 if b_is_transposed else 1)
@@ -1513,7 +1523,7 @@ def hgemm(
         stream,
     )
     run_cached(
-        hgemm_gfx950,
+        gemm_a16w16_gfx950,
         *dispatch_args,
         constexpr_param=param,
         compiler=flyc.compile,
