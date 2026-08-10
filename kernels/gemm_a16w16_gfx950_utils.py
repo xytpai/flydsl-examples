@@ -1,6 +1,7 @@
-import flydsl
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import fly, llvm, scf, vector
 from flydsl.expr import (
     arith,
     const_expr,
@@ -9,8 +10,6 @@ from flydsl.expr import (
     rocdl,
 )
 from flydsl.expr.typing import T
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import fly, llvm, scf, vector
 
 GFX950_DMA_BYTES = 16
 GFX950_WAVE_SIZE = 64
@@ -139,12 +138,8 @@ class SplitKProtocol:
         self.out_dtype_ = out_dtype_
         self.signal_idx = signal_idx
         self.c_stride = c_stride
-        self.semaphore_buf = rocdl.make_buffer_tensor(semaphore_ptr)
-        self.signal_buf = rocdl.make_buffer_tensor(signal_ptr)
         if const_expr(self.HAS_BIAS):
-            self.bias_vecs = fx.logical_divide(
-                self.bias_buf, fx.make_layout(self.STG_VEC_SIZE, 1)
-            )
+            self.bias_vecs = fx.logical_divide(self.bias_buf, fx.make_layout(self.STG_VEC_SIZE, 1))
 
     @flyc.jit
     def zero_c(self):
@@ -158,9 +153,7 @@ class SplitKProtocol:
                 global_n_idx = self.block_n_offset + n_local_idx
                 safe_global_n_idx = (global_n_idx < self.n).select(global_n_idx, 0)
                 if const_expr(self.HAS_BIAS):
-                    init_vec = self.bias_vecs[
-                        None, safe_global_n_idx // self.STG_VEC_SIZE
-                    ].load()
+                    init_vec = self.bias_vecs[None, safe_global_n_idx // self.STG_VEC_SIZE].load()
                     if const_expr(self.C_DTYPE_BYTES == 4):
                         init_vec = init_vec.to(self.out_dtype_)
                 else:
@@ -180,9 +173,7 @@ class SplitKProtocol:
                         elif const_expr(self.STG_VEC_SIZE == 8):
                             store_asm = "global_store_dwordx4 $0, $1, off sc0 sc1"
                         else:
-                            raise NotImplementedError(
-                                f"STG_VEC_SIZE={self.STG_VEC_SIZE}"
-                            )
+                            raise NotImplementedError(f"STG_VEC_SIZE={self.STG_VEC_SIZE}")
                         c_ptr = get_llvm_ptr(
                             self.c_ptr,
                             c_offset,
@@ -204,22 +195,16 @@ class SplitKProtocol:
                     4,
                     ir.Type.parse("!llvm.ptr<1>"),
                 )
-                llvm.InlineAsmOp(
-                    None,
-                    [signal_ptr, arith.constant(1, type=T.i32)],
-                    "global_store_dword $0, $1, off sc0 sc1",
-                    "v,v",
-                    has_side_effects=True,
+                llvm.StoreOp(
+                    arith.constant(1, type=T.i32),
+                    signal_ptr,
+                    alignment=4,
+                    ordering=llvm.AtomicOrdering.release,
+                    syncscope="agent",
                 )
-            gpu.barrier()
 
     @flyc.jit
-    def reset_sync_state(self):
-        self.semaphore_buf[self.signal_idx] = 0
-        self.signal_buf[self.signal_idx] = 0
-
-    @flyc.jit
-    def split_k_barrier(self, split_k):
+    def wait_until_initialized(self):
         if self.tid == 0:
             init_cur = arith.constant(0, type=T.i32)
             wait_loop = scf.WhileOp([T.i32], [init_cur])
@@ -240,16 +225,49 @@ class SplitKProtocol:
                     4,
                     ir.Type.parse("!llvm.ptr<1>"),
                 )
-                cur = llvm.InlineAsmOp(
+                cur = llvm.LoadOp(
                     T.i32,
-                    [signal_ptr],
-                    "global_load_dword $0, $1, off sc1",
-                    "=v,v",
-                    has_side_effects=True,
+                    signal_ptr,
+                    alignment=4,
+                    ordering=llvm.AtomicOrdering.acquire,
+                    syncscope="agent",
                 ).result
-                rocdl.s_waitcnt(0)
                 scf.YieldOp([cur])
         rocdl.sched_barrier(0)
+        gpu.barrier()
+
+    @flyc.jit
+    def reset_sync_state(self):
+        semaphore_ptr = get_llvm_ptr(
+            self.semaphore_ptr,
+            self.signal_idx,
+            4,
+            ir.Type.parse("!llvm.ptr<1>"),
+        )
+        signal_ptr = get_llvm_ptr(
+            self.signal_ptr,
+            self.signal_idx,
+            4,
+            ir.Type.parse("!llvm.ptr<1>"),
+        )
+        zero = arith.constant(0, type=T.i32)
+        llvm.StoreOp(
+            zero,
+            semaphore_ptr,
+            alignment=4,
+            ordering=llvm.AtomicOrdering.monotonic,
+            syncscope="agent",
+        )
+        llvm.StoreOp(
+            zero,
+            signal_ptr,
+            alignment=4,
+            ordering=llvm.AtomicOrdering.monotonic,
+            syncscope="agent",
+        )
+
+    @flyc.jit
+    def finish_split(self, split_k):
         gpu.barrier()
         if self.tid == 0:
             semaphore_ptr = get_llvm_ptr(
@@ -339,7 +357,7 @@ def buffer_load_lds_inline(rsrc, lds_ptr, global_offset, DMA_BYTES):
         None,
         [
             llvm.IntToPtrOp(
-                flydsl._mlir.ir.Type.parse("!llvm.ptr<3>"),
+                ir.Type.parse("!llvm.ptr<3>"),
                 fx.as_ir_value(fx.ptrtoint(lds_ptr)),
             ).result,
             fx.as_ir_value(global_offset),
