@@ -1117,6 +1117,8 @@ def gemm_a16w16_hti_gfx950_kernel(
     consume(c11, a1, b1, False)
     rocdl.sched_barrier(0)
     if const_expr(is_split_k):
+        if wid // n_waves == 0:
+            rocdl.s_barrier()
         rocdl.s_barrier()
         store_half_tile_to_lds(1, 0, c10)
         store_half_tile_to_lds(1, 1, c11)
