@@ -4,6 +4,7 @@ from torch.profiler import profile, ProfilerActivity
 from dataclasses import dataclass
 
 from kernels.gemm_a16w16_gfx950 import gemm_a16w16
+from kernels.gemm_a16w16_gfx950_utils import GFX950_DMA_BYTES
 
 ROTARY_INPUTS_TARGET_BYTES = 8 * 1024**3
 
@@ -27,6 +28,20 @@ class _TestArgs:
     layout: str = "nt"
     split_k: int = 1
     out_dtype: torch.dtype | None = None
+
+
+def _a_dma_vec_size(dtype: torch.dtype) -> int:
+    return GFX950_DMA_BYTES // torch.empty((), dtype=dtype).element_size()
+
+
+def _skip_unsupported_accuracy_layout(args: _TestArgs):
+    if args.layout[0] == "t":
+        a_vec_size = _a_dma_vec_size(args.dtype)
+        if args.m % a_vec_size != 0:
+            pytest.skip(
+                "column-major A requires M divisible by "
+                f"{a_vec_size} for GFX950 DMA; got M={args.m}"
+            )
 
 
 def empty_layout_matrix(rows: int, cols: int, dtype: torch.dtype, is_t: bool):
@@ -113,6 +128,7 @@ def get_rotary_inputs(sample_inputs: torch.Tensor, sample_outputs: torch.Tensor)
 
 
 def check_acc(args: _TestArgs):
+    _skip_unsupported_accuracy_layout(args)
     kwargs = {
         "block_m": args.block_m,
         "block_n": args.block_n,
@@ -807,6 +823,24 @@ def test_gemm_a16w16_rejects_unsupported_input_strides(operand: str, layout: str
 
     with pytest.raises(ValueError, match=rf"^{operand} does not satisfy"):
         gemm_a16w16(a, b, layout=layout)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_gemm_a16w16_rejects_unaligned_m_for_column_major_a(dtype: torch.dtype):
+    a_vec_size = _a_dma_vec_size(dtype)
+    m = a_vec_size + 1
+    n = 64
+    k = 256
+    padded_m = 2 * a_vec_size
+    a_storage = torch.randn((k, padded_m), dtype=dtype, device="cuda")
+    a = a_storage[:, :m].t()
+    b = torch.randn((k, n), dtype=dtype, device="cuda")
+
+    assert a.stride() == (1, padded_m)
+    assert a.data_ptr() % GFX950_DMA_BYTES == 0
+    assert a.stride(1) * a.element_size() % GFX950_DMA_BYTES == 0
+    with pytest.raises(ValueError, match=rf"M divisible by {a_vec_size}"):
+        gemm_a16w16(a, b, layout="tn")
 
 
 def test_gemm_a16w16_host_bias_contiguity_fallback():
