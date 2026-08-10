@@ -1,16 +1,16 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="620" viewBox="0 0 1200 620" role="img" aria-labelledby="title desc">
-  <title id="title">HGEMM BF16 Benchmark</title>
-  <desc id="desc">Bar chart comparing HGEMM and Torch hipBLAS BF16 throughput in TFLOPS for six GEMM benchmark shapes.</desc>
+  <title id="title">GEMM_A16W16 BF16 Benchmark</title>
+  <desc id="desc">Bar chart comparing GEMM_A16W16 and Torch hipBLAS BF16 throughput in TFLOPS for six GEMM benchmark shapes.</desc>
   <rect width="1200" height="620" fill="#ffffff"/>
-  <text x="64" y="46" font-family="Arial, sans-serif" font-size="26" font-weight="700" fill="#111827">HGEMM BF16 Benchmark</text>
+  <text x="64" y="46" font-family="Arial, sans-serif" font-size="26" font-weight="700" fill="#111827">GEMM_A16W16 BF16 Benchmark</text>
   <text x="64" y="76" font-family="Arial, sans-serif" font-size="14" fill="#4b5563">TFLOPS computed from Self CUDA total / 100 profiled calls, warmup=500, niters=600</text>
 
   <rect x="870" y="112" width="270" height="116" rx="10" fill="#f9fafb" stroke="#e5e7eb"/>
   <rect x="892" y="140" width="18" height="18" fill="#22d3ee" stroke="#0891b2"/>
-  <text x="920" y="154" font-family="Arial, sans-serif" font-size="14" font-weight="700" fill="#0891b2">HGEMM</text>
+  <text x="920" y="154" font-family="Arial, sans-serif" font-size="14" font-weight="700" fill="#0891b2">GEMM_A16W16</text>
   <rect x="892" y="174" width="18" height="18" fill="#f97316"/>
   <text x="920" y="188" font-family="Arial, sans-serif" font-size="14" fill="#111827">Torch hipBLAS</text>
-  <text x="892" y="214" font-family="Arial, sans-serif" font-size="13" fill="#4b5563">Speedup = HGEMM / hipBLAS</text>
+  <text x="892" y="214" font-family="Arial, sans-serif" font-size="13" fill="#4b5563">Speedup = GEMM_A16W16 / hipBLAS</text>
 
   <line x1="150" y1="515" x2="830" y2="515" stroke="#111827" stroke-width="1.5"/>
   <line x1="150" y1="125" x2="150" y2="515" stroke="#111827" stroke-width="1.5"/>
@@ -91,7 +91,7 @@
 
   <text x="870" y="286" font-family="Arial, sans-serif" font-size="15" font-weight="700" fill="#111827">Summary</text>
   <text x="870" y="314" font-family="Arial, sans-serif" font-size="13" fill="#374151">Best speedup: 2048x2048x2048, 1.173x</text>
-  <text x="870" y="338" font-family="Arial, sans-serif" font-size="13" fill="#374151">Peak HGEMM:</text>
+  <text x="870" y="338" font-family="Arial, sans-serif" font-size="13" fill="#374151">Peak GEMM_A16W16:</text>
   <text x="870" y="362" font-family="Arial, sans-serif" font-size="13" fill="#374151">8192x8192x8192, 1600.4 TFLOPS</text>
   <text x="870" y="386" font-family="Arial, sans-serif" font-size="13" fill="#374151">Profiler calls: 100 per kernel</text>
   <text x="870" y="410" font-family="Arial, sans-serif" font-size="13" fill="#374151">Shapes: 6 BF16 benchmark cases</text>

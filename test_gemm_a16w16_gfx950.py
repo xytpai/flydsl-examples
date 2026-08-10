@@ -3,7 +3,8 @@ import pytest
 from torch.profiler import profile, ProfilerActivity
 from dataclasses import dataclass
 
-from kernels.hgemm_universal_gfx950 import hgemm
+from kernels.gemm_a16w16_gfx950 import gemm_a16w16
+from kernels.gemm_a16w16_gfx950_utils import GFX950_DMA_BYTES
 
 ROTARY_INPUTS_TARGET_BYTES = 8 * 1024**3
 
@@ -27,6 +28,20 @@ class _TestArgs:
     layout: str = "nt"
     split_k: int = 1
     out_dtype: torch.dtype | None = None
+
+
+def _a_dma_vec_size(dtype: torch.dtype) -> int:
+    return GFX950_DMA_BYTES // torch.empty((), dtype=dtype).element_size()
+
+
+def _skip_unsupported_accuracy_layout(args: _TestArgs):
+    if args.layout[0] == "t":
+        a_vec_size = _a_dma_vec_size(args.dtype)
+        if args.m % a_vec_size != 0:
+            pytest.skip(
+                "column-major A requires M divisible by "
+                f"{a_vec_size} for GFX950 DMA; got M={args.m}"
+            )
 
 
 def empty_layout_matrix(rows: int, cols: int, dtype: torch.dtype, is_t: bool):
@@ -98,7 +113,7 @@ def make_triton_maxautotune_func():
 
 def func(*args):
     a, b, bias, c, kwargs, layout = args
-    hgemm(a, b, c, bias=bias, user_kwargs=kwargs, layout=layout)
+    gemm_a16w16(a, b, c, bias=bias, user_kwargs=kwargs, layout=layout)
 
 
 def tensor_nbytes(tensors: torch.Tensor):
@@ -113,6 +128,7 @@ def get_rotary_inputs(sample_inputs: torch.Tensor, sample_outputs: torch.Tensor)
 
 
 def check_acc(args: _TestArgs):
+    _skip_unsupported_accuracy_layout(args)
     kwargs = {
         "block_m": args.block_m,
         "block_n": args.block_n,
@@ -265,7 +281,7 @@ def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
         (2048, 2048, 2048, 128, 128, 64, 2, 2, 2, 0, False, True),
     ],
 )
-def test_hgemm_acc_main_loop(
+def test_gemm_a16w16_acc_main_loop(
     layout: str,
     dtype: str,
     m: int,
@@ -309,21 +325,21 @@ def test_hgemm_acc_main_loop(
     "m_waves, n_waves, k_waves, has_bias, group_m, "
     "use_half_tile_interleaved",
     [
-        # test_hgemm_acc_ft_stage_split_k
+        # test_gemm_a16w16_acc_ft_stage_split_k
         (32, 384, 7168, 32, 64, 64, 5, 8, 2, 2, 1, True, 0, False),
         (32, 384, 7168, 32, 64, 64, 5, 8, 2, 2, 1, False, 0, False),
         (32, 384, 7168, 32, 64, 64, 5, 8, 2, 2, 1, True, 4, False),
         (32, 384, 7168, 32, 64, 64, 5, 8, 2, 2, 1, False, 4, False),
-        # test_hgemm_acc_small_m
+        # test_gemm_a16w16_acc_small_m
         (3, 5120, 2880, 64, 64, 64, 5, 3, 2, 2, 1, True, 0, False),
         (3, 5120, 2880, 64, 64, 64, 5, 3, 2, 2, 1, False, 0, False),
-        # test_hgemm_acc_ft_slice_k
+        # test_gemm_a16w16_acc_ft_slice_k
         (800, 384, 7168, 32, 64, 128, 6, 1, 1, 2, 2, True, 0, False),
         (800, 384, 7168, 32, 64, 128, 6, 1, 1, 2, 2, False, 0, False),
         (800, 384, 7168, 32, 64, 128, 6, 2, 1, 2, 2, True, 0, False),
         (800, 384, 7168, 32, 64, 128, 6, 2, 1, 2, 2, False, 0, False),
         (800, 384, 7168, 32, 64, 128, 6, 2, 1, 2, 2, False, 4, False),
-        # test_hgemm_acc_hti_split_k
+        # test_gemm_a16w16_acc_hti_split_k
         (64, 64, 512, 64, 64, 64, 2, 2, 2, 2, 1, True, 0, True),
         (64, 64, 512, 64, 64, 64, 2, 2, 2, 2, 1, False, 0, True),
         # Common PR-tuned HTI split-K policies.
@@ -335,7 +351,7 @@ def test_hgemm_acc_main_loop(
         (129, 72, 1024, 128, 64, 128, 2, 2, 2, 2, 1, True, 0, True),
         (129, 136, 1536, 128, 128, 128, 2, 3, 2, 4, 1, False, 4, True),
         (257, 264, 512, 256, 256, 64, 2, 2, 2, 4, 1, False, 0, True),
-        # HTI split-K coverage mirrored from test_hgemm_layout.py.
+        # HTI split-K coverage mirrored from test_gemm_a16w16_layout.py.
         (64, 384, 7168, 64, 64, 64, 2, 8, 2, 2, 1, True, 0, True),
         (64, 384, 7168, 64, 64, 64, 2, 8, 2, 2, 1, False, 0, True),
         (64, 384, 7168, 64, 64, 64, 2, 8, 2, 2, 1, True, 4, True),
@@ -353,7 +369,7 @@ def test_hgemm_acc_main_loop(
         (1280, 64, 4096, 64, 64, 256, 2, 8, 2, 2, 1, False, 0, True),
     ],
 )
-def test_hgemm_acc_split_k(
+def test_gemm_a16w16_acc_split_k(
     layout: str,
     dtype: torch.dtype,
     m: int,
@@ -456,7 +472,7 @@ def test_hgemm_acc_split_k(
         # fmt: on
     ],
 )
-def test_hgemm_acc_tuned_policies(
+def test_gemm_a16w16_acc_tuned_policies(
     m: int,
     n: int,
     k: int,
@@ -500,7 +516,7 @@ def test_hgemm_acc_tuned_policies(
     "split_k, use_half_tile_interleaved",
     [(1, False), (3, False), (1, True), (3, True)],
 )
-def test_hgemm_acc_fp32_output(
+def test_gemm_a16w16_acc_fp32_output(
     layout: str,
     dtype: torch.dtype,
     has_bias: bool,
@@ -547,7 +563,7 @@ def test_hgemm_acc_fp32_output(
         (3, 32, 128 + 64, 128, 128, 64, 3, 2, 2, 4, True, False),
     ],
 )
-def test_hgemm_acc_small_m(
+def test_gemm_a16w16_acc_small_m(
     layout: str,
     dtype: str,
     m: int,
@@ -617,7 +633,7 @@ def test_hgemm_acc_small_m(
         (4096, 256, 4096, 64, 64, 64, 6, 4, 2, 4, True, False),
     ],
 )
-def test_hgemm_acc_bench(
+def test_gemm_a16w16_acc_bench(
     layout: str,
     dtype: str,
     m: int,
@@ -657,7 +673,7 @@ def test_hgemm_acc_bench(
 @pytest.mark.parametrize("layout", ["nn", "nt", "tn", "tt"])
 @pytest.mark.parametrize("split_k", [1, 2])
 @pytest.mark.parametrize("use_half_tile_interleaved", [False, True])
-def test_hgemm_padded_stride_and_storage_offset(
+def test_gemm_a16w16_padded_stride_and_storage_offset(
     layout: str,
     split_k: int,
     use_half_tile_interleaved: bool,
@@ -715,7 +731,7 @@ def test_hgemm_padded_stride_and_storage_offset(
         "use_half_tile_interleaved": use_half_tile_interleaved,
     }
 
-    result = hgemm(
+    result = gemm_a16w16(
         a,
         b,
         out,
@@ -736,7 +752,7 @@ def test_hgemm_padded_stride_and_storage_offset(
 
 
 @pytest.mark.parametrize("split_k", [1, 2])
-def test_hgemm_fp32_slice_k_without_bias(split_k: int):
+def test_gemm_a16w16_fp32_slice_k_without_bias(split_k: int):
     args = _TestArgs(
         dtype=torch.bfloat16,
         m=64,
@@ -759,14 +775,15 @@ def test_hgemm_fp32_slice_k_without_bias(split_k: int):
     check_acc(args)
 
 
-def test_hgemm_allocates_output_with_default_policy():
+def test_gemm_a16w16_allocates_output_with_default_policy():
     m = n = 64
     k = 256
     dtype = torch.bfloat16
     a = torch.randn((m, k), dtype=dtype, device="cuda")
-    b = torch.randn((k, n), dtype=dtype, device="cuda")
+    b = empty_layout_matrix(k, n, dtype, is_t=True)
+    b.normal_()
 
-    out = hgemm(a, b)
+    out = gemm_a16w16(a, b)
     ref = torch.mm(a, b)
 
     assert out.shape == (m, n)
@@ -775,18 +792,64 @@ def test_hgemm_allocates_output_with_default_policy():
     torch.testing.assert_close(out, ref, atol=3e-2, rtol=2e-1)
 
 
-@pytest.mark.parametrize("layout", ["nn", "nt"])
-def test_hgemm_host_contiguity_fallbacks(layout: str):
+@pytest.mark.parametrize(
+    ("operand", "layout"),
+    [
+        ("A", "nn"),
+        ("A", "tn"),
+        ("B", "nn"),
+        ("B", "nt"),
+    ],
+)
+def test_gemm_a16w16_rejects_unsupported_input_strides(operand: str, layout: str):
     m = n = 64
     k = 256
     dtype = torch.bfloat16
-    a_storage = torch.randn((m, k * 2), dtype=dtype, device="cuda")
-    a = a_storage[:, ::2]
-    if layout == "nn":
-        b_storage = torch.randn((k, n * 2), dtype=dtype, device="cuda")
-        b = b_storage[:, ::2]
+    a = empty_layout_matrix(m, k, dtype, is_t=layout[0] == "t")
+    b = empty_layout_matrix(k, n, dtype, is_t=layout[1] == "t")
+    a.normal_()
+    b.normal_()
+
+    if operand == "A":
+        if layout[0] == "t":
+            a = torch.randn((m, k), dtype=dtype, device="cuda")
+        else:
+            a = torch.randn((m, k * 2), dtype=dtype, device="cuda")[:, ::2]
     else:
-        b = torch.randn((k, n), dtype=dtype, device="cuda")
+        if layout[1] == "t":
+            b = torch.randn((k, n), dtype=dtype, device="cuda")
+        else:
+            b = torch.randn((k, n * 2), dtype=dtype, device="cuda")[:, ::2]
+
+    with pytest.raises(ValueError, match=rf"^{operand} does not satisfy"):
+        gemm_a16w16(a, b, layout=layout)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_gemm_a16w16_rejects_unaligned_m_for_column_major_a(dtype: torch.dtype):
+    a_vec_size = _a_dma_vec_size(dtype)
+    m = a_vec_size + 1
+    n = 64
+    k = 256
+    padded_m = 2 * a_vec_size
+    a_storage = torch.randn((k, padded_m), dtype=dtype, device="cuda")
+    a = a_storage[:, :m].t()
+    b = torch.randn((k, n), dtype=dtype, device="cuda")
+
+    assert a.stride() == (1, padded_m)
+    assert a.data_ptr() % GFX950_DMA_BYTES == 0
+    assert a.stride(1) * a.element_size() % GFX950_DMA_BYTES == 0
+    with pytest.raises(ValueError, match=rf"M divisible by {a_vec_size}"):
+        gemm_a16w16(a, b, layout="tn")
+
+
+def test_gemm_a16w16_host_bias_contiguity_fallback():
+    m = n = 64
+    k = 256
+    dtype = torch.bfloat16
+    a = torch.randn((m, k), dtype=dtype, device="cuda")
+    b = empty_layout_matrix(k, n, dtype, is_t=True)
+    b.normal_()
     bias_storage = torch.randn((n * 2,), dtype=dtype, device="cuda")
     bias = bias_storage[::2]
     out = torch.empty((m, n), dtype=dtype, device="cuda")
@@ -802,16 +865,15 @@ def test_hgemm_host_contiguity_fallbacks(layout: str):
         "use_half_tile_interleaved": False,
     }
 
-    hgemm(a, b, out, bias=bias, user_kwargs=kwargs, layout=layout)
-    ref_func(a, b, bias, ref, layout)
+    gemm_a16w16(a, b, out, bias=bias, user_kwargs=kwargs, layout="nt")
+    ref_func(a, b, bias, ref, "nt")
 
-    assert not a.is_contiguous()
     assert not bias.is_contiguous()
     torch.testing.assert_close(out, ref, atol=3e-2, rtol=2e-1)
 
 
 @pytest.mark.parametrize("n", [4096, 4032])
-def test_hgemm_block_swizzle_boundary_paths(n: int):
+def test_gemm_a16w16_block_swizzle_boundary_paths(n: int):
     args = _TestArgs(
         dtype=torch.bfloat16,
         m=320,
@@ -832,7 +894,7 @@ def test_hgemm_block_swizzle_boundary_paths(n: int):
     check_acc(args)
 
 
-def test_hgemm_slice_k_four_waves():
+def test_gemm_a16w16_slice_k_four_waves():
     args = _TestArgs(
         dtype=torch.bfloat16,
         m=64,
@@ -853,7 +915,7 @@ def test_hgemm_slice_k_four_waves():
     check_acc(args)
 
 
-def test_hgemm_split_k_uses_stream_local_sync_buffers():
+def test_gemm_a16w16_split_k_uses_stream_local_sync_buffers():
     args = _TestArgs(
         dtype=torch.bfloat16,
         m=64,
@@ -891,10 +953,10 @@ def test_hgemm_split_k_uses_stream_local_sync_buffers():
     stream0 = torch.cuda.Stream()
     stream1 = torch.cuda.Stream()
 
-    hgemm(a, b, out0, bias=bias, user_kwargs=kwargs, layout=args.layout)
+    gemm_a16w16(a, b, out0, bias=bias, user_kwargs=kwargs, layout=args.layout)
     torch.cuda.synchronize()
     with torch.cuda.stream(stream0):
-        hgemm(
+        gemm_a16w16(
             a,
             b,
             out0,
@@ -904,7 +966,7 @@ def test_hgemm_split_k_uses_stream_local_sync_buffers():
             stream=stream0,
         )
     with torch.cuda.stream(stream1):
-        hgemm(
+        gemm_a16w16(
             a,
             b,
             out1,
@@ -929,7 +991,7 @@ def test_hgemm_split_k_uses_stream_local_sync_buffers():
         (192, True, "HTI requires at least two"),
     ],
 )
-def test_hgemm_rejects_unsupported_k_partitioning(
+def test_gemm_a16w16_rejects_unsupported_k_partitioning(
     k: int,
     use_half_tile_interleaved: bool,
     message: str,
@@ -937,7 +999,8 @@ def test_hgemm_rejects_unsupported_k_partitioning(
     m = n = 64
     dtype = torch.bfloat16
     a = torch.randn((m, k), dtype=dtype, device="cuda")
-    b = torch.randn((k, n), dtype=dtype, device="cuda")
+    b = empty_layout_matrix(k, n, dtype, is_t=True)
+    b.normal_()
     kwargs = {
         "block_m": 64,
         "block_n": 64,
@@ -950,7 +1013,7 @@ def test_hgemm_rejects_unsupported_k_partitioning(
     }
 
     with pytest.raises(AssertionError, match=message):
-        hgemm(a, b, user_kwargs=kwargs, layout="nt")
+        gemm_a16w16(a, b, user_kwargs=kwargs, layout="nt")
 
 
 # =========================================== benchmark ===========================================
@@ -971,7 +1034,7 @@ def test_hgemm_rejects_unsupported_k_partitioning(
         # fmt: on
     ],
 )
-def test_hgemm_hti_split_k_benchmark(
+def test_gemm_a16w16_hti_split_k_benchmark(
     m: int,
     n: int,
     k: int,
@@ -1034,7 +1097,7 @@ def test_hgemm_hti_split_k_benchmark(
         (4096, 256, 4096, 64, 64, 64, 6, 4, 2, 4, True, False),
     ],
 )
-def test_hgemm_benchmark_smoke(
+def test_gemm_a16w16_benchmark_smoke(
     layout: str,
     dtype: str,
     m: int,

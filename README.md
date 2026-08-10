@@ -8,13 +8,13 @@ scratch in Python while keeping tiling, data movement, LDS usage, scheduling,
 and MFMA execution explicit. The programming model is similar in spirit
 to CUDA/CuTeDSL, but targets AMD GPUs through FlyDSL.
 
-![HGEMM BF16 benchmark versus Torch hipBLAS](images/hgemm_benchmark.svg)
+![GEMM_A16W16 BF16 benchmark versus Torch hipBLAS](images/gemm_a16w16_benchmark.svg)
 
 ## Highlights
 
-### A16W16 universal GEMM
+### A16W16 GEMM
 
-`kernels/hgemm_universal_gfx950.py` provides a layout-dynamic FP16/BF16 GEMM with:
+`kernels/gemm_a16w16_gfx950.py` provides a layout-dynamic FP16/BF16 GEMM with:
 
 - `NN`, `NT`, `TN`, and `TT` matrix layouts
 - FP16 and BF16 inputs
@@ -47,13 +47,13 @@ with A stored row-major and B stored column-major.
 ```python
 import torch
 
-from kernels.hgemm_universal_gfx950 import hgemm
+from kernels.gemm_a16w16_gfx950 import gemm_a16w16
 
 m, n, k = 2048, 4096, 4096
 a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
 b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16).t()
 
-c = hgemm(
+c = gemm_a16w16(
     a,
     b,
     layout="nt",
@@ -97,16 +97,16 @@ pip install -e .
 
 ## Tests
 
-Run the universal GEMM correctness suite:
+Run the GEMM correctness suite:
 
 ```bash
-pytest -sv test_hgemm_universal_gfx950.py
+pytest -sv test_gemm_a16w16_gfx950.py
 ```
 
 Run a focused layout test:
 
 ```bash
-pytest -sv test_hgemm_universal_gfx950.py -k "main_loop and nt"
+pytest -sv test_gemm_a16w16_gfx950.py -k "main_loop and nt"
 ```
 
 After changing FlyDSL compiler or kernel sources, clear the JIT cache when
@@ -150,7 +150,7 @@ python gemm_tune.py \
   --tune_all \
   --dtype bf16 \
   --layout nt \
-  --out temp/hgemm_tuned
+  --out temp/gemm_a16w16_tuned
 ```
 
 The tuner validates each policy, compiles policies in parallel, benchmarks
@@ -174,9 +174,9 @@ Use `--shape-index` to run a single built-in shape.
 
 ```text
 kernels/
-  hgemm_universal_gfx950.py        # A16W16 universal GEMM
-  hgemm_universal_gfx950_utils.py  # Layout, LDS, split-K, and store helpers
-test_hgemm_universal_gfx950.py     # Universal GEMM correctness and benchmarks
+  gemm_a16w16_gfx950.py        # A16W16 GEMM
+  gemm_a16w16_gfx950_utils.py  # Layout, LDS, split-K, and store helpers
+test_gemm_a16w16_gfx950.py     # GEMM correctness and benchmarks
 gemm_tune.py                    # Policy search and tuning
 torch_benchmark.py              # torch.compile backend comparison
 ```
