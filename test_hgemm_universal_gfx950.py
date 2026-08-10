@@ -764,7 +764,8 @@ def test_hgemm_allocates_output_with_default_policy():
     k = 256
     dtype = torch.bfloat16
     a = torch.randn((m, k), dtype=dtype, device="cuda")
-    b = torch.randn((k, n), dtype=dtype, device="cuda")
+    b = empty_layout_matrix(k, n, dtype, is_t=True)
+    b.normal_()
 
     out = hgemm(a, b)
     ref = torch.mm(a, b)
@@ -775,18 +776,46 @@ def test_hgemm_allocates_output_with_default_policy():
     torch.testing.assert_close(out, ref, atol=3e-2, rtol=2e-1)
 
 
-@pytest.mark.parametrize("layout", ["nn", "nt"])
-def test_hgemm_host_contiguity_fallbacks(layout: str):
+@pytest.mark.parametrize(
+    ("operand", "layout"),
+    [
+        ("A", "nn"),
+        ("A", "tn"),
+        ("B", "nn"),
+        ("B", "nt"),
+    ],
+)
+def test_hgemm_rejects_unsupported_input_strides(operand: str, layout: str):
     m = n = 64
     k = 256
     dtype = torch.bfloat16
-    a_storage = torch.randn((m, k * 2), dtype=dtype, device="cuda")
-    a = a_storage[:, ::2]
-    if layout == "nn":
-        b_storage = torch.randn((k, n * 2), dtype=dtype, device="cuda")
-        b = b_storage[:, ::2]
+    a = empty_layout_matrix(m, k, dtype, is_t=layout[0] == "t")
+    b = empty_layout_matrix(k, n, dtype, is_t=layout[1] == "t")
+    a.normal_()
+    b.normal_()
+
+    if operand == "A":
+        if layout[0] == "t":
+            a = torch.randn((m, k), dtype=dtype, device="cuda")
+        else:
+            a = torch.randn((m, k * 2), dtype=dtype, device="cuda")[:, ::2]
     else:
-        b = torch.randn((k, n), dtype=dtype, device="cuda")
+        if layout[1] == "t":
+            b = torch.randn((k, n), dtype=dtype, device="cuda")
+        else:
+            b = torch.randn((k, n * 2), dtype=dtype, device="cuda")[:, ::2]
+
+    with pytest.raises(ValueError, match=rf"^{operand} does not satisfy"):
+        hgemm(a, b, layout=layout)
+
+
+def test_hgemm_host_bias_contiguity_fallback():
+    m = n = 64
+    k = 256
+    dtype = torch.bfloat16
+    a = torch.randn((m, k), dtype=dtype, device="cuda")
+    b = empty_layout_matrix(k, n, dtype, is_t=True)
+    b.normal_()
     bias_storage = torch.randn((n * 2,), dtype=dtype, device="cuda")
     bias = bias_storage[::2]
     out = torch.empty((m, n), dtype=dtype, device="cuda")
@@ -802,10 +831,9 @@ def test_hgemm_host_contiguity_fallbacks(layout: str):
         "use_half_tile_interleaved": False,
     }
 
-    hgemm(a, b, out, bias=bias, user_kwargs=kwargs, layout=layout)
-    ref_func(a, b, bias, ref, layout)
+    hgemm(a, b, out, bias=bias, user_kwargs=kwargs, layout="nt")
+    ref_func(a, b, bias, ref, "nt")
 
-    assert not a.is_contiguous()
     assert not bias.is_contiguous()
     torch.testing.assert_close(out, ref, atol=3e-2, rtol=2e-1)
 
@@ -937,7 +965,8 @@ def test_hgemm_rejects_unsupported_k_partitioning(
     m = n = 64
     dtype = torch.bfloat16
     a = torch.randn((m, k), dtype=dtype, device="cuda")
-    b = torch.randn((k, n), dtype=dtype, device="cuda")
+    b = empty_layout_matrix(k, n, dtype, is_t=True)
+    b.normal_()
     kwargs = {
         "block_m": 64,
         "block_n": 64,

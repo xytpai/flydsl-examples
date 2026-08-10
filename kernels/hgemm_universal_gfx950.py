@@ -1371,6 +1371,7 @@ def hgemm(
 
     Each layout character controls only the corresponding tensor stride:
     N is row-major and T is column-major. Logical tensor shapes never change.
+    Inputs that violate the selected layout or DMA alignment are rejected.
     Set ``user_kwargs["split_k"]`` above 1 to atomically reduce K partitions.
     Set ``user_kwargs["k_waves"]`` above 1 for full-tile workgroup-local slice-K.
     ``out_dtype`` may be the input dtype or ``torch.float32``.
@@ -1401,36 +1402,49 @@ def hgemm(
             or a.stride(1) * a.element_size() % GFX950_DMA_BYTES != 0
             or m % a_vec_size != 0
         ):
-            padded_m = (m + a_vec_size - 1) // a_vec_size * a_vec_size
-            a_storage = torch.zeros(
-                (k, padded_m),
-                dtype=a.dtype,
-                device=a.device,
+            raise ValueError(
+                "A does not satisfy the GFX950 DMA requirements for a "
+                "column-major input: expected stride(0) == 1, a "
+                f"{GFX950_DMA_BYTES}-byte-aligned data pointer and leading "
+                f"stride, and M divisible by {a_vec_size}; got "
+                f"shape={tuple(a.shape)} and stride={a.stride()}"
             )
-            a_column_major = a_storage[:, :m].t()
-            a_column_major.copy_(a)
-            a = a_column_major
     else:
         if (
             a.stride(1) != 1
             or a.data_ptr() % GFX950_DMA_BYTES != 0
             or a.stride(0) * a.element_size() % GFX950_DMA_BYTES != 0
         ):
-            a = a.contiguous()
+            raise ValueError(
+                "A does not satisfy the GFX950 DMA requirements for a "
+                "row-major input: expected stride(1) == 1 and a "
+                f"{GFX950_DMA_BYTES}-byte-aligned data pointer and leading "
+                f"stride; got shape={tuple(a.shape)} and stride={a.stride()}"
+            )
     if b_is_transposed:
         if (
             b.stride(0) != 1
             or b.data_ptr() % GFX950_DMA_BYTES != 0
             or b.stride(1) * b.element_size() % GFX950_DMA_BYTES != 0
         ):
-            b = b.t().contiguous().t()
+            raise ValueError(
+                "B does not satisfy the GFX950 DMA requirements for a "
+                "column-major input: expected stride(0) == 1 and a "
+                f"{GFX950_DMA_BYTES}-byte-aligned data pointer and leading "
+                f"stride; got shape={tuple(b.shape)} and stride={b.stride()}"
+            )
     else:
         if (
             b.stride(1) != 1
             or b.data_ptr() % GFX950_DMA_BYTES != 0
             or b.stride(0) * b.element_size() % GFX950_DMA_BYTES != 0
         ):
-            b = b.contiguous()
+            raise ValueError(
+                "B does not satisfy the GFX950 DMA requirements for a "
+                "row-major input: expected stride(1) == 1 and a "
+                f"{GFX950_DMA_BYTES}-byte-aligned data pointer and leading "
+                f"stride; got shape={tuple(b.shape)} and stride={b.stride()}"
+            )
     if out_dtype is None:
         out_dtype = a.dtype if out is None else out.dtype
     if out_dtype not in (a.dtype, torch.float32):
