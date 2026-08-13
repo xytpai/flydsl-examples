@@ -3,16 +3,16 @@ from flydsl.expr import (
     range_constexpr,
     const_expr,
     arith,
-    vector,
     gpu,
     rocdl,
-    buffer_ops,
 )
 import flydsl.expr as fx
 import flydsl.compiler as flyc
 from flydsl.expr.typing import T, Vector as Vec
-from flydsl._mlir.dialects import llvm, fly, scf
+from flydsl._mlir.dialects import llvm, fly, scf, vector
 from flydsl._mlir import ir
+
+from . import buffer_ops
 
 
 def _to_raw(v):

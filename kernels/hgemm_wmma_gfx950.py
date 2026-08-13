@@ -5,21 +5,21 @@ from typing import Optional, Tuple
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr.typing import T
+from flydsl.expr.typing import T, as_ir_value
 from flydsl.expr import (
     range_constexpr,
     const_expr,
     arith,
-    vector,
     gpu,
     rocdl,
-    buffer_ops,
 )
 from flydsl._mlir import ir
 from flydsl.runtime.device import get_rocm_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr, SMEM_CAPACITY_MAP
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl._mlir.dialects import llvm, memref
+from flydsl._mlir.dialects import llvm, memref, vector
+
+from . import buffer_ops
 
 from .hgemm_wmma_gfx950_utils import (
     _run_compiled,
@@ -36,6 +36,12 @@ from .hgemm_wmma_gfx950_utils import (
     SplitKProtocol,
     BlockSwizzle,
 )
+
+
+def _vector_load(result_type, base, indices):
+    """Build a vector.load and return its result value."""
+    return vector.LoadOp(result_type, base, indices).result
+
 
 SPLIT_K_SEMAPHORE_MAX_LEN = 256
 
@@ -792,10 +798,10 @@ def hgemm_kernel(
                         col_base = warp_atom_k_idx + (w_tid // WMMA_N) * 16 + col_delta
                         col_swz = swizzle_fp8_128(row, col_base)
                         flat_offset = (s * BLOCK_N + row) * BLOCK_K + col_swz
-                        v16 = vector.load_op(
+                        v16 = _vector_load(
                             T.vec(LDG_VEC_SIZE, smem_input_dtype_),
                             smem_b_ptr.get(),
-                            [fx.Index(flat_offset)],
+                            [as_ir_value(fx.Index(flat_offset))],
                         )
                         if const_expr(mask_k_tail):
                             v16 = mask_tail_k_frag(
@@ -813,10 +819,10 @@ def hgemm_kernel(
                     flat_offset = (
                         s * BLOCK_N + row
                     ) * BLOCK_K + col_in_bytes // IN_DTYPE_BYTES
-                    vec = vector.load_op(
+                    vec = _vector_load(
                         T.vec(WMMA_B_FRAG_VALUES * MFMA_PER_WARP_K, smem_input_dtype_),
                         smem_b_ptr.get(),
-                        [fx.Index(flat_offset)],
+                        [as_ir_value(fx.Index(flat_offset))],
                     )
                     if const_expr(mask_k_tail):
                         b_frags[ii] = mask_tail_k_frag(
@@ -837,10 +843,10 @@ def hgemm_kernel(
                         col_base = warp_atom_k_idx + (w_tid // WMMA_M) * 16 + col_delta
                         col_swz = swizzle_fp8_128(row, col_base)
                         flat_offset = (s * BLOCK_M + row) * BLOCK_K + col_swz
-                        v16 = vector.load_op(
+                        v16 = _vector_load(
                             T.vec(LDG_VEC_SIZE, smem_input_dtype_),
                             smem_a_ptr.get(),
-                            [fx.Index(flat_offset)],
+                            [as_ir_value(fx.Index(flat_offset))],
                         )
                         if const_expr(mask_k_tail):
                             v16 = mask_tail_k_frag(
@@ -858,10 +864,10 @@ def hgemm_kernel(
                     flat_offset = (
                         s * BLOCK_M + row
                     ) * BLOCK_K + col_in_bytes // IN_DTYPE_BYTES
-                    vec = vector.load_op(
+                    vec = _vector_load(
                         T.vec(WMMA_A_FRAG_VALUES * MFMA_PER_WARP_K, smem_input_dtype_),
                         smem_a_ptr.get(),
-                        [fx.Index(flat_offset)],
+                        [as_ir_value(fx.Index(flat_offset))],
                     )
                     if const_expr(mask_k_tail):
                         a_frags[ii] = mask_tail_k_frag(
@@ -1011,7 +1017,10 @@ def hgemm_kernel(
                 val = vector.from_elements(T.vec(1, smem_output_dtype_), [val])
                 flat_offset = (wid_k * BLOCK_M + lds_m_idx) * BLOCK_N + lds_n_idx
                 vector.store(
-                    val, smem_c_ptr.get(), [fx.Index(flat_offset)], alignment=16
+                    val,
+                    smem_c_ptr.get(),
+                    [as_ir_value(fx.Index(flat_offset))],
+                    alignment=16,
                 )
 
     # write back to global
@@ -1047,16 +1056,20 @@ def hgemm_kernel(
         global_n_idx = block_n_offset + n_local_idx
         if (global_m_idx < m) and (global_n_idx < n):
             flat_offset = m_local_idx * BLOCK_N + n_local_idx
-            c_vec = vector.load_op(
+            c_vec = _vector_load(
                 T.vec(STG_VEC_SIZE, smem_output_dtype_),
                 smem_c_ptr_,
-                [fx.Index(flat_offset)],
+                [as_ir_value(fx.Index(flat_offset))],
             )
             for ksi in range_constexpr(1, BLOCK_K_WARPS):
-                peer_c_vec = vector.load_op(
+                peer_c_vec = _vector_load(
                     T.vec(STG_VEC_SIZE, smem_output_dtype_),
                     smem_c_ptr_,
-                    [fx.Index(flat_offset + ksi * BLOCK_M * BLOCK_N)],
+                    [
+                        as_ir_value(
+                            fx.Index(flat_offset + ksi * BLOCK_M * BLOCK_N)
+                        )
+                    ],
                 )
                 c_vec += peer_c_vec
             c_vec_global = cast_vec_to_global_dtype(
@@ -1413,10 +1426,10 @@ def hgemm_ht_kernel(
                         flat_offset = (
                             (k_buf * 2 + m_part) * HALF_BLOCK_M + row
                         ) * BLOCK_K + col_swz
-                        v16 = vector.load_op(
+                        v16 = _vector_load(
                             T.vec(LDG_VEC_SIZE, smem_input_dtype_),
                             smem_a_ptr.get(),
-                            [fx.Index(flat_offset)],
+                            [as_ir_value(fx.Index(flat_offset))],
                         )
                         if const_expr(mask_k_tail):
                             v16 = mask_tail_k_frag(
@@ -1436,10 +1449,10 @@ def hgemm_ht_kernel(
                     flat_offset = (
                         (k_buf * 2 + m_part) * HALF_BLOCK_M + row
                     ) * BLOCK_K + col_in_bytes // IN_DTYPE_BYTES
-                    vec = vector.load_op(
+                    vec = _vector_load(
                         T.vec(WMMA_A_FRAG_VALUES * MFMA_PER_WARP_K, smem_input_dtype_),
                         smem_a_ptr.get(),
-                        [fx.Index(flat_offset)],
+                        [as_ir_value(fx.Index(flat_offset))],
                     )
                     if const_expr(mask_k_tail):
                         a_frags[ki * WARP_M_STEPS + mi] = mask_tail_k_frag(
@@ -1472,10 +1485,10 @@ def hgemm_ht_kernel(
                         flat_offset = (
                             (k_buf * 2 + n_part) * HALF_BLOCK_N + row
                         ) * BLOCK_K + col_swz
-                        v16 = vector.load_op(
+                        v16 = _vector_load(
                             T.vec(LDG_VEC_SIZE, smem_input_dtype_),
                             smem_b_ptr.get(),
-                            [fx.Index(flat_offset)],
+                            [as_ir_value(fx.Index(flat_offset))],
                         )
                         if const_expr(mask_k_tail):
                             v16 = mask_tail_k_frag(
@@ -1497,10 +1510,10 @@ def hgemm_ht_kernel(
                     flat_offset = (
                         (k_buf * 2 + n_part) * HALF_BLOCK_N + row
                     ) * BLOCK_K + col_in_bytes // IN_DTYPE_BYTES
-                    vec = vector.load_op(
+                    vec = _vector_load(
                         T.vec(WMMA_B_FRAG_VALUES * MFMA_PER_WARP_K, smem_input_dtype_),
                         smem_b_ptr.get(),
-                        [fx.Index(flat_offset)],
+                        [as_ir_value(fx.Index(flat_offset))],
                     )
                     if const_expr(mask_k_tail):
                         b_frags[ki * WARP_N_STEPS + ni] = mask_tail_k_frag(
@@ -1662,7 +1675,10 @@ def hgemm_ht_kernel(
                     val = vector.from_elements(T.vec(1, smem_output_dtype_), [val])
                     flat_offset = lds_m_idx * BLOCK_N + lds_n_idx
                     vector.store(
-                        val, smem_c_ptr.get(), [fx.Index(flat_offset)], alignment=16
+                        val,
+                        smem_c_ptr.get(),
+                        [as_ir_value(fx.Index(flat_offset))],
+                        alignment=16,
                     )
 
     def atomic_add_vec_to_c(global_m_idx, global_n_idx, vec):
@@ -1735,10 +1751,10 @@ def hgemm_ht_kernel(
 
                 if (global_m_idx < m) and (global_n_idx < n):
                     flat_offset = m_tile_idx * BLOCK_N + n_tile_idx
-                    c_vec = vector.load_op(
+                    c_vec = _vector_load(
                         T.vec(STG_VEC_SIZE, smem_output_dtype_),
                         smem_c_ptr_,
-                        [fx.Index(flat_offset)],
+                        [as_ir_value(fx.Index(flat_offset))],
                     )
                     store_vec_to_c(
                         global_m_idx,
