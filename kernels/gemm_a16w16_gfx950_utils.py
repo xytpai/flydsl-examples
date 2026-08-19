@@ -16,14 +16,9 @@ GFX950_WAVE_SIZE = 64
 SPLIT_K_SEMAPHORE_MAX_LEN = 256
 
 
-def __barrier(vmcnt=0):
-    llvm.InlineAsmOp(
-        None,
-        [],
-        f"s_waitcnt vmcnt({vmcnt})\n\ts_barrier",
-        "",
-        has_side_effects=True,
-    )
+def wait_vmcnt_and_barrier(vmcnt=0):
+    rocdl.s_waitcnt(vmcnt=vmcnt)
+    rocdl.s_barrier()
 
 
 def get_llvm_ptr(ptr, offset, dtype_bytes, ptr_type):
@@ -197,7 +192,7 @@ class SplitKProtocol:
                             "v,v",
                             has_side_effects=True,
                         )
-            __barrier(0)
+            wait_vmcnt_and_barrier(0)
             if self.tid == 0:
                 signal_ptr = get_llvm_ptr(
                     self.signal_ptr,
