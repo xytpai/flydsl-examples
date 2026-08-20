@@ -318,7 +318,9 @@ def async_load_to_lds(
         unit_layout = fx.make_layout(1, 1)
         src = fx.make_view(src_base + global_offset, unit_layout)
         dst = fx.make_view(lds_ptr, unit_layout)
+        rocdl.sched_barrier(0)
         fx.copy_atom_call(copy_atom, src, dst)
+        rocdl.sched_barrier(0)
         if i < load_iters - 1:
             lds_ptr = lds_ptr + block_threads * async_load_vec_size
 
