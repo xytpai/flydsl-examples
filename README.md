@@ -87,7 +87,7 @@ The following revision is the version used by this repository:
 pip uninstall -y flydsl
 git clone git@github.com:ROCm/FlyDSL.git
 cd FlyDSL
-git checkout e338067610c0d420e63d4f36042987ad8c87841a
+git checkout b33938b00ed444f9719805f910f094a4d1858cbf
 git submodule sync
 git submodule update --init --recursive
 bash scripts/build_llvm.sh -j32
