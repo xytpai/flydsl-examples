@@ -89,6 +89,36 @@ class GemmConfigPruner:
         )
         return self.m * self.n * self.k / (padded_m * padded_n * padded_k)
 
+    def _occupancy(self, config):
+        props = self.device_props
+        waves = config["m_waves"] * config["n_waves"] * config["k_waves"]
+        lds = max(
+            config["stages"]
+            * (config["block_m"] + config["block_n"])
+            * config["block_k"]
+            * self.element_bytes,
+            config["k_waves"]
+            * config["block_m"]
+            * config["block_n"]
+            * self.element_bytes,
+        )
+        lds_per_cu = getattr(
+            props,
+            "shared_memory_per_multiprocessor",
+            props.shared_memory_per_block,
+        )
+        resident = min(
+            props.max_threads_per_multi_processor // props.warp_size // waves,
+            lds_per_cu // lds,
+        ) * waves
+        grid = (
+            self._tiles(config)
+            * config["split_k"]
+            * waves
+            / props.multi_processor_count
+        )
+        return min(self.target_waves_per_cu, resident, grid)
+    
     def prune(self, configs):
         if not configs:
             return configs
@@ -119,7 +149,6 @@ class GemmConfigPruner:
                 )
             ):
                 kept.append(config)
-
         best = {}
         keep = set()
         for index, config in sorted(
@@ -136,35 +165,6 @@ class GemmConfigPruner:
                 keep.add(index)
         return [config for index, config in enumerate(kept) if index in keep]
 
-    def _occupancy(self, config):
-        props = self.device_props
-        waves = config["m_waves"] * config["n_waves"] * config["k_waves"]
-        lds = max(
-            config["stages"]
-            * (config["block_m"] + config["block_n"])
-            * config["block_k"]
-            * self.element_bytes,
-            config["k_waves"]
-            * config["block_m"]
-            * config["block_n"]
-            * self.element_bytes,
-        )
-        lds_per_cu = getattr(
-            props,
-            "shared_memory_per_multiprocessor",
-            props.shared_memory_per_block,
-        )
-        resident = min(
-            props.max_threads_per_multi_processor // props.warp_size // waves,
-            lds_per_cu // lds,
-        ) * waves
-        grid = (
-            self._tiles(config)
-            * config["split_k"]
-            * waves
-            / props.multi_processor_count
-        )
-        return min(self.target_waves_per_cu, resident, grid)
 
 def empty_layout_matrix(rows, cols, dtype, is_t, device="cuda"):
     if is_t:
