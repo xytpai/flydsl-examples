@@ -123,7 +123,7 @@ class GemmConfigPruner:
         if not configs:
             return configs
         ious = [self._iou(config) for config in configs]
-        keep_ratio = 0.75 if self.m <= 32 else 0.85 if self.m <= 128 else 0.95
+        keep_ratio = max(0.625, 1 - self.m / 160, 1 - 120 / self.m)
         min_iou = max(ious) * keep_ratio
         num_cus = self.device_props.multi_processor_count
         max_tiles = max(
