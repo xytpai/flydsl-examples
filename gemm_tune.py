@@ -58,38 +58,112 @@ class TunedArgs:
 
 
 @dataclass(frozen=True)
-class GemmTileIoUPruner:
+class GemmConfigPruner:
     m: int
     n: int
     k: int
-    keep_ratio: float
+    device_props: object
+    element_bytes: int
+    target_waves_per_cu: int = 8
+    max_split_grid_rounds: int = 2
+    max_tile_grid_ratio: int = 4
 
     @staticmethod
     def _ceil_div(value, divisor):
         return (value + divisor - 1) // divisor
 
-    def _split_k_padded(self, block_k, split_k):
-        working_k = self._ceil_div(self.k, split_k)
-        padded_k = 0
-        for split_idx in range(split_k):
-            remaining_k = max(self.k - split_idx * working_k, 0)
-            part_k = min(working_k, remaining_k)
-            if part_k > 0:
-                padded_k += self._ceil_div(part_k, block_k) * block_k
-        return padded_k
+    def _tiles(self, config):
+        return self._ceil_div(self.m, config["block_m"]) * self._ceil_div(
+            self.n, config["block_n"]
+        )
 
-    def _config_iou(self, config):
+    def _iou(self, config):
+        split_k = config["split_k"]
         padded_m = self._ceil_div(self.m, config["block_m"]) * config["block_m"]
         padded_n = self._ceil_div(self.n, config["block_n"]) * config["block_n"]
-        padded_k = self._split_k_padded(config["block_k"], config["split_k"])
-        return (self.m * self.n * self.k) / (padded_m * padded_n * padded_k)
+        part_k = self.k // split_k
+        padded_k = (
+            self._ceil_div(part_k, config["block_k"])
+            * config["block_k"]
+            * split_k
+        )
+        return self.m * self.n * self.k / (padded_m * padded_n * padded_k)
 
+    def _occupancy(self, config):
+        props = self.device_props
+        waves = config["m_waves"] * config["n_waves"] * config["k_waves"]
+        lds = max(
+            config["stages"]
+            * (config["block_m"] + config["block_n"])
+            * config["block_k"]
+            * self.element_bytes,
+            config["k_waves"]
+            * config["block_m"]
+            * config["block_n"]
+            * self.element_bytes,
+        )
+        lds_per_cu = getattr(
+            props,
+            "shared_memory_per_multiprocessor",
+            props.shared_memory_per_block,
+        )
+        resident = min(
+            props.max_threads_per_multi_processor // props.warp_size // waves,
+            lds_per_cu // lds,
+        ) * waves
+        grid = (
+            self._tiles(config)
+            * config["split_k"]
+            * waves
+            / props.multi_processor_count
+        )
+        return min(self.target_waves_per_cu, resident, grid)
+    
     def prune(self, configs):
         if not configs:
             return configs
-        config_ious = [self._config_iou(config) for config in configs]
-        threshold = max(config_ious) * self.keep_ratio
-        return [config for config, iou in zip(configs, config_ious) if iou >= threshold]
+        ious = [self._iou(config) for config in configs]
+        keep_ratio = max(0.625, 1 - self.m / 160, 1 - 120 / self.m)
+        min_iou = max(ious) * keep_ratio
+        num_cus = self.device_props.multi_processor_count
+        max_tiles = max(
+            num_cus, min(self._tiles(config) for config in configs)
+        ) * self.max_tile_grid_ratio
+        kept = []
+        for config, iou in zip(configs, ious):
+            tiles = self._tiles(config)
+            max_split_k = (
+                1
+                if tiles >= num_cus
+                else self._ceil_div(
+                    self.max_split_grid_rounds * num_cus, tiles
+                )
+            )
+            if (
+                iou >= min_iou
+                and tiles <= max_tiles
+                and config["split_k"] <= max_split_k
+                and (
+                    config["group_m"] == 0
+                    or (tiles >= num_cus and tiles % 8 == 0)
+                )
+            ):
+                kept.append(config)
+        best = {}
+        keep = set()
+        for index, config in sorted(
+            enumerate(kept), key=lambda item: (item[1]["k_waves"], item[0])
+        ):
+            key = tuple(
+                (name, value)
+                for name, value in config.items()
+                if name != "k_waves"
+            )
+            occupancy = self._occupancy(config)
+            if occupancy > best.get(key, -1.0) + 1e-9:
+                best[key] = occupancy
+                keep.add(index)
+        return [config for index, config in enumerate(kept) if index in keep]
 
 
 def empty_layout_matrix(rows, cols, dtype, is_t, device="cuda"):
@@ -247,13 +321,17 @@ def gemm_a16w16_get_configs(args):
     keys = selections.keys()
     values = selections.values()
     configs = [dict(zip(keys, combo)) for combo in itertools.product(*values)]
-    keep_ratio = 0.75 if args.m <= 32 else 0.85 if args.m <= 128 else 0.95
-    configs = GemmTileIoUPruner(
+    device_props = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    )
+    pruner = GemmConfigPruner(
         args.m,
         args.n,
         args.k,
-        keep_ratio,
-    ).prune(configs)
+        device_props,
+        2,
+    )
+    configs = pruner.prune(configs)
     valid_configs = []
     is_large_gemm = args.m >= 4096 and args.n >= 4096 and args.k >= 4096
     in_dtype_id = (
