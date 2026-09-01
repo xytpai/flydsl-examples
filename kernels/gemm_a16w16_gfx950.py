@@ -76,7 +76,6 @@ class GemmABContext:
 class AsyncLoadTile:
     lds_base: Any
     src_base: Any
-    copy_atom: Any
     lds_layout: Any
     outer_tile_size: Any
     outer_bound: Any
@@ -388,7 +387,7 @@ def async_load_to_lds(
         src = fx.make_view(tile.src_base + global_offset, g2s_copy_layout)
         dst = fx.make_view(lds_ptr, g2s_copy_layout)
         rocdl.sched_barrier(0)
-        fx.copy_atom_call(tile.copy_atom, src, dst)
+        fx.copy_atom_call(context.async_g2s_copy_atom, src, dst)
         rocdl.sched_barrier(0)
         if i < load_iters - 1:
             lds_ptr = lds_ptr + block_threads * async_load_vec_size
@@ -553,7 +552,6 @@ def gemm_a16w16_gfx950_kernel(
         ks_begin=ks_begin,
         param=param,
     )
-    async_g2s_copy_atom = ab_context.async_g2s_copy_atom
     a_s2r_copy_atom = ab_context.a_s2r_copy_atom
     b_s2r_copy_atom = ab_context.b_s2r_copy_atom
     a_tiled_copy_atom = ab_context.a_tiled_copy_atom
@@ -613,7 +611,6 @@ def gemm_a16w16_gfx950_kernel(
             tile=AsyncLoadTile(
                 lds_base=smem_a + stage * block_m * block_k,
                 src_base=fx.get_iter(a_buf),
-                copy_atom=async_g2s_copy_atom,
                 lds_layout=a_lds_layout,
                 outer_tile_size=block_m,
                 outer_bound=m,
@@ -631,7 +628,6 @@ def gemm_a16w16_gfx950_kernel(
             tile=AsyncLoadTile(
                 lds_base=smem_b + stage * block_n * block_k,
                 src_base=fx.get_iter(b_buf),
-                copy_atom=async_g2s_copy_atom,
                 lds_layout=b_lds_layout,
                 outer_tile_size=block_n,
                 outer_bound=n,
@@ -852,7 +848,6 @@ def gemm_a16w16_hti_gfx950_kernel(
         ks_begin=ks_begin,
         param=param,
     )
-    async_g2s_copy_atom = ab_context.async_g2s_copy_atom
     a_s2r_copy_atom = ab_context.a_s2r_copy_atom
     b_s2r_copy_atom = ab_context.b_s2r_copy_atom
     a_tiled_copy_atom = ab_context.a_tiled_copy_atom
@@ -880,7 +875,6 @@ def gemm_a16w16_hti_gfx950_kernel(
             tile=AsyncLoadTile(
                 lds_base=half_a_base(stage, m_part),
                 src_base=fx.get_iter(a_buf),
-                copy_atom=async_g2s_copy_atom,
                 lds_layout=a_lds_layout,
                 outer_tile_size=half_block_m,
                 outer_bound=m,
@@ -898,7 +892,6 @@ def gemm_a16w16_hti_gfx950_kernel(
             tile=AsyncLoadTile(
                 lds_base=half_b_base(stage, n_part),
                 src_base=fx.get_iter(b_buf),
-                copy_atom=async_g2s_copy_atom,
                 lds_layout=b_lds_layout,
                 outer_tile_size=half_block_n,
                 outer_bound=n,
