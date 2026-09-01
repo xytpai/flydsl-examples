@@ -377,9 +377,7 @@ def async_load_to_lds(
                 )
             )
         global_outer_idx = tile.global_outer_offset + outer_local_idx
-        safe_global_outer_idx = (global_outer_idx < tile.outer_bound).select(
-            global_outer_idx, 0
-        )
+        safe_global_outer_idx = (global_outer_idx < tile.outer_bound).select(global_outer_idx, 0)
         if const_expr(is_k_major):
             global_offset = global_k_idx * tile.leading_stride + safe_global_outer_idx
         else:
