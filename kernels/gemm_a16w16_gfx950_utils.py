@@ -14,10 +14,9 @@ from flydsl.expr.typing import T
 GFX950_DMA_BYTES = 16
 GFX950_WAVE_SIZE = 64
 SPLIT_K_SEMAPHORE_MAX_LEN = 256
-NUM_TRANSPOSE_GROUP_ITEMS = 16
-TRANSPOSE_GROUP_BITS = NUM_TRANSPOSE_GROUP_ITEMS.bit_length() - 1
-TRANSPOSE_SWIZZLE_BITS = 2
-TRANSPOSE_SWIZZLE_SHIFT_BY_ROWS = {64: 2, 128: 3, 256: 4}
+_LDS_BANK_PERIOD_LOG2 = 6
+_LDS_READ_B128_BASE = 3
+_LDS_READ_TR16_BASE = 4
 
 
 def wait_vmcnt_and_barrier(vmcnt=0):
@@ -298,33 +297,33 @@ class SplitKProtocol:
         gpu.barrier()
 
 
-def make_lds_layout(rows, block_k):
-    swizzle = fx.static(fx.SwizzleType.get(3, 3, 3))
+def _make_xor_swizzle(contiguous_extent, base):
+    mask = _LDS_BANK_PERIOD_LOG2 - base
+    shift = contiguous_extent.bit_length() - 1 - base
+    return fx.static(fx.SwizzleType.get(mask, base, shift))
+
+
+def make_lds_layout(rows, block_k, is_transposed):
+    if const_expr(is_transposed):
+        contiguous_extent = rows
+        base = _LDS_READ_TR16_BASE
+        order = (0, 1)
+    else:
+        contiguous_extent = block_k
+        base = _LDS_READ_B128_BASE
+        order = (1, 0)
+
+    base_layout = fx.make_ordered_layout((rows, block_k), order)
+    extent_log2 = contiguous_extent.bit_length() - 1
+    mask = _LDS_BANK_PERIOD_LOG2 - base
+    shift = extent_log2 - base
+    is_power_of_two = contiguous_extent == 1 << extent_log2
+    if const_expr(not is_power_of_two or shift < mask):
+        return base_layout
     return fx.make_composed_layout(
-        swizzle,
-        fx.make_ordered_layout((rows, block_k), (1, 0)),
+        _make_xor_swizzle(contiguous_extent, base),
+        base_layout,
     )
-
-
-def make_transposed_lds_layout(rows, block_k):
-    # Preserve the 16-element groups required by ds_read_tr16 while swizzling
-    # contiguous-dimension bits to spread LDS bank accesses.
-    base_layout = fx.make_ordered_layout((rows, block_k), (0, 1))
-    for supported_rows, swizzle_shift in TRANSPOSE_SWIZZLE_SHIFT_BY_ROWS.items():
-        if const_expr(rows == supported_rows):
-            return fx.make_composed_layout(
-                fx.static(
-                    fx.SwizzleType.get(
-                        TRANSPOSE_SWIZZLE_BITS,
-                        TRANSPOSE_GROUP_BITS,
-                        swizzle_shift,
-                    )
-                ),
-                base_layout,
-            )
-    # Other supported tile sizes intentionally remain unswizzled. The layout is
-    # correct for ds_read_tr16 but may incur additional LDS bank conflicts.
-    return base_layout
 
 
 def get_wave_lds_offset(tid, async_load_bytes):

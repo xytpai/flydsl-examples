@@ -17,7 +17,6 @@ from .gemm_a16w16_gfx950_utils import (
     SplitKProtocol,
     get_wave_lds_offset,
     make_lds_layout,
-    make_transposed_lds_layout,
     swizzled_contiguous_idx,
     wait_vmcnt_and_barrier,
 )
@@ -283,15 +282,10 @@ def make_gemm_a16w16_gfx950_kernel_name(param: GemmA16W16Gfx950Param):
 
 
 def make_gemm_ab_lds_layouts(rows_a, rows_b, block_k, a_is_transposed, b_is_transposed):
-    a_lds_layout = (
-        make_transposed_lds_layout(rows_a, block_k) if const_expr(a_is_transposed) else make_lds_layout(rows_a, block_k)
+    return (
+        make_lds_layout(rows_a, block_k, a_is_transposed),
+        make_lds_layout(rows_b, block_k, not b_is_transposed),
     )
-    b_lds_layout = (
-        make_transposed_lds_layout(rows_b, block_k)
-        if const_expr(not b_is_transposed)
-        else make_lds_layout(rows_b, block_k)
-    )
-    return a_lds_layout, b_lds_layout
 
 
 def make_gemm_ab_load_context(
