@@ -18,8 +18,7 @@ from .gemm_a16w16_gfx950_utils import (
     get_wave_lds_offset,
     make_lds_layout,
     make_transposed_lds_layout,
-    swizzled_col_idx,
-    transposed_contiguous_idx,
+    swizzled_contiguous_idx,
     wait_vmcnt_and_barrier,
 )
 
@@ -355,7 +354,7 @@ def async_load_operand(
             outer_x_threads = operand.outer_tile_size // async_load_vec_size
             outer_lds_idx = global_tid % outer_x_threads * async_load_vec_size
             k_local_idx = global_tid // outer_x_threads
-            outer_local_idx = transposed_contiguous_idx(
+            outer_local_idx = swizzled_contiguous_idx(
                 outer_lds_idx,
                 k_local_idx,
                 operand.lds_layout,
@@ -368,7 +367,7 @@ def async_load_operand(
             global_k_idx = (
                 context.ks_begin
                 + k_tile * block_k
-                + swizzled_col_idx(
+                + swizzled_contiguous_idx(
                     outer_local_idx,
                     k_local_idx,
                     operand.lds_layout,
