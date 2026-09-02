@@ -1,6 +1,5 @@
 import argparse
 import csv
-import warnings
 from pathlib import Path
 
 
@@ -88,14 +87,6 @@ def replace_csv_rows(
                             row[column].strip() for column in TUNING_INPUT_COLS
                         )
                         missing_rows.add(missing_row)
-                        shape = ", ".join(
-                            f"{column}={value}"
-                            for column, value in zip(TUNING_INPUT_COLS, missing_row)
-                        )
-                        warnings.warn(
-                            f"{input_file.name}: missing {gfx} config for {shape}",
-                            stacklevel=2,
-                        )
                     writer.writerow(aggregate_data.get(key, row))
 
     with open(
@@ -147,6 +138,13 @@ def main():
         print(f"  {index:>2}. {csv_file.name}")
 
     aggregate_data, _ = aggregate_csv_data(csv_files)
+    flydsl_count = sum(
+        "flydsl_hgemm_" in row["kernelName"] for row in aggregate_data.values()
+    )
+    total_count = len(aggregate_data)
+    ratio = flydsl_count / total_count if total_count else 0
+    print(f"\nFlyDSL HGEMM: {flydsl_count}/{total_count} ({ratio:.2%})")
+
     replace_csv_rows(
         args.replace_directory,
         args.output_directory,
