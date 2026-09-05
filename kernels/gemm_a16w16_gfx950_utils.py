@@ -14,6 +14,9 @@ from flydsl.expr.typing import T
 GFX950_DMA_BYTES = 16
 GFX950_WAVE_SIZE = 64
 SPLIT_K_SEMAPHORE_MAX_LEN = 256
+_LDS_BANK_PERIOD_LOG2 = 6
+_LDS_READ_B128_BASE = 3
+_LDS_READ_TR16_BASE = 4
 
 
 def wait_vmcnt_and_barrier(vmcnt=0):
@@ -294,28 +297,33 @@ class SplitKProtocol:
         gpu.barrier()
 
 
-def make_lds_layout(rows, block_k):
-    swizzle = fx.static(fx.SwizzleType.get(3, 3, 3))
+def _make_xor_swizzle(contiguous_extent, base):
+    mask = _LDS_BANK_PERIOD_LOG2 - base
+    shift = contiguous_extent.bit_length() - 1 - base
+    return fx.static(fx.SwizzleType.get(mask, base, shift))
+
+
+def make_lds_layout(rows, block_k, is_transposed):
+    if const_expr(is_transposed):
+        contiguous_extent = rows
+        base = _LDS_READ_TR16_BASE
+        order = (0, 1)
+    else:
+        contiguous_extent = block_k
+        base = _LDS_READ_B128_BASE
+        order = (1, 0)
+
+    base_layout = fx.make_ordered_layout((rows, block_k), order)
+    extent_log2 = contiguous_extent.bit_length() - 1
+    mask = _LDS_BANK_PERIOD_LOG2 - base
+    shift = extent_log2 - base
+    is_power_of_two = contiguous_extent == 1 << extent_log2
+    if const_expr(not is_power_of_two or shift < mask):
+        return base_layout
     return fx.make_composed_layout(
-        swizzle,
-        fx.make_ordered_layout((rows, block_k), (1, 0)),
+        _make_xor_swizzle(contiguous_extent, base),
+        base_layout,
     )
-
-
-def make_transposed_lds_layout(rows, block_k):
-    # Preserve the 16-element groups required by ds_read_tr16 and XOR low K
-    # bits into contiguous-dimension bits [4:6] to spread LDS bank accesses.
-    base_layout = fx.make_ordered_layout((rows, block_k), (0, 1))
-    if const_expr(rows == 64):
-        trans_swizzle = fx.static(fx.SwizzleType.get(2, 4, 2))
-        return fx.make_composed_layout(trans_swizzle, base_layout)
-    if const_expr(rows == 128):
-        trans_swizzle = fx.static(fx.SwizzleType.get(2, 4, 3))
-        return fx.make_composed_layout(trans_swizzle, base_layout)
-    if const_expr(rows == 256):
-        trans_swizzle = fx.static(fx.SwizzleType.get(2, 4, 4))
-        return fx.make_composed_layout(trans_swizzle, base_layout)
-    return base_layout
 
 
 def get_wave_lds_offset(tid, async_load_bytes):
@@ -325,14 +333,8 @@ def get_wave_lds_offset(tid, async_load_bytes):
     )
 
 
-def swizzled_col_idx(row, col, layout, block_k):
-    elem_offset = fx.get_scalar(fx.crd2idx((row, col), layout))
-    return elem_offset % block_k
-
-
-def transposed_contiguous_idx(idx, k_idx, layout, rows):
-    # The XOR swizzle is self-inverse. Given the physical contiguous
-    # position written by direct-to-LDS DMA, select the logical global
-    # vector that belongs at that position.
-    elem_offset = fx.get_scalar(fx.crd2idx((idx, k_idx), layout))
-    return elem_offset % rows
+def swizzled_contiguous_idx(idx0, idx1, layout, extent):
+    # The XOR swizzle is self-inverse. Map each physical contiguous position
+    # written by direct-to-LDS DMA back to its logical global vector.
+    elem_offset = fx.get_scalar(fx.crd2idx((idx0, idx1), layout))
+    return elem_offset % extent
