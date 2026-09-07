@@ -36,7 +36,7 @@ Inputs and dimensions must satisfy the kernel's vector-alignment constraints.
 `kernels/gemm_fp8_ptpc_gfx950.py` is the same layout-dynamic gfx950 pipeline
 for `float8_e4m3fn` inputs with per-token scales:
 
-- MMA atom is `MFMA_Scale` 16×16×128 (hardware scale left at identity)
+- MMA atom is gfx950 peak FP8 `MFMA_Scale` 16×16×128 (hardware scale left at identity)
 - Epilogue `C = (A @ B) * scale_a[:, None] * scale_b[None, :]` (+ optional BF16 bias)
 - Default output is BF16; FP32 output is optional
 - Same `NN`/`NT`/`TN`/`TT` layout convention as A16W16

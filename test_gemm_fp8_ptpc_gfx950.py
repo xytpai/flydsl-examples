@@ -1,9 +1,12 @@
 import torch
 import pytest
 from dataclasses import dataclass
+from torch.profiler import profile, ProfilerActivity
 
 from kernels.gemm_fp8_ptpc_gfx950 import gemm_fp8_ptpc
 from kernels.gemm_a16w16_gfx950_utils import GFX950_DMA_BYTES
+
+ROTARY_INPUTS_TARGET_BYTES = 8 * 1024**3
 
 
 @dataclass
@@ -167,6 +170,27 @@ def test_fp8_ptpc_acc_full_tile(out_dtype):
     )
 
 
+def test_fp8_ptpc_acc_full_tile_nn():
+    check_acc(
+        _TestArgs(
+            m=128,
+            n=128,
+            k=256,
+            block_m=128,
+            block_n=128,
+            block_k=128,
+            stages=2,
+            m_waves=4,
+            n_waves=4,
+            k_waves=1,
+            group_m=0,
+            has_bias=False,
+            use_half_tile_interleaved=False,
+            layout="nn",
+        )
+    )
+
+
 def test_fp8_ptpc_acc_split_k():
     check_acc(
         _TestArgs(
@@ -217,3 +241,145 @@ def test_fp8_ptpc_rejects_unsupported_k_partitioning():
             layout="nt",
             user_kwargs={"use_half_tile_interleaved": True, "block_k": 128, "stages": 2},
         )
+
+
+def create_outputs(args: _TestArgs):
+    c = torch.empty((args.m, args.n), dtype=args.out_dtype, device="cuda")
+    return (c,)
+
+
+def tensor_nbytes(tensors):
+    return sum(t.numel() * t.element_size() for t in tensors if t is not None)
+
+
+def get_rotary_inputs(sample_inputs, sample_outputs):
+    slot_bytes = 2 * (tensor_nbytes(sample_inputs) + tensor_nbytes(sample_outputs))
+    rotary_inputs = ROTARY_INPUTS_TARGET_BYTES // slot_bytes
+    return max(1, int(rotary_inputs))
+
+
+def ref_func(a, b, scale_a, scale_b, out):
+    torch._scaled_mm(
+        a,
+        b,
+        scale_a=scale_a.view(-1, 1).contiguous(),
+        scale_b=scale_b.view(1, -1).contiguous(),
+        out_dtype=out.dtype,
+        out=out,
+    )
+
+
+def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
+    _skip_if_no_fp8()
+    kwargs = _kwargs(args)
+    sample_inputs = create_inputs(args)
+    sample_outputs = create_outputs(args)
+    rotary_inputs = get_rotary_inputs(sample_inputs, sample_outputs)
+    inputs = [sample_inputs] + [create_inputs(args) for _ in range(rotary_inputs - 1)]
+    outputs = [sample_outputs] + [
+        create_outputs(args) for _ in range(rotary_inputs - 1)
+    ]
+    flops = 2.0 * args.m * args.n * args.k
+    print(
+        f"rotary_inputs:{rotary_inputs}, target_bytes:{ROTARY_INPUTS_TARGET_BYTES}, "
+        f"warmup:{warmup}, niters:{niters}, flops:{flops:.3e}"
+    )
+
+    def run_flydsl(idx):
+        a, b, scale_a, scale_b, bias = inputs[idx]
+        (c,) = outputs[idx]
+        gemm_fp8_ptpc(
+            a,
+            b,
+            scale_a,
+            scale_b,
+            out=c,
+            bias=bias,
+            user_kwargs=kwargs,
+            layout=args.layout,
+            out_dtype=args.out_dtype,
+        )
+
+    has_scaled_mm = hasattr(torch, "_scaled_mm")
+    if has_scaled_mm:
+        try:
+            a, b, scale_a, scale_b, _bias = inputs[0]
+            (c,) = outputs[0]
+            ref_func(a, b, scale_a, scale_b, c)
+            torch.cuda.synchronize()
+        except Exception as exc:
+            print(f"torch._scaled_mm unavailable: {exc}")
+            has_scaled_mm = False
+
+    def run_ref(idx):
+        a, b, scale_a, scale_b, _bias = inputs[idx]
+        (c,) = outputs[idx]
+        ref_func(a, b, scale_a, scale_b, c)
+
+    def run_once(i, idx):
+        if not has_scaled_mm:
+            run_flydsl(idx)
+            return
+        if i % 2 == 0:
+            run_ref(idx)
+            run_flydsl(idx)
+        else:
+            run_flydsl(idx)
+            run_ref(idx)
+
+    print("===================== [INTERLEAVED] =====================")
+    for i in range(warmup):
+        run_once(i, i % rotary_inputs)
+        torch.cuda.synchronize()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    timed_iters = 50
+    start.record()
+    for i in range(timed_iters):
+        run_flydsl(i % rotary_inputs)
+    end.record()
+    torch.cuda.synchronize()
+    flydsl_ms = start.elapsed_time(end) / timed_iters
+    print(
+        f"flydsl_fp8_ptpc: {flydsl_ms:.3f} ms, "
+        f"{flops / flydsl_ms / 1e9:.2f} TFLOPS"
+    )
+    if has_scaled_mm:
+        start.record()
+        for i in range(timed_iters):
+            run_ref(i % rotary_inputs)
+        end.record()
+        torch.cuda.synchronize()
+        scaled_ms = start.elapsed_time(end) / timed_iters
+        print(
+            f"torch._scaled_mm: {scaled_ms:.3f} ms, "
+            f"{flops / scaled_ms / 1e9:.2f} TFLOPS"
+        )
+
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        for i in range(warmup, niters):
+            run_once(i, i % rotary_inputs)
+            torch.cuda.synchronize()
+    print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))
+
+
+def test_fp8_ptpc_benchmark_8192_hti_nt():
+    benchmark(
+        _TestArgs(
+            m=8192,
+            n=8192,
+            k=8192,
+            block_m=256,
+            block_n=256,
+            block_k=128,
+            stages=2,
+            m_waves=2,
+            n_waves=4,
+            k_waves=1,
+            group_m=0,
+            has_bias=False,
+            use_half_tile_interleaved=True,
+            layout="nt",
+        )
+    )
