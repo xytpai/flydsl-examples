@@ -294,6 +294,31 @@ def make_gemm_ab_lds_layouts(rows_a, rows_b, block_k, a_is_transposed, b_is_tran
     )
 
 
+def make_fp8_ptpc_tiled_mma(param: GemmFp8PtpcGfx950Param):
+    # MFMA_Scale has no rebuildStaticValue, so a TiledMma kernel argument
+    # never folds back to make_tiled_mma. fly.gemm then feeds the tiled
+    # MMA into mma_atom_call. Build it in-kernel instead.
+    mma_atom = fx.make_mma_atom(
+        fx.rocdl.cdna4.MFMA_Scale(param.mma_m, param.mma_n, param.mma_k, fx.Float8E4M3FN)
+    )
+    k_per_mfma_group = param.mma_k // 4
+    return fx.make_tiled_mma(
+        mma_atom,
+        fx.make_layout(
+            (param.m_waves, param.n_waves, 1),
+            (param.n_waves, 1, 0),
+        ),
+        fx.make_tile(
+            None,
+            None,
+            fx.make_layout(
+                (k_per_mfma_group, 4),
+                (1, k_per_mfma_group),
+            ),
+        ),
+    )
+
+
 def make_gemm_ab_load_context(
     elem_dtype,
     tiled_mma,
@@ -432,9 +457,9 @@ def gemm_fp8_ptpc_gfx950_kernel(
     working_k: fx.Int32,
     a_leading_stride: fx.Int32,
     b_leading_stride: fx.Int32,
-    tiled_mma: fx.TiledMma,
     param: GemmFp8PtpcGfx950Param,
 ):
+    tiled_mma = make_fp8_ptpc_tiled_mma(param)
     is_split_k = param.is_split_k
     is_slice_k = param.k_waves > 1
     block_m = param.block_m
@@ -738,9 +763,9 @@ def gemm_fp8_ptpc_hti_gfx950_kernel(
     working_k: fx.Int32,
     a_leading_stride: fx.Int32,
     b_leading_stride: fx.Int32,
-    tiled_mma: fx.TiledMma,
     param: GemmFp8PtpcGfx950Param,
 ):
+    tiled_mma = make_fp8_ptpc_tiled_mma(param)
     is_split_k = param.is_split_k
     block_m = param.block_m
     block_n = param.block_n
@@ -1154,24 +1179,6 @@ def gemm_fp8_ptpc_gfx950(
     k = fx.Int32(fx.get_scalar(a.shape[1]))
     a_leading_stride = fx.Int32(fx.get_scalar(a.stride[1] if const_expr(param.a_is_transposed) else a.stride[0]))
     b_leading_stride = fx.Int32(fx.get_scalar(b.stride[1] if const_expr(param.b_is_transposed) else b.stride[0]))
-    elem_dtype = fx.Float8E4M3FN
-    mma_atom = fx.make_mma_atom(fx.rocdl.cdna4.MFMA_Scale(param.mma_m, param.mma_n, param.mma_k, elem_dtype))
-    k_per_mfma_group = param.mma_k // 4
-    tiled_mma = fx.make_tiled_mma(
-        mma_atom,
-        fx.make_layout(
-            (param.m_waves, param.n_waves, 1),
-            (param.n_waves, 1, 0),
-        ),
-        fx.make_tile(
-            None,
-            None,
-            fx.make_layout(
-                (k_per_mfma_group, 4),
-                (1, k_per_mfma_group),
-            ),
-        ),
-    )
     split_alignment = GFX950_DMA_BYTES // param.in_data_bytes
     working_k = (k + split_k - 1) // split_k
     working_k = (working_k + split_alignment - 1) // split_alignment * split_alignment
@@ -1198,7 +1205,6 @@ def gemm_fp8_ptpc_gfx950(
         working_k,
         a_leading_stride,
         b_leading_stride,
-        tiled_mma,
         param,
     ).launch(
         grid=(num_pid_m * num_pid_n, split_k, 1),
