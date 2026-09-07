@@ -17,6 +17,11 @@ SPLIT_K_SEMAPHORE_MAX_LEN = 256
 _LDS_BANK_PERIOD_LOG2 = 6
 _LDS_READ_B128_BASE = 3
 _LDS_READ_TR16_BASE = 4
+_LDS_READ_TR8_BASE = 3
+# FlyDSL fp8_gemm verified SwizzleType.get(3, 4, 4) == swizzle_fp8_128 for K=128.
+_FP8_KCONTIG_SWIZZLE_MASK = 3
+_FP8_KCONTIG_SWIZZLE_BASE = 4
+_FP8_KCONTIG_SWIZZLE_SHIFT = 4
 
 
 def wait_vmcnt_and_barrier(vmcnt=0):
@@ -323,6 +328,41 @@ def make_lds_layout(rows, block_k, is_transposed):
     return fx.make_composed_layout(
         _make_xor_swizzle(contiguous_extent, base),
         base_layout,
+    )
+
+
+def make_fp8_lds_layout(rows, block_k, is_k_major):
+    """LDS layout for gfx950 FP8 PTPC.
+
+    K-contiguous (NT A/B) uses Swizzle<3,4,4>, which FlyDSL's fp8_gemm
+    verified byte-identical to ``swizzle_fp8_128`` for ``block_k == 128``.
+    K-major uses ``ds_read_tr8`` 8-element groups, with the same XOR helper
+    as the 16-bit transposed path but ``base=3``.
+    """
+    if const_expr(is_k_major):
+        contiguous_extent = rows
+        base = _LDS_READ_TR8_BASE
+        order = (0, 1)
+        base_layout = fx.make_ordered_layout((rows, block_k), order)
+        extent_log2 = contiguous_extent.bit_length() - 1
+        mask = _LDS_BANK_PERIOD_LOG2 - base
+        shift = extent_log2 - base
+        is_power_of_two = contiguous_extent == 1 << extent_log2
+        if const_expr(not is_power_of_two or shift < mask):
+            return base_layout
+        return fx.make_composed_layout(
+            _make_xor_swizzle(contiguous_extent, base),
+            base_layout,
+        )
+    return fx.make_composed_layout(
+        fx.static(
+            fx.SwizzleType.get(
+                _FP8_KCONTIG_SWIZZLE_MASK,
+                _FP8_KCONTIG_SWIZZLE_BASE,
+                _FP8_KCONTIG_SWIZZLE_SHIFT,
+            )
+        ),
+        fx.make_ordered_layout((rows, block_k), (1, 0)),
     )
 
 
