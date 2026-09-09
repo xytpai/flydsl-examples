@@ -330,29 +330,42 @@ def make_lds_layout(rows, block_k, is_transposed):
     )
 
 
+def _fp8_kcontig_swizzle(block_k):
+    """K-contiguous ds_read_b128 XOR. Dest bits must stay inside K so the
+    swizzle permutes only columns (r == row); otherwise G2S ``% block_k``
+    and S2R ``crd2idx`` disagree.
+
+    ``Swizzle<3,4,4>`` is FlyDSL ``swizzle_128``: dest [4, 7), which fits
+    ``block_k >= 128``. ``block_k == 64`` only has two K-bits above the
+    16-element vector, so dest is [4, 6) and the source is row[1:3].
+    """
+    if const_expr(block_k >= 128):
+        return fx.SwizzleType.get(
+            _FP8_KCONTIG_SWIZZLE_MASK,
+            _FP8_KCONTIG_SWIZZLE_BASE,
+            _FP8_KCONTIG_SWIZZLE_SHIFT,
+        )
+    if const_expr(block_k == 64):
+        return fx.SwizzleType.get(2, 4, 3)
+    return None
+
+
 def make_fp8_lds_layout(rows, block_k, is_k_major):
     """LDS layout for gfx950 FP8 PTPC.
 
-    K-contiguous (NT A/B) uses Swizzle<3,4,4>, which FlyDSL's fp8_gemm
-    verified byte-identical to ``swizzle_fp8_128`` for ``block_k == 128``.
-
-    K-major uses the same 16-element XOR groups as ``ds_read_tr16``.
-    ``ds_read_tr8`` is still a 16-lane cooperative op; scrambling bits
-    below 16-element alignment breaks the address pattern the instruction
-    expects, even though each load is only 8 bytes.
+    K-contiguous (NT A/B) uses a block_k-dependent XOR swizzle; see
+    ``_fp8_kcontig_swizzle``. K-major uses the same 16-element XOR groups
+    as ``ds_read_tr16``. ``ds_read_tr8`` is still a 16-lane cooperative
+    op; scrambling bits below 16-element alignment breaks the address
+    pattern the instruction expects, even though each load is only 8 bytes.
     """
     if const_expr(is_k_major):
         return make_lds_layout(rows, block_k, is_transposed=True)
-    return fx.make_composed_layout(
-        fx.static(
-            fx.SwizzleType.get(
-                _FP8_KCONTIG_SWIZZLE_MASK,
-                _FP8_KCONTIG_SWIZZLE_BASE,
-                _FP8_KCONTIG_SWIZZLE_SHIFT,
-            )
-        ),
-        fx.make_ordered_layout((rows, block_k), (1, 0)),
-    )
+    base_layout = fx.make_ordered_layout((rows, block_k), (1, 0))
+    swizzle = _fp8_kcontig_swizzle(block_k)
+    if swizzle is None:
+        return base_layout
+    return fx.make_composed_layout(fx.static(swizzle), base_layout)
 
 
 def get_wave_lds_offset(tid, async_load_bytes):
