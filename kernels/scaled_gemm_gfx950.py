@@ -1301,7 +1301,7 @@ def scaled_gemm(
         "n_waves": 4,
         "k_waves": 1,
         "group_m": 0,
-        "use_half_tile_interleaved": False,
+        "use_half_tile_interleaved": True,
     }
 
     kwargs.update(user_kwargs)
