@@ -1031,23 +1031,33 @@ def scaled_gemm_hti_gfx950_kernel(
     rocdl.s_barrier()
     a1 = load_a_fragment(1, 1)
     rocdl.s_barrier()
-    consume(c10, a1, b0, True)
-    consume(c11, a1, b1, True)
+    # Balance the prologue's staggered M-wave groups before reusing AB
+    # storage. Unlike the reference's wave-local C-shuffle, tiled partition_C
+    # and the linear global-store mapping exchange data across both M groups.
     rocdl.sched_barrier(0)
     if wid // n_waves == 0:
         rocdl.s_barrier()
     wait_vmcnt_and_barrier(0)
+
+    # Overlap the last two MMA groups with the PTPC epilogue, as in the
+    # reference: C00/C01 -> global, then C10, then C11.
     store_half_tile_to_lds(0, 0, c00)
     store_half_tile_to_lds(0, 1, c01)
-    store_half_tile_to_lds(1, 0, c10)
-    store_half_tile_to_lds(1, 1, c11)
+    consume(c10, a1, b0, False)
+    rocdl.sched_barrier(0)
+    rocdl.s_barrier()
+    rocdl.sched_barrier(0)
     if const_expr(is_split_k):
         splitk_protocol.wait_until_initialized()
-    else:
-        gpu.barrier()
     store_half_tile_to_global(0, 0)
     store_half_tile_to_global(0, 1)
+    store_half_tile_to_lds(1, 0, c10)
+    consume(c11, a1, b1, False)
+    rocdl.sched_barrier(0)
+    rocdl.s_barrier()
     store_half_tile_to_global(1, 0)
+    store_half_tile_to_lds(1, 1, c11)
+    rocdl.s_barrier()
     store_half_tile_to_global(1, 1)
     if const_expr(is_split_k):
         splitk_protocol.finish_split(split_k)
