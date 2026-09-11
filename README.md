@@ -31,6 +31,20 @@ to CUDA/CuTeDSL, but targets AMD GPUs through FlyDSL.
 HTI currently requires `stages=2`, `m_waves=2`, and `k_waves=1`.
 Inputs and dimensions must satisfy the kernel's vector-alignment constraints.
 
+### FP8 PTPC GEMM
+
+`kernels/gemm_fp8_ptpc_gfx950.py` is the same layout-dynamic gfx950 pipeline
+for `float8_e4m3fn` inputs with per-token scales:
+
+- MMA atom is gfx950 peak FP8 `MFMA_Scale` 16×16×128 (hardware scale left at identity)
+- Epilogue `C = (A @ B) * scale_a[:, None] * scale_b[None, :]` (+ optional BF16 bias)
+- Default output is BF16; FP32 output is optional
+- Same `NN`/`NT`/`TN`/`TT` layout convention as A16W16
+- Same async G2S, HTI, slice-K, and split-K structure
+- `block_k` must be a multiple of 128
+
+Default policy is 256×256×128, `stages=2`, `m_waves=2`, `n_waves=4`, HTI on.
+
 ## Layout Convention
 
 Layout characters describe physical tensor strides without changing logical
@@ -72,6 +86,20 @@ c = gemm_a16w16(
 )
 ```
 
+FP8 per-token scale:
+
+```python
+from kernels.gemm_fp8_ptpc_gfx950 import gemm_fp8_ptpc
+
+m, n, k = 256, 256, 256
+a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn).t()
+scale_a = torch.rand((m,), device="cuda", dtype=torch.float32) * 0.25 + 0.05
+scale_b = torch.rand((n,), device="cuda", dtype=torch.float32) * 0.25 + 0.05
+
+c = gemm_fp8_ptpc(a, b, scale_a, scale_b, layout="nt")
+```
+
 ## Requirements
 
 - Linux with ROCm
@@ -101,12 +129,14 @@ Run the GEMM correctness suite:
 
 ```bash
 pytest -sv test_gemm_a16w16_gfx950.py
+pytest -sv test_gemm_fp8_ptpc_gfx950.py
 ```
 
 Run a focused layout test:
 
 ```bash
 pytest -sv test_gemm_a16w16_gfx950.py -k "main_loop and nt"
+pytest -sv test_gemm_fp8_ptpc_gfx950.py -k "hti_default and nt"
 ```
 
 After changing FlyDSL compiler or kernel sources, clear the JIT cache when
@@ -176,7 +206,9 @@ Use `--shape-index` to run a single built-in shape.
 kernels/
   gemm_a16w16_gfx950.py        # A16W16 GEMM
   gemm_a16w16_gfx950_utils.py  # Layout, LDS, split-K, and store helpers
-test_gemm_a16w16_gfx950.py     # GEMM correctness and benchmarks
+  gemm_fp8_ptpc_gfx950.py      # FP8 per-token-scale GEMM
+test_gemm_a16w16_gfx950.py     # A16W16 correctness and benchmarks
+test_gemm_fp8_ptpc_gfx950.py   # FP8 PTPC correctness
 gemm_tune.py                    # Policy search and tuning
 torch_benchmark.py              # torch.compile backend comparison
 ```
