@@ -29,6 +29,11 @@ from .gemm_a16w16_gfx950 import (
 SCALED_GEMM_DTYPE_FP32 = 1
 SCALED_GEMM_DTYPE_BF16 = 2
 SCALED_GEMM_DTYPE_FP8 = 4
+SCALED_GEMM_DTYPE_MXFP8 = 5
+MXFP8_BLOCK_SIZE = 32
+# Two four-tile buffers occupy the same LDS as one eight-tile buffer.
+MXFP8_HTI_SCALE_CHUNK_TILES = 4
+MXFP8_HTI_SCALE_BUFFERS = 2
 
 
 @fx.struct
@@ -87,6 +92,68 @@ class AsyncLoadOperand:
     is_k_major: Any
 
 
+def mxfp8_scale_stage_bytes(rows, block_k, block_threads):
+    # A complete 32-bit DMA per thread, padding the last workgroup-sized
+    # chunk. Extra lanes duplicate valid rows rather than reading out of bounds.
+    workgroup_bytes = block_threads * 4
+    return (rows * (block_k // MXFP8_BLOCK_SIZE) + workgroup_bytes - 1) // workgroup_bytes * workgroup_bytes
+
+
+def uses_lds_mxfp8_scales(param):
+    # Four E8M0 bytes cover 128 K elements. K=64 tiles keep scalar loads:
+    # their two-byte rows/tile offsets need not satisfy dword DMA alignment.
+    return param.in_dtype_id == SCALED_GEMM_DTYPE_MXFP8 and param.block_k % 128 == 0
+
+
+def async_load_mxfp8_scales(scale, lds_base, tid, outer_offset, outer_bound, k_begin, rows, param):
+    """Stage four E8M0 bytes/lane with the same completion protocol as A/B."""
+    scale_k = param.block_k // MXFP8_BLOCK_SIZE
+    words_per_row = scale_k // 4
+    stage_bytes = mxfp8_scale_stage_bytes(rows, param.block_k, param.block_threads)
+    atom = fx.make_copy_atom(fx.rocdl.cdna4.BufferLoadAsyncLDS32b(), 32)
+    layout = fx.make_layout(4, 1)
+    wave_offset = fx.Int32(get_wave_lds_offset(tid, 4))
+    stride = fx.Int32(fx.get_scalar(scale.stride[0]))
+    for i in range_constexpr(stage_bytes // (param.block_threads * 4)):
+        word = i * param.block_threads + tid
+        row = outer_offset + (word // words_per_row) % rows
+        safe_row = (row < outer_bound).select(row, 0)
+        offset = safe_row * stride + k_begin // MXFP8_BLOCK_SIZE + word % words_per_row * 4
+        src = fx.make_view(fx.get_iter(scale) + offset, layout)
+        dst = fx.make_view(lds_base + wave_offset + i * param.block_threads * 4, layout)
+        rocdl.sched_barrier(0)
+        fx.copy_atom_call(atom, src, dst)
+        rocdl.sched_barrier(0)
+
+
+def async_load_mxfp8_scale_chunk(
+    scale, lds_base, tid, outer_offset, outer_bound, k_begin, k_end, rows, chunk_k, param,
+):
+    """Coalesce scale traffic across K tiles; the caller fences the whole chunk.
+
+    A short final chunk may extend past this split's K end. Its unused dwords
+    duplicate a valid address, never issue an out-of-bounds global read.
+    k_begin/k_end are 128-element aligned, so each valid dword is wholly valid.
+    Unlike per-tile DMA, no per-instruction scheduler fences are needed here.
+    """
+    scale_k = chunk_k // MXFP8_BLOCK_SIZE
+    words_per_row = scale_k // 4
+    stage_bytes = mxfp8_scale_stage_bytes(rows, chunk_k, param.block_threads)
+    atom = fx.make_copy_atom(fx.rocdl.cdna4.BufferLoadAsyncLDS32b(), 32)
+    layout = fx.make_layout(4, 1)
+    wave_offset = fx.Int32(get_wave_lds_offset(tid, 4))
+    stride = fx.Int32(fx.get_scalar(scale.stride[0]))
+    for i in range_constexpr(stage_bytes // (param.block_threads * 4)):
+        word = i * param.block_threads + tid
+        row = outer_offset + (word // words_per_row) % rows
+        safe_row = (row < outer_bound).select(row, 0)
+        sk = k_begin // MXFP8_BLOCK_SIZE + word % words_per_row * 4
+        safe_sk = (sk < k_end // MXFP8_BLOCK_SIZE).select(sk, 0)
+        src = fx.make_view(fx.get_iter(scale) + safe_row * stride + safe_sk, layout)
+        dst = fx.make_view(lds_base + wave_offset + i * param.block_threads * 4, layout)
+        fx.copy_atom_call(atom, src, dst)
+
+
 def make_scaled_gemm_gfx950_param(
     in_dtype_id: int = SCALED_GEMM_DTYPE_FP8,
     out_dtype_id: int = SCALED_GEMM_DTYPE_BF16,
@@ -107,7 +174,7 @@ def make_scaled_gemm_gfx950_param(
     mma_n: int = 16,
     mma_k: int = 128,
 ) -> ScaledGemmGfx950Param:
-    if in_dtype_id not in (SCALED_GEMM_DTYPE_FP8,):
+    if in_dtype_id not in (SCALED_GEMM_DTYPE_FP8, SCALED_GEMM_DTYPE_MXFP8):
         raise ValueError(f"unsupported in_dtype_id={in_dtype_id}")
     if out_dtype_id not in (SCALED_GEMM_DTYPE_BF16, SCALED_GEMM_DTYPE_FP32):
         raise ValueError(f"unsupported out_dtype_id={out_dtype_id} for in_dtype_id={in_dtype_id}")
@@ -152,6 +219,18 @@ def make_scaled_gemm_gfx950_param(
         assert block_n % cshuffle_r2g_vec_size == 0
     smem_bytes = stages * (block_m + block_n) * block_k * in_dbytes
     smem_bytes = max(smem_bytes, k_waves * block_m * block_n * 2)  # cshuffle uses bf16
+    if in_dtype_id == SCALED_GEMM_DTYPE_MXFP8 and block_k % 128 == 0:
+        parts = 2 if use_half_tile_interleaved else 1
+        if use_half_tile_interleaved and block_k == 128:
+            smem_bytes += 2 * MXFP8_HTI_SCALE_BUFFERS * (
+                mxfp8_scale_stage_bytes(block_m // 2, block_k * MXFP8_HTI_SCALE_CHUNK_TILES, block_threads)
+                + mxfp8_scale_stage_bytes(block_n // 2, block_k * MXFP8_HTI_SCALE_CHUNK_TILES, block_threads)
+            )
+        else:
+            smem_bytes += stages * parts * (
+                mxfp8_scale_stage_bytes(block_m // parts, block_k, block_threads)
+                + mxfp8_scale_stage_bytes(block_n // parts, block_k, block_threads)
+            )
     arch = get_rocm_arch()
     SMEM_CAPACITY_MAP = {
         "gfx942": 65536,
@@ -218,7 +297,14 @@ def make_scaled_gemm_gfx950_param(
             f"covered={ldg_b_iters * block_threads * async_load_vec_size}, "
             f"required={block_n * block_k}"
         )
-    assert (stages - 2) * (ldg_a_iters + ldg_b_iters) < 63
+    scale_load_iters = 0
+    if in_dtype_id == SCALED_GEMM_DTYPE_MXFP8 and block_k % 128 == 0:
+        parts = 2 if use_half_tile_interleaved else 1
+        scale_load_iters = parts * (
+            mxfp8_scale_stage_bytes(block_m // parts, block_k, block_threads)
+            + mxfp8_scale_stage_bytes(block_n // parts, block_k, block_threads)
+        ) // (block_threads * 4)
+    assert (stages - 2) * (ldg_a_iters + ldg_b_iters + scale_load_iters) < 63
     mma_m_repeat = block_m // m_waves // mma_m
     mma_n_repeat = block_n // n_waves // mma_n
     mma_k_repeat = block_k // k_waves // mma_k
@@ -272,7 +358,7 @@ def make_scaled_gemm_gfx950_param(
 
 
 def make_scaled_gemm_gfx950_kernel_name(param: ScaledGemmGfx950Param):
-    dtype_str = "fp8"
+    dtype_str = "mxfp8" if param.in_dtype_id == SCALED_GEMM_DTYPE_MXFP8 else "fp8"
     out_suffix = "_fp32" if param.out_dtype_id == SCALED_GEMM_DTYPE_FP32 else ""
     name = f"hgemm_{dtype_str}{out_suffix}_t{param.block_m}x{param.block_n}x{param.block_k}x{param.stages}"
     name += "_ksd" if param.is_split_k else "_ks1"
@@ -338,7 +424,12 @@ def make_scaled_tiled_mma(param: ScaledGemmGfx950Param):
     if const_expr(param.mma_k == 128):
         k_perm = fx.make_layout((16, 2, 4), (1, 64, 16))
     elif const_expr(param.mma_k == 64):
-        k_perm = fx.make_layout((32, 2), (1, 32))
+        if const_expr(param.in_dtype_id == SCALED_GEMM_DTYPE_MXFP8):
+            # f8f6f4 packs two 16-byte strips per lane. Preserve logical
+            # 32-element scale groups (the PTPC path can permute K freely).
+            k_perm = fx.make_layout((16, 2, 2), (1, 32, 16))
+        else:
+            k_perm = fx.make_layout((32, 2), (1, 32))
     else:
         assert False, f"unsupported MFMA_Scale MNK {(param.mma_m, param.mma_n, param.mma_k)}"
     tiled_mma = fx.make_tiled_mma(
@@ -350,6 +441,72 @@ def make_scaled_tiled_mma(param: ScaledGemmGfx950Param):
         fx.make_tile(None, None, k_perm),
     )
     return tiled_mma
+
+
+def mxfp8_gemm(
+    frag_C,
+    frag_A,
+    frag_B,
+    scale_a,
+    scale_b,
+    tid,
+    m_offset,
+    n_offset,
+    k_offset,
+    m,
+    n,
+    param: ScaledGemmGfx950Param,
+    scales_are_fragments=False,
+):
+    """Apply one MMA K step with unshuffled [outer, K // 32] E8M0 scales.
+
+    For both supported MFMA shapes, lane % mma_m selects the row/column
+    and lane // mma_m selects its 32-element K scale group. This scale
+    mapping is independent of the FP8 operand register K permutation.
+    opsel=0 consumes the low byte of each lane's i32 scale operand.
+    HTI passes register scale fragments so each A/B scale can be reused
+    after the corresponding LDS stage is overwritten by the next tile.
+    """
+    mma_atom = fx.make_mma_atom(
+        fx.rocdl.cdna4.MFMA_Scale(param.mma_m, param.mma_n, param.mma_k, fx.Float8E4M3FN)
+    )
+    lane = tid % GFX950_WAVE_SIZE
+    wave = tid // GFX950_WAVE_SIZE
+    wave_m = wave // param.n_waves
+    wave_n = wave % param.n_waves
+    scale_lane = lane % param.mma_m
+    scale_group = lane // param.mma_m
+    scale_k = k_offset // MXFP8_BLOCK_SIZE + scale_group
+
+    a_scales = []
+    for mi in range_constexpr(fx.size(frag_A.shape[1]).unpack()):
+        if const_expr(scales_are_fragments):
+            a_scales.append(scale_a[mi])
+        else:
+            row = m_offset + (mi * param.m_waves + wave_m) * param.mma_m + scale_lane
+            safe_row = (row < m).select(row, 0)
+            a_scales.append(scale_a[safe_row, scale_k].to(fx.Int32))
+    b_scales = []
+    for ni in range_constexpr(fx.size(frag_B.shape[1]).unpack()):
+        if const_expr(scales_are_fragments):
+            b_scales.append(scale_b[ni])
+        else:
+            col = n_offset + (ni * param.n_waves + wave_n) * param.mma_n + scale_lane
+            safe_col = (col < n).select(col, 0)
+            b_scales.append(scale_b[safe_col, scale_k].to(fx.Int32))
+
+    # Atom calls need rank-1 value vectors; coalesce only changes the view.
+    for ni in range_constexpr(fx.size(frag_B.shape[1]).unpack()):
+        for mi in range_constexpr(fx.size(frag_A.shape[1]).unpack()):
+            fx.gemm(
+                mma_atom,
+                fx.coalesce(frag_C[None, mi, ni]),
+                fx.coalesce(frag_A[None, mi]),
+                fx.coalesce(frag_B[None, ni]),
+                fx.coalesce(frag_C[None, mi, ni]),
+                scale_a=a_scales[mi],
+                scale_b=b_scales[ni],
+            )
 
 
 @flyc.kernel
@@ -423,7 +580,8 @@ def scaled_gemm_gfx950_kernel(
         ab: SharedABStorage
         c: fx.Array[shuffle_dtype, k_waves * block_m * block_n, 16]
 
-    storage = fx.SharedAllocator().allocate(SharedStorage)
+    allocator = fx.SharedAllocator()
+    storage = allocator.allocate(SharedStorage)
     smem_a = storage.ab.a.peek().ptr
     smem_b = storage.ab.b.peek().ptr
     smem_c = storage.c.peek().ptr
@@ -433,6 +591,18 @@ def scaled_gemm_gfx950_kernel(
     out_buf = fx.rocdl.make_buffer_tensor(out, max_size=True)
     scale_a_buf = fx.rocdl.make_buffer_tensor(scale_a, max_size=True)
     scale_b_buf = fx.rocdl.make_buffer_tensor(scale_b, max_size=True)
+    use_lds_scale = uses_lds_mxfp8_scales(param)
+    if const_expr(use_lds_scale):
+        # Separate from the AB/C union: HTI's last MMA groups overlap C-shuffle.
+        scale_k = block_k // MXFP8_BLOCK_SIZE
+        scale_a_stage_bytes = mxfp8_scale_stage_bytes(block_m, block_k, block_threads)
+        scale_b_stage_bytes = mxfp8_scale_stage_bytes(block_n, block_k, block_threads)
+        smem_sa = allocator.allocate(
+            fx.Array[fx.Uint8, stages * scale_a_stage_bytes, 16]
+        ).peek().ptr
+        smem_sb = allocator.allocate(
+            fx.Array[fx.Uint8, stages * scale_b_stage_bytes, 16]
+        ).peek().ptr
     if const_expr(param.has_bias):
         bias_buf = fx.rocdl.make_buffer_tensor(bias, max_size=True)
     else:
@@ -534,6 +704,11 @@ def scaled_gemm_gfx950_kernel(
             global_outer_offset=block_m_offset,
             k_tile=k_tile,
         )
+        if const_expr(use_lds_scale):
+            async_load_mxfp8_scales(
+                scale_a_buf, smem_sa + stage * scale_a_stage_bytes,
+                tid, block_m_offset, m, ks_begin + k_tile * block_k, block_m, param,
+            )
 
     def async_load_b_to_lds(k_tile, stage):
         async_load_operand(
@@ -542,6 +717,11 @@ def scaled_gemm_gfx950_kernel(
             global_outer_offset=block_n_offset,
             k_tile=k_tile,
         )
+        if const_expr(use_lds_scale):
+            async_load_mxfp8_scales(
+                scale_b_buf, smem_sb + stage * scale_b_stage_bytes,
+                tid, block_n_offset, n, ks_begin + k_tile * block_k, block_n, param,
+            )
 
     def compute_stage(read_stage, k_tile):
         thr_sA_s2r = thr_copy_A.partition_S(fx.make_view(smem_a + read_stage * block_m * block_k, a_lds_layout))
@@ -559,14 +739,39 @@ def scaled_gemm_gfx950_kernel(
                 thr_sA_s2r[None, None, block_k_iter],
                 frag_A_retile[None, None, block_k_iter],
             )
-            fx.gemm(
-                tiled_mma,
-                frag_C,
-                frag_A_chunk,
-                frag_B[None, None, block_k_iter],
-                frag_C,
-                traversal_order=fx.GemmTraversalOrder.KNM,
-            )
+            if const_expr(use_lds_scale):
+                mxfp8_gemm(
+                    frag_C, frag_A_chunk, frag_B[None, None, block_k_iter],
+                    fx.make_view(smem_sa + read_stage * scale_a_stage_bytes,
+                                 fx.make_layout((block_m, scale_k), (scale_k, 1))),
+                    fx.make_view(smem_sb + read_stage * scale_b_stage_bytes,
+                                 fx.make_layout((block_n, scale_k), (scale_k, 1))),
+                    tid_in_k_slice, 0, 0, block_k_iter * param.mma_k, block_m, block_n, param,
+                )
+            elif const_expr(param.in_dtype_id == SCALED_GEMM_DTYPE_MXFP8):
+                mxfp8_gemm(
+                    frag_C,
+                    frag_A_chunk,
+                    frag_B[None, None, block_k_iter],
+                    scale_a_buf,
+                    scale_b_buf,
+                    tid_in_k_slice,
+                    block_m_offset,
+                    block_n_offset,
+                    ks_begin + k_tile * block_k + block_k_iter * param.mma_k,
+                    m,
+                    n,
+                    param,
+                )
+            else:
+                fx.gemm(
+                    tiled_mma,
+                    frag_C,
+                    frag_A_chunk,
+                    frag_B[None, None, block_k_iter],
+                    frag_C,
+                    traversal_order=fx.GemmTraversalOrder.KNM,
+                )
 
         for k_slice in range_constexpr(k_waves):
             if k_wave_idx == k_slice:
@@ -607,7 +812,9 @@ def scaled_gemm_gfx950_kernel(
         global_col = block_n_offset + col
         safe_m = (global_row < m).select(global_row, 0)
         safe_n = (global_col < n).select(global_col, 0)
-        acc = frag_C[i] * scale_a_buf[safe_m] * scale_b_buf[safe_n]
+        acc = frag_C[i]
+        if const_expr(param.in_dtype_id == SCALED_GEMM_DTYPE_FP8):
+            acc = acc * scale_a_buf[safe_m] * scale_b_buf[safe_n]
         if const_expr(param.has_bias):
             if const_expr(not is_split_k):
                 bias_val = bias_buf[safe_n].to(fx.Float32)
@@ -729,7 +936,8 @@ def scaled_gemm_hti_gfx950_kernel(
         ab: SharedABStorage
         c: fx.Array[shuffle_dtype, block_m * block_n, 16]
 
-    storage = fx.SharedAllocator().allocate(SharedStorage)
+    allocator = fx.SharedAllocator()
+    storage = allocator.allocate(SharedStorage)
     smem_a = storage.ab.a.peek().ptr
     smem_b = storage.ab.b.peek().ptr
     smem_c = storage.c.peek().ptr
@@ -739,6 +947,26 @@ def scaled_gemm_hti_gfx950_kernel(
     out_buf = fx.rocdl.make_buffer_tensor(out, max_size=True)
     scale_a_buf = fx.rocdl.make_buffer_tensor(scale_a, max_size=True)
     scale_b_buf = fx.rocdl.make_buffer_tensor(scale_b, max_size=True)
+    use_lds_scale = uses_lds_mxfp8_scales(param)
+    use_scale_chunk = use_lds_scale and block_k == 128
+    scale_chunk_tiles = MXFP8_HTI_SCALE_CHUNK_TILES if const_expr(use_scale_chunk) else 1
+    if const_expr(use_lds_scale):
+        # Separate from the AB/C union: HTI's last MMA groups overlap C-shuffle.
+        scale_k = block_k * scale_chunk_tiles // MXFP8_BLOCK_SIZE
+        scale_stages = MXFP8_HTI_SCALE_BUFFERS if const_expr(use_scale_chunk) else stages
+        scale_a_stage_bytes = mxfp8_scale_stage_bytes(block_m // 2, block_k * scale_chunk_tiles, block_threads)
+        scale_b_stage_bytes = mxfp8_scale_stage_bytes(block_n // 2, block_k * scale_chunk_tiles, block_threads)
+        smem_sa = allocator.allocate(
+            fx.Array[fx.Uint8, scale_stages * 2 * scale_a_stage_bytes, 16]
+        ).peek().ptr
+        smem_sb = allocator.allocate(
+            fx.Array[fx.Uint8, scale_stages * 2 * scale_b_stage_bytes, 16]
+        ).peek().ptr
+        # Per-tile scale DMA shares the AB wait counts. Chunk prefetch is
+        # separately fenced, so it must NOT inflate these counts.
+        if const_expr(not use_scale_chunk):
+            half_ldg_a_iters += scale_a_stage_bytes // (block_threads * 4)
+            half_ldg_b_iters += scale_b_stage_bytes // (block_threads * 4)
     if const_expr(param.has_bias):
         bias_buf = fx.rocdl.make_buffer_tensor(bias, max_size=True)
     else:
@@ -788,7 +1016,7 @@ def scaled_gemm_hti_gfx950_kernel(
         outer_tile_size=half_block_m,
         outer_bound=m,
         leading_stride=a_leading_stride,
-        load_iters=half_ldg_a_iters,
+        load_iters=param.ldg_a_iters // 2,
         is_k_major=param.a_is_transposed,
     )
     b_load_operand = AsyncLoadOperand(
@@ -798,7 +1026,7 @@ def scaled_gemm_hti_gfx950_kernel(
         outer_tile_size=half_block_n,
         outer_bound=n,
         leading_stride=b_leading_stride,
-        load_iters=half_ldg_b_iters,
+        load_iters=param.ldg_b_iters // 2,
         is_k_major=not param.b_is_transposed,
     )
     c_lds_layout = fx.make_layout((half_block_m, half_block_n), (half_block_n, 1))
@@ -816,6 +1044,12 @@ def scaled_gemm_hti_gfx950_kernel(
             global_outer_offset=block_m_offset + m_part * half_block_m,
             k_tile=k_tile,
         )
+        if const_expr(use_lds_scale and not use_scale_chunk):
+            async_load_mxfp8_scales(
+                scale_a_buf, smem_sa + (stage * 2 + m_part) * scale_a_stage_bytes,
+                tid, block_m_offset + m_part * half_block_m, m,
+                ks_begin + k_tile * block_k, half_block_m, param,
+            )
 
     def async_load_b_to_lds(n_part, k_tile, stage):
         async_load_operand(
@@ -824,6 +1058,47 @@ def scaled_gemm_hti_gfx950_kernel(
             global_outer_offset=block_n_offset + n_part * half_block_n,
             k_tile=k_tile,
         )
+        if const_expr(use_lds_scale and not use_scale_chunk):
+            async_load_mxfp8_scales(
+                scale_b_buf, smem_sb + (stage * 2 + n_part) * scale_b_stage_bytes,
+                tid, block_n_offset + n_part * half_block_n, n,
+                ks_begin + k_tile * block_k, half_block_n, param,
+            )
+
+    def issue_scale_chunk(k_tile):
+        # A chunk's scales are shared by all M/N waves. Alternate slots so
+        # the next chunk's DMA can overlap computation on the current one.
+        for part in range_constexpr(2):
+            slot = (k_tile // scale_chunk_tiles) % MXFP8_HTI_SCALE_BUFFERS
+            async_load_mxfp8_scale_chunk(
+                scale_a_buf, smem_sa + (slot * 2 + part) * scale_a_stage_bytes,
+                tid, block_m_offset + part * half_block_m, m,
+                ks_begin + k_tile * block_k, ks_end, half_block_m,
+                block_k * scale_chunk_tiles, param,
+            )
+            async_load_mxfp8_scale_chunk(
+                scale_b_buf, smem_sb + (slot * 2 + part) * scale_b_stage_bytes,
+                tid, block_n_offset + part * half_block_n, n,
+                ks_begin + k_tile * block_k, ks_end, half_block_n,
+                block_k * scale_chunk_tiles, param,
+            )
+
+    def prefetch_scale_chunk(k_tile):
+        if const_expr(use_scale_chunk):
+            if k_tile % scale_chunk_tiles == 0:
+                # Balance HTI's staggered M-wave groups before reusing the
+                # other slot, and wait for this chunk's earlier DMA to finish.
+                rocdl.sched_barrier(0)
+                if wid // n_waves == 0:
+                    rocdl.s_barrier()
+                wait_vmcnt_and_barrier(0)
+                issue_scale_chunk(k_tile + scale_chunk_tiles)
+                # No VMEM wait here: upcoming AB waits also retire these
+                # older loads; the next chunk boundary fences them explicitly.
+                # Restore the stagger needed by the original AB pipeline.
+                if wid // n_waves == 1:
+                    rocdl.s_barrier()
+                rocdl.sched_barrier(0)
 
     def make_gC(m_part, n_part):
         return fx.flat_divide(out_buf, (half_block_m, half_block_n))[None, None, bid_m * 2 + m_part, bid_n * 2 + n_part]
@@ -837,7 +1112,26 @@ def scaled_gemm_hti_gfx950_kernel(
         gC = make_gC(m_part, n_part)
         return thr_mma.make_fragment_C(gC)
 
-    def load_a_fragment(m_part, read_stage):
+    def load_scale_fragment(smem, rows, wave_idx, waves, stage_bytes, part, stage, k_tile):
+        # Load alongside the FP8 fragment, BEFORE any DMA can reuse this
+        # half-stage. Both consumers of the A/B fragment reuse these scales.
+        scale_layout = fx.make_layout((rows, scale_k), (scale_k, 1))
+        if const_expr(use_scale_chunk):
+            slot = k_tile // scale_chunk_tiles % MXFP8_HTI_SCALE_BUFFERS
+            src = fx.make_view(smem + (slot * 2 + part) * stage_bytes, scale_layout)
+            scale_offset = k_tile % scale_chunk_tiles * (block_k // MXFP8_BLOCK_SIZE)
+        else:
+            src = fx.make_view(smem + (stage * 2 + part) * stage_bytes, scale_layout)
+            scale_offset = 0
+        frag = fx.make_rmem_tensor((rows // waves // param.mma_m, block_k // param.mma_k), fx.Int32)
+        for ki in range_constexpr(block_k // param.mma_k):
+            for ri in range_constexpr(rows // waves // param.mma_m):
+                row = (ri * waves + wave_idx) * param.mma_m + tid % GFX950_WAVE_SIZE % param.mma_m
+                sk = ki * (param.mma_k // MXFP8_BLOCK_SIZE) + tid % GFX950_WAVE_SIZE // param.mma_m
+                frag[ri, ki] = src[row, scale_offset + sk].to(fx.Int32)
+        return frag
+
+    def load_a_fragment(m_part, read_stage, k_tile):
         sA = fx.make_view(half_a_base(read_stage, m_part), a_lds_layout)
         frag_A = thr_mma.make_fragment_A(sA)
         frag_A_retile = thr_copy_A.retile(frag_A)
@@ -848,9 +1142,13 @@ def scaled_gemm_hti_gfx950_kernel(
                 thr_sA_s2r[None, None, block_k_iter],
                 frag_A_retile[None, None, block_k_iter],
             )
+        if const_expr(use_lds_scale):
+            return frag_A, load_scale_fragment(
+                smem_sa, half_block_m, wid // n_waves, param.m_waves, scale_a_stage_bytes, m_part, read_stage, k_tile,
+            )
         return frag_A
 
-    def load_b_fragment(n_part, read_stage):
+    def load_b_fragment(n_part, read_stage, k_tile):
         sB = fx.make_view(half_b_base(read_stage, n_part), b_lds_layout)
         frag_B = thr_mma.make_fragment_B(sB)
         frag_B_retile = thr_copy_B.retile(frag_B)
@@ -861,20 +1159,49 @@ def scaled_gemm_hti_gfx950_kernel(
                 thr_sB_s2r[None, None, block_k_iter],
                 frag_B_retile[None, None, block_k_iter],
             )
+        if const_expr(use_lds_scale):
+            return frag_B, load_scale_fragment(
+                smem_sb, half_block_n, wid % n_waves, n_waves, scale_b_stage_bytes, n_part, read_stage, k_tile,
+            )
         return frag_B
 
-    def consume(frag_C, frag_A, frag_B, emit_sched_barrier):
+    def consume(frag_C, frag_A, frag_B, m_part, n_part, k_tile, emit_sched_barrier):
+        if const_expr(use_lds_scale):
+            frag_A, frag_SA = frag_A
+            frag_B, frag_SB = frag_B
         if const_expr(emit_sched_barrier):
             rocdl.sched_barrier(0)
         for block_k_iter in range_constexpr(block_k // param.mma_k):
-            fx.gemm(
-                tiled_mma,
-                frag_C,
-                frag_A[None, None, block_k_iter],
-                frag_B[None, None, block_k_iter],
-                frag_C,
-                traversal_order=fx.GemmTraversalOrder.KNM,
-            )
+            if const_expr(use_lds_scale):
+                mxfp8_gemm(
+                    frag_C, frag_A[None, None, block_k_iter], frag_B[None, None, block_k_iter],
+                    frag_SA[None, block_k_iter], frag_SB[None, block_k_iter],
+                    tid, 0, 0, 0, half_block_m, half_block_n, param, scales_are_fragments=True,
+                )
+            elif const_expr(param.in_dtype_id == SCALED_GEMM_DTYPE_MXFP8):
+                mxfp8_gemm(
+                    frag_C,
+                    frag_A[None, None, block_k_iter],
+                    frag_B[None, None, block_k_iter],
+                    scale_a_buf,
+                    scale_b_buf,
+                    tid,
+                    block_m_offset + m_part * half_block_m,
+                    block_n_offset + n_part * half_block_n,
+                    ks_begin + k_tile * block_k + block_k_iter * param.mma_k,
+                    m,
+                    n,
+                    param,
+                )
+            else:
+                fx.gemm(
+                    tiled_mma,
+                    frag_C,
+                    frag_A[None, None, block_k_iter],
+                    frag_B[None, None, block_k_iter],
+                    frag_C,
+                    traversal_order=fx.GemmTraversalOrder.KNM,
+                )
         if const_expr(emit_sched_barrier):
             rocdl.sched_barrier(0)
 
@@ -891,7 +1218,9 @@ def scaled_gemm_hti_gfx950_kernel(
             global_col = block_n_offset + n_part * half_block_n + col
             safe_m = (global_row < m).select(global_row, 0)
             safe_n = (global_col < n).select(global_col, 0)
-            acc = frag_C[i] * scale_a_buf[safe_m] * scale_b_buf[safe_n]
+            acc = frag_C[i]
+            if const_expr(param.in_dtype_id == SCALED_GEMM_DTYPE_FP8):
+                acc = acc * scale_a_buf[safe_m] * scale_b_buf[safe_n]
             if const_expr(param.has_bias):
                 if const_expr(not is_split_k):
                     acc = acc + bias_buf[safe_n].to(fx.Float32)
@@ -936,6 +1265,12 @@ def scaled_gemm_hti_gfx950_kernel(
     if const_expr(is_split_k):
         splitk_protocol.zero_c()
 
+    if const_expr(use_scale_chunk):
+        # Prime the first slot while all waves are aligned, before the
+        # AB prologue establishes the staggered barrier schedule.
+        issue_scale_chunk(0)
+        wait_vmcnt_and_barrier(0)
+
     async_load_b_to_lds(0, 0, 0)
     async_load_a_to_lds(0, 0, 0)
     async_load_b_to_lds(1, 0, 0)
@@ -954,82 +1289,84 @@ def scaled_gemm_hti_gfx950_kernel(
 
     main_loop_end = k_tiles - 2
     for k_tile in range(0, main_loop_end, 2):
+        prefetch_scale_chunk(k_tile)
         next_k_tile = k_tile + 2
         # 0
-        b0 = load_b_fragment(0, 0)
-        a0 = load_a_fragment(0, 0)
+        b0 = load_b_fragment(0, 0, k_tile)
+        a0 = load_a_fragment(0, 0, k_tile)
         async_load_a_to_lds(1, k_tile + 1, 1)
         rocdl.s_barrier()
-        consume(c00, a0, b0, True)
+        consume(c00, a0, b0, 0, 0, k_tile, True)
         rocdl.s_barrier()
-        b1 = load_b_fragment(1, 0)
+        b1 = load_b_fragment(1, 0, k_tile)
         async_load_b_to_lds(0, next_k_tile, 0)
         rocdl.s_barrier()
-        consume(c01, a0, b1, True)
+        consume(c01, a0, b1, 0, 1, k_tile, True)
         rocdl.s_barrier()
-        a1 = load_a_fragment(1, 0)
+        a1 = load_a_fragment(1, 0, k_tile)
         async_load_a_to_lds(0, next_k_tile, 0)
         rocdl.s_barrier()
-        consume(c10, a1, b0, True)
+        consume(c10, a1, b0, 1, 0, k_tile, True)
         rocdl.s_barrier()
-        b0 = load_b_fragment(0, 1)
+        b0 = load_b_fragment(0, 1, k_tile + 1)
         async_load_b_to_lds(1, next_k_tile, 0)
         wait_vmcnt_and_barrier(2 * half_ldg_b_iters + half_ldg_a_iters)
-        consume(c11, a1, b1, True)
+        consume(c11, a1, b1, 1, 1, k_tile, True)
         rocdl.s_barrier()
         # 1
-        a0 = load_a_fragment(0, 1)
+        a0 = load_a_fragment(0, 1, k_tile + 1)
         async_load_a_to_lds(1, next_k_tile, 0)
         rocdl.s_barrier()
-        consume(c00, a0, b0, True)
+        consume(c00, a0, b0, 0, 0, k_tile + 1, True)
         rocdl.s_barrier()
-        b1 = load_b_fragment(1, 1)
+        b1 = load_b_fragment(1, 1, k_tile + 1)
         async_load_b_to_lds(0, next_k_tile + 1, 1)
         rocdl.s_barrier()
-        consume(c01, a0, b1, True)
+        consume(c01, a0, b1, 0, 1, k_tile + 1, True)
         rocdl.s_barrier()
-        a1 = load_a_fragment(1, 1)
+        a1 = load_a_fragment(1, 1, k_tile + 1)
         async_load_a_to_lds(0, next_k_tile + 1, 1)
         rocdl.s_barrier()
-        consume(c10, a1, b0, True)
+        consume(c10, a1, b0, 1, 0, k_tile + 1, True)
         rocdl.s_barrier()
         async_load_b_to_lds(1, next_k_tile + 1, 1)
         wait_vmcnt_and_barrier(half_ldg_b_iters + half_ldg_a_iters)
-        consume(c11, a1, b1, True)
+        consume(c11, a1, b1, 1, 1, k_tile + 1, True)
         rocdl.s_barrier()
 
     k_tile = main_loop_end
+    prefetch_scale_chunk(k_tile)
     # 0
     if const_expr(is_split_k):
         wait_vmcnt_and_barrier(0)
-    b0 = load_b_fragment(0, 0)
-    a0 = load_a_fragment(0, 0)
+    b0 = load_b_fragment(0, 0, k_tile)
+    a0 = load_a_fragment(0, 0, k_tile)
     async_load_a_to_lds(1, k_tile + 1, 1)
     rocdl.s_barrier()
-    consume(c00, a0, b0, True)
+    consume(c00, a0, b0, 0, 0, k_tile, True)
     rocdl.s_barrier()
-    b1 = load_b_fragment(1, 0)
+    b1 = load_b_fragment(1, 0, k_tile)
     rocdl.s_barrier()
-    consume(c01, a0, b1, True)
+    consume(c01, a0, b1, 0, 1, k_tile, True)
     rocdl.s_barrier()
-    a1 = load_a_fragment(1, 0)
+    a1 = load_a_fragment(1, 0, k_tile)
     rocdl.s_barrier()
-    consume(c10, a1, b0, True)
+    consume(c10, a1, b0, 1, 0, k_tile, True)
     rocdl.s_barrier()
-    b0 = load_b_fragment(0, 1)
+    b0 = load_b_fragment(0, 1, k_tile + 1)
     rocdl.s_barrier()
-    consume(c11, a1, b1, True)
+    consume(c11, a1, b1, 1, 1, k_tile, True)
     wait_vmcnt_and_barrier(0)
     # 1
-    a0 = load_a_fragment(0, 1)
+    a0 = load_a_fragment(0, 1, k_tile + 1)
     rocdl.s_barrier()
-    consume(c00, a0, b0, True)
+    consume(c00, a0, b0, 0, 0, k_tile + 1, True)
     rocdl.s_barrier()
-    b1 = load_b_fragment(1, 1)
+    b1 = load_b_fragment(1, 1, k_tile + 1)
     rocdl.s_barrier()
-    consume(c01, a0, b1, True)
+    consume(c01, a0, b1, 0, 1, k_tile + 1, True)
     rocdl.s_barrier()
-    a1 = load_a_fragment(1, 1)
+    a1 = load_a_fragment(1, 1, k_tile + 1)
     rocdl.s_barrier()
     # Balance the prologue's staggered M-wave groups before reusing AB
     # storage. Unlike the reference's wave-local C-shuffle, tiled partition_C
@@ -1043,7 +1380,7 @@ def scaled_gemm_hti_gfx950_kernel(
     # reference: C00/C01 -> global, then C10, then C11.
     store_half_tile_to_lds(0, 0, c00)
     store_half_tile_to_lds(0, 1, c01)
-    consume(c10, a1, b0, False)
+    consume(c10, a1, b0, 1, 0, k_tile + 1, False)
     rocdl.sched_barrier(0)
     rocdl.s_barrier()
     rocdl.sched_barrier(0)
@@ -1052,7 +1389,7 @@ def scaled_gemm_hti_gfx950_kernel(
     store_half_tile_to_global(0, 0)
     store_half_tile_to_global(0, 1)
     store_half_tile_to_lds(1, 0, c10)
-    consume(c11, a1, b1, False)
+    consume(c11, a1, b1, 1, 1, k_tile + 1, False)
     rocdl.sched_barrier(0)
     rocdl.s_barrier()
     store_half_tile_to_global(1, 0)
@@ -1199,7 +1536,19 @@ def scaled_gemm(
     layout: str = "nt",
     out_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
-    """Compute C[M, N] = (A[M, K] @ B[K, N]) * scale_a[:, None] * scale_b[None, :] [+ bias].
+    """Compute a per-row/per-column FP8 or block-scaled MXFP8 GEMM.
+
+    FP8 uses float32 scales of shapes [M] and [N] (per-row/per-column):
+    C = (A @ B) * scale_a[:, None] * scale_b[None, :] [+ bias].
+    MXFP8 is selected by ``torch.float8_e8m0fnu`` or raw ``torch.uint8``
+    scales of shapes [M, K // 32] and [N, K // 32]. Each E8M0 byte scales
+    32 consecutive K elements: C = dequant(A) @ dequant(B) [+ bias].
+    Raw scale byte e represents 2**(e - 127); 255 represents NaN.
+    Scale shapes are independent of ``layout``; no preshuffling is required.
+    Both modes take ``torch.float8_e4m3fn`` data and support the same pipelines.
+    MXFP8 HTI with block_k=128 double-buffers scales in four-K-tile chunks,
+    overlapping next-chunk prefetch with current-chunk computation. This
+    requires no input preshuffle or extra K alignment from the caller.
 
     Each layout character controls only the corresponding tensor stride:
     N is row-major and T is column-major. Logical tensor shapes never change.
@@ -1276,14 +1625,38 @@ def scaled_gemm(
                 f"{GFX950_DMA_BYTES}-byte-aligned data pointer and leading "
                 f"stride; got shape={tuple(b.shape)} and stride={b.stride()}"
             )
-    assert scale_a.dtype == torch.float32 and scale_b.dtype == torch.float32
+    mx_scale_dtypes = (torch.uint8, torch.float8_e8m0fnu)
+    is_mxfp8 = scale_a.dtype in mx_scale_dtypes or scale_b.dtype in mx_scale_dtypes
     assert scale_a.device == device and scale_b.device == device
-    assert scale_a.ndim == 1 and scale_a.shape[0] == m
-    assert scale_b.ndim == 1 and scale_b.shape[0] == n
-    if not scale_a.is_contiguous():
-        scale_a = scale_a.contiguous()
-    if not scale_b.is_contiguous():
-        scale_b = scale_b.contiguous()
+    if is_mxfp8:
+        if scale_a.dtype not in mx_scale_dtypes or scale_b.dtype not in mx_scale_dtypes:
+            raise ValueError("MXFP8 requires both scales to have E8M0 or uint8 dtype")
+        if k % MXFP8_BLOCK_SIZE != 0:
+            raise ValueError(f"MXFP8 requires K divisible by {MXFP8_BLOCK_SIZE}")
+        if tuple(scale_a.shape) != (m, k // MXFP8_BLOCK_SIZE):
+            raise ValueError("MXFP8 scale_a must have shape [M, K // 32]")
+        if tuple(scale_b.shape) != (n, k // MXFP8_BLOCK_SIZE):
+            raise ValueError("MXFP8 scale_b must have shape [N, K // 32]")
+        # Preserve E8M0 encodings, not a numeric conversion to integers.
+        # Materialize on the launch stream so strided scale inputs are safe.
+        with torch.cuda.stream(stream):
+            scale_a = scale_a.view(torch.uint8).contiguous()
+            scale_b = scale_b.view(torch.uint8).contiguous()
+            # contiguous() is a no-op on an offset contiguous view. Dword
+            # direct-to-LDS requires 4-byte alignment, including leading stride.
+            if user_kwargs.get("block_k", 128) % 128 == 0:
+                if scale_a.data_ptr() % 4 != 0 or scale_a.stride(0) % 4 != 0:
+                    scale_a = scale_a.clone(memory_format=torch.contiguous_format)
+                if scale_b.data_ptr() % 4 != 0 or scale_b.stride(0) % 4 != 0:
+                    scale_b = scale_b.clone(memory_format=torch.contiguous_format)
+    else:
+        assert scale_a.dtype == torch.float32 and scale_b.dtype == torch.float32
+        assert scale_a.ndim == 1 and scale_a.shape[0] == m
+        assert scale_b.ndim == 1 and scale_b.shape[0] == n
+        if not scale_a.is_contiguous():
+            scale_a = scale_a.contiguous()
+        if not scale_b.is_contiguous():
+            scale_b = scale_b.contiguous()
     if out_dtype is None:
         out_dtype = torch.bfloat16 if out is None else out.dtype
     if out_dtype not in (torch.bfloat16, torch.float32):
@@ -1317,7 +1690,7 @@ def scaled_gemm(
     kwargs.update(user_kwargs)
     kwargs["a_is_transposed"] = a_is_transposed
     kwargs["b_is_transposed"] = b_is_transposed
-    kwargs["in_dtype_id"] = SCALED_GEMM_DTYPE_FP8
+    kwargs["in_dtype_id"] = SCALED_GEMM_DTYPE_MXFP8 if is_mxfp8 else SCALED_GEMM_DTYPE_FP8
     kwargs["out_dtype_id"] = SCALED_GEMM_DTYPE_FP32 if out.dtype is torch.float32 else SCALED_GEMM_DTYPE_BF16
     kwargs["has_bias"] = False if bias is None else True
     split_k = kwargs["split_k"]
@@ -1332,8 +1705,8 @@ def scaled_gemm(
     a_arg = _dynamic_tensor_arg(a, 0 if a_is_transposed else 1)
     b_arg = _dynamic_tensor_arg(b, 0 if b_is_transposed else 1)
     out_arg = _dynamic_tensor_arg(out, 1)
-    scale_a_arg = _dynamic_tensor_arg(scale_a, 0)
-    scale_b_arg = _dynamic_tensor_arg(scale_b, 0)
+    scale_a_arg = _dynamic_tensor_arg(scale_a, 1 if is_mxfp8 else 0)
+    scale_b_arg = _dynamic_tensor_arg(scale_b, 1 if is_mxfp8 else 0)
     bias_arg = scale_a_arg if bias is None else _dynamic_tensor_arg(bias, 0)
     semaphore, signal = get_split_k_buffers(stream, device) if param.is_split_k else (scale_a_arg, scale_a_arg)
     dispatch_args = (
