@@ -81,6 +81,7 @@ class GemmGfx950Param:
     ldg_sa_iters: fx.Constexpr[int]
     ldg_sb_iters: fx.Constexpr[int]
     scale_row_bytes: fx.Constexpr[int]
+    scale_chunk_tiles: fx.Constexpr[int]
 
 
 @dataclass(slots=True, kw_only=True, eq=False)
@@ -187,19 +188,38 @@ def make_gemm_gfx950_param(
         assert block_n % cshuffle_r2g_vec_size == 0
     
     if is_mxfp:
+        assert block_k % MXFP_SCALE_BLOCK_K == 0
         scale_rows_a = block_m // 2 if use_half_tile_interleaved else block_m
         scale_rows_b = block_n // 2 if use_half_tile_interleaved else block_n
         workgroup_bytes = block_threads * GFX950_SCALE_DMA_BYTES
-        sa_stage_bytes = mxfp_scale_padded_bytes(scale_rows_a, block_k, block_threads)
-        sb_stage_bytes = mxfp_scale_padded_bytes(scale_rows_b, block_k, block_threads)
-        ldg_sa_iters = sa_stage_bytes // workgroup_bytes
-        ldg_sb_iters = sb_stage_bytes // workgroup_bytes
-        scale_row_bytes = block_k // MXFP_SCALE_BLOCK_K
+        if use_half_tile_interleaved:
+            # Fill at least one DMA pass for both halves, sharing an even K-tile count.
+            # The smaller half determines the chunk; the larger may need more passes.
+            double_tile_scale_bytes = (
+                2 * min(scale_rows_a, scale_rows_b) * block_k // MXFP_SCALE_BLOCK_K
+            )
+            scale_chunk_tiles = 2 * (
+                (workgroup_bytes + double_tile_scale_bytes - 1) // double_tile_scale_bytes
+            )
+        else:
+            scale_chunk_tiles = 1
+        scale_block_k = block_k * scale_chunk_tiles
+        # Each allocation is one half in one scale slot; HTI has two chunk slots.
+        sa_stage_bytes = mxfp_scale_padded_bytes(scale_rows_a, scale_block_k, block_threads)
+        sb_stage_bytes = mxfp_scale_padded_bytes(scale_rows_b, scale_block_k, block_threads)
+        # HTI chunk DMA is fenced separately, so it is not part of per-tile AB waits.
+        ldg_sa_iters = 0 if use_half_tile_interleaved else sa_stage_bytes // workgroup_bytes
+        ldg_sb_iters = 0 if use_half_tile_interleaved else sb_stage_bytes // workgroup_bytes
+        scale_row_bytes = scale_block_k // MXFP_SCALE_BLOCK_K
     else:
-        sa_stage_bytes = sb_stage_bytes = 0
+        sa_stage_bytes = sb_stage_bytes = scale_chunk_tiles = 0
         ldg_sa_iters = ldg_sb_iters = scale_row_bytes = 0
     
-    smem_bytes = stages * (block_m + block_n) * block_k_bytes + stages * (sa_stage_bytes + sb_stage_bytes)
+    scale_halves = 2 if use_half_tile_interleaved else 1
+    smem_bytes = (
+        stages * (block_m + block_n) * block_k_bytes
+        + stages * scale_halves * (sa_stage_bytes + sb_stage_bytes)
+    )
     smem_bytes = max(smem_bytes, k_waves * block_m * block_n * GEMM_DTYPE_BITS[cshuffle_dtype_id] // 8)
     arch = get_rocm_arch()
     SMEM_CAPACITY_MAP = {
@@ -324,6 +344,7 @@ def make_gemm_gfx950_param(
         ldg_sa_iters=ldg_sa_iters,
         ldg_sb_iters=ldg_sb_iters,
         scale_row_bytes=scale_row_bytes,
+        scale_chunk_tiles=scale_chunk_tiles,
     )
 
 
