@@ -66,6 +66,7 @@ class GemmGfx950Param:
     mma_n: fx.Constexpr[int]
     mma_k: fx.Constexpr[int]
     # derived params
+    cshuffle_dtype_id: fx.Constexpr[int]
     async_load_bytes: fx.Constexpr[int]
     in_data_bits: fx.Constexpr[int]
     out_data_bits: fx.Constexpr[int]
@@ -156,6 +157,7 @@ def make_gemm_gfx950_param(
         raise ValueError(f"unsupported out_dtype_id={out_dtype_id} for in_dtype_id={in_dtype_id}")
     in_data_bits = GEMM_DTYPE_BITS[in_dtype_id]
     out_data_bits = GEMM_DTYPE_BITS[out_dtype_id]
+    cshuffle_dtype_id = GEMM_DTYPE_BF16 if is_mxfp else in_dtype_id
     block_k_bytes = block_k * in_data_bits // 8
 
     block_threads = m_waves * n_waves * k_waves * GFX950_WAVE_SIZE
@@ -198,7 +200,7 @@ def make_gemm_gfx950_param(
         ldg_sa_iters = ldg_sb_iters = scale_row_bytes = 0
     
     smem_bytes = stages * (block_m + block_n) * block_k_bytes + stages * (sa_stage_bytes + sb_stage_bytes)
-    smem_bytes = max(smem_bytes, k_waves * block_m * block_n * in_data_bits // 8)
+    smem_bytes = max(smem_bytes, k_waves * block_m * block_n * GEMM_DTYPE_BITS[cshuffle_dtype_id] // 8)
     arch = get_rocm_arch()
     SMEM_CAPACITY_MAP = {
         "gfx942": 65536,
@@ -305,6 +307,10 @@ def make_gemm_gfx950_param(
         a_is_transposed=a_is_transposed,
         b_is_transposed=b_is_transposed,
         has_bias=has_bias,
+        mma_m=mma_m,
+        mma_n=mma_n,
+        mma_k=mma_k,
+        cshuffle_dtype_id=cshuffle_dtype_id,
         async_load_bytes=GFX950_DMA_BYTES,
         in_data_bits=in_data_bits,
         out_data_bits=out_data_bits,
@@ -313,9 +319,6 @@ def make_gemm_gfx950_param(
         block_threads=block_threads,
         ldg_a_iters=ldg_a_iters,
         ldg_b_iters=ldg_b_iters,
-        mma_m=mma_m,
-        mma_n=mma_n,
-        mma_k=mma_k,
         sa_stage_bytes=sa_stage_bytes,
         sb_stage_bytes=sb_stage_bytes,
         ldg_sa_iters=ldg_sa_iters,
