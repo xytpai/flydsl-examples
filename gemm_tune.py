@@ -16,11 +16,11 @@ from pathlib import Path
 from dataclasses import dataclass
 from flydsl.runtime.device import get_rocm_arch
 
-from kernels.gemm_a16w16_gfx950 import (
-    GEMM_A16W16_DTYPE_BF16,
-    GEMM_A16W16_DTYPE_FP16,
-    gemm_a16w16,
-    make_gemm_a16w16_param_and_validate,
+from kernels.gemm_gfx950 import (
+    GEMM_DTYPE_BF16,
+    GEMM_DTYPE_FP16,
+    gemm,
+    make_gemm_param_and_validate,
 )
 
 DEFAULT_COMPILE_WORKERS = 32
@@ -216,7 +216,7 @@ def _compile_policy_worker(job):
     try:
         assert _COMPILE_TENSORS is not None
         a, b, out, bias = _COMPILE_TENSORS
-        gemm_a16w16(
+        gemm(
             a,
             b,
             out,
@@ -264,7 +264,7 @@ def tuning_benchmark(args, kwargs={}, niters=50):
     c = create_outputs(args)[0]
     c_ref = create_outputs(args)[0]
     torch.addmm(bias, a, b, out=c_ref)
-    gemm_a16w16(a, b, c, bias=bias, user_kwargs=kwargs, layout=args.layout)
+    gemm(a, b, c, bias=bias, user_kwargs=kwargs, layout=args.layout)
     tol = (
         float(args.k)
         / 2048
@@ -281,7 +281,7 @@ def tuning_benchmark(args, kwargs={}, niters=50):
         activities=[ProfilerActivity.CUDA],
     ) as prof:
         for i in range(niters):
-            gemm_a16w16(
+            gemm(
                 inputs[i][0],
                 inputs[i][1],
                 outputs[i][0],
@@ -292,15 +292,15 @@ def tuning_benchmark(args, kwargs={}, niters=50):
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
     # table = prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1)
-    gemm_a16w16_durations = []
+    gemm_durations = []
     for event in prof.events():
         if event.name.startswith("hgemm_"):
-            gemm_a16w16_durations.append(event.device_time)
-    duration = np.median(gemm_a16w16_durations)
+            gemm_durations.append(event.device_time)
+    duration = np.median(gemm_durations)
     return duration
 
 
-def gemm_a16w16_get_configs(args):
+def gemm_get_configs(args):
     split_k_candidates = [1]
     if args.enable_split_k:
         split_k_candidates.extend(
@@ -335,9 +335,9 @@ def gemm_a16w16_get_configs(args):
     valid_configs = []
     is_large_gemm = args.m >= 4096 and args.n >= 4096 and args.k >= 4096
     in_dtype_id = (
-        GEMM_A16W16_DTYPE_FP16
+        GEMM_DTYPE_FP16
         if args.dtype is torch.float16
-        else GEMM_A16W16_DTYPE_BF16
+        else GEMM_DTYPE_BF16
     )
     for config in configs:
         if is_large_gemm:
@@ -365,7 +365,7 @@ def gemm_a16w16_get_configs(args):
                 "in_dtype_id": in_dtype_id,
                 "out_dtype_id": in_dtype_id,
             }
-            param = make_gemm_a16w16_param_and_validate(
+            param = make_gemm_param_and_validate(
                 args.m,
                 args.n,
                 args.k,
@@ -379,7 +379,7 @@ def gemm_a16w16_get_configs(args):
 
 
 def tune_single(args):
-    configs = gemm_a16w16_get_configs(args)
+    configs = gemm_get_configs(args)
     configs = parallel_compile_policies(
         args,
         configs,
@@ -486,7 +486,7 @@ def tune_all(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Examples")
-    parser.add_argument("--out", type=str, default="temp/gemm_a16w16_tuned")
+    parser.add_argument("--out", type=str, default="temp/gemm_tuned")
     parser.add_argument("--dtype", type=str, default="bf16")
     parser.add_argument(
         "--layout",

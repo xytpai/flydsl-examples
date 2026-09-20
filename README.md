@@ -12,9 +12,9 @@ to CUDA/CuTeDSL, but targets AMD GPUs through FlyDSL.
 
 ## Highlights
 
-### A16W16 GEMM
+### gfx950 GEMM
 
-`kernels/gemm_a16w16_gfx950.py` provides a layout-dynamic FP16/BF16 GEMM with:
+`kernels/gemm_gfx950.py` provides a layout-dynamic FP16/BF16 GEMM with:
 
 - `NN`, `NT`, `TN`, and `TT` matrix layouts
 - FP16 and BF16 inputs
@@ -47,13 +47,13 @@ with A stored row-major and B stored column-major.
 ```python
 import torch
 
-from kernels.gemm_a16w16_gfx950 import gemm_a16w16
+from kernels.gemm_gfx950 import gemm
 
 m, n, k = 2048, 4096, 4096
 a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
 b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16).t()
 
-c = gemm_a16w16(
+c = gemm(
     a,
     b,
     layout="nt",
@@ -100,13 +100,13 @@ pip install -e .
 Run the GEMM correctness suite:
 
 ```bash
-pytest -sv test_gemm_a16w16_gfx950.py
+pytest -sv test_gemm_gfx950.py
 ```
 
 Run a focused layout test:
 
 ```bash
-pytest -sv test_gemm_a16w16_gfx950.py -k "main_loop and nt"
+pytest -sv test_gemm_gfx950.py -k "main_loop and nt"
 ```
 
 After changing FlyDSL compiler or kernel sources, clear the JIT cache when
@@ -150,7 +150,7 @@ python gemm_tune.py \
   --tune_all \
   --dtype bf16 \
   --layout nt \
-  --out temp/gemm_a16w16_tuned
+  --out temp/gemm_tuned
 ```
 
 The tuner validates each policy, compiles policies in parallel, benchmarks
@@ -174,9 +174,9 @@ Use `--shape-index` to run a single built-in shape.
 
 ```text
 kernels/
-  gemm_a16w16_gfx950.py        # A16W16 GEMM
-  gemm_a16w16_gfx950_utils.py  # Layout, LDS, split-K, and store helpers
-test_gemm_a16w16_gfx950.py     # GEMM correctness and benchmarks
+  gemm_gfx950.py               # gfx950 GEMM
+  gemm_gfx950_utils.py         # Layout, LDS, split-K, and store helpers
+test_gemm_gfx950.py            # GEMM correctness and benchmarks
 gemm_tune.py                    # Policy search and tuning
 torch_benchmark.py              # torch.compile backend comparison
 ```

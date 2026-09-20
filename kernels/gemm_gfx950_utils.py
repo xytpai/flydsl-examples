@@ -12,6 +12,7 @@ from flydsl.expr import (
 from flydsl.expr.typing import T
 
 GFX950_DMA_BYTES = 16
+GFX950_SCALE_DMA_BYTES = 4
 GFX950_WAVE_SIZE = 64
 SPLIT_K_SEMAPHORE_MAX_LEN = 256
 _LDS_BANK_PERIOD_LOG2 = 6
