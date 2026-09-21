@@ -3,10 +3,24 @@ import pytest
 from torch.profiler import profile, ProfilerActivity
 from dataclasses import dataclass
 
-from kernels.gemm_gfx950 import gemm
+from kernels.gemm_gfx950 import (
+    GEMM_DTYPE_BF16,
+    GEMM_DTYPE_FP32,
+    GEMM_DTYPE_MXFP8,
+    GEMM_DTYPE_MXFP4,
+    gemm,
+    make_gemm_param_and_validate,
+)
 from kernels.gemm_gfx950_utils import GFX950_DMA_BYTES
 
 ROTARY_INPUTS_TARGET_BYTES = 8 * 1024**3
+DTYPES = {
+    "bf16": torch.bfloat16,
+    "fp16": torch.float16,
+    "mxfp8": torch.float8_e4m3fn,
+    "mxfp4": torch.float4_e2m1fn_x2,
+}
+MXFP_DTYPES = (DTYPES["mxfp8"], DTYPES["mxfp4"])
 
 
 @dataclass
@@ -29,14 +43,22 @@ class _TestArgs:
     split_k: int = 1
     out_dtype: torch.dtype | None = None
 
+    @property
+    def is_mxfp(self):
+        return self.dtype in MXFP_DTYPES
 
-def _a_dma_vec_size(dtype: torch.dtype) -> int:
+    def __post_init__(self):
+        if self.is_mxfp and self.out_dtype is None:
+            self.out_dtype = torch.bfloat16
+
+
+def a_dma_vec_size(dtype: torch.dtype) -> int:
     return GFX950_DMA_BYTES // torch.empty((), dtype=dtype).element_size()
 
 
-def _skip_unsupported_accuracy_layout(args: _TestArgs):
+def skip_unsupported_accuracy_layout(args: _TestArgs):
     if args.layout[0] == "t":
-        a_vec_size = _a_dma_vec_size(args.dtype)
+        a_vec_size = a_dma_vec_size(args.dtype)
         if args.m % a_vec_size != 0:
             pytest.skip(
                 "column-major A requires M divisible by "
@@ -50,7 +72,56 @@ def empty_layout_matrix(rows: int, cols: int, dtype: torch.dtype, is_t: bool):
     return torch.empty((rows, cols), dtype=dtype, device="cuda")
 
 
+def create_mxfp_operand(rows, k, dtype, is_t):
+    if dtype == torch.float8_e4m3fn:
+        data = torch.empty((rows, k), device="cuda").uniform_(-1, 1).to(dtype)
+    else:
+        codes = torch.randint(0, 16, (rows, k), dtype=torch.uint8, device="cuda")
+        packed = codes[:, ::2] | (codes[:, 1::2] << 4)
+        data = packed.view(dtype)
+    if is_t:
+        data = data.t().contiguous().t()
+    # Independent E8M0 exponents across rows and K groups expose scale indexing
+    # and stage-reuse errors. Keep magnitudes comparable to the 16-bit tests.
+    # FP8 samples span +/-1, whereas raw FP4 spans +/-6.
+    exponent = 125 if dtype == torch.float8_e4m3fn else 123
+    scale = torch.randint(exponent, exponent + 3, (rows, k // 32), dtype=torch.uint8, device="cuda")
+    return data, scale.view(torch.float8_e8m0fnu)
+
+
+def dequantize_mxfp(data, scale):
+    if data.dtype == torch.float8_e4m3fn:
+        values = data.float()
+    else:
+        packed = data.view(torch.uint8)
+        codes = torch.stack((packed & 15, packed >> 4), dim=-1).flatten(-2).long()
+        lut = torch.tensor(
+            [0., .5, 1., 1.5, 2., 3., 4., 6., -0., -.5, -1., -1.5, -2., -3., -4., -6.],
+            device=data.device,
+        )
+        values = lut[codes]
+    scales = torch.exp2(scale.view(torch.uint8).float() - 127)
+    return (values.unflatten(1, (-1, 32)) * scales.unsqueeze(-1)).flatten(1)
+
+
+def reference_inputs(inputs):
+    a, b, bias, *scales = inputs
+    if scales:
+        sa, sb = scales
+        a = dequantize_mxfp(a, sa)
+        b = dequantize_mxfp(b.t(), sb).t()
+    return a, b, bias
+
+
 def create_inputs(args: _TestArgs):
+    if args.is_mxfp:
+        a, sa = create_mxfp_operand(args.m, args.k, args.dtype, args.layout[0] == "t")
+        bt, sb = create_mxfp_operand(args.n, args.k, args.dtype, args.layout[1] != "t")
+        bias = (
+            torch.empty((args.n,), dtype=args.out_dtype, device="cuda").uniform_(10, 20)
+            if args.has_bias else None
+        )
+        return a, bt.t(), bias, sa, sb
     a = empty_layout_matrix(
         args.m,
         args.k,
@@ -80,7 +151,8 @@ def create_outputs(args: _TestArgs):
 
 
 def ref_func(*args):
-    a, b, bias, c, _layout = args
+    c, _layout = args[-2:]
+    a, b, bias = reference_inputs(args[:-2])
     if c.dtype == a.dtype:
         if bias is None:
             torch.mm(a, b, out=c)
@@ -112,23 +184,26 @@ def make_triton_maxautotune_func():
 
 
 def func(*args):
-    a, b, bias, c, kwargs, layout = args
-    gemm(a, b, c, bias=bias, user_kwargs=kwargs, layout=layout)
+    a, b, bias, *scales, c, kwargs, layout = args
+    scale_kwargs = dict(zip(("scale_a", "scale_b"), scales))
+    gemm(a, b, c, bias=bias, user_kwargs=kwargs, layout=layout, **scale_kwargs)
 
 
 def tensor_nbytes(tensors: torch.Tensor):
     return sum(t.numel() * t.element_size() for t in tensors if t is not None)
 
 
-def get_rotary_inputs(sample_inputs: torch.Tensor, sample_outputs: torch.Tensor):
+def get_rotary_inputs(sample_inputs, sample_outputs, sample_ref_inputs):
     global ROTARY_INPUTS_TARGET_BYTES
-    slot_bytes = 2 * (tensor_nbytes(sample_inputs) + tensor_nbytes(sample_outputs))
+    slot_bytes = (
+        tensor_nbytes(sample_inputs) + tensor_nbytes(sample_ref_inputs)
+        + 2 * tensor_nbytes(sample_outputs)
+    )
     rotary_inputs = ROTARY_INPUTS_TARGET_BYTES // slot_bytes
     return max(1, int(rotary_inputs))
 
 
-def check_acc(args: _TestArgs):
-    _skip_unsupported_accuracy_layout(args)
+def gemm_kwargs(args: _TestArgs):
     kwargs = {
         "block_m": args.block_m,
         "block_n": args.block_n,
@@ -141,18 +216,40 @@ def check_acc(args: _TestArgs):
         "use_half_tile_interleaved": args.use_half_tile_interleaved,
         "split_k": args.split_k,
     }
+    if args.is_mxfp:
+        min_block_k = 128 * args.k_waves
+        if args.block_k < min_block_k:
+            pytest.skip(f"MXFP requires block_k >= {min_block_k} for k_waves={args.k_waves}; got {args.block_k}")
+        validation_kwargs = {
+            **kwargs,
+            "in_dtype_id": GEMM_DTYPE_MXFP8 if args.dtype == torch.float8_e4m3fn else GEMM_DTYPE_MXFP4,
+            "out_dtype_id": GEMM_DTYPE_FP32 if args.out_dtype == torch.float32 else GEMM_DTYPE_BF16,
+            "a_is_transposed": args.layout[0] == "t",
+            "b_is_transposed": args.layout[1] == "t",
+            "has_bias": args.has_bias,
+        }
+        if make_gemm_param_and_validate(args.m, args.n, args.k, validation_kwargs) is None:
+            pytest.skip(f"MXFP shape/policy unsupported: {args}")
+    return kwargs
+
+
+def check_acc(args: _TestArgs):
+    skip_unsupported_accuracy_layout(args)
+    kwargs = gemm_kwargs(args)
     inputs = create_inputs(args)
     outputs = create_outputs(args)
     ref_outputs = create_outputs(args)
     inouts = inputs + outputs
-    ref_inouts = inputs + ref_outputs
+    ref_inouts = reference_inputs(inputs) + ref_outputs
     maxdiff_out_ = []
 
     def get_tol(args):
         k_scale = (args.k / 8192) ** 0.5
         k_scale *= args.split_k * args.k_waves
         atol_scale = 1.5 if args.has_bias else 1.0
-        if args.dtype is torch.bfloat16:
+        if args.is_mxfp and args.out_dtype == torch.float32:
+            return 2e-4 * max(1.0, k_scale), 2e-4
+        if args.dtype is torch.bfloat16 or args.is_mxfp:
             return 2e-1 * k_scale * atol_scale, 2e-1
         return 5e-2 * k_scale * atol_scale, 5e-2
 
@@ -175,29 +272,24 @@ def check_acc(args: _TestArgs):
 
 
 def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
-    kwargs = {
-        "block_m": args.block_m,
-        "block_n": args.block_n,
-        "block_k": args.block_k,
-        "stages": args.stages,
-        "m_waves": args.m_waves,
-        "n_waves": args.n_waves,
-        "k_waves": args.k_waves,
-        "group_m": args.group_m,
-        "use_half_tile_interleaved": args.use_half_tile_interleaved,
-        "split_k": args.split_k,
-    }
+    kwargs = gemm_kwargs(args)
     sample_inputs = create_inputs(args)
     sample_outputs = create_outputs(args)
-    rotary_inputs = get_rotary_inputs(sample_inputs, sample_outputs)
+    sample_ref_inputs = reference_inputs(create_inputs(args))
+    rotary_inputs = get_rotary_inputs(sample_inputs, sample_outputs, sample_ref_inputs)
     inputs = [sample_inputs] + [create_inputs(args) for _ in range(rotary_inputs - 1)]
-    ref_inputs = [create_inputs(args) for _ in range(rotary_inputs)]
+    # MXFP benchmarks compare with decoded FP32 GEMM; decoding is NOT timed.
+    ref_inputs = [sample_ref_inputs] + [
+        reference_inputs(create_inputs(args)) for _ in range(rotary_inputs - 1)
+    ]
     outputs = [sample_outputs] + [
         create_outputs(args) for _ in range(rotary_inputs - 1)
     ]
     ref_outputs = [create_outputs(args) for _ in range(rotary_inputs)]
     triton_maxautotune_func = make_triton_maxautotune_func()
     global ROTARY_INPUTS_TARGET_BYTES
+    if args.is_mxfp:
+        print(f"MXFP policy: {args}; torch/Triton baseline: decoded FP32 GEMM")
     print(
         f"rotary_inputs:{rotary_inputs}, target_bytes:{ROTARY_INPUTS_TARGET_BYTES}, "
         f"warmup:{warmup}, niters:{niters}"
@@ -251,13 +343,7 @@ def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
 
 
 @pytest.mark.parametrize("layout", ["nn", "nt", "tn", "tt"])
-@pytest.mark.parametrize(
-    "dtype",
-    [
-        "bf16",
-        "fp16",
-    ],
-)
+@pytest.mark.parametrize("dtype", list(DTYPES))
 @pytest.mark.parametrize(
     "m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, group_m, has_bias, is_hti",
     [
@@ -297,7 +383,7 @@ def test_gemm_acc_main_loop(
     has_bias: bool,
     is_hti: bool,
 ):
-    dtype = torch.bfloat16 if "bf16" in dtype else torch.half
+    dtype = DTYPES[dtype]
     args = _TestArgs(
         dtype,
         m,
@@ -319,7 +405,7 @@ def test_gemm_acc_main_loop(
 
 
 @pytest.mark.parametrize("layout", ["nn", "nt", "tn", "tt"])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("dtype", DTYPES.values(), ids=DTYPES)
 @pytest.mark.parametrize(
     "m, n, k, block_m, block_n, block_k, stages, split_k, "
     "m_waves, n_waves, k_waves, has_bias, group_m, "
@@ -487,7 +573,9 @@ def test_gemm_acc_split_k(
         # fmt: on
     ],
 )
+@pytest.mark.parametrize("dtype", [torch.bfloat16, *MXFP_DTYPES], ids=["bf16", "mxfp8", "mxfp4"])
 def test_gemm_acc_tuned_policies(
+    dtype: torch.dtype,
     m: int,
     n: int,
     k: int,
@@ -504,7 +592,7 @@ def test_gemm_acc_tuned_policies(
     layout: str,
 ):
     args = _TestArgs(
-        dtype=torch.bfloat16,
+        dtype=dtype,
         m=m,
         n=n,
         k=k,
@@ -525,7 +613,7 @@ def test_gemm_acc_tuned_policies(
 
 
 @pytest.mark.parametrize("layout", ["nn", "nt", "tn", "tt"])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("dtype", DTYPES.values(), ids=DTYPES)
 @pytest.mark.parametrize("has_bias", [False, True])
 @pytest.mark.parametrize(
     "split_k, use_half_tile_interleaved",
@@ -561,13 +649,7 @@ def test_gemm_acc_fp32_output(
 
 
 @pytest.mark.parametrize("layout", ["nn", "nt", "tn", "tt"])
-@pytest.mark.parametrize(
-    "dtype",
-    [
-        "bf16",
-        "fp16",
-    ],
-)
+@pytest.mark.parametrize("dtype", list(DTYPES))
 @pytest.mark.parametrize(
     "m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, group_m, has_bias, is_hti",
     [
@@ -594,7 +676,7 @@ def test_gemm_acc_small_m(
     has_bias: bool,
     is_hti: bool,
 ):
-    dtype = torch.bfloat16 if "bf16" in dtype else torch.half
+    dtype = DTYPES[dtype]
     args = _TestArgs(
         dtype,
         m,
@@ -616,13 +698,7 @@ def test_gemm_acc_small_m(
 
 
 @pytest.mark.parametrize("layout", ["nn", "nt", "tn", "tt"])
-@pytest.mark.parametrize(
-    "dtype",
-    [
-        "bf16",
-        "fp16",
-    ],
-)
+@pytest.mark.parametrize("dtype", list(DTYPES))
 @pytest.mark.parametrize(
     "m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, group_m, has_bias, is_hti",
     [
@@ -664,7 +740,7 @@ def test_gemm_acc_bench(
     has_bias: bool,
     is_hti: bool,
 ):
-    dtype = torch.bfloat16 if "bf16" in dtype else torch.half
+    dtype = DTYPES[dtype]
     args = _TestArgs(
         dtype,
         m,
@@ -683,6 +759,225 @@ def test_gemm_acc_bench(
         layout,
     )
     check_acc(args)
+
+
+
+@pytest.mark.parametrize(
+    "overrides, fence_before_load",
+    [
+        ({"in_dtype_id": GEMM_DTYPE_MXFP8, "block_k": 128}, True),
+        ({}, False),
+        ({"has_bias": True}, False),
+        ({"group_m": 4}, False),
+        ({"split_k": 2}, True),
+        ({"use_half_tile_interleaved": False}, True),
+        ({"block_m": 128}, True),
+        ({"block_k": 128}, True),
+        ({"n_waves": 2}, True),
+        ({"a_is_transposed": True}, True),
+        ({"b_is_transposed": False}, True),
+    ],
+)
+def test_gemm_fence_before_load_policy(monkeypatch, overrides, fence_before_load):
+    import kernels.gemm_gfx950 as kernel
+
+    monkeypatch.setattr(kernel, "get_rocm_arch", lambda: "gfx950")
+    param = kernel.make_gemm_gfx950_param(**{
+        "in_dtype_id": GEMM_DTYPE_MXFP4,
+        "out_dtype_id": GEMM_DTYPE_BF16,
+        "block_m": 256, "block_n": 256, "block_k": 256,
+        "m_waves": 2, "n_waves": 4, "use_half_tile_interleaved": True,
+        **overrides,
+    })
+    assert param.fence_before_load is fence_before_load
+    peer = kernel.GemmGfx950Param(**{
+        **{name: getattr(param, name) for name in kernel.GemmGfx950Param.__annotations__},
+        "fence_before_load": not fence_before_load,
+    })
+    assert peer.__cache_signature__() != param.__cache_signature__()
+
+
+@pytest.mark.parametrize("rows", [32, 64, 96, 128, 160])
+@pytest.mark.parametrize("storage_k", [32, 64, 96, 128, 192, 256, 320, 384, 448, 512])
+@pytest.mark.parametrize("is_transposed", [False, True])
+def test_gemm_mxfp_lds_swizzle_mapping(rows, storage_k, is_transposed):
+    import flydsl.expr as fx
+    from flydsl._mlir import ir
+    from kernels.gemm_gfx950 import make_mxfp_lds_layout
+
+    # Check the actual layout, including non-power-of-two row/K extents.
+    with ir.Context(), ir.Location.unknown():
+        module = ir.Module.create()
+        with ir.InsertionPoint(module.body):
+            layout = make_mxfp_lds_layout(rows, storage_k, is_transposed)
+            extent = rows if is_transposed else storage_k
+
+            def address(offset):
+                row, col = (
+                    (offset % rows, offset // rows) if is_transposed
+                    else (offset // storage_k, offset % storage_k)
+                )
+                return fx.get_scalar(fx.crd2idx((row, col), layout))
+
+            for offset in range(0, rows * storage_k, 16):
+                mapped = address(offset)
+                # Loader keeps the outer coordinate and inverts within the row.
+                assert mapped // extent == offset // extent
+                assert mapped % 16 == 0
+                assert address(mapped) == offset
+                assert address(offset + 15) == mapped + 15
+
+
+@pytest.mark.parametrize("dtype", MXFP_DTYPES, ids=["mxfp8", "mxfp4"])
+@pytest.mark.parametrize("layout", ["nn", "nt", "tn", "tt"])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    "block_m, block_n, block_k, m_waves, n_waves, k_waves, is_hti",
+    [
+        (96, 96, 384, 3, 1, 1, False),
+        (160, 32, 640, 5, 1, 1, False),
+        # Both contiguous/transpose paths, including HTI halves and slice-K.
+        (128, 192, 384, 2, 3, 1, True),
+        (96, 96, 384, 1, 1, 3, False),
+    ],
+)
+def test_gemm_mxfp_non_power_of_two_k(
+    dtype, layout, out_dtype, block_m, block_n, block_k,
+    m_waves, n_waves, k_waves, is_hti,
+):
+    args = _TestArgs(
+        dtype=dtype, m=block_m, n=block_n, k=block_k * 2,
+        block_m=block_m, block_n=block_n, block_k=block_k, stages=2,
+        m_waves=m_waves, n_waves=n_waves, k_waves=k_waves, group_m=0,
+        has_bias=False, use_half_tile_interleaved=is_hti,
+        layout=layout, out_dtype=out_dtype,
+    )
+    check_acc(args)
+
+
+@pytest.mark.parametrize("dtype", MXFP_DTYPES, ids=["mxfp8", "mxfp4"])
+@pytest.mark.parametrize("layout", ["nn", "nt", "tn", "tt"])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    "block_m, block_n, block_k, n_waves, k, split_k, has_bias",
+    [
+        # Short partition, exact chunk, chunk-slot reuse, and partial final chunk.
+        (128, 128, 128, 2, 512, 2, False),
+        (128, 128, 128, 2, 1024, 1, True),
+        (64, 64, 256, 2, 7168, 1, False),
+        (64, 64, 256, 2, 3072, 2, True),
+        # Unequal A/B scale sizes and larger MMA repeats.
+        (64, 128, 256, 2, 6144, 3, True),
+        (64, 256, 256, 2, 6144, 3, False),
+        (128, 128, 256, 4, 6144, 3, False),
+        # FP4 large-tile pre-load fence policy, with and without bias.
+        (256, 256, 256, 4, 3072, 1, False),
+        (256, 256, 256, 4, 3072, 1, True),
+    ],
+)
+def test_gemm_mxfp_hti_scales(
+    dtype, layout, out_dtype, block_m, block_n, block_k, n_waves, k, split_k, has_bias,
+):
+    args = _TestArgs(
+        dtype=dtype, m=80, n=112, k=k,
+        block_m=block_m, block_n=block_n, block_k=block_k, stages=2,
+        m_waves=2, n_waves=n_waves, k_waves=1, group_m=0,
+        has_bias=has_bias, use_half_tile_interleaved=True,
+        layout=layout, split_k=split_k, out_dtype=out_dtype,
+    )
+    kwargs = gemm_kwargs(args)
+    assert kwargs["use_half_tile_interleaved"]  # Must not fall back to full-tile.
+    a, b, bias, sa, sb = create_inputs(args)
+
+    def pad(tensor, is_t, alignment):
+        data = tensor.view(torch.uint8)
+        data = data.t() if is_t else data
+        storage = torch.empty(
+            (data.shape[0] + 1, data.shape[1] + alignment), dtype=torch.uint8, device=data.device,
+        )
+        padded = storage[1:, alignment:]
+        padded.copy_(data)
+        return (padded.t() if is_t else padded).view(tensor.dtype)
+
+    out = create_outputs(args)[0]
+    ref = create_outputs(args)[0]
+    ref_func(a, b, bias, sa, sb, ref, layout)
+    # Reuse one compiled policy with dense and offset/padded dynamic strides.
+    inputs = [
+        (a, b, bias, sa, sb),
+        (pad(a, layout[0] == "t", 16), pad(b, layout[1] == "t", 16), bias,
+         pad(sa, False, 4), pad(sb, False, 4)),
+    ]
+    for tensors in inputs:
+        for _ in range(3):
+            out.fill_(float("nan"))
+            func(*tensors, out, kwargs, layout)
+            torch.testing.assert_close(
+                out, ref,
+                atol=2e-3 if out_dtype == torch.float32 else 2e-1 * split_k,
+                rtol=2e-4 if out_dtype == torch.float32 else 2e-2,
+            )
+
+@pytest.mark.parametrize("dtype", MXFP_DTYPES, ids=["mxfp8", "mxfp4"])
+@pytest.mark.parametrize("layout", ["nn", "nt", "tn", "tt"])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    "block_m, block_n, block_k, n_waves, k_waves, stages, k, split_k, has_bias",
+    [
+        (64, 64, 256, 2, 1, 2, 256, 1, False),
+        (64, 64, 256, 2, 1, 2, 512, 1, True),
+        (64, 64, 256, 2, 2, 2, 1536, 3, False),
+        (128, 128, 128, 2, 1, 2, 1024, 2, False),
+        (256, 256, 256, 4, 1, 2, 3072, 1, False),
+        (256, 256, 256, 4, 1, 2, 3072, 1, True),
+        # Inline DMA waits must include scales for every outstanding stage.
+        (64, 64, 256, 2, 1, 3, 512, 1, False),
+        (64, 64, 256, 2, 1, 4, 768, 1, False),
+        (64, 64, 256, 2, 2, 3, 1536, 3, False),
+        (64, 64, 256, 2, 2, 4, 6144, 2, False),
+    ],
+)
+def test_gemm_mxfp_ft_waits(
+    dtype, layout, out_dtype, block_m, block_n, block_k, n_waves, k_waves, stages, k, split_k, has_bias,
+):
+    args = _TestArgs(
+        dtype=dtype, m=80, n=112, k=k,
+        block_m=block_m, block_n=block_n, block_k=block_k, stages=stages,
+        m_waves=2, n_waves=n_waves, k_waves=k_waves, group_m=0,
+        has_bias=has_bias, use_half_tile_interleaved=False,
+        layout=layout, split_k=split_k, out_dtype=out_dtype,
+    )
+    kwargs = gemm_kwargs(args)
+    a, b, bias, sa, sb = create_inputs(args)
+
+    def pad(tensor, is_t, alignment):
+        data = tensor.view(torch.uint8)
+        data = data.t() if is_t else data
+        storage = torch.empty(
+            (data.shape[0] + 1, data.shape[1] + alignment), dtype=torch.uint8, device=data.device,
+        )
+        padded = storage[1:, alignment:]
+        padded.copy_(data)
+        return (padded.t() if is_t else padded).view(tensor.dtype)
+
+    out = create_outputs(args)[0]
+    ref = create_outputs(args)[0]
+    ref_func(a, b, bias, sa, sb, ref, layout)
+    # Reuse one compiled policy with dense and offset/padded dynamic strides.
+    inputs = [
+        (a, b, bias, sa, sb),
+        (pad(a, layout[0] == "t", 16), pad(b, layout[1] == "t", 16), bias,
+         pad(sa, False, 4), pad(sb, False, 4)),
+    ]
+    for tensors in inputs:
+        for _ in range(3):
+            out.fill_(float("nan"))
+            func(*tensors, out, kwargs, layout)
+            torch.testing.assert_close(
+                out, ref,
+                atol=2e-3 if out_dtype == torch.float32 else 2e-1 * split_k,
+                rtol=2e-4 if out_dtype == torch.float32 else 2e-2,
+            )
 
 
 @pytest.mark.parametrize("layout", ["nn", "nt", "tn", "tt"])
@@ -767,9 +1062,10 @@ def test_gemm_padded_stride_and_storage_offset(
 
 
 @pytest.mark.parametrize("split_k", [1, 2])
-def test_gemm_fp32_slice_k_without_bias(split_k: int):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, *MXFP_DTYPES], ids=["bf16", "mxfp8", "mxfp4"])
+def test_gemm_fp32_slice_k_without_bias(dtype: torch.dtype, split_k: int):
     args = _TestArgs(
-        dtype=torch.bfloat16,
+        dtype=dtype,
         m=64,
         n=128,
         k=2048,
@@ -842,7 +1138,7 @@ def test_gemm_rejects_unsupported_input_strides(operand: str, layout: str):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_gemm_rejects_unaligned_m_for_column_major_a(dtype: torch.dtype):
-    a_vec_size = _a_dma_vec_size(dtype)
+    a_vec_size = a_dma_vec_size(dtype)
     m = a_vec_size + 1
     n = 64
     k = 256
@@ -888,9 +1184,10 @@ def test_gemm_host_bias_contiguity_fallback():
 
 
 @pytest.mark.parametrize("n", [4096, 4032])
-def test_gemm_block_swizzle_boundary_paths(n: int):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, *MXFP_DTYPES], ids=["bf16", "mxfp8", "mxfp4"])
+def test_gemm_block_swizzle_boundary_paths(dtype: torch.dtype, n: int):
     args = _TestArgs(
-        dtype=torch.bfloat16,
+        dtype=dtype,
         m=320,
         n=n,
         k=256,
@@ -909,9 +1206,10 @@ def test_gemm_block_swizzle_boundary_paths(n: int):
     check_acc(args)
 
 
-def test_gemm_slice_k_four_waves():
+@pytest.mark.parametrize("dtype", [torch.bfloat16, *MXFP_DTYPES], ids=["bf16", "mxfp8", "mxfp4"])
+def test_gemm_slice_k_four_waves(dtype: torch.dtype):
     args = _TestArgs(
-        dtype=torch.bfloat16,
+        dtype=dtype,
         m=64,
         n=128,
         k=1024,
@@ -1049,7 +1347,9 @@ def test_gemm_rejects_unsupported_k_partitioning(
         # fmt: on
     ],
 )
+@pytest.mark.parametrize("dtype", [torch.bfloat16, *MXFP_DTYPES], ids=["bf16", "mxfp8", "mxfp4"])
 def test_gemm_hti_split_k_benchmark(
+    dtype: torch.dtype,
     m: int,
     n: int,
     k: int,
@@ -1065,7 +1365,7 @@ def test_gemm_hti_split_k_benchmark(
     has_bias: bool,
 ):
     args = _TestArgs(
-        dtype=torch.bfloat16,
+        dtype=dtype,
         m=m,
         n=n,
         k=k,
@@ -1086,7 +1386,7 @@ def test_gemm_hti_split_k_benchmark(
 
 
 @pytest.mark.parametrize("layout", ["nn", "nt", "tn", "tt"])
-@pytest.mark.parametrize("dtype", ["bf16"])
+@pytest.mark.parametrize("dtype", ["bf16", "mxfp8", "mxfp4"])
 @pytest.mark.parametrize(
     "m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, group_m, has_bias, is_hti",
     [
@@ -1128,7 +1428,7 @@ def test_gemm_benchmark_smoke(
     has_bias: bool,
     is_hti: bool,
 ):
-    dtype = torch.bfloat16 if "bf16" in dtype else torch.half
+    dtype = DTYPES[dtype]
     args = _TestArgs(
         dtype,
         m,
