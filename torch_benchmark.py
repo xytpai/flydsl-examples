@@ -1,4 +1,5 @@
 import argparse
+import ast
 import json
 import statistics
 from pathlib import Path
@@ -339,6 +340,70 @@ def cuda_graph_bench(fn, inputs, warmup, reps, rounds, check):
     return ms
 
 
+def get_kernel_info(codes):
+    """Read called entries and static tuning config from the final wrappers."""
+    kernels = {}
+    config_keys = {
+        "TILE_M", "TILE_N", "TILE_K", "STAGES", "M_WAVES", "N_WAVES",
+        "GROUP_M", "USE_HALF_TILE_INTERLEAVED", "BLOCK_M", "BLOCK_N", "BLOCK_K",
+        "matrix_instr_nonkdim", "waves_per_eu", "kpack",
+    }
+    error = None
+    try:
+        for code in codes:
+            tree = ast.parse(code)
+            definitions = {
+                node.targets[0].id: node.value
+                for node in tree.body
+                if isinstance(node, ast.Assign)
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Call)
+                and ast.unparse(node.value.func) in (
+                    "async_compile.flydsl", "async_compile.triton",
+                )
+            }
+            calls = sorted(
+                (node for node in ast.walk(tree) if isinstance(node, ast.Call)),
+                key=lambda node: (node.lineno, node.col_offset),
+            )
+            for call in calls:
+                func = ast.unparse(call.func)
+                if func.endswith(".run") and func[:-4] in definitions:
+                    definition = definitions[func[:-4]]
+                    name = ast.literal_eval(definition.args[0])
+                    source = ast.parse(ast.literal_eval(definition.args[1]))
+                    cfg = {}
+                    for node in ast.walk(source):
+                        if (isinstance(node, ast.AnnAssign)
+                                and isinstance(node.target, ast.Name)
+                                and node.target.id in config_keys
+                                and isinstance(node.value, ast.Constant)):
+                            cfg[node.target.id] = node.value.value
+                        elif (isinstance(node, ast.keyword)
+                              and node.arg in ("num_warps", "num_stages")
+                              and isinstance(node.value, ast.Constant)):
+                            cfg[node.arg] = node.value.value
+                    kernels[name] = cfg
+                elif func in (
+                    "extern_kernels.mm", "extern_kernels.addmm",
+                    "torch.ops.aten._scaled_mm_v2.default",
+                    "aten._scaled_mm_v2.default",
+                ):
+                    # The library's internal GPU kernel is not exposed here.
+                    kernels[func] = {}
+        if not kernels:
+            error = "No supported kernel calls found in generated wrapper"
+    except (SyntaxError, ValueError, TypeError, IndexError) as exc:
+        kernels.clear()
+        error = repr(exc)
+    return {
+        "kernel_name": "; ".join(kernels) or None,
+        "kernel_config": kernels,
+        "kernel_name_source": "inductor_wrapper",
+        "kernel_name_error": error,
+    }
+
+
 def run_case(backend, m, n, k, args):
     torch._dynamo.reset()
     torch.cuda.empty_cache()
@@ -372,11 +437,11 @@ def run_case(backend, m, n, k, args):
         config["max_autotune_gemm_search_space"] = args.search_space
     with inductor_config.patch(**config):
         compiled = torch.compile(fn, backend="inductor")
+        from torch._inductor.utils import run_and_get_code
+
+        result, codes = run_and_get_code(compiled, *inputs)
         selected_backend = backend
         if is_mxfp:
-            from torch._inductor.utils import run_and_get_code
-
-            result, codes = run_and_get_code(compiled, *inputs)
             code = "\n".join(codes)
             selected_backend = (
                 "flydsl" if "async_compile.flydsl" in code
@@ -389,10 +454,9 @@ def run_case(backend, m, n, k, args):
                     f"requested {backend}, but MXFP lowered to {selected_backend}; "
                     "refusing to report fallback performance as the requested backend"
                 )
-        else:
-            result = compiled(*inputs)
         # A failed correctness check must not produce performance numbers.
         check(result)
+        kernel_info = get_kernel_info(codes)
         e2e_ms = e2e_bench(
             compiled, inputs, args.warmup, args.reps, args.rounds, check,
         )
@@ -410,6 +474,7 @@ def run_case(backend, m, n, k, args):
     return {
         "backend": backend,
         "selected_backend": selected_backend,
+        **kernel_info,
         "m": m,
         "n": n,
         "k": k,
@@ -477,7 +542,8 @@ def main():
     header = (
         f"{'Backend':<8} {'Shape (M/N/K)':<28} {'DType':<10} {'Accuracy':<8} "
         f"{'E2E ms':>10} {'E2E TFLOPS':>12} "
-        f"{'Graph ms':>10} {'Graph TFLOPS':>13} {'Max diff':>11}  Error"
+        f"{'Graph ms':>10} {'Graph TFLOPS':>13} {'Max diff':>11}  "
+        f"{'Kernel name / config':<40}  Error"
     )
     print(header)
     print("-" * len(header))
@@ -495,6 +561,7 @@ def main():
                         "k": k,
                         "dtype": args.dtype,
                         "ok": False,
+                        "kernel_name": None,
                         "error": repr(exc),
                     }
                 f.write(json.dumps(row, sort_keys=True) + "\n")
@@ -528,14 +595,20 @@ def main():
                     if row.get("float_max_diff") is not None
                     else "-"
                 )
-                error = row.get("error") or row.get("graph_error") or ""
+                kernel_name = row.get("kernel_name") or "-"
+                if row.get("kernel_config"):
+                    kernel_name = "; ".join(
+                        name + (" [" + ", ".join(f"{k}={v}" for k, v in cfg.items()) + "]" if cfg else "")
+                        for name, cfg in row["kernel_config"].items()
+                    )
+                error = row.get("error") or row.get("graph_error") or row.get("kernel_name_error") or ""
                 shape = f"M={m} N={n} K={k}"
                 print(
                     f"{backend.upper():<8} {shape:<28} "
                     f"{args.dtype:<10} {accuracy:<8} "
                     f"{e2e_ms:>10} {e2e_tflops:>12} "
                     f"{graph_ms:>10} {graph_tflops:>13} "
-                    f"{max_diff:>11}  {error}",
+                    f"{max_diff:>11}  {kernel_name:<40}  {error}",
                     flush=True,
                 )
 
