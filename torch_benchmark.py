@@ -543,7 +543,7 @@ def main():
         f"{'Backend':<8} {'Shape (M/N/K)':<28} {'DType':<10} {'Accuracy':<8} "
         f"{'E2E ms':>10} {'E2E TFLOPS':>12} "
         f"{'Graph ms':>10} {'Graph TFLOPS':>13} {'Max diff':>11}  "
-        f"{'Kernel name / config':<40}  Error"
+        "Config"
     )
     print(header)
     print("-" * len(header))
@@ -595,22 +595,26 @@ def main():
                     if row.get("float_max_diff") is not None
                     else "-"
                 )
-                kernel_name = row.get("kernel_name") or "-"
-                if row.get("kernel_config"):
-                    kernel_name = "; ".join(
-                        name + (" [" + ", ".join(f"{k}={v}" for k, v in cfg.items()) + "]" if cfg else "")
-                        for name, cfg in row["kernel_config"].items()
-                    )
-                error = row.get("error") or row.get("graph_error") or row.get("kernel_name_error") or ""
+                config_text = "; ".join(
+                    ", ".join(f"{k}={v}" for k, v in cfg.items()) or "-"
+                    for cfg in row.get("kernel_config", {}).values()
+                ) or "-"
                 shape = f"M={m} N={n} K={k}"
                 print(
                     f"{backend.upper():<8} {shape:<28} "
                     f"{args.dtype:<10} {accuracy:<8} "
                     f"{e2e_ms:>10} {e2e_tflops:>12} "
                     f"{graph_ms:>10} {graph_tflops:>13} "
-                    f"{max_diff:>11}  {kernel_name:<40}  {error}",
+                    f"{max_diff:>11}  {config_text}",
                     flush=True,
                 )
+                for field, label in (
+                    ("error", "Error"),
+                    ("graph_error", "Graph warning"),
+                    ("kernel_name_error", "Config warning"),
+                ):
+                    if row.get(field):
+                        print(f"  {label}: {row[field]}", flush=True)
 
 
 if __name__ == "__main__":
