@@ -496,12 +496,27 @@ def run_case(backend, m, n, k, args):
     }
 
 
+def parse_backends(value):
+    backends = [name.strip() for name in value.split(",")]
+    if backends == ["all"]:
+        return list(BACKEND_PATCHES)
+    if any(name not in BACKEND_PATCHES for name in backends):
+        raise argparse.ArgumentTypeError(
+            "expected aten, triton, flydsl, or a comma-separated combination; "
+            "all must be used alone"
+        )
+    return list(dict.fromkeys(backends))
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--backend",
-        choices=["aten", "triton", "flydsl", "all"],
+        type=parse_backends,
         default="all",
+        metavar="BACKENDS",
+        help="aten, triton, flydsl, a comma-separated combination (e.g. flydsl,aten), "
+             "or all (default); runs in the given order, ignoring duplicates",
     )
     parser.add_argument("--output", default="./temp")
     parser.add_argument("--warmup", type=int, default=10)
@@ -534,7 +549,7 @@ def main():
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    backends = ["aten", "triton", "flydsl"] if args.backend == "all" else [args.backend]
+    backends = args.backend
     if args.shape_index is not None and not 0 <= args.shape_index < len(SHAPES):
         parser.error(f"--shape-index must be between 0 and {len(SHAPES) - 1}")
     shapes = SHAPES if args.shape_index is None else [SHAPES[args.shape_index]]
