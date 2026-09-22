@@ -7,6 +7,34 @@ from unittest import mock
 import torch
 import torch._dynamo
 import torch._inductor.config as inductor_config
+import torch.nn.functional as F
+
+
+# Reference GEMM throughput in TFLOP/s on MI355X (gfx950). Empty cells were not measured.
+# BF16: pytorch#190903 graph replay (ATen default, Triton/FlyDSL EXHAUSTIVE).
+# MXFP8/MXFP4: pytorch#196719 (ATen vs FlyDSL).
+# | M | N | K | BF16 ATen | BF16 Triton | BF16 FlyDSL | MXFP8 ATen | MXFP8 FlyDSL | MXFP4 ATen | MXFP4 FlyDSL |
+# |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+# | 8 | 4096 | 4096 | 22.8 | 20.6 | 22.9 |  |  |  |  |
+# | 16 | 4096 | 4096 | 43.6 | 39.2 | 45.9 |  |  |  |  |
+# | 32 | 4096 | 4096 | 72.6 | 69.3 | 85.2 | 31.3 | 69.8 | 39.4 | 99.6 |
+# | 64 | 4096 | 4096 | 112.7 | 120.3 | 160.3 | 70.4 | 135.7 | 103.1 | 190.2 |
+# | 128 | 4096 | 4096 | 188.0 | 181.2 | 246.1 | 138.5 | 240.7 | 187.4 | 406.0 |
+# | 256 | 4096 | 4096 | 364.0 | 310.1 | 434.9 | 293.3 | 412.2 | 468.1 | 698.0 |
+# | 512 | 4096 | 4096 | 539.4 | 509.8 | 598.6 | 459.3 | 634.6 | 677.7 | 1127.5 |
+# | 1024 | 4096 | 4096 | 747.8 | 782.7 | 842.2 | 729.3 | 1057.5 | 1075.6 | 1662.4 |
+# | 2048 | 4096 | 4096 | 706.3 | 953.1 | 1126.5 | 1129.5 | 1559.7 | 1540.5 | 2281.6 |
+# | 4096 | 4096 | 4096 | 1379.2 | 1161.8 | 1384.1 | 1321.9 | 2114.7 | 2244.2 | 3030.1 |
+# | 4096 | 4096 | 8192 | 1514.9 | 1238.5 | 1491.5 | 1505.1 | 2484.4 | 2809.4 | 3679.7 |
+# | 8192 | 8192 | 8192 | 1571.2 | 1240.6 | 1540.9 | 1369.7 | 2804.0 | 3110.0 | 4155.1 |
+# | 32 | 14336 | 4096 | 148.0 | 141.5 | 166.7 | 94.7 | 192.7 | 111.3 | 329.6 |
+# | 16 | 28672 | 4096 | 77.8 | 100.6 | 101.6 |  |  |  |  |
+# | 32 | 28672 | 4096 |  |  |  | 180.8 | 271.1 | 204.6 | 487.7 |
+# | 4096 | 256 | 4096 | 385.2 | 378.4 | 415.0 | 298.8 | 406.1 | 505.8 | 691.8 |
+# | 4096 | 4096 | 256 |  |  |  | 304.0 | 400.6 | 343.4 | 566.6 |
+# | 4096 | 4096 | 512 |  |  |  | 520.4 | 681.7 | 607.4 | 947.0 |
+# | 4096 | 4096 | 1024 |  |  |  | 810.7 | 1111.2 | 1043.2 | 1499.2 |
+# | 4096 | 4096 | 2048 |  |  |  | 1111.4 | 1637.7 | 1613.7 | 2266.2 |
 
 
 SHAPES = [
@@ -26,6 +54,11 @@ SHAPES = [
     (32, 14336, 4096),
     (16, 28672, 4096),
     (4096, 256, 4096),
+    (32, 28672, 4096),
+    (4096, 4096, 256),
+    (4096, 4096, 512),
+    (4096, 4096, 1024),
+    (4096, 4096, 2048),
 ]
 
 
@@ -52,11 +85,80 @@ BACKEND_PATCHES = {
 DTYPES = {
     "bfloat16": torch.bfloat16,
     "float16": torch.float16,
+    "mxfp8": torch.float8_e4m3fn,
+    "mxfp4": torch.float4_e2m1fn_x2,
 }
 
 
 def mm_nt(a, b):
     return torch.mm(a, b.t())
+
+
+def scaled_mm_nt(a, b, scale_a, scale_b):
+    # B is stored [N, storage_K], just as in mm_nt; scales are NOT transposed.
+    from torch.nn.functional import ScalingType, SwizzleType
+
+    return F.scaled_mm(
+        a, b.t(),
+        scale_a, ScalingType.BlockWise1x32,
+        scale_b, ScalingType.BlockWise1x32,
+        SwizzleType.NO_SWIZZLE, SwizzleType.NO_SWIZZLE,
+        output_dtype=torch.bfloat16,
+    )
+
+
+def decode_mxfp(data, scale):
+    if data.dtype == torch.float8_e4m3fn:
+        values = data.float()
+    else:
+        # Low nibble is the first logical K element.
+        packed = data.view(torch.uint8)
+        codes = torch.stack((packed & 15, packed >> 4), dim=-1).flatten(-2)
+        lut = torch.tensor(
+            [0., .5, 1., 1.5, 2., 3., 4., 6.,
+             -0., -.5, -1., -1.5, -2., -3., -4., -6.],
+            device=data.device,
+        )
+        values = lut[codes.long()]
+    exponents = scale.view(torch.uint8).float()
+    factors = torch.exp2(exponents - 127).repeat_interleave(32, dim=-1)
+    return values * factors
+
+
+def create_mxfp_inputs(m, n, k, mxfp_format, device="cuda"):
+    # The PR uses this quantizer. Import lazily so ordinary GEMM does not need
+    # PyTorch's internal quantization test utilities.
+    from torch.testing._internal.common_quantized import to_mxfp
+
+    scale_a, a = to_mxfp(torch.randn(m, k, device=device), format=mxfp_format)
+    scale_b, b = to_mxfp(torch.randn(n, k, device=device), format=mxfp_format)
+    a, b = a.contiguous(), b.contiguous()
+    scale_a, scale_b = scale_a.contiguous(), scale_b.contiguous()
+    # Compare against the actual quantized operands, NOT the pre-quantized input.
+    allow_tf32 = torch.backends.cuda.matmul.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        reference = decode_mxfp(a, scale_a) @ decode_mxfp(b, scale_b).t()
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+    return (a, b, scale_a, scale_b), reference
+
+
+def check_accuracy(result, reference, is_mxfp):
+    if not torch.isfinite(result).all().item():
+        raise AssertionError("GEMM output contains NaN or Inf")
+    diff = result.float() - reference.float()
+    max_diff = diff.abs().max().item()
+    relative_rms = (
+        diff.square().mean() / reference.float().square().mean().clamp_min(1e-20)
+    ).sqrt().item()
+    atol, rtol = (6e-2, 3e-2) if is_mxfp else (3e-2, 3e-2)
+    torch.testing.assert_close(
+        result.float(), reference.float(), atol=atol, rtol=rtol
+    )
+    if is_mxfp and relative_rms > .008:
+        raise AssertionError(f"MXFP relative RMS error {relative_rms} exceeds .008")
+    return max_diff, relative_rms
 
 
 def run_padded_stride_regression(args):
@@ -193,85 +295,134 @@ def tflops(m, n, k, ms):
     return 2.0 * m * n * k / (ms * 1.0e9)
 
 
-def e2e_bench(fn, a, b, warmup, reps, rounds):
+def e2e_bench(fn, inputs, warmup, reps, rounds, check):
     for _ in range(warmup):
-        fn(a, b)
+        fn(*inputs)
     torch.cuda.synchronize()
-    
+
     samples = []
     for _ in range(rounds):
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
         for _ in range(reps):
-            fn(a, b)
+            result = fn(*inputs)
         end.record()
         end.synchronize()
         samples.append(start.elapsed_time(end) / reps)
+        # Validate each timing round outside its event interval.
+        check(result)
     return statistics.median(samples)
 
 
-def cuda_graph_bench(fn, a, b, warmup, reps, rounds):
-    # Replaying a captured graph bypasses the backend's Python launch path.
-    # Comparing this with e2e_bench separates launch bubbles from GPU
-    # kernel execution.
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        graph_output = fn(a, b)
+def cuda_graph_bench(fn, inputs, warmup, reps, rounds, check):
+    # One call per graph, one input allocation (hot); this bypasses the compiled
+    # backend's Python launch path, but still measures graph replay launch gaps.
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            graph_output = fn(*inputs)
 
-    def replay(_a, _b):
+        # Guard against capture on the wrong stream / an empty graph.
+        graph_output.fill_(float("nan"))
         graph.replay()
-        return graph_output
+        check(graph_output)
 
-    return e2e_bench(replay, a, b, warmup, reps, rounds)
+        def replay(*_inputs):
+            graph.replay()
+            return graph_output
+
+        ms = e2e_bench(replay, inputs, warmup, reps, rounds, check)
+    torch.cuda.current_stream().wait_stream(stream)
+    return ms
 
 
 def run_case(backend, m, n, k, args):
     torch._dynamo.reset()
     torch.cuda.empty_cache()
-    dtype = DTYPES[args.dtype]
-    a = torch.randn((m, k), device="cuda", dtype=dtype)
-    b = torch.randn((n, k), device="cuda", dtype=dtype)
+    # Reuse the same random values for every backend at a given shape.
+    torch.manual_seed(args.seed)
+    is_mxfp = args.dtype in ("mxfp8", "mxfp4")
+    if is_mxfp:
+        inputs, ref = create_mxfp_inputs(m, n, k, args.dtype)
+        fn = scaled_mm_nt
+    else:
+        dtype = DTYPES[args.dtype]
+        a = torch.randn((m, k), device="cuda", dtype=dtype)
+        b = torch.randn((n, k), device="cuda", dtype=dtype)
+        inputs = (a, b)
+        fn = mm_nt
+        ref = mm_nt(a, b)
 
-    with inductor_config.patch(**BACKEND_PATCHES[backend]):
-        compiled = torch.compile(mm_nt, backend="inductor")
-        result = compiled(a, b)
+    metrics = {"float_max_diff": 0., "relative_rms": 0., "accuracy_checks": 0}
 
-    ref = mm_nt(a, b)
-    float_max_diff = (result.float() - ref.float()).abs().max().item()
-    ok = torch.allclose(result, ref, atol=3e-2, rtol=3e-2)
+    def check(result):
+        expected_dtype = torch.bfloat16 if is_mxfp else DTYPES[args.dtype]
+        if result.dtype != expected_dtype:
+            raise AssertionError(f"expected {expected_dtype} output, got {result.dtype}")
+        max_diff, relative_rms = check_accuracy(result, ref, is_mxfp)
+        metrics["float_max_diff"] = max(metrics["float_max_diff"], max_diff)
+        metrics["relative_rms"] = max(metrics["relative_rms"], relative_rms)
+        metrics["accuracy_checks"] += 1
 
-    e2e_ms = e2e_bench(
-        compiled,
-        a,
-        b,
-        warmup=args.warmup,
-        reps=args.reps,
-        rounds=args.rounds,
-    )
-    graph_error = None
-    try:
-        graph_ms = cuda_graph_bench(
-            compiled,
-            a,
-            b,
-            warmup=args.warmup,
-            reps=args.reps,
-            rounds=args.rounds,
+    config = dict(BACKEND_PATCHES[backend])
+    if args.search_space is not None:
+        config["max_autotune_gemm_search_space"] = args.search_space
+    with inductor_config.patch(**config):
+        compiled = torch.compile(fn, backend="inductor")
+        selected_backend = backend
+        if is_mxfp:
+            from torch._inductor.utils import run_and_get_code
+
+            result, codes = run_and_get_code(compiled, *inputs)
+            code = "\n".join(codes)
+            selected_backend = (
+                "flydsl" if "async_compile.flydsl" in code
+                else "triton" if "async_compile.triton" in code
+                else "aten" if "_scaled_mm_v2" in code
+                else "unknown"
+            )
+            if selected_backend != backend:
+                raise RuntimeError(
+                    f"requested {backend}, but MXFP lowered to {selected_backend}; "
+                    "refusing to report fallback performance as the requested backend"
+                )
+        else:
+            result = compiled(*inputs)
+        # A failed correctness check must not produce performance numbers.
+        check(result)
+        e2e_ms = e2e_bench(
+            compiled, inputs, args.warmup, args.reps, args.rounds, check,
         )
-    except Exception as exc:
-        graph_ms = None
-        graph_error = repr(exc)
+        graph_error = None
+        try:
+            graph_ms = cuda_graph_bench(
+                compiled, inputs, args.warmup, args.reps, args.rounds, check,
+            )
+        except AssertionError:
+            raise
+        except Exception as exc:
+            graph_ms = None
+            graph_error = repr(exc)
 
     return {
         "backend": backend,
+        "selected_backend": selected_backend,
         "m": m,
         "n": n,
         "k": k,
         "dtype": args.dtype,
-        "ok": bool(ok),
-        "float_max_diff": float_max_diff,
+        "output_dtype": str(torch.bfloat16 if is_mxfp else DTYPES[args.dtype]),
+        "op": "scaled_mm" if is_mxfp else "mm",
+        "layout": "nt",
+        "bias": False,
+        "seed": args.seed,
+        "search_space": config["max_autotune_gemm_search_space"],
+        "timing": "hot; CUDA events; one invocation per captured graph",
+        "ok": True,
+        **metrics,
         "e2e_ms": e2e_ms,
         "graph_ms": graph_ms,
         "graph_error": graph_error,
@@ -291,8 +442,16 @@ def main():
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--reps", type=int, default=50)
     parser.add_argument("--rounds", type=int, default=5)
-    parser.add_argument("--shape-index", type=int, default=None)
-    parser.add_argument("--dtype", choices=sorted(DTYPES), default="bfloat16")
+    parser.add_argument(
+        "--shape-index", type=int, default=None,
+        help="index in the shared SHAPES list for all dtypes",
+    )
+    parser.add_argument("--dtype", choices=list(DTYPES), default="bfloat16")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--search-space", choices=["DEFAULT", "EXHAUSTIVE"], default=None,
+        help="override the backend's default autotuning search space",
+    )
     parser.add_argument(
         "--padded-stride-regression",
         action="store_true",
@@ -300,13 +459,19 @@ def main():
     )
     args = parser.parse_args()
 
+    if args.warmup < 0 or args.reps <= 0 or args.rounds <= 0:
+        parser.error("warmup must be nonnegative; reps and rounds must be positive")
     if args.padded_stride_regression:
+        if args.dtype in ("mxfp8", "mxfp4"):
+            parser.error("--padded-stride-regression only supports bfloat16/float16")
         run_padded_stride_regression(args)
         return
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     backends = ["aten", "triton", "flydsl"] if args.backend == "all" else [args.backend]
+    if args.shape_index is not None and not 0 <= args.shape_index < len(SHAPES):
+        parser.error(f"--shape-index must be between 0 and {len(SHAPES) - 1}")
     shapes = SHAPES if args.shape_index is None else [SHAPES[args.shape_index]]
 
     header = (
