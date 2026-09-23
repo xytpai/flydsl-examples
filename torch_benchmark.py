@@ -1,9 +1,14 @@
 import argparse
 import ast
 import json
+import multiprocessing as mp
+import os
 import statistics
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from unittest import mock
+
+from tqdm import tqdm
 
 import torch
 import torch._dynamo
@@ -54,12 +59,33 @@ SHAPES = [
     (32, 14336, 4096),
     (16, 28672, 4096),
     (4096, 256, 4096),
+]
+
+
+# pytorch#196719 MXFP8 and MXFP4 suite. Same shapes for both formats.
+MXFP_SHAPES = [
+    (32, 4096, 4096),
+    (32, 14336, 4096),
     (32, 28672, 4096),
+    (64, 4096, 4096),
+    (128, 4096, 4096),
+    (256, 4096, 4096),
+    (512, 4096, 4096),
+    (1024, 4096, 4096),
+    (2048, 4096, 4096),
+    (4096, 256, 4096),
     (4096, 4096, 256),
     (4096, 4096, 512),
     (4096, 4096, 1024),
     (4096, 4096, 2048),
+    (4096, 4096, 4096),
+    (4096, 4096, 8192),
+    (8192, 8192, 8192),
 ]
+
+
+def shapes_for_dtype(dtype):
+    return MXFP_SHAPES if dtype in ("mxfp8", "mxfp4") else SHAPES
 
 
 BACKEND_PATCHES = {
@@ -403,8 +429,240 @@ def get_kernel_info(codes):
     }
 
 
-def run_case(backend, m, n, k, args):
-    torch._dynamo.reset()
+def _flydsl_compile_jobs(dtype, shapes, search_space):
+    """One job per distinct FlyDSL config, using a shape that config accepts."""
+    from torch._inductor.heuristics.template.flydsl import (
+        get_gemm_configs,
+        is_gemm_config_valid_for_shape,
+        is_gemm_config_worth_tuning,
+    )
+    from torch._inductor.kernel.vendored_templates.flydsl.kernels.gemm_gfx950 import (
+        GEMM_DTYPE_BF16,
+        GEMM_DTYPE_FP16,
+        GEMM_DTYPE_MXFP4,
+        GEMM_DTYPE_MXFP8,
+        infer_has_k_tail,
+    )
+
+    mxfp = dtype in ("mxfp8", "mxfp4")
+    dtype_id = {
+        "bfloat16": GEMM_DTYPE_BF16,
+        "float16": GEMM_DTYPE_FP16,
+        "mxfp8": GEMM_DTYPE_MXFP8,
+        "mxfp4": GEMM_DTYPE_MXFP4,
+    }[dtype]
+    out_dtype_id = GEMM_DTYPE_BF16 if mxfp else None
+    with inductor_config.patch(
+        max_autotune_gemm=True,
+        flydsl_enable_autotuning=True,
+        max_autotune_gemm_search_space=search_space or "EXHAUSTIVE",
+    ):
+        configs = get_gemm_configs(dtype if mxfp else None)
+    jobs = []
+    seen = set()
+    for m, n, k in shapes:
+        for cfg in configs:
+            if not is_gemm_config_worth_tuning(m, n, k, cfg):
+                continue
+            if not is_gemm_config_valid_for_shape(
+                m,
+                n,
+                k,
+                dtype_id,
+                cfg,
+                a_is_transposed=False,
+                b_is_transposed=True,
+                out_dtype_id=out_dtype_id,
+                has_bias=False,
+            ):
+                continue
+            tile_k = int(cfg["TILE_K"])
+            stages = int(cfg["STAGES"])
+            hti = bool(cfg.get("USE_HALF_TILE_INTERLEAVED", False))
+            key = (
+                dtype,
+                int(cfg["TILE_M"]),
+                int(cfg["TILE_N"]),
+                tile_k,
+                stages,
+                int(cfg["M_WAVES"]),
+                int(cfg["N_WAVES"]),
+                int(cfg["GROUP_M"]),
+                hti,
+                infer_has_k_tail(k, tile_k, stages, hti),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            jobs.append((dtype, m, n, k, cfg))
+    return jobs
+
+
+def _compile_flydsl_job(job):
+    """Compile one FlyDSL config. Runs in its own process."""
+    dtype_name, m, n, k, cfg = job
+    os.environ["COMPILE_ONLY"] = "1"
+    os.environ["FLYDSL_COMPILE_ONLY"] = "1"
+    try:
+        import flydsl.compiler as flyc
+
+        from torch._inductor.kernel.vendored_templates.flydsl.kernels.gemm_gfx950 import (
+            GEMM_DTYPE_BF16,
+            GEMM_DTYPE_FP16,
+            GEMM_DTYPE_MXFP4,
+            GEMM_DTYPE_MXFP8,
+            gemm_gfx950,
+            gemm_mxfp_gfx950,
+            infer_has_k_tail,
+            make_gemm_param_and_validate,
+        )
+
+        torch.cuda.set_device(0)
+        dtype_id = {
+            "bfloat16": GEMM_DTYPE_BF16,
+            "float16": GEMM_DTYPE_FP16,
+            "mxfp8": GEMM_DTYPE_MXFP8,
+            "mxfp4": GEMM_DTYPE_MXFP4,
+        }[dtype_name]
+        mxfp = dtype_name in ("mxfp8", "mxfp4")
+        tile_k = int(cfg["TILE_K"])
+        stages = int(cfg["STAGES"])
+        hti = bool(cfg.get("USE_HALF_TILE_INTERLEAVED", False))
+        param = make_gemm_param_and_validate(
+            m,
+            n,
+            k,
+            {
+                "dtype_id": dtype_id,
+                "out_dtype_id": GEMM_DTYPE_BF16 if mxfp else None,
+                "tile_m": int(cfg["TILE_M"]),
+                "tile_n": int(cfg["TILE_N"]),
+                "tile_k": tile_k,
+                "stages": stages,
+                "m_waves": int(cfg["M_WAVES"]),
+                "n_waves": int(cfg["N_WAVES"]),
+                "group_m": int(cfg["GROUP_M"]),
+                "use_half_tile_interleaved": hti,
+                "a_is_transposed": False,
+                "b_is_transposed": True,
+                "has_bias": False,
+                "has_k_tail": infer_has_k_tail(k, tile_k, stages, hti),
+            },
+        )
+        if param is None:
+            return f"rejected {cfg}"
+        storage_k = k // 2 if dtype_name == "mxfp4" else k
+        if mxfp:
+            value_dtype = (
+                torch.float4_e2m1fn_x2
+                if dtype_name == "mxfp4"
+                else torch.float8_e4m3fn
+            )
+            out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+            a = torch.empty((m, storage_k), device="cuda", dtype=value_dtype)
+            b = torch.empty((storage_k, n), device="cuda", dtype=value_dtype)
+            scale_a = torch.empty((m, k // 32), device="cuda", dtype=torch.float8_e8m0fnu)
+            scale_b = torch.empty((n, k // 32), device="cuda", dtype=torch.float8_e8m0fnu)
+            tensors = (out, a, b, scale_a, scale_b, out)
+            kernel = gemm_mxfp_gfx950
+        else:
+            value_dtype = torch.bfloat16 if dtype_name == "bfloat16" else torch.float16
+            out = torch.empty((m, n), device="cuda", dtype=value_dtype)
+            a = torch.empty((m, k), device="cuda", dtype=value_dtype)
+            b = torch.empty((k, n), device="cuda", dtype=value_dtype)
+            tensors = (out, a, b)
+            kernel = gemm_gfx950
+        flyc.compile(
+            kernel,
+            *(flyc.from_torch_tensor(t).mark_layout_dynamic() for t in tensors),
+            param,
+            0,
+        )
+        return None
+    except Exception as exc:
+        return f"{cfg}: {exc}"
+
+
+_AUTOTUNE_DESC = ["autotune"]
+
+
+def _install_autotune_progress():
+    from torch._inductor.select_algorithm import AlgorithmSelectorCache
+
+    if getattr(AlgorithmSelectorCache, "_benchmark_progress", False):
+        return
+    AlgorithmSelectorCache._benchmark_progress = True
+    orig_choices = AlgorithmSelectorCache.benchmark_choices
+    orig_choice = AlgorithmSelectorCache.benchmark_choice
+    bar = {"tqdm": None}
+
+    def benchmark_choices(cls, choices, autotune_args, is_collective=False):
+        bar["tqdm"] = tqdm(
+            total=len(choices),
+            desc=_AUTOTUNE_DESC[0],
+            unit="config",
+            leave=False,
+        )
+        try:
+            return orig_choices.__func__(cls, choices, autotune_args, is_collective)
+        finally:
+            bar["tqdm"].close()
+            bar["tqdm"] = None
+
+    def benchmark_choice(cls, choice, autotune_args):
+        try:
+            return orig_choice.__func__(cls, choice, autotune_args)
+        finally:
+            if bar["tqdm"] is not None:
+                bar["tqdm"].update(1)
+
+    AlgorithmSelectorCache.benchmark_choices = classmethod(benchmark_choices)
+    AlgorithmSelectorCache.benchmark_choice = classmethod(benchmark_choice)
+
+
+def aot_precompile_flydsl(dtype, shapes, search_space, workers):
+    """Compile each FlyDSL config once, before the results table."""
+    from torch._inductor.runtime.flydsl_cache import configure_flydsl_cache_dir
+
+    os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = str(workers)
+    inductor_config.compile_threads = workers
+    configure_flydsl_cache_dir()
+    jobs = _flydsl_compile_jobs(dtype, shapes, search_space)
+    if not jobs:
+        return
+    pool_size = min(workers, len(jobs))
+    failures = []
+    executor = ProcessPoolExecutor(
+        max_workers=pool_size,
+        mp_context=mp.get_context("spawn"),
+    )
+    try:
+        for error in tqdm(
+            executor.map(_compile_flydsl_job, jobs, chunksize=1),
+            total=len(jobs),
+            desc=f"AOT precompile ({pool_size} processes)",
+            unit="config",
+        ):
+            if error:
+                failures.append(error)
+    finally:
+        # Workers hold a CUDA context and do not exit when the pool joins.
+        processes = list(getattr(executor, "_processes", {}).values())
+        executor.shutdown(wait=False, cancel_futures=True)
+        for process in processes:
+            if process.is_alive():
+                process.kill()
+    if failures:
+        print(f"AOT precompile failed {len(failures)} configs. First: {failures[0]}")
+
+
+def compile_case(backend, m, n, k, args):
+    # Do not reset Dynamo here. This loop compiles every shape before timing
+    # any of them, and reset() drops the earlier specializations. The later
+    # call then retraces mm_nt with automatic dynamic shapes (M/N become
+    # symbols). FlyDSL only emits configs for static shapes, so Inductor
+    # raises NoValidChoicesError. dynamic=False keeps each shape static;
+    # isolate_recompiles keeps each shape's cache past the recompile limit.
     torch.cuda.empty_cache()
     # Reuse the same random values for every backend at a given shape.
     torch.manual_seed(args.seed)
@@ -435,7 +693,9 @@ def run_case(backend, m, n, k, args):
     if args.search_space is not None:
         config["max_autotune_gemm_search_space"] = args.search_space
     with inductor_config.patch(**config):
-        compiled = torch.compile(fn, backend="inductor")
+        compiled = torch.compile(
+            fn, backend="inductor", dynamic=False, isolate_recompiles=True
+        )
         from torch._inductor.utils import run_and_get_code
 
         result, codes = run_and_get_code(compiled, *inputs)
@@ -456,13 +716,41 @@ def run_case(backend, m, n, k, args):
         # A failed correctness check must not produce performance numbers.
         check(result)
         kernel_info = get_kernel_info(codes)
+    return {
+        "backend": backend,
+        "selected_backend": selected_backend,
+        "kernel_info": kernel_info,
+        "m": m,
+        "n": n,
+        "k": k,
+        "is_mxfp": is_mxfp,
+        "config": config,
+        "compiled": compiled,
+        "inputs": inputs,
+        "check": check,
+        "metrics": metrics,
+    }
+
+
+def time_case(prepared, args):
+    with inductor_config.patch(**prepared["config"]):
         e2e_ms = e2e_bench(
-            compiled, inputs, args.warmup, args.reps, args.rounds, check,
+            prepared["compiled"],
+            prepared["inputs"],
+            args.warmup,
+            args.reps,
+            args.rounds,
+            prepared["check"],
         )
         graph_error = None
         try:
             graph_ms = cuda_graph_bench(
-                compiled, inputs, args.warmup, args.reps, args.rounds, check,
+                prepared["compiled"],
+                prepared["inputs"],
+                args.warmup,
+                args.reps,
+                args.rounds,
+                prepared["check"],
             )
         except AssertionError:
             raise
@@ -470,28 +758,33 @@ def run_case(backend, m, n, k, args):
             graph_ms = None
             graph_error = repr(exc)
 
+    is_mxfp = prepared["is_mxfp"]
     return {
-        "backend": backend,
-        "selected_backend": selected_backend,
-        **kernel_info,
-        "m": m,
-        "n": n,
-        "k": k,
+        "backend": prepared["backend"],
+        "selected_backend": prepared["selected_backend"],
+        **prepared["kernel_info"],
+        "m": prepared["m"],
+        "n": prepared["n"],
+        "k": prepared["k"],
         "dtype": args.dtype,
         "output_dtype": str(torch.bfloat16 if is_mxfp else DTYPES[args.dtype]),
         "op": "scaled_mm" if is_mxfp else "mm",
         "layout": "nt",
         "bias": False,
         "seed": args.seed,
-        "search_space": config["max_autotune_gemm_search_space"],
+        "search_space": prepared["config"]["max_autotune_gemm_search_space"],
         "timing": "hot; CUDA events; one invocation per captured graph",
         "ok": True,
-        **metrics,
+        **prepared["metrics"],
         "e2e_ms": e2e_ms,
         "graph_ms": graph_ms,
         "graph_error": graph_error,
-        "e2e_tflops": tflops(m, n, k, e2e_ms),
-        "graph_tflops": tflops(m, n, k, graph_ms) if graph_ms is not None else None,
+        "e2e_tflops": tflops(prepared["m"], prepared["n"], prepared["k"], e2e_ms),
+        "graph_tflops": (
+            tflops(prepared["m"], prepared["n"], prepared["k"], graph_ms)
+            if graph_ms is not None
+            else None
+        ),
     }
 
 
@@ -523,10 +816,16 @@ def main():
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument(
         "--shape-index", type=int, default=None,
-        help="index in the shared SHAPES list for all dtypes",
+        help="index in the shape list for the selected dtype",
     )
     parser.add_argument("--dtype", choices=list(DTYPES), default="bfloat16")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--compile-workers",
+        type=int,
+        default=16,
+        help="FlyDSL config compile processes. Threads share one kernel and do not overlap.",
+    )
     parser.add_argument(
         "--search-space", choices=["DEFAULT", "EXHAUSTIVE"], default=None,
         help="override the backend's default autotuning search space",
@@ -540,6 +839,8 @@ def main():
 
     if args.warmup < 0 or args.reps <= 0 or args.rounds <= 0:
         parser.error("warmup must be nonnegative; reps and rounds must be positive")
+    if args.compile_workers <= 0:
+        parser.error("--compile-workers must be positive")
     if args.padded_stride_regression:
         if args.dtype in ("mxfp8", "mxfp4"):
             parser.error("--padded-stride-regression only supports bfloat16/float16")
@@ -549,9 +850,33 @@ def main():
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     backends = args.backend
-    if args.shape_index is not None and not 0 <= args.shape_index < len(SHAPES):
-        parser.error(f"--shape-index must be between 0 and {len(SHAPES) - 1}")
-    shapes = SHAPES if args.shape_index is None else [SHAPES[args.shape_index]]
+    shapes = shapes_for_dtype(args.dtype)
+    if args.shape_index is not None and not 0 <= args.shape_index < len(shapes):
+        parser.error(f"--shape-index must be between 0 and {len(shapes) - 1}")
+    if args.shape_index is not None:
+        shapes = [shapes[args.shape_index]]
+
+    if "flydsl" in backends:
+        aot_precompile_flydsl(args.dtype, shapes, args.search_space, args.compile_workers)
+        print("AOT precompile finished.", flush=True)
+
+    _install_autotune_progress()
+    # One reset before the compile loop, not inside it. See compile_case.
+    torch._dynamo.reset()
+    prepared = []
+    for backend in backends:
+        for m, n, k in shapes:
+            _AUTOTUNE_DESC[0] = f"autotune {backend} M={m} N={n} K={k}"
+            try:
+                prepared.append(compile_case(backend, m, n, k, args))
+            except Exception as exc:
+                prepared.append({
+                    "error": repr(exc),
+                    "backend": backend,
+                    "m": m,
+                    "n": n,
+                    "k": k,
+                })
 
     header = (
         f"{'Backend':<8} {'Shape (M/N/K)':<28} {'DType':<10} {'Accuracy':<8} "
@@ -563,10 +888,23 @@ def main():
     print("-" * len(header))
 
     with out_path.open("a", buffering=1) as f:
-        for backend in backends:
-            for m, n, k in shapes:
+        for item in prepared:
+            backend = item["backend"]
+            m, n, k = item["m"], item["n"], item["k"]
+            if item.get("error") and "compiled" not in item:
+                row = {
+                    "backend": backend,
+                    "m": m,
+                    "n": n,
+                    "k": k,
+                    "dtype": args.dtype,
+                    "ok": False,
+                    "kernel_name": None,
+                    "error": item["error"],
+                }
+            else:
                 try:
-                    row = run_case(backend, m, n, k, args)
+                    row = time_case(item, args)
                 except Exception as exc:
                     row = {
                         "backend": backend,
@@ -578,57 +916,57 @@ def main():
                         "kernel_name": None,
                         "error": repr(exc),
                     }
-                f.write(json.dumps(row, sort_keys=True) + "\n")
-                accuracy = (
-                    "ERROR"
-                    if row.get("error")
-                    else "PASS"
-                    if row["ok"]
-                    else "FAIL"
-                )
-                e2e_ms = (
-                    f"{row['e2e_ms']:.4f}" if row.get("e2e_ms") is not None else "-"
-                )
-                e2e_tflops = (
-                    f"{row['e2e_tflops']:.1f}"
-                    if row.get("e2e_tflops") is not None
-                    else "-"
-                )
-                graph_ms = (
-                    f"{row['graph_ms']:.4f}"
-                    if row.get("graph_ms") is not None
-                    else "-"
-                )
-                graph_tflops = (
-                    f"{row['graph_tflops']:.1f}"
-                    if row.get("graph_tflops") is not None
-                    else "-"
-                )
-                max_diff = (
-                    f"{row['float_max_diff']:.3e}"
-                    if row.get("float_max_diff") is not None
-                    else "-"
-                )
-                config_text = "; ".join(
-                    ", ".join(f"{k}={v}" for k, v in cfg.items()) or "-"
-                    for cfg in row.get("kernel_config", {}).values()
-                ) or "-"
-                shape = f"M={m} N={n} K={k}"
-                print(
-                    f"{backend.upper():<8} {shape:<28} "
-                    f"{args.dtype:<10} {accuracy:<8} "
-                    f"{e2e_ms:>10} {e2e_tflops:>12} "
-                    f"{graph_ms:>10} {graph_tflops:>13} "
-                    f"{max_diff:>11}  {config_text}",
-                    flush=True,
-                )
-                for field, label in (
-                    ("error", "Error"),
-                    ("graph_error", "Graph warning"),
-                    ("kernel_name_error", "Config warning"),
-                ):
-                    if row.get(field):
-                        print(f"  {label}: {row[field]}", flush=True)
+            f.write(json.dumps(row, sort_keys=True) + "\n")
+            accuracy = (
+                "ERROR"
+                if row.get("error")
+                else "PASS"
+                if row["ok"]
+                else "FAIL"
+            )
+            e2e_ms = (
+                f"{row['e2e_ms']:.4f}" if row.get("e2e_ms") is not None else "-"
+            )
+            e2e_tflops = (
+                f"{row['e2e_tflops']:.1f}"
+                if row.get("e2e_tflops") is not None
+                else "-"
+            )
+            graph_ms = (
+                f"{row['graph_ms']:.4f}"
+                if row.get("graph_ms") is not None
+                else "-"
+            )
+            graph_tflops = (
+                f"{row['graph_tflops']:.1f}"
+                if row.get("graph_tflops") is not None
+                else "-"
+            )
+            max_diff = (
+                f"{row['float_max_diff']:.3e}"
+                if row.get("float_max_diff") is not None
+                else "-"
+            )
+            config_text = "; ".join(
+                ", ".join(f"{k}={v}" for k, v in cfg.items()) or "-"
+                for cfg in row.get("kernel_config", {}).values()
+            ) or "-"
+            shape = f"M={m} N={n} K={k}"
+            print(
+                f"{backend.upper():<8} {shape:<28} "
+                f"{args.dtype:<10} {accuracy:<8} "
+                f"{e2e_ms:>10} {e2e_tflops:>12} "
+                f"{graph_ms:>10} {graph_tflops:>13} "
+                f"{max_diff:>11}  {config_text}",
+                flush=True,
+            )
+            for field, label in (
+                ("error", "Error"),
+                ("graph_error", "Graph warning"),
+                ("kernel_name_error", "Config warning"),
+            ):
+                if row.get(field):
+                    print(f"  {label}: {row[field]}", flush=True)
 
 
 if __name__ == "__main__":
