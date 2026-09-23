@@ -559,10 +559,16 @@ def _compile_flydsl_job(job):
                 else torch.float8_e4m3fn
             )
             out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
-            a = torch.empty((m, storage_k), device="cuda", dtype=value_dtype)
-            b = torch.empty((storage_k, n), device="cuda", dtype=value_dtype)
-            scale_a = torch.empty((m, k // 32), device="cuda", dtype=torch.float8_e8m0fnu)
-            scale_b = torch.empty((n, k // 32), device="cuda", dtype=torch.float8_e8m0fnu)
+            # Match flydsl_mm.py.jinja: values and e8m0 scales are passed as uint8.
+            # from_torch_tensor has no memref type for float8_e8m0fnu.
+            a = torch.empty((m, storage_k), device="cuda", dtype=value_dtype).view(
+                torch.uint8
+            )
+            b = torch.empty((storage_k, n), device="cuda", dtype=value_dtype).view(
+                torch.uint8
+            )
+            scale_a = torch.empty((m, k // 32), device="cuda", dtype=torch.uint8)
+            scale_b = torch.empty((n, k // 32), device="cuda", dtype=torch.uint8)
             tensors = (out, a, b, scale_a, scale_b, out)
             kernel = gemm_mxfp_gfx950
         else:
