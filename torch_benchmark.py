@@ -559,12 +559,13 @@ def _compile_flydsl_job(job):
                 else torch.float8_e4m3fn
             )
             out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
-            # Match flydsl_mm.py.jinja: values and e8m0 scales are passed as uint8.
-            # from_torch_tensor has no memref type for float8_e8m0fnu.
+            # Values and e8m0 scales are uint8, matching flydsl_mm.py.jinja.
+            # B is stored [N, K] and compiled as b.t(), so the stride-1 axis is K.
+            # mark_layout_dynamic keeps that axis in the disk cache key.
             a = torch.empty((m, storage_k), device="cuda", dtype=value_dtype).view(
                 torch.uint8
             )
-            b = torch.empty((storage_k, n), device="cuda", dtype=value_dtype).view(
+            b = torch.empty((n, storage_k), device="cuda", dtype=value_dtype).t().view(
                 torch.uint8
             )
             scale_a = torch.empty((m, k // 32), device="cuda", dtype=torch.uint8)
@@ -575,7 +576,8 @@ def _compile_flydsl_job(job):
             value_dtype = torch.bfloat16 if dtype_name == "bfloat16" else torch.float16
             out = torch.empty((m, n), device="cuda", dtype=value_dtype)
             a = torch.empty((m, k), device="cuda", dtype=value_dtype)
-            b = torch.empty((k, n), device="cuda", dtype=value_dtype)
+            # Same NT layout as mm_nt: B storage is [N, K], the kernel sees b.t().
+            b = torch.empty((n, k), device="cuda", dtype=value_dtype).t()
             tensors = (out, a, b)
             kernel = gemm_gfx950
         flyc.compile(
