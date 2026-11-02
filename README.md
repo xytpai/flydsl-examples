@@ -98,6 +98,27 @@ computation are excluded. This is one measurement run, not an autotuning result.
 At fixed BK=64, deeper staging helps this shape. More stages do not always
 win: BK=128 with 2 stages remains faster for FP16 in this run.
 
+**Follow-up: avoid register spills in the K remainder.** The initial port's
+optional last-main-tile `if` was lowered to a predicated region that kept old
+and new accumulator sets live. With the default tile, that used 256 VGPRs
+and 484 bytes of scratch per thread. A zero-or-one-trip loop keeps the
+accumulators loop-carried instead: 212 VGPRs, no spills and no scratch for
+both FP16 and BF16, without changing the pipeline math or supported shapes.
+
+A separate GPU1 run (8192 cubed, default tile, same inputs, 41 randomized
+paired rounds, 20 launches per HIP graph) measured:
+
+| Dtype | Initial FlyDSL TFLOPS | No-spill FlyDSL TFLOPS | PeakGemm C++ TFLOPS |
+|---|---:|---:|---:|
+| FP16 | 2174.17 | 2358.10 | 2402.00 |
+| BF16 | 2144.97 | 2328.93 | 2370.97 |
+
+All 105 correctness tests passed. BF16 improved by 8.6% in that run.
+These follow-up numbers are a paired comparison on GPU1, not directly
+comparable to the earlier absolute numbers above. In particular, the
+same-run C++ baseline also did not reach 2.5 PFLOPS.
+
+
 ## Layout Convention
 
 Layout characters describe physical tensor strides without changing logical

@@ -203,7 +203,9 @@ def _build_kernel(
                 )
                 compute_tile(read_stage)
                 current_stage = (current_stage + 1) % stages
-        if main_tiles % 2 != 0:
+        # A one-trip loop keeps the accumulators loop-carried instead of
+        # materializing both sides of a predicated remainder branch.
+        for remaining in range(main_tiles % 2):
             wait_tile(stages - 2)
             copy_tile((current_stage + stages - 1) % stages, main_tiles + stages - 2)
             compute_tile(current_stage)
