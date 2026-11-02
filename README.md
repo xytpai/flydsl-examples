@@ -34,6 +34,15 @@ Inputs and dimensions must satisfy the kernel's vector-alignment constraints.
 
 ### gfx1250: PeakGemm multi-stage TDM GEMM
 
+**BF16 8192³ follow-up:** the no-spill implementation already measured
+**2.84–2.87 PFLOPS in short bursts** on two f01 GPUs. Under sustained load,
+PPT limiting reduced GFX clock to about 1.5 GHz and throughput to 2.21–2.24
+PFLOPS; C++ PeakGemm showed the same effect. See the
+[ISA/ATT and power-state analysis](docs/gfx1250_bf16_analysis.md).
+Use `--mode both --dtype bf16 --json bf16_phases.json` to report burst and
+sustained results separately; the default legacy timing remains unchanged.
+
+
 `kernels/gemm_a16w16_tdm_gfx1250.py` is a small port of
 [PeakGemm's TDM kernel](https://github.com/xytpai/PeakGemm/blob/3d2a481/include/peak_gemm/kernel/hgemm_tdm_gfx1250.hpp).
 It keeps the same pipeline structure:

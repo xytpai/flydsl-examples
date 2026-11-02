@@ -2,6 +2,10 @@
 
 import argparse
 import itertools
+import json
+import statistics
+import time
+from pathlib import Path
 
 import pytest
 import torch
@@ -318,6 +322,39 @@ def test_bias_rounding_order(dtype):
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
+def benchmark_graph(graph, nodes, mode):
+    """Return all event samples in ms/GEMM; never select the fastest sample."""
+    if mode == "burst":
+        # Explicit idle interval: this measures a burst, NOT sustained throughput.
+        torch.cuda.synchronize()
+        time.sleep(0.5)
+        graph.replay()
+        torch.cuda.synchronize()
+        rounds, replays = 5, 1
+    elif mode == "sustained":
+        begin = time.monotonic()
+        while time.monotonic() - begin < 0.5:
+            graph.replay()
+            torch.cuda.synchronize()
+        rounds, replays = 21, 4
+    else:
+        for _ in range(3):
+            graph.replay()
+        torch.cuda.synchronize()
+        rounds, replays = 9, 1
+    samples = []
+    for _ in range(rounds):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(replays):
+            graph.replay()
+        end.record()
+        end.synchronize()
+        samples.append(start.elapsed_time(end) / (nodes * replays))
+    return samples
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mnk", nargs=3, type=int, default=[8192, 8192, 8192])
@@ -326,6 +363,16 @@ def main():
     parser.add_argument("--stages", nargs="+", type=int, default=[2])
     parser.add_argument(
         "--dtype", nargs="+", choices=["fp16", "bf16"], default=["fp16", "bf16"]
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["legacy", "burst", "sustained", "both"],
+        default="legacy",
+        help="legacy keeps the original timing; burst includes a 0.5s idle interval; "
+        "sustained includes >=0.5s continuous warmup; both reports them separately",
+    )
+    parser.add_argument(
+        "--json", type=Path, help="save configuration and every timing sample"
     )
     args = parser.parse_args()
     require_gfx1250()
@@ -345,30 +392,59 @@ def main():
         for _ in range(10):
             gemm_a16w16(a, b, out, **config)
         torch.cuda.synchronize()
-        # Capture repeated launches so the timings measure GPU work, not Python.
+        # Keep the original default protocol. Explicit phase modes use eight
+        # nodes, matching the paired BF16 power-state study in docs/.
+        nodes = 20 if args.mode == "legacy" else 8
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            for _ in range(20):
+            for _ in range(nodes):
                 gemm_a16w16(a, b, out, **config)
-        for _ in range(3):
-            graph.replay()
-        torch.cuda.synchronize()
-        times = []
-        for _ in range(9):
-            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
-                enable_timing=True
+        modes = ["burst", "sustained"] if args.mode == "both" else [args.mode]
+        repeats = 1 if args.mode == "legacy" else 3
+        for repeat in range(repeats):
+            for mode in modes:
+                samples = benchmark_graph(graph, nodes, mode)
+                ms = statistics.median(samples)
+                rows.append(
+                    {
+                        "dtype": name,
+                        "shape": [m, n, k],
+                        "config": config,
+                        "mode": mode,
+                        "repeat": repeat,
+                        "graph_nodes": nodes,
+                        "samples_ms": samples,
+                        "median_ms": ms,
+                        "tflops": 2 * m * n * k / ms / 1e9,
+                    }
+                )
+                # Clear C and replay after timing; a stale result cannot pass.
+                out.fill_(float("nan"))
+                graph.replay()
+                torch.cuda.synchronize()
+                torch.testing.assert_close(out, expected, atol=0.02, rtol=0.02)
+        graph.reset()
+    print("| Dtype | Stages | Mode | Repeat | ms | TFLOPS |")
+    print("|---|---:|---|---:|---:|---:|")
+    for row in rows:
+        print(
+            f"| {row['dtype']} | {row['config']['stages']} | {row['mode']} | "
+            f"{row['repeat']} | {row['median_ms']:.6f} | {row['tflops']:.2f} |"
+        )
+    if args.json:
+        args.json.parent.mkdir(parents=True, exist_ok=True)
+        args.json.write_text(
+            json.dumps(
+                {
+                    "torch": torch.__version__,
+                    "hip": torch.version.hip,
+                    "device": str(torch.cuda.get_device_properties(0)),
+                    "protocol": args.mode,
+                    "results": rows,
+                },
+                indent=2,
             )
-            start.record()
-            graph.replay()
-            end.record()
-            end.synchronize()
-            times.append(start.elapsed_time(end) / 20)
-        ms = sorted(times)[4]
-        rows.append((name, stages, ms, 2 * m * n * k / ms / 1e9))
-    print("| Dtype | Stages | ms | TFLOPS |")
-    print("|---|---:|---:|---:|")
-    for name, stages, ms, tflops in rows:
-        print(f"| {name} | {stages} | {ms:.6f} | {tflops:.2f} |")
+        )
 
 
 if __name__ == "__main__":
