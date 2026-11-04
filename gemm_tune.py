@@ -11,6 +11,7 @@ import multiprocessing as mp
 import numpy as np
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor
+from torch.profiler import profile, ProfilerActivity
 from pathlib import Path
 from dataclasses import dataclass
 from flydsl.runtime.device import get_rocm_arch
@@ -309,19 +310,30 @@ def tuning_benchmark(args, kwargs={}, niters=50):
     )
     is_allclose = torch.allclose(c, c_ref, atol=tol, rtol=tol)
     assert is_allclose
-    for _ in range(3):
-        run_gemm(a, b, c, bias, kwargs, args.layout)
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    samples = []
-    for _ in range(niters):
-        start.record()
-        run_gemm(a, b, c, bias, kwargs, args.layout)
-        end.record()
-        end.synchronize()
-        samples.append(start.elapsed_time(end) * 1000.0)
-    return float(np.median(samples))
+    # performance bench
+    inputs = [create_inputs(args) for i in range(niters)]
+    outputs = [create_outputs(args) for i in range(niters)]
+    with profile(
+        activities=[ProfilerActivity.CUDA],
+    ) as prof:
+        for i in range(niters):
+            run_gemm(
+                inputs[i][0],
+                inputs[i][1],
+                outputs[i][0],
+                inputs[i][2],
+                kwargs,
+                args.layout,
+            )
+            torch.cuda.synchronize()
+            # torch.cuda.empty_cache()
+    # table = prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1)
+    gemm_a16w16_durations = []
+    for event in prof.events():
+        if event.name.startswith("hgemm_"):
+            gemm_a16w16_durations.append(event.device_time)
+    duration = np.median(gemm_a16w16_durations)
+    return duration
 
 
 def gemm_gfx1250_get_configs(args):
@@ -472,11 +484,6 @@ def tune_single(args):
     best_idx = 0
     pbar = tqdm(total=len(configs), desc=f"{args}")
     for i, config in enumerate(configs):
-        pbar.set_postfix_str(
-            f"{config['block_m']}x{config['block_n']}x{config['block_k']}"
-            f" s{config['stages']} w{config['m_waves']}x{config['n_waves']}",
-            refresh=False,
-        )
         try:
             dur = tuning_benchmark(args, kwargs=config)
         except Exception:
