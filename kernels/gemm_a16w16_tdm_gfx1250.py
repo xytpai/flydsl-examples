@@ -9,9 +9,14 @@ import torch
 from flydsl.expr import const_expr, range_constexpr, rocdl, tdm_ops
 from flydsl.expr.typing import T
 
+from .gemm_a16w16_gfx950_utils import BlockSwizzle
+
 
 WAVE_SIZE = 32
 LDS_PAD = 8
+# MI455X SPX: 8 XCDs, 256 WGPs. Same pid threshold as the gfx950 kernel.
+NUM_XCDS = 8
+NUM_PIDS_THRESHOLD = 256
 
 
 GEMM_DTYPE_FP32 = 1
@@ -131,15 +136,12 @@ def build_gemm_gfx1250(
         block_id = fx.block_idx.x
         m_blocks = (m + block_m - 1) // block_m
         n_blocks = (n + block_n - 1) // block_n
-        if const_expr(group_m == 0):
-            block_row, block_col = block_id // n_blocks, block_id % n_blocks
-        else:
-            group_size = group_m * n_blocks
-            first_row = block_id // group_size * group_m
-            rows_in_group = fx.min(m_blocks - first_row, group_m)
-            within_group = block_id % group_size
-            block_row = first_row + within_group % rows_in_group
-            block_col = within_group // rows_in_group
+        block_swizzle = BlockSwizzle(
+            NUM_XCDS=NUM_XCDS,
+            NUM_PIDS_THRESHOLD=NUM_PIDS_THRESHOLD,
+            GROUP_M=group_m,
+        )
+        block_row, block_col = block_swizzle.swizzle(m_blocks, n_blocks, block_id)
         row_start, col_start = block_row * block_m, block_col * block_n
         wave_row = wave // n_waves * (block_m // m_waves)
         wave_col = wave % n_waves * (block_n // n_waves)
