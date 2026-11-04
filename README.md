@@ -59,14 +59,14 @@ there is no automatic tuning or dispatch to another GEMM implementation.
 
 ```python
 import torch
-from kernels.gemm_a16w16_tdm_gfx1250 import gemm_a16w16
+from kernels.gemm_a16w16_tdm_gfx1250 import gemm_a16w16_gfx1250
 
 a = torch.randn((8192, 8192), device="cuda", dtype=torch.float16)
 b = torch.randn((8192, 8192), device="cuda", dtype=torch.float16).t()
-c = gemm_a16w16(a, b)  # tile=256x256x128, waves=4x4, stages=2
+c = gemm_a16w16_gfx1250(a, b)  # tile=256x256x128, waves=4x4, stages=2
 
 # A deeper pipeline needs a smaller K tile to fit in LDS.
-c = gemm_a16w16(a, b, block_k=64, stages=4)
+c = gemm_a16w16_gfx1250(a, b, block_k=64, stages=4)
 ```
 
 First-version contract:

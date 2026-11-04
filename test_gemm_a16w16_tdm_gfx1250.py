@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from kernels.gemm_a16w16_tdm_gfx1250 import _check_config, gemm_a16w16
+from kernels.gemm_a16w16_tdm_gfx1250 import _check_config, gemm_a16w16_gfx1250
 
 
 def require_gfx1250():
@@ -58,7 +58,7 @@ def test_pipeline(dtype, stages, extra_tiles, use_bias):
     }
     expected = reference(a, b, bias)
     torch.cuda.synchronize()
-    actual = gemm_a16w16(a, b, out, bias, **kwargs)
+    actual = gemm_a16w16_gfx1250(a, b, out, bias, **kwargs)
     torch.cuda.synchronize()
     assert actual.data_ptr() == out.data_ptr()
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
@@ -81,13 +81,13 @@ def test_graph_changed_input(dtype, stages):
         "n_waves": 2,
         "group_m": 2,
     }
-    gemm_a16w16(a, b, out, bias, **kwargs)
+    gemm_a16w16_gfx1250(a, b, out, bias, **kwargs)
     torch.cuda.synchronize()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
-        gemm_a16w16(a, b, out, bias, stream=stream, **kwargs)
+        gemm_a16w16_gfx1250(a, b, out, bias, stream=stream, **kwargs)
     torch.cuda.current_stream().wait_stream(stream)
     for _ in range(3):
         a.neg_()
@@ -156,7 +156,7 @@ def test_tile_variants(dtype, shape, config):
     a, b = inputs(m, n, k, dtype)
     expected = reference(a, b)
     torch.cuda.synchronize()
-    out = gemm_a16w16(a, b, **config)
+    out = gemm_a16w16_gfx1250(a, b, **config)
     torch.cuda.synchronize()
     torch.testing.assert_close(out, expected, atol=0, rtol=0)
 
@@ -207,21 +207,21 @@ def test_input_contract():
     a, b = inputs(64, 128, 64, torch.float16)
     config = {"block_m": 64, "block_n": 128, "block_k": 32, "m_waves": 2, "n_waves": 2}
     with pytest.raises(ValueError, match="NT layout"):
-        gemm_a16w16(a, b.contiguous(), **config)
+        gemm_a16w16_gfx1250(a, b.contiguous(), **config)
     with pytest.raises(ValueError, match="out must"):
-        gemm_a16w16(
+        gemm_a16w16_gfx1250(
             a,
             b,
             out=torch.empty((64, 128), device="cuda", dtype=torch.float32),
             **config,
         )
     with pytest.raises(ValueError, match="bias must"):
-        gemm_a16w16(
+        gemm_a16w16_gfx1250(
             a, b, bias=torch.empty((127,), device="cuda", dtype=a.dtype), **config
         )
     square_a, square_b = inputs(64, 64, 64, torch.float16)
     with pytest.raises(ValueError, match="overlap"):
-        gemm_a16w16(
+        gemm_a16w16_gfx1250(
             square_a,
             square_b,
             out=square_a,
@@ -248,7 +248,7 @@ def test_padded_leading_strides(dtype, layout):
     out = storage[:, :n]
     expected = reference(a, b)
     torch.cuda.synchronize()
-    actual = gemm_a16w16(
+    actual = gemm_a16w16_gfx1250(
         a,
         b,
         out,
@@ -277,7 +277,7 @@ def test_partial_mn_tile(dtype, layout):
         b = (torch.randint(-4, 5, (k, n), device="cuda").float() / 16).to(dtype)
     expected = reference(a, b)
     torch.cuda.synchronize()
-    actual = gemm_a16w16(
+    actual = gemm_a16w16_gfx1250(
         a,
         b,
         layout=layout,
@@ -303,7 +303,7 @@ def test_random_matrices(dtype, stages, shape):
     bias = (torch.randn((n,), device="cuda") / 8).to(dtype)
     expected = reference(a, b, bias)
     torch.cuda.synchronize()
-    actual = gemm_a16w16(
+    actual = gemm_a16w16_gfx1250(
         a,
         b,
         bias=bias,
@@ -332,7 +332,7 @@ def test_explicit_stream(dtype, zero_input):
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     # Pass an explicit stream without changing PyTorch's current stream.
-    gemm_a16w16(
+    gemm_a16w16_gfx1250(
         a,
         b,
         out,
@@ -366,7 +366,7 @@ def test_bias_rounding_order(dtype):
     fused = (a.float() @ b.float() + bias.float()).to(dtype)
     assert (expected != fused).all()
     torch.cuda.synchronize()
-    actual = gemm_a16w16(
+    actual = gemm_a16w16_gfx1250(
         a,
         b,
         bias=bias,
@@ -444,18 +444,18 @@ def test_gemm_a16w16_benchmark_smoke(
     out = torch.empty((m, n), device="cuda", dtype=torch_dtype)
     expected = reference(a, b, bias)
     torch.cuda.synchronize()
-    gemm_a16w16(a, b, out, bias, **config)
+    gemm_a16w16_gfx1250(a, b, out, bias, **config)
     torch.cuda.synchronize()
     torch.testing.assert_close(out, expected, atol=0.02, rtol=0.02)
 
     for _ in range(3):
-        gemm_a16w16(a, b, out, bias, **config)
+        gemm_a16w16_gfx1250(a, b, out, bias, **config)
     torch.cuda.synchronize()
     nodes = 8
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         for _ in range(nodes):
-            gemm_a16w16(a, b, out, bias, **config)
+            gemm_a16w16_gfx1250(a, b, out, bias, **config)
     samples = benchmark_graph(graph, nodes, "legacy")
     graph.reset()
     ms = statistics.median(samples)
@@ -531,11 +531,11 @@ def main():
         config.update(m_waves=args.waves[0], n_waves=args.waves[1], stages=stages)
         expected = reference(a, b)
         torch.cuda.synchronize()
-        gemm_a16w16(a, b, out, **config)
+        gemm_a16w16_gfx1250(a, b, out, **config)
         torch.cuda.synchronize()
         torch.testing.assert_close(out, expected, atol=0.02, rtol=0.02)
         for _ in range(10):
-            gemm_a16w16(a, b, out, **config)
+            gemm_a16w16_gfx1250(a, b, out, **config)
         torch.cuda.synchronize()
         # Keep the original default protocol. Explicit phase modes use eight
         # nodes, matching the paired BF16 power-state study in docs/.
@@ -543,7 +543,7 @@ def main():
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             for _ in range(nodes):
-                gemm_a16w16(a, b, out, **config)
+                gemm_a16w16_gfx1250(a, b, out, **config)
         modes = ["burst", "sustained"] if args.mode == "both" else [args.mode]
         repeats = 1 if args.mode == "legacy" else 3
         for repeat in range(repeats):

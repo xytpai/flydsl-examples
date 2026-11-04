@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""PeakGemm-style wave32 TDM GEMM: NT or NN layout, full tiles, no split-K."""
+"""Wave32 TDM GEMM: NT or NN layout, full tiles, no split-K."""
 
 import functools
 
@@ -76,6 +76,17 @@ def _check_config(
     n_blocks = (n + block_n - 1) // block_n
     if group_m * n_blocks > (2**32 - 1) // 2:
         raise ValueError("block swizzle offsets exceed the supported 32-bit range")
+
+
+def make_gemm_a16w16_gfx1250_kernel_name(
+    dtype_id, block_m, block_n, block_k, stages, m_waves, n_waves, group_m, has_bias, b_k_contiguous,
+):
+    dtype_name = GEMM_DTYPE_NAMES[dtype_id]
+    layout = "nt" if b_k_contiguous else "nn"
+    return (
+        f"hgemm_{dtype_name}_t{block_m}x{block_n}x{block_k}x{stages}"
+        f"_w{m_waves}x{n_waves}_gm{group_m}_bias{int(has_bias)}_l{layout}"
+    )
 
 
 @functools.lru_cache(maxsize=128)
@@ -258,8 +269,8 @@ def build_gemm_gfx1250(
         for stage in range_constexpr(stages - 1):
             copy_tile(stage, fx.Int32(stage))
 
-        # Two tiles per iteration, matching PeakGemm. Double buffering retains
-        # literal LDS offsets; deeper pipelines advance the ring modulo stages.
+        # Two tiles per iteration. Double buffering retains literal LDS offsets;
+        # deeper pipelines advance the ring modulo stages.
         main_tiles = k // block_k - (stages - 1)
         current_stage = fx.Int32(0)
         for pair in range(main_tiles // 2):
@@ -271,6 +282,7 @@ def build_gemm_gfx1250(
                 )
                 compute_tile(read_stage)
                 current_stage = (current_stage + 1) % stages
+        
         # A one-trip loop keeps the accumulators loop-carried instead of
         # materializing both sides of a predicated remainder branch.
         for remaining in range(main_tiles % 2):
@@ -285,7 +297,7 @@ def build_gemm_gfx1250(
             compute_tile(current_stage)
             current_stage = (current_stage + 1) % stages
 
-        # Reuse the A/B LDS arena for coalesced output stores (PeakGemm cshuffle).
+        # Reuse the A/B LDS arena for coalesced output stores.
         # Native WMMA output: column=lane%16, row=lane//16*8+register_index.
         fx.gpu.barrier()
         for mi in range_constexpr(m_steps):
@@ -314,7 +326,7 @@ def build_gemm_gfx1250(
                     bias_values = fx.ptr_load(
                         bias + col_start + col, result_type=T.vec(8, elem.ir_type)
                     )
-                    # Round C to input dtype BEFORE bias, as PeakGemm does.
+                    # Round C to input dtype BEFORE bias.
                     values = (values.to(fx.Float32) + bias_values.to(fx.Float32)).to(elem)
                 fx.make_view(destination, fx.make_layout(8, 1)).store(values)
             else:
@@ -348,10 +360,22 @@ def build_gemm_gfx1250(
             stream=stream,
         )
 
+    kernel._func.__name__ = make_gemm_a16w16_gfx1250_kernel_name(
+        dtype_id,
+        block_m,
+        block_n,
+        block_k,
+        stages,
+        m_waves,
+        n_waves,
+        group_m,
+        has_bias,
+        b_k_contiguous,
+    )
     return launch
 
 
-def gemm_a16w16(
+def gemm_a16w16_gfx1250(
     a,
     b,
     out=None,
