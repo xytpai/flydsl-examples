@@ -2,6 +2,7 @@
 """Wave32 TDM GEMM: NT or NN layout, full tiles, no split-K."""
 
 import functools
+from typing import Optional
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -9,6 +10,7 @@ import torch
 from flydsl.expr import const_expr, range_constexpr, rocdl, tdm_ops
 from flydsl.expr.typing import T
 
+from .common import run_cached
 from .gemm_a16w16_gfx950_utils import BlockSwizzle
 
 
@@ -31,17 +33,34 @@ GEMM_DTYPE_NAMES = {
     GEMM_DTYPE_MXFP8: "mxfp8",
     GEMM_DTYPE_MXFP4: "mxfp4",
 }
+SUPPORTED_MMA = {
+    GEMM_DTYPE_BF16: ((16, 16, 32),),
+    GEMM_DTYPE_FP16: ((16, 16, 32),),
+}
+GEMM_DTYPE_BITS = {
+    GEMM_DTYPE_FP32: 32,
+    GEMM_DTYPE_BF16: 16,
+    GEMM_DTYPE_FP16: 16,
+    GEMM_DTYPE_MXFP8: 8,
+    GEMM_DTYPE_MXFP4: 4,
+}
+STORE_VEC_BITS = 16 * 8
 
 
-def _check_config(
+def validate_gemm_gfx1250_config(
     m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, group_m,
-    b_k_contiguous=True,
+    dtype_id, mma_m, mma_n, mma_k, b_k_contiguous=True,
 ):
-    values = (m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves)
+    values = (m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, mma_m, mma_n, mma_k)
     if any(type(v) is not int or v <= 0 for v in values):
         raise ValueError(
-            "dimensions, tiles, stages and wave counts must be positive integers"
+            "dimensions, tiles, stages, wave counts and WMMA sizes must be positive integers"
         )
+    supported_mma = SUPPORTED_MMA.get(dtype_id)
+    mma = (mma_m, mma_n, mma_k)
+    if supported_mma is None or mma not in supported_mma:
+        dtype_name = GEMM_DTYPE_NAMES.get(dtype_id, "unknown")
+        raise ValueError(f"unsupported WMMA {mma_m}x{mma_n}x{mma_k} for {dtype_name}")
     if type(group_m) is not int or group_m < 0:
         raise ValueError("group_m must be a nonnegative integer")
     if not 2 <= stages <= 33:
@@ -51,22 +70,30 @@ def _check_config(
     waves = m_waves * n_waves
     if waves > 32:
         raise ValueError("a workgroup cannot exceed 1024 threads")
-    if block_m % (m_waves * 16) or block_n % (n_waves * 16):
-        raise ValueError(
-            "tile dimensions must be divisible by their wave count times 16"
-        )
+    if block_m % (m_waves * mma_m) or block_n % (n_waves * mma_n) or block_k % mma_k:
+        raise ValueError("tile dimensions must be divisible by the WMMA atom")
     if not (
-        1 <= block_m // (m_waves * 16) <= 8 and 1 <= block_n // (n_waves * 16) <= 8
+        1 <= block_m // (m_waves * mma_m) <= 8 and 1 <= block_n // (n_waves * mma_n) <= 8
     ):
         raise ValueError("each wave must compute 1..8 WMMA tiles along M and N")
     if block_m % waves or block_n % waves:
         raise ValueError("each wave must own a whole number of A and B rows")
+    elem_bits = GEMM_DTYPE_BITS.get(dtype_id)
+    if elem_bits is None or STORE_VEC_BITS % elem_bits:
+        dtype_name = GEMM_DTYPE_NAMES.get(dtype_id, "unknown")
+        raise ValueError(f"unsupported element size for {dtype_name}")
+    vec_elems = STORE_VEC_BITS // elem_bits
     threads = waves * WAVE_SIZE
-    if threads % (block_n // 8) or block_m * block_n % (threads * 8):
+    if (
+        block_n % vec_elems
+        or threads % (block_n // vec_elems)
+        or block_m * block_n % (threads * vec_elems)
+    ):
         raise ValueError("the output tile must support whole-workgroup 16-byte stores")
     a_stage_size = block_m * (block_k + LDS_PAD)
     b_stage_size = block_n * (block_k + LDS_PAD) if b_k_contiguous else block_k * (block_n + LDS_PAD)
-    shared_bytes = 2 * max(stages * (a_stage_size + b_stage_size), block_m * block_n)
+    shared_elements = max(stages * (a_stage_size + b_stage_size), block_m * block_n)
+    shared_bytes = (shared_elements * elem_bits + 7) // 8
     if shared_bytes > 320 * 1024:
         raise ValueError("pipeline exceeds gfx1250's 320 KiB LDS capacity")
     if k % block_k:
@@ -80,13 +107,32 @@ def _check_config(
 
 def make_gemm_a16w16_gfx1250_kernel_name(
     dtype_id, block_m, block_n, block_k, stages, m_waves, n_waves, group_m, has_bias, b_k_contiguous,
+    mma_m, mma_n, mma_k,
 ):
     dtype_name = GEMM_DTYPE_NAMES[dtype_id]
     layout = "nt" if b_k_contiguous else "nn"
     return (
         f"hgemm_{dtype_name}_t{block_m}x{block_n}x{block_k}x{stages}"
         f"_w{m_waves}x{n_waves}_gm{group_m}_bias{int(has_bias)}_l{layout}"
+        f"_mma{mma_m}x{mma_n}x{mma_k}"
     )
+
+
+@fx.struct
+class GemmA16W16Gfx1250Param:
+    dtype_id: fx.Constexpr[int]
+    block_m: fx.Constexpr[int]
+    block_n: fx.Constexpr[int]
+    block_k: fx.Constexpr[int]
+    stages: fx.Constexpr[int]
+    m_waves: fx.Constexpr[int]
+    n_waves: fx.Constexpr[int]
+    group_m: fx.Constexpr[int]
+    has_bias: fx.Constexpr[bool]
+    b_k_contiguous: fx.Constexpr[bool]
+    mma_m: fx.Constexpr[int]
+    mma_n: fx.Constexpr[int]
+    mma_k: fx.Constexpr[int]
 
 
 @functools.lru_cache(maxsize=128)
@@ -101,6 +147,9 @@ def build_gemm_gfx1250(
     group_m: int,
     has_bias: bool,
     b_k_contiguous: bool,
+    mma_m: int,
+    mma_n: int,
+    mma_k: int,
 ):
     elem = {GEMM_DTYPE_FP16: fx.Float16, GEMM_DTYPE_BF16: fx.BFloat16}.get(dtype_id)
     if elem is None:
@@ -121,7 +170,7 @@ def build_gemm_gfx1250(
         b_stage_size = block_k * b_pitch
         b_tile_stride = (b_pitch, 1)
     shared_elements = max(stages * (a_stage_size + b_stage_size), block_m * block_n)
-    m_steps, n_steps = block_m // (m_waves * 16), block_n // (n_waves * 16)
+    m_steps, n_steps = block_m // (m_waves * mma_m), block_n // (n_waves * mma_n)
 
     @fx.struct
     class SharedStorage:
@@ -221,7 +270,7 @@ def build_gemm_gfx1250(
             # This also protects the previous tile's LDS reads before recycling.
             fx.gpu.barrier()
 
-        mma = fx.make_mma_atom(rocdl.WMMA(16, 16, 32, elem, fx.Float32))
+        mma = fx.make_mma_atom(rocdl.WMMA(mma_m, mma_n, mma_k, elem, fx.Float32))
         accumulators = [
             fx.make_rmem_tensor(8, fx.Float32)
             for _ in range_constexpr(m_steps * n_steps)
@@ -247,10 +296,10 @@ def build_gemm_gfx1250(
             return fragment
 
         def compute_tile(stage):
-            for ki in range_constexpr(block_k // 32):
+            for ki in range_constexpr(block_k // mma_k):
                 b_fragments = [
                     load_fragment(
-                        shared_b, b_stage_size, stage, wave_col + ni * 16, ki * 32,
+                        shared_b, b_stage_size, stage, wave_col + ni * mma_n, ki * mma_k,
                         k_contiguous=b_k_contiguous,
                     )
                     for ni in range_constexpr(n_steps)
@@ -258,7 +307,7 @@ def build_gemm_gfx1250(
                 rocdl.sched_barrier(0)
                 for mi in range_constexpr(m_steps):
                     a_fragment = load_fragment(
-                        shared_a, a_stage_size, stage, wave_row + mi * 16, ki * 32
+                        shared_a, a_stage_size, stage, wave_row + mi * mma_m, ki * mma_k
                     )
                     rocdl.sched_barrier(0)
                     for ni in range_constexpr(n_steps):
@@ -303,8 +352,8 @@ def build_gemm_gfx1250(
         for mi in range_constexpr(m_steps):
             for ni in range_constexpr(n_steps):
                 values = accumulators[mi * n_steps + ni].load().to(elem)
-                row = wave_row + mi * 16 + lane // 16 * 8
-                col = wave_col + ni * 16 + lane % 16
+                row = wave_row + mi * mma_m + lane // 16 * 8
+                col = wave_col + ni * mma_n + lane % 16
                 for i in range_constexpr(8):
                     fx.ptr_store(values[i], shared_a + (row + i) * block_n + col)
         fx.gpu.barrier()
@@ -371,26 +420,32 @@ def build_gemm_gfx1250(
         group_m,
         has_bias,
         b_k_contiguous,
+        mma_m,
+        mma_n,
+        mma_k,
     )
     return launch
 
 
 def gemm_a16w16_gfx1250(
-    a,
-    b,
-    out=None,
-    bias=None,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
     *,
-    block_m=256,
-    block_n=256,
-    block_k=128,
-    stages=2,
-    m_waves=4,
-    n_waves=4,
-    group_m=0,
-    stream=None,
-    layout="nt",
-):
+    block_m: int = 256,
+    block_n: int = 256,
+    block_k: int = 128,
+    stages: int = 2,
+    m_waves: int = 4,
+    n_waves: int = 4,
+    group_m: int = 0,
+    mma_m: int = 16,
+    mma_n: int = 16,
+    mma_k: int = 32,
+    stream: Optional[torch.cuda.Stream] = None,
+    layout: str = "nt",
+) -> torch.Tensor:
     """C = A[M,K] @ B[K,N]; FP16/BF16 output, optional bias.
 
     ``layout`` is ``nt`` or ``nn``. N means that dimension is contiguous
@@ -404,6 +459,7 @@ def gemm_a16w16_gfx1250(
         raise ValueError("expected A[M,K] and B[K,N]")
     if a.dtype not in (torch.float16, torch.bfloat16) or b.dtype != a.dtype:
         raise ValueError("A and B must have the same FP16 or BF16 dtype")
+    dtype_id = GEMM_DTYPE_FP16 if a.dtype is torch.float16 else GEMM_DTYPE_BF16
     if a.device != b.device or a.device.type != "cuda":
         raise ValueError("A and B must be on the same ROCm device")
     layout = layout.lower()
@@ -411,7 +467,10 @@ def gemm_a16w16_gfx1250(
         raise ValueError("layout must be 'nn' or 'nt'")
     m, k = a.shape
     n = b.shape[1]
-    _check_config(m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, group_m, layout == "nt")
+    validate_gemm_gfx1250_config(
+        m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, group_m,
+        dtype_id, mma_m, mma_n, mma_k, layout == "nt",
+    )
     a_leading_stride = _leading_stride(a, 1, 0, k, f"A does not satisfy the {layout.upper()} layout")
     if layout == "nt":
         b_leading_stride = _leading_stride(b, 0, 1, k, "B does not satisfy the NT layout")
@@ -445,12 +504,28 @@ def gemm_a16w16_gfx1250(
             stream = torch.cuda.current_stream()
         if stream.device != a.device:
             raise ValueError("stream must belong to the input device")
-        dtype_id = GEMM_DTYPE_FP16 if a.dtype is torch.float16 else GEMM_DTYPE_BF16
         dtype = fx.Float16 if dtype_id == GEMM_DTYPE_FP16 else fx.BFloat16
         pointers = [
             flyc.from_c_void_p(dtype, t.data_ptr())
             for t in (a, b, out, a if bias is None else bias)
         ]
+        has_bias = bias is not None
+        b_k_contiguous = layout == "nt"
+        param = GemmA16W16Gfx1250Param(
+            dtype_id=dtype_id,
+            block_m=block_m,
+            block_n=block_n,
+            block_k=block_k,
+            stages=stages,
+            m_waves=m_waves,
+            n_waves=n_waves,
+            group_m=group_m,
+            has_bias=has_bias,
+            b_k_contiguous=b_k_contiguous,
+            mma_m=mma_m,
+            mma_n=mma_n,
+            mma_k=mma_k,
+        )
         launch = build_gemm_gfx1250(
             dtype_id,
             block_m,
@@ -460,10 +535,29 @@ def gemm_a16w16_gfx1250(
             m_waves,
             n_waves,
             group_m,
-            bias is not None,
-            layout == "nt",
+            has_bias,
+            b_k_contiguous,
+            mma_m,
+            mma_n,
+            mma_k,
         )
-        flyc.compile(launch, *pointers, m, n, k, a_leading_stride, b_leading_stride, c_leading_stride, stream)
+        dispatch_args = (
+            *pointers,
+            m,
+            n,
+            k,
+            a_leading_stride,
+            b_leading_stride,
+            c_leading_stride,
+            stream,
+        )
+        run_cached(
+            launch,
+            *dispatch_args,
+            constexpr_param=param,
+            compiler=flyc.compile,
+            dispatch_args=dispatch_args,
+        )
     return out
 
 

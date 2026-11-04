@@ -10,7 +10,11 @@ from pathlib import Path
 import pytest
 import torch
 
-from kernels.gemm_a16w16_tdm_gfx1250 import _check_config, gemm_a16w16_gfx1250
+from kernels.gemm_a16w16_tdm_gfx1250 import (
+    GEMM_DTYPE_BF16,
+    validate_gemm_gfx1250_config,
+    gemm_a16w16_gfx1250,
+)
 
 
 def require_gfx1250():
@@ -196,10 +200,14 @@ def test_config_rejections(changed, message):
         "m_waves": 2,
         "n_waves": 2,
         "group_m": 0,
+        "dtype_id": GEMM_DTYPE_BF16,
+        "mma_m": 16,
+        "mma_n": 16,
+        "mma_k": 32,
     }
     config.update(changed)
     with pytest.raises(ValueError, match=message):
-        _check_config(**config)
+        validate_gemm_gfx1250_config(**config)
 
 
 def test_input_contract():
