@@ -167,7 +167,7 @@ def test_tile_variants(dtype, shape, config):
         ({"stages": 1}, "stages"),
         ({"stages": 34}, "stages"),
         ({"k": 32, "stages": 3}, "prefetch"),
-        ({"m": 65}, "aligned"),
+        ({"k": 40}, "K must"),
         ({"block_k": 48}, "power of two"),
         (
             {
@@ -231,6 +231,64 @@ def test_input_contract():
             m_waves=2,
             n_waves=2,
         )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("layout", ["nt", "nn"])
+def test_padded_leading_strides(dtype, layout):
+    require_gfx1250()
+    m, n, k = 64, 128, 64
+    torch.manual_seed(1102)
+    a = (torch.randint(-4, 5, (m, 80), device="cuda").float() / 16).to(dtype)[:, :k]
+    if layout == "nt":
+        b = (torch.randint(-4, 5, (n, 96), device="cuda").float() / 16).to(dtype)[:, :k].t()
+    else:
+        b = (torch.randint(-4, 5, (k, 160), device="cuda").float() / 16).to(dtype)[:, :n]
+    storage = torch.full((m, 192), 83, device="cuda", dtype=dtype)
+    out = storage[:, :n]
+    expected = reference(a, b)
+    torch.cuda.synchronize()
+    actual = gemm_a16w16(
+        a,
+        b,
+        out,
+        layout=layout,
+        block_m=64,
+        block_n=128,
+        block_k=32,
+        m_waves=2,
+        n_waves=2,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert (storage[:, n:] == 83).all()
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("layout", ["nt", "nn"])
+def test_partial_mn_tile(dtype, layout):
+    require_gfx1250()
+    m, n, k = 80, 200, 64
+    torch.manual_seed(1102)
+    a = (torch.randint(-4, 5, (m, k), device="cuda").float() / 16).to(dtype)
+    if layout == "nt":
+        b = (torch.randint(-4, 5, (n, k), device="cuda").float() / 16).to(dtype).t()
+    else:
+        b = (torch.randint(-4, 5, (k, n), device="cuda").float() / 16).to(dtype)
+    expected = reference(a, b)
+    torch.cuda.synchronize()
+    actual = gemm_a16w16(
+        a,
+        b,
+        layout=layout,
+        block_m=64,
+        block_n=128,
+        block_k=32,
+        m_waves=2,
+        n_waves=2,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -320,6 +378,93 @@ def test_bias_rounding_order(dtype):
         n_waves=2,
     )
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("layout", ["nn", "nt"])
+@pytest.mark.parametrize("dtype", ["bf16"])
+@pytest.mark.parametrize(
+    "m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, group_m, has_bias",
+    [
+        (8, 4096, 4096, 16, 16, 128, 8, 1, 1, 4, True),
+        (16, 4096, 4096, 16, 16, 128, 8, 1, 1, 4, True),
+        (32, 4096, 4096, 16, 16, 64, 8, 1, 1, 0, True),
+        (64, 4096, 4096, 32, 32, 64, 8, 2, 2, 4, True),
+        (128, 4096, 4096, 64, 32, 128, 4, 4, 2, 4, True),
+        (256, 4096, 4096, 64, 64, 64, 7, 4, 2, 4, True),
+        (512, 4096, 4096, 64, 128, 64, 6, 2, 4, 4, True),
+        (1024, 4096, 4096, 128, 128, 64, 4, 2, 4, 4, True),
+        (2048, 4096, 4096, 128, 256, 64, 3, 4, 4, 4, True),
+        (1024, 1024, 1024, 64, 64, 64, 4, 2, 4, 0, True),
+        (2048, 2048, 2048, 128, 128, 64, 3, 4, 2, 0, True),
+        (4096, 4096, 4096, 256, 256, 64, 2, 2, 4, 4, True),
+        (4096, 4096, 8192, 256, 256, 64, 2, 2, 4, 4, True),
+        (8192, 8192, 8192, 256, 256, 64, 2, 2, 4, 0, True),
+        (16384, 16384, 16384, 256, 256, 64, 2, 2, 4, 4, True),
+        (8, 7168, 2048, 16, 16, 128, 8, 1, 1, 4, True),
+        (32, 384, 7168, 16, 16, 128, 8, 1, 1, 0, True),
+        (32, 14336, 4096, 32, 64, 64, 8, 2, 2, 0, True),
+        (16, 28672, 4096, 16, 64, 128, 3, 1, 4, 4, True),
+        (4096, 256, 4096, 64, 64, 64, 6, 4, 2, 4, True),
+    ],
+)
+def test_gemm_a16w16_benchmark_smoke(
+    layout,
+    dtype,
+    m,
+    n,
+    k,
+    block_m,
+    block_n,
+    block_k,
+    stages,
+    m_waves,
+    n_waves,
+    group_m,
+    has_bias,
+):
+    require_gfx1250()
+    torch_dtype = torch.bfloat16 if dtype == "bf16" else torch.float16
+    torch.manual_seed(1102)
+    a = (torch.randn((m, k), device="cuda") / 8).to(torch_dtype)
+    if layout == "nt":
+        b = (torch.randn((n, k), device="cuda") / 8).to(torch_dtype).t()
+    else:
+        b = (torch.randn((k, n), device="cuda") / 8).to(torch_dtype)
+    bias = (torch.randn((n,), device="cuda") / 8).to(torch_dtype) if has_bias else None
+    config = {
+        "block_m": block_m,
+        "block_n": block_n,
+        "block_k": block_k,
+        "stages": stages,
+        "m_waves": m_waves,
+        "n_waves": n_waves,
+        "group_m": group_m,
+        "layout": layout,
+    }
+    out = torch.empty((m, n), device="cuda", dtype=torch_dtype)
+    expected = reference(a, b, bias)
+    torch.cuda.synchronize()
+    gemm_a16w16(a, b, out, bias, **config)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, expected, atol=0.02, rtol=0.02)
+
+    for _ in range(3):
+        gemm_a16w16(a, b, out, bias, **config)
+    torch.cuda.synchronize()
+    nodes = 8
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for _ in range(nodes):
+            gemm_a16w16(a, b, out, bias, **config)
+    samples = benchmark_graph(graph, nodes, "legacy")
+    graph.reset()
+    ms = statistics.median(samples)
+    print(
+        f"layout={layout} shape=({m},{n},{k}) "
+        f"tile=({block_m},{block_n},{block_k}) stages={stages} "
+        f"waves=({m_waves},{n_waves}) group_m={group_m} "
+        f"ms={ms:.6f} tflops={2 * m * n * k / ms / 1e9:.2f}"
+    )
 
 
 def benchmark_graph(graph, nodes, mode):

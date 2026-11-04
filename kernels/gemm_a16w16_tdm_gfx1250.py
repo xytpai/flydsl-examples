@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""PeakGemm-style wave32 TDM GEMM: NT layout, full tiles, no split-K."""
+"""PeakGemm-style wave32 TDM GEMM: NT or NN layout, full tiles, no split-K."""
 
 import functools
 
@@ -9,12 +9,28 @@ import torch
 from flydsl.expr import const_expr, range_constexpr, rocdl, tdm_ops
 from flydsl.expr.typing import T
 
+
 WAVE_SIZE = 32
 LDS_PAD = 8
 
 
+GEMM_DTYPE_FP32 = 1
+GEMM_DTYPE_BF16 = 2
+GEMM_DTYPE_FP16 = 3
+GEMM_DTYPE_MXFP8 = 4
+GEMM_DTYPE_MXFP4 = 5
+GEMM_DTYPE_NAMES = {
+    GEMM_DTYPE_FP32: "fp32",
+    GEMM_DTYPE_BF16: "bf16",
+    GEMM_DTYPE_FP16: "fp16",
+    GEMM_DTYPE_MXFP8: "mxfp8",
+    GEMM_DTYPE_MXFP4: "mxfp4",
+}
+
+
 def _check_config(
-    m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, group_m
+    m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, group_m,
+    b_k_contiguous=True,
 ):
     values = (m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves)
     if any(type(v) is not int or v <= 0 for v in values):
@@ -43,28 +59,51 @@ def _check_config(
     threads = waves * WAVE_SIZE
     if threads % (block_n // 8) or block_m * block_n % (threads * 8):
         raise ValueError("the output tile must support whole-workgroup 16-byte stores")
-    shared_bytes = 2 * max(
-        stages * (block_m + block_n) * (block_k + LDS_PAD), block_m * block_n
-    )
+    a_stage_size = block_m * (block_k + LDS_PAD)
+    b_stage_size = block_n * (block_k + LDS_PAD) if b_k_contiguous else block_k * (block_n + LDS_PAD)
+    shared_bytes = 2 * max(stages * (a_stage_size + b_stage_size), block_m * block_n)
     if shared_bytes > 320 * 1024:
         raise ValueError("pipeline exceeds gfx1250's 320 KiB LDS capacity")
-    if m % block_m or n % block_n or k % block_k:
-        raise ValueError("M, N and K must be block-tile aligned")
+    if k % block_k:
+        raise ValueError("K must be block-tile aligned")
     if k < (stages - 1) * block_k:
         raise ValueError("K needs at least stages - 1 tiles for the prefetch prologue")
-    if max(m * k, n * k, m * n, group_m * (n // block_n)) > (2**32 - 1) // 2:
-        raise ValueError("tensor or block offsets exceed the supported 32-bit range")
+    n_blocks = (n + block_n - 1) // block_n
+    if group_m * n_blocks > (2**32 - 1) // 2:
+        raise ValueError("block swizzle offsets exceed the supported 32-bit range")
 
 
 @functools.lru_cache(maxsize=128)
-def _build_kernel(
-    is_fp16, block_m, block_n, block_k, stages, m_waves, n_waves, group_m, has_bias
+def build_gemm_gfx1250(
+    dtype_id: int,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    stages: int,
+    m_waves: int,
+    n_waves: int,
+    group_m: int,
+    has_bias: bool,
+    b_k_contiguous: bool,
 ):
-    elem = fx.Float16 if is_fp16 else fx.BFloat16
+    elem = {GEMM_DTYPE_FP16: fx.Float16, GEMM_DTYPE_BF16: fx.BFloat16}.get(dtype_id)
+    if elem is None:
+        name = GEMM_DTYPE_NAMES.get(dtype_id, "unknown")
+        raise ValueError(f"unsupported dtype_id={dtype_id} ({name})")
     waves = m_waves * n_waves
     threads = waves * WAVE_SIZE
-    pitch = block_k + LDS_PAD
-    a_stage_size, b_stage_size = block_m * pitch, block_n * pitch
+    # Views are A[M, K] and B[K, N]. Pad whichever dimension is contiguous.
+    a_pitch = block_k + LDS_PAD
+    a_stage_size = block_m * a_pitch
+    a_shared_stride = (a_pitch, 1)
+    if b_k_contiguous:
+        b_pitch = block_k + LDS_PAD
+        b_stage_size = block_n * b_pitch
+        b_shared_stride = (1, b_pitch)
+    else:
+        b_pitch = block_n + LDS_PAD
+        b_stage_size = block_k * b_pitch
+        b_shared_stride = (b_pitch, 1)
     shared_elements = max(stages * (a_stage_size + b_stage_size), block_m * block_n)
     m_steps, n_steps = block_m // (m_waves * 16), block_n // (n_waves * 16)
 
@@ -81,13 +120,17 @@ def _build_kernel(
         m: fx.Int32,
         n: fx.Int32,
         k: fx.Int32,
+        a_leading_stride: fx.Int32,
+        b_leading_stride: fx.Int32,
+        c_leading_stride: fx.Int32,
     ):
         rocdl.disable_xdl_arb_stall()
         tid = fx.thread_idx.x
         wave = rocdl.wave_id()
         lane = tid % WAVE_SIZE
         block_id = fx.block_idx.x
-        m_blocks, n_blocks = m // block_m, n // block_n
+        m_blocks = (m + block_m - 1) // block_m
+        n_blocks = (n + block_n - 1) // block_n
         if const_expr(group_m == 0):
             block_row, block_col = block_id // n_blocks, block_id % n_blocks
         else:
@@ -105,43 +148,58 @@ def _build_kernel(
         shared_a = storage.data.ptr
         shared_b = shared_a + stages * a_stage_size
 
-        # Describe the entire K range once. TDM splits disjoint rows across waves
-        # and derives the 8-element LDS padding from the destination layout.
-        def tdm_operand(pointer, start, rows):
+        # Full tensor, not the tile. A tile that hangs past M or N stays
+        # block-sized in LDS; TDM zero-fills the out-of-range elements.
+        def tdm_operand(pointer, shape, tile, global_stride, shared_stride):
             global_view = fx.make_view(
-                pointer + fx.Int64(start) * fx.Int64(k),
-                fx.make_layout((rows, k), (k, 1)),
+                pointer,
+                fx.make_layout(shape, global_stride),
             )
-            tile = (rows, block_k)
             atom, coords = rocdl.cdna5.make_tiled_tdm_atom(
                 rocdl.TensorLoad(),
                 global_view,
-                fx.make_layout(tile, (pitch, 1)),
+                fx.make_layout(tile, shared_stride),
                 tile,
                 num_warps=waves,
             )
-            return atom, fx.zipped_divide(coords, tile)[None, (0, None)]
+            return atom, fx.zipped_divide(coords, tile)
 
-        atom_a, coords_a = tdm_operand(a, row_start, block_m)
-        atom_b, coords_b = tdm_operand(b, col_start, block_n)
+        a_global_stride = (a_leading_stride, 1)
+        if const_expr(b_k_contiguous):
+            b_global_stride = (1, b_leading_stride)
+        else:
+            b_global_stride = (b_leading_stride, 1)
+        atom_a, coords_a = tdm_operand(
+            a, (m, k), (block_m, block_k), a_global_stride, a_shared_stride,
+        )
+        atom_b, coords_b = tdm_operand(
+            b, (k, n), (block_k, block_n), b_global_stride, b_shared_stride,
+        )
 
-        def copy_operand(atom, coords, shared, rows, stage, tile_index):
+        def copy_operand(atom, shared, tile_shape, stage, tile_index, shared_stride, stage_size, coord):
             shared_view = fx.make_view(
-                shared + stage * rows * pitch,
-                fx.make_layout(((rows, block_k), 1), ((pitch, 1), rows * pitch)),
+                shared + stage * stage_size,
+                fx.make_layout((tile_shape, 1), (shared_stride, stage_size)),
             )
             dst, src = rocdl.cdna5.tdm_partition(
                 atom,
                 wave,
                 fx.make_layout(waves, 1),
                 shared_view,
-                coords,
+                coord,
             )
             fx.copy(atom, src[None, tile_index], dst[None, 0])
 
         def copy_tile(stage, tile_index):
-            copy_operand(atom_b, coords_b, shared_b, block_n, stage, tile_index)
-            copy_operand(atom_a, coords_a, shared_a, block_m, stage, tile_index)
+            # Rest modes follow the view: A is (M tile, K tile), B is (K tile, N tile).
+            copy_operand(
+                atom_b, shared_b, (block_k, block_n), stage, tile_index,
+                b_shared_stride, b_stage_size, coords_b[None, (None, block_col)],
+            )
+            copy_operand(
+                atom_a, shared_a, (block_m, block_k), stage, tile_index,
+                a_shared_stride, a_stage_size, coords_a[None, (block_row, None)],
+            )
             rocdl.sched_barrier(0)
 
         def wait_tile(pending_stages):
@@ -158,21 +216,28 @@ def _build_kernel(
         for acc in accumulators:
             acc.store(fx.full(8, 0.0, fx.Float32))
 
-        def load_fragment(shared, stage, stage_size, row, column):
-            offset = (
-                stage * stage_size + (row + lane % 16) * pitch + column + lane // 16 * 8
-            )
-            low = fx.ptr_load(shared + offset, result_type=T.vec(8, elem.ir_type))
-            high = fx.ptr_load(shared + offset + 16, result_type=T.vec(8, elem.ir_type))
+        def load_fragment(shared, stage, stage_size, row, column, is_k_major=True):
+            if const_expr(is_k_major):
+                offset = stage * stage_size + (row + lane % 16) * a_pitch + column + lane // 16 * 8
+                low = fx.ptr_load(shared + offset, result_type=T.vec(8, elem.ir_type))
+                high = fx.ptr_load(shared + offset + 16, result_type=T.vec(8, elem.ir_type))
+                values = low.shuffle(high, list(range(16)))
+            else:
+                offset = stage * stage_size + row + lane % 16 + (column + lane // 16 * 8) * b_pitch
+                values = fx.Vector.from_elements([
+                    fx.ptr_load(shared + offset + (i % 8 + i // 8 * 16) * b_pitch)
+                    for i in range_constexpr(16)
+                ])
             fragment = fx.make_rmem_tensor(16, elem)
-            fragment.store(low.shuffle(high, list(range(16))))
+            fragment.store(values)
             return fragment
 
         def compute_tile(stage):
             for ki in range_constexpr(block_k // 32):
                 b_fragments = [
                     load_fragment(
-                        shared_b, stage, b_stage_size, wave_col + ni * 16, ki * 32
+                        shared_b, stage, b_stage_size, wave_col + ni * 16, ki * 32,
+                        is_k_major=b_k_contiguous,
                     )
                     for ni in range_constexpr(n_steps)
                 ]
@@ -233,16 +298,32 @@ def _build_kernel(
             offset = (i * threads + tid) * 8
             row, col = offset // block_n, offset % block_n
             values = fx.ptr_load(shared_a + offset, result_type=T.vec(8, elem.ir_type))
-            if const_expr(has_bias):
-                bias_values = fx.ptr_load(
-                    bias + col_start + col, result_type=T.vec(8, elem.ir_type)
-                )
-                # Round C to input dtype BEFORE bias, as PeakGemm does.
-                values = (values.to(fx.Float32) + bias_values.to(fx.Float32)).to(elem)
             destination = (
-                out + fx.Int64(row_start + row) * fx.Int64(n) + col_start + col
+                out
+                + fx.Int64(row_start + row) * fx.Int64(c_leading_stride)
+                + col_start
+                + col
             )
-            fx.make_view(destination, fx.make_layout(8, 1)).store(values)
+            # Interior tiles store 8 contiguous N elements. An edge tile may
+            # cover rows or columns past M or N; those elements stay unstored.
+            if (row_start + block_m <= m) and (col_start + block_n <= n):
+                if const_expr(has_bias):
+                    bias_values = fx.ptr_load(
+                        bias + col_start + col, result_type=T.vec(8, elem.ir_type)
+                    )
+                    # Round C to input dtype BEFORE bias, as PeakGemm does.
+                    values = (values.to(fx.Float32) + bias_values.to(fx.Float32)).to(elem)
+                fx.make_view(destination, fx.make_layout(8, 1)).store(values)
+            else:
+                for element in range_constexpr(8):
+                    if (row_start + row < m) and (col_start + col + element < n):
+                        value = values[element]
+                        if const_expr(has_bias):
+                            bias_value = fx.ptr_load(
+                                bias + col_start + col + element, result_type=elem.ir_type
+                            )
+                            value = (value.to(fx.Float32) + bias_value.to(fx.Float32)).to(elem)
+                        fx.ptr_store(value, destination + element)
 
     @flyc.jit
     def launch(
@@ -253,10 +334,13 @@ def _build_kernel(
         m: fx.Int32,
         n: fx.Int32,
         k: fx.Int32,
+        a_leading_stride: fx.Int32,
+        b_leading_stride: fx.Int32,
+        c_leading_stride: fx.Int32,
         stream: fx.Stream,
     ):
-        kernel(a, b, out, bias, m, n, k).launch(
-            grid=(m // block_m * (n // block_n), 1, 1),
+        kernel(a, b, out, bias, m, n, k, a_leading_stride, b_leading_stride, c_leading_stride).launch(
+            grid=((m + block_m - 1) // block_m * ((n + block_n - 1) // block_n), 1, 1),
             block=(threads, 1, 1),
             stream=stream,
         )
@@ -278,12 +362,16 @@ def gemm_a16w16(
     n_waves=4,
     group_m=0,
     stream=None,
+    layout="nt",
 ):
-    """C = A[M,K] @ B[K,N], NT storage; FP16/BF16 output, optional bias.
+    """C = A[M,K] @ B[K,N]; FP16/BF16 output, optional bias.
 
-    A and C are contiguous. B is a transposed contiguous [N,K] tensor.
-    Full tiles only; K must contain at least stages - 1 complete tiles.
-    Unlike the gfx950 example, this first port has no split-K or tail path.
+    ``layout`` is ``nt`` or ``nn``. N means that dimension is contiguous
+    (stride 1); T means the other dimension is contiguous. The other stride
+    is the leading stride and may be larger than the contiguous size, so
+    padded rows are allowed. C is always row-major. M and N may end on a
+    partial tile; K must contain at least ``stages - 1`` complete tiles.
+    No split-K or K tail path.
     """
     if a.ndim != 2 or b.ndim != 2 or a.shape[1] != b.shape[0]:
         raise ValueError("expected A[M,K] and B[K,N]")
@@ -291,22 +379,22 @@ def gemm_a16w16(
         raise ValueError("A and B must have the same FP16 or BF16 dtype")
     if a.device != b.device or a.device.type != "cuda":
         raise ValueError("A and B must be on the same ROCm device")
+    layout = layout.lower()
+    if layout not in ("nn", "nt"):
+        raise ValueError("layout must be 'nn' or 'nt'")
     m, k = a.shape
     n = b.shape[1]
-    _check_config(m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, group_m)
-    if not a.is_contiguous() or b.stride() != (1, k):
-        raise ValueError(
-            "NT layout requires contiguous A and B = contiguous_weights.t()"
-        )
+    _check_config(m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, group_m, layout == "nt")
+    a_leading_stride = _leading_stride(a, 1, 0, k, f"A does not satisfy the {layout.upper()} layout")
+    if layout == "nt":
+        b_leading_stride = _leading_stride(b, 0, 1, k, "B does not satisfy the NT layout")
+    else:
+        b_leading_stride = _leading_stride(b, 1, 0, n, "B does not satisfy the NN layout")
     if out is None:
         out = torch.empty((m, n), device=a.device, dtype=a.dtype)
-    if (
-        out.shape != (m, n)
-        or out.dtype != a.dtype
-        or out.device != a.device
-        or not out.is_contiguous()
-    ):
-        raise ValueError("out must be contiguous [M,N] with the input dtype and device")
+    if out.shape != (m, n) or out.dtype != a.dtype or out.device != a.device:
+        raise ValueError("out must be [M,N] with the input dtype and device")
+    c_leading_stride = _leading_stride(out, 1, 0, n, "out must be row-major [M,N]")
     if bias is not None and (
         bias.shape != (n,)
         or bias.dtype != a.dtype
@@ -317,11 +405,10 @@ def gemm_a16w16(
     tensors = [a, b, out] + ([] if bias is None else [bias])
     if any(t.data_ptr() % 16 for t in tensors):
         raise ValueError("all pointers must be 16-byte aligned")
-    lo, hi = out.data_ptr(), out.data_ptr() + out.numel() * out.element_size()
-    if any(
-        lo < t.data_ptr() + t.numel() * t.element_size() and t.data_ptr() < hi
-        for t in [a, b] + ([] if bias is None else [bias])
-    ):
+    if max(m * a_leading_stride, k * b_leading_stride, n * b_leading_stride, m * c_leading_stride) > (2**32 - 1) // 2:
+        raise ValueError("tensor offsets exceed the supported 32-bit range")
+    out_lo, out_hi = _storage_span(out)
+    if any(_overlaps(out_lo, out_hi, t) for t in [a, b] + ([] if bias is None else [bias])):
         raise ValueError("out must not overlap the inputs")
     with torch.cuda.device(a.device):
         arch = torch.cuda.get_device_properties(a.device).gcnArchName.split(":")[0]
@@ -331,13 +418,14 @@ def gemm_a16w16(
             stream = torch.cuda.current_stream()
         if stream.device != a.device:
             raise ValueError("stream must belong to the input device")
-        dtype = fx.Float16 if a.dtype == torch.float16 else fx.BFloat16
+        dtype_id = GEMM_DTYPE_FP16 if a.dtype is torch.float16 else GEMM_DTYPE_BF16
+        dtype = fx.Float16 if dtype_id == GEMM_DTYPE_FP16 else fx.BFloat16
         pointers = [
             flyc.from_c_void_p(dtype, t.data_ptr())
             for t in (a, b, out, a if bias is None else bias)
         ]
-        launch = _build_kernel(
-            a.dtype == torch.float16,
+        launch = build_gemm_gfx1250(
+            dtype_id,
             block_m,
             block_n,
             block_k,
@@ -346,6 +434,35 @@ def gemm_a16w16(
             n_waves,
             group_m,
             bias is not None,
+            layout == "nt",
         )
-        flyc.compile(launch, *pointers, m, n, k, stream)
+        flyc.compile(launch, *pointers, m, n, k, a_leading_stride, b_leading_stride, c_leading_stride, stream)
     return out
+
+
+def _leading_stride(tensor, unit_dim, leading_dim, min_leading, message):
+    unit, leading = tensor.stride(unit_dim), tensor.stride(leading_dim)
+    if (
+        unit != 1
+        or leading < min_leading
+        or leading * tensor.element_size() % 16 != 0
+    ):
+        raise ValueError(
+            f"{message}: expected stride({unit_dim}) == 1 and a 16-byte-aligned "
+            f"leading stride({leading_dim}) >= {min_leading}; got stride={tuple(tensor.stride())}"
+        )
+    return int(leading)
+
+
+def _storage_span(tensor):
+    last = (tensor.shape[0] - 1) * tensor.stride(0) + (tensor.shape[1] - 1) * tensor.stride(1)
+    start = tensor.data_ptr()
+    return start, start + (last + 1) * tensor.element_size()
+
+
+def _overlaps(out_lo, out_hi, tensor):
+    lo, hi = _storage_span(tensor) if tensor.ndim == 2 else (
+        tensor.data_ptr(),
+        tensor.data_ptr() + tensor.numel() * tensor.element_size(),
+    )
+    return out_lo < hi and lo < out_hi
