@@ -100,15 +100,15 @@ def build_gemm_gfx1250(
     # Views are A[M, K] and B[K, N]. Pad whichever dimension is contiguous.
     a_pitch = block_k + LDS_PAD
     a_stage_size = block_m * a_pitch
-    a_shared_stride = (a_pitch, 1)
+    a_tile_stride = (a_pitch, 1)
     if b_k_contiguous:
         b_pitch = block_k + LDS_PAD
         b_stage_size = block_n * b_pitch
-        b_shared_stride = (1, b_pitch)
+        b_tile_stride = (1, b_pitch)
     else:
         b_pitch = block_n + LDS_PAD
         b_stage_size = block_k * b_pitch
-        b_shared_stride = (b_pitch, 1)
+        b_tile_stride = (b_pitch, 1)
     shared_elements = max(stages * (a_stage_size + b_stage_size), block_m * block_n)
     m_steps, n_steps = block_m // (m_waves * 16), block_n // (n_waves * 16)
 
@@ -152,19 +152,19 @@ def build_gemm_gfx1250(
 
         # Full tensor, not the tile. A tile that hangs past M or N stays
         # block-sized in LDS; TDM zero-fills the out-of-range elements.
-        def tdm_operand(pointer, shape, tile, global_stride, shared_stride):
+        def tdm_operand(global_pointer, global_shape, global_stride, tile_shape, tile_stride):
             global_view = fx.make_view(
-                pointer,
-                fx.make_layout(shape, global_stride),
+                global_pointer,
+                fx.make_layout(global_shape, global_stride),
             )
             atom, coords = rocdl.cdna5.make_tiled_tdm_atom(
                 rocdl.TensorLoad(),
                 global_view,
-                fx.make_layout(tile, shared_stride),
-                tile,
+                fx.make_layout(tile_shape, tile_stride),
+                tile_shape,
                 num_warps=waves,
             )
-            return atom, fx.zipped_divide(coords, tile)
+            return atom, fx.zipped_divide(coords, tile_shape)
 
         a_global_stride = (a_leading_stride, 1)
         if const_expr(b_k_contiguous):
@@ -172,16 +172,16 @@ def build_gemm_gfx1250(
         else:
             b_global_stride = (b_leading_stride, 1)
         atom_a, coords_a = tdm_operand(
-            a, (m, k), (block_m, block_k), a_global_stride, a_shared_stride,
+            a, (m, k), a_global_stride, (block_m, block_k), a_tile_stride,
         )
         atom_b, coords_b = tdm_operand(
-            b, (k, n), (block_k, block_n), b_global_stride, b_shared_stride,
+            b, (k, n), b_global_stride, (block_k, block_n), b_tile_stride,
         )
 
-        def copy_operand(atom, shared, tile_shape, stage, tile_index, shared_stride, stage_size, coord):
+        def copy_operand(atom, shared_pointer, tile_shape, tile_stride, stage_size, dst_stage, src_stage, coord):
             shared_view = fx.make_view(
-                shared + stage * stage_size,
-                fx.make_layout((tile_shape, 1), (shared_stride, stage_size)),
+                shared_pointer,
+                fx.make_layout((tile_shape, stages), (tile_stride, stage_size)),
             )
             dst, src = rocdl.cdna5.tdm_partition(
                 atom,
@@ -190,17 +190,17 @@ def build_gemm_gfx1250(
                 shared_view,
                 coord,
             )
-            fx.copy(atom, src[None, tile_index], dst[None, 0])
+            fx.copy(atom, src[None, src_stage], dst[None, dst_stage])
 
-        def copy_tile(stage, tile_index):
+        def copy_tile(dst_stage, src_stage):
             # Rest modes follow the view: A is (M tile, K tile), B is (K tile, N tile).
             copy_operand(
-                atom_b, shared_b, (block_k, block_n), stage, tile_index,
-                b_shared_stride, b_stage_size, coords_b[None, (None, block_col)],
+                atom_b, shared_b, (block_k, block_n), b_tile_stride, b_stage_size,
+                dst_stage, src_stage, coords_b[None, (None, block_col)],
             )
             copy_operand(
-                atom_a, shared_a, (block_m, block_k), stage, tile_index,
-                a_shared_stride, a_stage_size, coords_a[None, (block_row, None)],
+                atom_a, shared_a, (block_m, block_k), a_tile_stride, a_stage_size,
+                dst_stage, src_stage, coords_a[None, (block_row, None)],
             )
             rocdl.sched_barrier(0)
 
@@ -218,16 +218,17 @@ def build_gemm_gfx1250(
         for acc in accumulators:
             acc.store(fx.full(8, 0.0, fx.Float32))
 
-        def load_fragment(shared, stage, stage_size, row, column, is_k_major=True):
-            if const_expr(is_k_major):
-                offset = stage * stage_size + (row + lane % 16) * a_pitch + column + lane // 16 * 8
-                low = fx.ptr_load(shared + offset, result_type=T.vec(8, elem.ir_type))
-                high = fx.ptr_load(shared + offset + 16, result_type=T.vec(8, elem.ir_type))
+        def load_fragment(shared_pointer, stage_size, stage, row, column, k_contiguous=True):
+            if const_expr(k_contiguous):
+                # A is always k_contiguous
+                offset = stage * stage_size + (row + lane % 16) * (block_k + LDS_PAD) + column + lane // 16 * 8
+                low = fx.ptr_load(shared_pointer + offset, result_type=T.vec(8, elem.ir_type))
+                high = fx.ptr_load(shared_pointer + offset + 16, result_type=T.vec(8, elem.ir_type))
                 values = low.shuffle(high, list(range(16)))
             else:
                 offset = stage * stage_size + row + lane % 16 + (column + lane // 16 * 8) * b_pitch
                 values = fx.Vector.from_elements([
-                    fx.ptr_load(shared + offset + (i % 8 + i // 8 * 16) * b_pitch)
+                    fx.ptr_load(shared_pointer + offset + (i % 8 + i // 8 * 16) * b_pitch)
                     for i in range_constexpr(16)
                 ])
             fragment = fx.make_rmem_tensor(16, elem)
@@ -238,15 +239,15 @@ def build_gemm_gfx1250(
             for ki in range_constexpr(block_k // 32):
                 b_fragments = [
                     load_fragment(
-                        shared_b, stage, b_stage_size, wave_col + ni * 16, ki * 32,
-                        is_k_major=b_k_contiguous,
+                        shared_b, b_stage_size, stage, wave_col + ni * 16, ki * 32,
+                        k_contiguous=b_k_contiguous,
                     )
                     for ni in range_constexpr(n_steps)
                 ]
                 rocdl.sched_barrier(0)
                 for mi in range_constexpr(m_steps):
                     a_fragment = load_fragment(
-                        shared_a, stage, a_stage_size, wave_row + mi * 16, ki * 32
+                        shared_a, a_stage_size, stage, wave_row + mi * 16, ki * 32
                     )
                     rocdl.sched_barrier(0)
                     for ni in range_constexpr(n_steps):
