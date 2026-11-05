@@ -102,7 +102,7 @@ def validate_gemm_gfx1250_config(
     if k % (split_k * block_k):
         raise ValueError("K must be divisible by split_k * block_k")
     if k // split_k < (stages - 1) * block_k:
-        raise ValueError("each K slice needs at least stages - 1 tiles")
+        raise ValueError("prefetch needs at least stages - 1 tiles in each K slice")
     n_blocks = (n + block_n - 1) // block_n
     if group_m * n_blocks > (2**32 - 1) // 2:
         raise ValueError("block swizzle offsets exceed the supported 32-bit range")
