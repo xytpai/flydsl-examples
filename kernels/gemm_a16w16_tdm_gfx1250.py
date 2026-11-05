@@ -117,7 +117,7 @@ def make_gemm_a16w16_gfx1250_kernel_name(
     return (
         f"hgemm_{dtype_name}_t{block_m}x{block_n}x{block_k}x{stages}"
         f"_w{m_waves}x{n_waves}_gm{group_m}_bias{int(has_bias)}_l{layout}"
-        f"_mma{mma_m}x{mma_n}x{mma_k}_sk{split_k}"
+        f"_sk{split_k}_mma{mma_m}x{mma_n}x{mma_k}"
     )
 
 
