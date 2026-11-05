@@ -156,10 +156,13 @@ def build_gemm_gfx1250(
     mma_k: int,
     split_k: int = 1,
 ):
-    elem = {GEMM_DTYPE_FP16: fx.Float16, GEMM_DTYPE_BF16: fx.BFloat16}.get(dtype_id)
-    if elem is None:
+    elem_dtype = {GEMM_DTYPE_FP16: fx.Float16, GEMM_DTYPE_BF16: fx.BFloat16}.get(dtype_id)
+    if elem_dtype is None:
         name = GEMM_DTYPE_NAMES.get(dtype_id, "unknown")
         raise ValueError(f"unsupported dtype_id={dtype_id} ({name})")
+    elem_bits = GEMM_DTYPE_BITS[dtype_id]
+    vec_elems = STORE_VEC_BITS // elem_bits
+    acc_elems = mma_m * mma_n // WAVE_SIZE
     waves = m_waves * n_waves
     threads = waves * WAVE_SIZE
     # Views are A[M, K] and B[K, N]. Pad whichever dimension is contiguous.
@@ -179,7 +182,7 @@ def build_gemm_gfx1250(
 
     @fx.struct
     class SharedStorage:
-        data: fx.Array[elem, shared_elements, 16]
+        data: fx.Array[elem_dtype, shared_elements, 16]
 
     @flyc.kernel
     def kernel(
@@ -276,20 +279,20 @@ def build_gemm_gfx1250(
             # This also protects the previous tile's LDS reads before recycling.
             fx.gpu.barrier()
 
-        mma = fx.make_mma_atom(rocdl.WMMA(mma_m, mma_n, mma_k, elem, fx.Float32))
+        mma = fx.make_mma_atom(rocdl.WMMA(mma_m, mma_n, mma_k, elem_dtype, fx.Float32))
         accumulators = [
-            fx.make_rmem_tensor(8, fx.Float32)
+            fx.make_rmem_tensor(acc_elems, fx.Float32)
             for _ in range_constexpr(m_steps * n_steps)
         ]
         for acc in accumulators:
-            acc.store(fx.full(8, 0.0, fx.Float32))
+            acc.store(fx.full(acc_elems, 0.0, fx.Float32))
 
         def load_fragment(shared_pointer, stage_size, stage, row, column, k_contiguous=True):
             if const_expr(k_contiguous):
                 # A is always k_contiguous
                 offset = stage * stage_size + (row + lane % 16) * (block_k + LDS_PAD) + column + lane // 16 * 8
-                low = fx.ptr_load(shared_pointer + offset, result_type=T.vec(8, elem.ir_type))
-                high = fx.ptr_load(shared_pointer + offset + 16, result_type=T.vec(8, elem.ir_type))
+                low = fx.ptr_load(shared_pointer + offset, result_type=T.vec(8, elem_dtype.ir_type))
+                high = fx.ptr_load(shared_pointer + offset + 16, result_type=T.vec(8, elem_dtype.ir_type))
                 values = low.shuffle(high, list(range(16)))
             else:
                 offset = stage * stage_size + row + lane % 16 + (column + lane // 16 * 8) * b_pitch
@@ -297,7 +300,7 @@ def build_gemm_gfx1250(
                     fx.ptr_load(shared_pointer + offset + (i % 8 + i // 8 * 16) * b_pitch)
                     for i in range_constexpr(16)
                 ])
-            fragment = fx.make_rmem_tensor(16, elem)
+            fragment = fx.make_rmem_tensor(16, elem_dtype)
             fragment.store(values)
             return fragment
 
@@ -361,14 +364,14 @@ def build_gemm_gfx1250(
             current_stage = (current_stage + 1) % stages
 
         # Reuse the A/B LDS arena for coalesced output stores.
-        # Native WMMA output: column=lane%16, row=lane//16*8+register_index.
+        # Native WMMA output: column=lane%16, row=lane//16*acc_elems+register_index.
         fx.gpu.barrier()
         for mi in range_constexpr(m_steps):
             for ni in range_constexpr(n_steps):
-                values = accumulators[mi * n_steps + ni].load().to(elem)
-                row = wave_row + mi * mma_m + lane // 16 * 8
+                values = accumulators[mi * n_steps + ni].load().to(elem_dtype)
+                row = wave_row + mi * mma_m + lane // 16 * acc_elems
                 col = wave_col + ni * mma_n + lane % 16
-                for i in range_constexpr(8):
+                for i in range_constexpr(acc_elems):
                     fx.ptr_store(values[i], shared_a + (row + i) * block_n + col)
         fx.gpu.barrier()
 
@@ -379,39 +382,39 @@ def build_gemm_gfx1250(
                 + col_start
                 + col
             )
-            # Interior tiles store 8 contiguous N elements. An edge tile may
+            # Interior tiles store one 16-byte vector along N. An edge tile may
             # cover rows or columns past M or N; those elements stay unstored.
             if (row_start + block_m <= m) and (col_start + block_n <= n):
                 if const_expr(has_bias):
                     bias_values = fx.ptr_load(
-                        bias + col_start + col, result_type=T.vec(8, elem.ir_type)
+                        bias + col_start + col, result_type=T.vec(vec_elems, elem_dtype.ir_type)
                     )
                     # Round C to input dtype BEFORE bias.
-                    values = (values.to(fx.Float32) + bias_values.to(fx.Float32)).to(elem)
-                fx.make_view(destination, fx.make_layout(8, 1)).store(values)
+                    values = (values.to(fx.Float32) + bias_values.to(fx.Float32)).to(elem_dtype)
+                fx.make_view(destination, fx.make_layout(vec_elems, 1)).store(values)
             else:
-                for element in range_constexpr(8):
+                for element in range_constexpr(vec_elems):
                     if (row_start + row < m) and (col_start + col + element < n):
                         value = values[element]
                         if const_expr(has_bias):
                             bias_value = fx.ptr_load(
-                                bias + col_start + col + element, result_type=elem.ir_type
+                                bias + col_start + col + element, result_type=elem_dtype.ir_type
                             )
-                            value = (value.to(fx.Float32) + bias_value.to(fx.Float32)).to(elem)
+                            value = (value.to(fx.Float32) + bias_value.to(fx.Float32)).to(elem_dtype)
                         fx.ptr_store(value, destination + element)
 
         tile_elems = block_m * block_n
         if const_expr(split_k == 1):
-            for i in range_constexpr(tile_elems // (threads * 8)):
-                offset = (i * threads + tid) * 8
+            for i in range_constexpr(tile_elems // (threads * vec_elems)):
+                offset = (i * threads + tid) * vec_elems
                 row, col = offset // block_n, offset % block_n
-                values = fx.ptr_load(shared_a + offset, result_type=T.vec(8, elem.ir_type))
+                values = fx.ptr_load(shared_a + offset, result_type=T.vec(vec_elems, elem_dtype.ir_type))
                 commit_output(values, row, col)
         else:
-            for i in range_constexpr(tile_elems // (threads * 8)):
-                offset = (i * threads + tid) * 8
+            for i in range_constexpr(tile_elems // (threads * vec_elems)):
+                offset = (i * threads + tid) * vec_elems
                 row, col = offset // block_n, offset % block_n
-                values = fx.ptr_load(shared_a + offset, result_type=T.vec(8, elem.ir_type))
+                values = fx.ptr_load(shared_a + offset, result_type=T.vec(vec_elems, elem_dtype.ir_type))
                 partial = (
                     workspace
                     + fx.Int64(block_id) * (split_k * tile_elems)
@@ -419,15 +422,15 @@ def build_gemm_gfx1250(
                     + row * block_n
                     + col
                 )
-                fx.make_view(partial, fx.make_layout(8, 1)).store(values)
+                fx.make_view(partial, fx.make_layout(vec_elems, 1)).store(values)
             cluster_barrier()
             if k_rank == 0:
-                for i in range_constexpr(tile_elems // (threads * 8)):
-                    offset = (i * threads + tid) * 8
+                for i in range_constexpr(tile_elems // (threads * vec_elems)):
+                    offset = (i * threads + tid) * vec_elems
                     row, col = offset // block_n, offset % block_n
                     total = fx.ptr_load(
                         workspace + fx.Int64(block_id) * (split_k * tile_elems) + offset,
-                        result_type=T.vec(8, elem.ir_type),
+                        result_type=T.vec(vec_elems, elem_dtype.ir_type),
                     ).to(fx.Float32)
                     for part in range_constexpr(split_k - 1):
                         partial = fx.ptr_load(
@@ -435,10 +438,10 @@ def build_gemm_gfx1250(
                             + fx.Int64(block_id) * (split_k * tile_elems)
                             + (part + 1) * tile_elems
                             + offset,
-                            result_type=T.vec(8, elem.ir_type),
+                            result_type=T.vec(vec_elems, elem_dtype.ir_type),
                         )
                         total = total + partial.to(fx.Float32)
-                    commit_output(total.to(elem), row, col)
+                    commit_output(total.to(elem_dtype), row, col)
 
     @flyc.jit
     def launch(
