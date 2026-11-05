@@ -340,7 +340,7 @@ def gemm_gfx1250_get_configs(args):
     split_k_candidates = [1]
     if args.enable_split_k:
         split_k_candidates.extend(
-            split_k for split_k in (2, 4) if args.k % split_k == 0
+            split_k for split_k in range(2, 10) if args.k % split_k == 0
         )
     selections = {
         "block_m": [16, 32, 48, 64, 80, 96, 128, 256],
@@ -599,7 +599,7 @@ if __name__ == "__main__":
         "--enable_split_k",
         "--enable-split-k",
         action="store_true",
-        help="include split_k > 1; gfx1250 searches cluster sizes 2 and 4",
+        help="include split_k > 1; gfx1250 searches cluster sizes 2 through 9",
     )
     parser.add_argument(
         "--compile-workers",

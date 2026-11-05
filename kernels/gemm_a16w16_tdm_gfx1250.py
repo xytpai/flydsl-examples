@@ -97,8 +97,8 @@ def validate_gemm_gfx1250_config(
     shared_bytes = (shared_elements * elem_bits + 7) // 8
     if shared_bytes > 320 * 1024:
         raise ValueError("pipeline exceeds gfx1250's 320 KiB LDS capacity")
-    if split_k not in (1, 2, 4):
-        raise ValueError("cluster split_k must be 1, 2, or 4")
+    if split_k not in range(1, 10):
+        raise ValueError("cluster split_k must be in 1..9")
     if k % (split_k * block_k):
         raise ValueError("K must be divisible by split_k * block_k")
     if k // split_k < (stages - 1) * block_k:
@@ -524,7 +524,7 @@ def gemm_a16w16_gfx1250(
     padded rows are allowed. C is always row-major. M and N may end on a
     partial tile; K must contain at least ``stages - 1`` complete tiles.
     No split-K tail: K must be divisible by split_k * block_k. split_k is the
-    cluster size along the K split and must be 1, 2, or 4.
+    cluster size along the K split and must be in 1..9.
     """
     if a.ndim != 2 or b.ndim != 2 or a.shape[1] != b.shape[0]:
         raise ValueError("expected A[M,K] and B[K,N]")
