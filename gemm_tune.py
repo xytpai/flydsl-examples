@@ -337,11 +337,17 @@ def tuning_benchmark(args, kwargs={}, niters=50):
 
 
 def gemm_gfx1250_get_configs(args):
+    split_k_candidates = [1]
+    if args.enable_split_k:
+        split_k_candidates.extend(
+            split_k for split_k in (2, 4) if args.k % split_k == 0
+        )
     selections = {
         "block_m": [16, 32, 48, 64, 80, 96, 128, 256],
         "block_n": [16, 32, 64, 80, 96, 128, 256],
         "block_k": [64, 128, 256, 512],
         "stages": [i for i in range(2, 10)],
+        "split_k": split_k_candidates,
         "m_waves": [1, 2, 4],
         "n_waves": [1, 2, 4],
         "group_m": [0, 4],
@@ -384,6 +390,7 @@ def gemm_gfx1250_get_configs(args):
                 config["mma_n"],
                 config["mma_k"],
                 b_k_contiguous,
+                config["split_k"],
             )
             valid_configs.append(config)
         except Exception:
@@ -592,7 +599,7 @@ if __name__ == "__main__":
         "--enable_split_k",
         "--enable-split-k",
         action="store_true",
-        help="include valid split_k values greater than 1 in tuning",
+        help="include split_k > 1; gfx1250 searches cluster sizes 2 and 4",
     )
     parser.add_argument(
         "--compile-workers",

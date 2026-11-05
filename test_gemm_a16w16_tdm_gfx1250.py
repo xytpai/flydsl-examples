@@ -37,6 +37,25 @@ def inputs(m, n, k, dtype):
     return a, b
 
 
+def test_cluster_split_k():
+    require_gfx1250()
+    dtype = torch.bfloat16
+    a, b = inputs(128, 128, 128, dtype)
+    expected = reference(a, b)
+    actual = gemm_a16w16_gfx1250(
+        a,
+        b,
+        split_k=2,
+        block_m=64,
+        block_n=128,
+        block_k=32,
+        stages=2,
+        m_waves=2,
+        n_waves=2,
+    )
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("stages", [2, 3, 4, 5])
 @pytest.mark.parametrize("extra_tiles", [0, 1, 2, 7])

@@ -8,6 +8,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from flydsl.expr import const_expr, range_constexpr, rocdl, tdm_ops
+from flydsl.expr.rocdl.cluster import cluster_barrier
 from flydsl.expr.typing import T
 
 from .common import run_cached
@@ -49,7 +50,7 @@ STORE_VEC_BITS = 16 * 8
 
 def validate_gemm_gfx1250_config(
     m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, group_m,
-    dtype_id, mma_m, mma_n, mma_k, b_k_contiguous=True,
+    dtype_id, mma_m, mma_n, mma_k, b_k_contiguous=True, split_k=1,
 ):
     values = (m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, mma_m, mma_n, mma_k)
     if any(type(v) is not int or v <= 0 for v in values):
@@ -96,10 +97,12 @@ def validate_gemm_gfx1250_config(
     shared_bytes = (shared_elements * elem_bits + 7) // 8
     if shared_bytes > 320 * 1024:
         raise ValueError("pipeline exceeds gfx1250's 320 KiB LDS capacity")
-    if k % block_k:
-        raise ValueError("K must be block-tile aligned")
-    if k < (stages - 1) * block_k:
-        raise ValueError("K needs at least stages - 1 tiles for the prefetch prologue")
+    if split_k not in (1, 2, 4):
+        raise ValueError("cluster split_k must be 1, 2, or 4")
+    if k % (split_k * block_k):
+        raise ValueError("K must be divisible by split_k * block_k")
+    if k // split_k < (stages - 1) * block_k:
+        raise ValueError("each K slice needs at least stages - 1 tiles")
     n_blocks = (n + block_n - 1) // block_n
     if group_m * n_blocks > (2**32 - 1) // 2:
         raise ValueError("block swizzle offsets exceed the supported 32-bit range")
@@ -107,14 +110,14 @@ def validate_gemm_gfx1250_config(
 
 def make_gemm_a16w16_gfx1250_kernel_name(
     dtype_id, block_m, block_n, block_k, stages, m_waves, n_waves, group_m, has_bias, b_k_contiguous,
-    mma_m, mma_n, mma_k,
+    mma_m, mma_n, mma_k, split_k,
 ):
     dtype_name = GEMM_DTYPE_NAMES[dtype_id]
     layout = "nt" if b_k_contiguous else "nn"
     return (
         f"hgemm_{dtype_name}_t{block_m}x{block_n}x{block_k}x{stages}"
         f"_w{m_waves}x{n_waves}_gm{group_m}_bias{int(has_bias)}_l{layout}"
-        f"_mma{mma_m}x{mma_n}x{mma_k}"
+        f"_mma{mma_m}x{mma_n}x{mma_k}_sk{split_k}"
     )
 
 
@@ -133,6 +136,7 @@ class GemmA16W16Gfx1250Param:
     mma_m: fx.Constexpr[int]
     mma_n: fx.Constexpr[int]
     mma_k: fx.Constexpr[int]
+    split_k: fx.Constexpr[int]
 
 
 @functools.lru_cache(maxsize=128)
@@ -150,6 +154,7 @@ def build_gemm_gfx1250(
     mma_m: int,
     mma_n: int,
     mma_k: int,
+    split_k: int = 1,
 ):
     elem = {GEMM_DTYPE_FP16: fx.Float16, GEMM_DTYPE_BF16: fx.BFloat16}.get(dtype_id)
     if elem is None:
@@ -182,6 +187,7 @@ def build_gemm_gfx1250(
         b: fx.Pointer,
         out: fx.Pointer,
         bias: fx.Pointer,
+        workspace: fx.Pointer,
         m: fx.Int32,
         n: fx.Int32,
         k: fx.Int32,
@@ -314,29 +320,37 @@ def build_gemm_gfx1250(
                         acc = accumulators[mi * n_steps + ni]
                         fx.gemm(mma, acc, a_fragment, b_fragments[ni], acc)
 
-        # Prologue: fill stages - 1 slots, leaving one slot for the next tile.
+        # Each cluster rank owns an equal K slice. Tile indices stay in the
+        # full-tensor coordinate space.
+        k_rank = fx.block_idx.y
+        k_tiles = (k // split_k) // block_k
+        k_tile_base = k_rank * k_tiles
         for stage in range_constexpr(stages - 1):
-            copy_tile(stage, fx.Int32(stage))
+            copy_tile(stage, k_tile_base + fx.Int32(stage))
 
         # Two tiles per iteration. Double buffering retains literal LDS offsets;
         # deeper pipelines advance the ring modulo stages.
-        main_tiles = k // block_k - (stages - 1)
+        main_tiles = k_tiles - (stages - 1)
         current_stage = fx.Int32(0)
         for pair in range(main_tiles // 2):
             for step in range_constexpr(2):
                 read_stage = step if stages == 2 else current_stage
                 wait_tile(stages - 2)
                 copy_tile(
-                    (read_stage + stages - 1) % stages, pair * 2 + step + stages - 1
+                    (read_stage + stages - 1) % stages,
+                    k_tile_base + pair * 2 + step + stages - 1,
                 )
                 compute_tile(read_stage)
                 current_stage = (current_stage + 1) % stages
-        
+
         # A one-trip loop keeps the accumulators loop-carried instead of
         # materializing both sides of a predicated remainder branch.
         for remaining in range(main_tiles % 2):
             wait_tile(stages - 2)
-            copy_tile((current_stage + stages - 1) % stages, main_tiles + stages - 2)
+            copy_tile(
+                (current_stage + stages - 1) % stages,
+                k_tile_base + main_tiles + stages - 2,
+            )
             compute_tile(current_stage)
             current_stage = (current_stage + 1) % stages
 
@@ -358,10 +372,7 @@ def build_gemm_gfx1250(
                     fx.ptr_store(values[i], shared_a + (row + i) * block_n + col)
         fx.gpu.barrier()
 
-        for i in range_constexpr(block_m * block_n // (threads * 8)):
-            offset = (i * threads + tid) * 8
-            row, col = offset // block_n, offset % block_n
-            values = fx.ptr_load(shared_a + offset, result_type=T.vec(8, elem.ir_type))
+        def commit_output(values, row, col):
             destination = (
                 out
                 + fx.Int64(row_start + row) * fx.Int64(c_leading_stride)
@@ -389,12 +400,53 @@ def build_gemm_gfx1250(
                             value = (value.to(fx.Float32) + bias_value.to(fx.Float32)).to(elem)
                         fx.ptr_store(value, destination + element)
 
+        tile_elems = block_m * block_n
+        if const_expr(split_k == 1):
+            for i in range_constexpr(tile_elems // (threads * 8)):
+                offset = (i * threads + tid) * 8
+                row, col = offset // block_n, offset % block_n
+                values = fx.ptr_load(shared_a + offset, result_type=T.vec(8, elem.ir_type))
+                commit_output(values, row, col)
+        else:
+            for i in range_constexpr(tile_elems // (threads * 8)):
+                offset = (i * threads + tid) * 8
+                row, col = offset // block_n, offset % block_n
+                values = fx.ptr_load(shared_a + offset, result_type=T.vec(8, elem.ir_type))
+                partial = (
+                    workspace
+                    + fx.Int64(block_id) * (split_k * tile_elems)
+                    + fx.Int64(k_rank) * tile_elems
+                    + row * block_n
+                    + col
+                )
+                fx.make_view(partial, fx.make_layout(8, 1)).store(values)
+            cluster_barrier()
+            if k_rank == 0:
+                for i in range_constexpr(tile_elems // (threads * 8)):
+                    offset = (i * threads + tid) * 8
+                    row, col = offset // block_n, offset % block_n
+                    total = fx.ptr_load(
+                        workspace + fx.Int64(block_id) * (split_k * tile_elems) + offset,
+                        result_type=T.vec(8, elem.ir_type),
+                    ).to(fx.Float32)
+                    for part in range_constexpr(split_k - 1):
+                        partial = fx.ptr_load(
+                            workspace
+                            + fx.Int64(block_id) * (split_k * tile_elems)
+                            + (part + 1) * tile_elems
+                            + offset,
+                            result_type=T.vec(8, elem.ir_type),
+                        )
+                        total = total + partial.to(fx.Float32)
+                    commit_output(total.to(elem), row, col)
+
     @flyc.jit
     def launch(
         a: fx.Pointer,
         b: fx.Pointer,
         out: fx.Pointer,
         bias: fx.Pointer,
+        workspace: fx.Pointer,
         m: fx.Int32,
         n: fx.Int32,
         k: fx.Int32,
@@ -403,11 +455,27 @@ def build_gemm_gfx1250(
         c_leading_stride: fx.Int32,
         stream: fx.Stream,
     ):
-        kernel(a, b, out, bias, m, n, k, a_leading_stride, b_leading_stride, c_leading_stride).launch(
-            grid=((m + block_m - 1) // block_m * ((n + block_n - 1) // block_n), 1, 1),
-            block=(threads, 1, 1),
-            stream=stream,
-        )
+        mn_tiles = (m + block_m - 1) // block_m * ((n + block_n - 1) // block_n)
+        if split_k == 1:
+            kernel(
+                a, b, out, bias, workspace, m, n, k,
+                a_leading_stride, b_leading_stride, c_leading_stride,
+            ).launch(
+                grid=(mn_tiles, 1, 1),
+                block=(threads, 1, 1),
+                stream=stream,
+            )
+        else:
+            kernel(
+                a, b, out, bias, workspace, m, n, k,
+                a_leading_stride, b_leading_stride, c_leading_stride,
+                value_attrs={"rocdl.cluster_dims": f"1,{split_k},1"},
+            ).launch(
+                grid=(mn_tiles, split_k, 1),
+                block=(threads, 1, 1),
+                stream=stream,
+                cluster=(1, split_k, 1),
+            )
 
     kernel._func.__name__ = make_gemm_a16w16_gfx1250_kernel_name(
         dtype_id,
@@ -423,6 +491,7 @@ def build_gemm_gfx1250(
         mma_m,
         mma_n,
         mma_k,
+        split_k,
     )
     return launch
 
@@ -443,6 +512,7 @@ def gemm_a16w16_gfx1250(
     mma_m: int = 16,
     mma_n: int = 16,
     mma_k: int = 32,
+    split_k: int = 1,
     stream: Optional[torch.cuda.Stream] = None,
     layout: str = "nt",
 ) -> torch.Tensor:
@@ -453,7 +523,8 @@ def gemm_a16w16_gfx1250(
     is the leading stride and may be larger than the contiguous size, so
     padded rows are allowed. C is always row-major. M and N may end on a
     partial tile; K must contain at least ``stages - 1`` complete tiles.
-    No split-K or K tail path.
+    No split-K tail: K must be divisible by split_k * block_k. split_k is the
+    cluster size along the K split and must be 1, 2, or 4.
     """
     if a.ndim != 2 or b.ndim != 2 or a.shape[1] != b.shape[0]:
         raise ValueError("expected A[M,K] and B[K,N]")
@@ -469,7 +540,7 @@ def gemm_a16w16_gfx1250(
     n = b.shape[1]
     validate_gemm_gfx1250_config(
         m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, group_m,
-        dtype_id, mma_m, mma_n, mma_k, layout == "nt",
+        dtype_id, mma_m, mma_n, mma_k, layout == "nt", split_k,
     )
     a_leading_stride = _leading_stride(a, 1, 0, k, f"A does not satisfy the {layout.upper()} layout")
     if layout == "nt":
@@ -505,9 +576,19 @@ def gemm_a16w16_gfx1250(
         if stream.device != a.device:
             raise ValueError("stream must belong to the input device")
         dtype = fx.Float16 if dtype_id == GEMM_DTYPE_FP16 else fx.BFloat16
+        mn_tiles = ((m + block_m - 1) // block_m) * ((n + block_n - 1) // block_n)
+        workspace = (
+            out
+            if split_k == 1
+            else torch.empty(
+                (mn_tiles * split_k * block_m * block_n,),
+                device=a.device,
+                dtype=a.dtype,
+            )
+        )
         pointers = [
             flyc.from_c_void_p(dtype, t.data_ptr())
-            for t in (a, b, out, a if bias is None else bias)
+            for t in (a, b, out, a if bias is None else bias, workspace)
         ]
         has_bias = bias is not None
         b_k_contiguous = layout == "nt"
@@ -525,6 +606,7 @@ def gemm_a16w16_gfx1250(
             mma_m=mma_m,
             mma_n=mma_n,
             mma_k=mma_k,
+            split_k=split_k,
         )
         launch = build_gemm_gfx1250(
             dtype_id,
@@ -540,6 +622,7 @@ def gemm_a16w16_gfx1250(
             mma_m,
             mma_n,
             mma_k,
+            split_k,
         )
         dispatch_args = (
             *pointers,
