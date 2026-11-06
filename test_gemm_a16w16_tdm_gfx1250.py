@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from kernels.gemm_a16w16_tdm_gfx1250 import (
     GEMM_DTYPE_BF16,
     gemm_a16w16_gfx1250,
+    gemm_fp8_ptpc_gfx1250,
     validate_gemm_gfx1250_config,
 )
 
@@ -15,6 +16,23 @@ ROTARY_INPUTS_TARGET_BYTES = 8 * 1024**3
 @dataclass
 class _TestArgs:
     dtype: torch.dtype
+    m: int
+    n: int
+    k: int
+    block_m: int
+    block_n: int
+    block_k: int
+    stages: int
+    m_waves: int
+    n_waves: int
+    group_m: int
+    has_bias: bool
+    layout: str = "nt"
+    split_k: int = 1
+
+
+@dataclass
+class _Fp8PtpcArgs:
     m: int
     n: int
     k: int
@@ -214,6 +232,114 @@ def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
                 run_triton_maxautotune(idx)
                 run_flydsl(idx)
                 run_ref(idx)
+            torch.cuda.synchronize()
+    print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))
+
+
+def _fp8_ptpc_kernel_kwargs(args: _Fp8PtpcArgs):
+    return {
+        "block_m": args.block_m,
+        "block_n": args.block_n,
+        "block_k": args.block_k,
+        "stages": args.stages,
+        "m_waves": args.m_waves,
+        "n_waves": args.n_waves,
+        "group_m": args.group_m,
+        "split_k": args.split_k,
+    }
+
+
+def _fp8_layout_matrix(rows: int, cols: int, is_t: bool):
+    shape = (cols, rows) if is_t else (rows, cols)
+    storage = torch.empty(shape, dtype=torch.float16, device="cuda")
+    storage.uniform_(-0.5, 0.5)
+    matrix = storage.to(torch.float8_e4m3fn)
+    return matrix.t() if is_t else matrix
+
+
+def create_fp8_ptpc_inputs(args: _Fp8PtpcArgs):
+    a = _fp8_layout_matrix(args.m, args.k, args.layout[0] == "t")
+    b = _fp8_layout_matrix(args.k, args.n, args.layout[1] == "t")
+    scale_a = torch.empty((args.m,), dtype=torch.float32, device="cuda")
+    scale_b = torch.empty((args.n,), dtype=torch.float32, device="cuda")
+    scale_a.uniform_(0.5, 1.5)
+    scale_b.uniform_(0.5, 1.5)
+    if args.has_bias:
+        bias = torch.empty((args.n,), dtype=torch.bfloat16, device="cuda")
+        bias.uniform_(-0.5, 0.5)
+    else:
+        bias = None
+    return a, b, scale_a, scale_b, bias
+
+
+def create_fp8_ptpc_output(args: _Fp8PtpcArgs):
+    return torch.empty((args.m, args.n), dtype=torch.bfloat16, device="cuda")
+
+
+def fp8_ptpc_ref_func(a, b, scale_a, scale_b, bias, split_k):
+    if split_k == 1:
+        product = a.float() @ b.float()
+    else:
+        part_k = a.shape[1] // split_k
+        partials = [
+            (
+                a[:, part * part_k : (part + 1) * part_k].float()
+                @ b[part * part_k : (part + 1) * part_k].float()
+            )
+            .to(torch.bfloat16)
+            .float()
+            for part in range(split_k)
+        ]
+        product = partials[0]
+        for partial in partials[1:]:
+            product = product + partial
+    product = product * scale_a[:, None]
+    product = product * scale_b[None, :]
+    result = product.to(torch.bfloat16)
+    if bias is not None:
+        result = (result.float() + bias.float()).to(torch.bfloat16)
+    return result
+
+
+def benchmark_fp8_ptpc(
+    args: _Fp8PtpcArgs, warmup: int = 500, niters: int = 600
+):
+    kwargs = _fp8_ptpc_kernel_kwargs(args)
+    sample_inputs = create_fp8_ptpc_inputs(args)
+    sample_output = create_fp8_ptpc_output(args)
+    rotary_inputs = get_rotary_inputs(sample_inputs, (sample_output,))
+    inputs = [sample_inputs] + [
+        create_fp8_ptpc_inputs(args) for _ in range(rotary_inputs - 1)
+    ]
+    outputs = [sample_output] + [
+        create_fp8_ptpc_output(args) for _ in range(rotary_inputs - 1)
+    ]
+    print(
+        f"rotary_inputs:{rotary_inputs}, target_bytes:{ROTARY_INPUTS_TARGET_BYTES}, "
+        f"warmup:{warmup}, niters:{niters}"
+    )
+
+    def run_flydsl(idx):
+        a, b, scale_a, scale_b, bias = inputs[idx]
+        gemm_fp8_ptpc_gfx1250(
+            a,
+            b,
+            scale_a,
+            scale_b,
+            out=outputs[idx],
+            bias=bias,
+            layout=args.layout,
+            **kwargs,
+        )
+
+    print("===================== [FP8 PTPC FLYDSL] =====================")
+    for i in range(warmup):
+        run_flydsl(i % rotary_inputs)
+    torch.cuda.synchronize()
+
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        for i in range(warmup, niters):
+            run_flydsl(i % rotary_inputs)
             torch.cuda.synchronize()
     print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))
 
@@ -877,6 +1003,60 @@ def test_config_rejections(changed, message):
         validate_gemm_gfx1250_config(**config)
 
 
+@pytest.mark.parametrize("layout", ["nn", "nt"])
+@pytest.mark.parametrize("split_k", [1, 2], ids=["no-split", "split-k"])
+@pytest.mark.parametrize("has_bias", [False, True], ids=["no-bias", "bias"])
+@pytest.mark.parametrize("edge", [False, True], ids=["full-tile", "edge-tile"])
+def test_gemm_fp8_ptpc_gfx1250_all_paths(
+    layout: str,
+    split_k: int,
+    has_bias: bool,
+    edge: bool,
+):
+    # Covers vector/gather B loads, pre/post-reduction scaling, bias, interior/
+    # edge stores, output allocation, and both paired/remainder pipeline loops.
+    torch.manual_seed(0)
+    m, n = (65, 80) if edge else (64, 64)
+    args = _Fp8PtpcArgs(
+        m=m,
+        n=n,
+        k=768,
+        block_m=64,
+        block_n=64,
+        block_k=128,
+        stages=3,
+        m_waves=2,
+        n_waves=2,
+        group_m=4 if edge else 0,
+        has_bias=has_bias,
+        layout=layout,
+        split_k=split_k,
+    )
+    a, b, scale_a, scale_b, bias = create_fp8_ptpc_inputs(args)
+    out = create_fp8_ptpc_output(args) if edge else None
+    result = gemm_fp8_ptpc_gfx1250(
+        a,
+        b,
+        scale_a,
+        scale_b,
+        out=out,
+        bias=bias,
+        layout=layout,
+        **_fp8_ptpc_kernel_kwargs(args),
+    )
+    reference = fp8_ptpc_ref_func(a, b, scale_a, scale_b, bias, split_k)
+
+    if out is not None:
+        assert result.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(
+        result,
+        reference,
+        atol=2.5e-1 if split_k > 1 else 1.25e-1,
+        rtol=1e-1,
+        check_dtype=True,
+    )
+
+
 # =========================================== benchmark ===========================================
 
 
@@ -1006,3 +1186,22 @@ def test_gemm_a16w16_gfx1250_benchmark_smoke(
         split_k,
     )
     benchmark(args)
+
+
+def test_gemm_fp8_ptpc_gfx1250_benchmark_smoke():
+    args = _Fp8PtpcArgs(
+        m=8192,
+        n=8192,
+        k=8192,
+        block_m=256,
+        block_n=256,
+        block_k=128,
+        stages=2,
+        m_waves=4,
+        n_waves=2,
+        group_m=0,
+        has_bias=False,
+        layout="nt",
+        split_k=1,
+    )
+    benchmark_fp8_ptpc(args)
