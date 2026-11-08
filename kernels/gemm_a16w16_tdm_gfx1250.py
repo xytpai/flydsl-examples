@@ -697,6 +697,21 @@ def build_gemm_gfx1250(
                     ])
                     for ni in range_constexpr(n_steps)
                 ]
+            if const_expr(has_bias and split_k == 1):
+                # Reuse each column's bias across M fragments. Clamped edge
+                # lanes are discarded by the bounds-checked TDM output store.
+                bias_fragments = [
+                    fx.Vector.from_elements([
+                        fx.ptr_load(
+                            bias + fx.min(
+                                col_start + wave_col + ni * mma_n + lane // 16 * acc_elems + i, n - 1
+                            ),
+                            result_type=out_dtype.ir_type,
+                        )
+                        for i in range_constexpr(acc_elems)
+                    ])
+                    for ni in range_constexpr(n_steps)
+                ]
             for mi in range_constexpr(m_steps):
                 for ni in range_constexpr(n_steps):
                     row = wave_row + mi * mma_m + lane % 16
@@ -704,9 +719,13 @@ def build_gemm_gfx1250(
                     values = accumulators[mi * n_steps + ni].load()
                     if const_expr(is_fp8_ptpc and split_k == 1):
                         values = values * row_scales[mi] * col_scales[ni]
+                    values = values.to(out_dtype)
+                    if const_expr(has_bias and split_k == 1):
+                        # Preserve round(product) + bias, not round(product + bias).
+                        values = (values.to(fx.Float32) + bias_fragments[ni].to(fx.Float32)).to(out_dtype)
                     fx.make_view(
                         shared_out + row * c_pitch + col, fx.make_layout(acc_elems, 1)
-                    ).store(values.to(out_dtype))
+                    ).store(values)
         else:
             # Reuse row/column scales across accumulator tiles. Clamped edge
             # lanes are never committed to global output.
@@ -798,7 +817,7 @@ def build_gemm_gfx1250(
                         fx.ptr_store(value, destination + element)
 
         tile_elems = block_m * block_n
-        if const_expr(interleave and split_k == 1 and not has_bias):
+        if const_expr(interleave and split_k == 1):
             c_tile = (block_m, c_pitch)
             atom_c, coords_c = tdm_operand(
                 out + fx.Int64(row_start) * fx.Int64(c_leading_stride) + col_start,
