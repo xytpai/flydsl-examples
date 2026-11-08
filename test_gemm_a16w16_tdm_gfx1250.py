@@ -93,7 +93,13 @@ def create_outputs(args: _TestArgs):
 def ref_func(*args):
     a, b, bias, c, _layout = args
     # Round the accumulator to the output dtype before adding bias.
-    product = (a.float() @ b.float()).to(a.dtype)
+    accumulator = a.float() @ b.float()
+    if torch.version.hip is not None:
+        # Work around an asynchronous ROCm BLAS fault reproduced by the
+        # FP32 reference alone at M=4112, N=55296, K=6144. Keep the
+        # accumulator live and retire the GEMM before conversion/bias.
+        torch.cuda.current_stream(a.device).synchronize()
+    product = accumulator.to(a.dtype)
     if bias is not None:
         product = (product.float() + bias.float()).to(a.dtype)
     c.copy_(product)
@@ -1495,6 +1501,7 @@ def test_gemm_a16w16_gfx1250_split_k_benchmark(
         ( 4096,   256,  4096, 128, 128, 128,  3,  4,  4,  4,  0,  True, "nn", False),
         ( 4096,   256,  4096, 128, 128, 128,  3,  4,  4,  4,  0,  True, "nt", False),
         ( 8192,  8192,  8192, 256, 256, 128,  2,  1,  2,  2,  0, False, "nt",  True),
+        ( 4112, 55296,  6144, 256, 256, 128,  2,  1,  2,  2,  0,  True, "nt",  True),
         # fmt: on
     ],
 )
