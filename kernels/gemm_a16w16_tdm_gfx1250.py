@@ -1122,6 +1122,8 @@ def gemm_a16w16_gfx1250(
             raise ValueError("stream must belong to the input device")
         dtype = fx.Float16 if dtype_id == GEMM_DTYPE_FP16 else fx.BFloat16
         mn_tiles = ((m + block_m - 1) // block_m) * ((n + block_n - 1) // block_n)
+        # Partials use the input/output dtype: BF16 GEMM has a 2-byte BF16
+        # workspace. Only the post-barrier register sum is FP32.
         workspace = (
             out
             if split_k == 1 or split_k_atomic

@@ -350,6 +350,12 @@ def gemm_gfx1250_get_configs(args):
         "block_k": [64, 128, 256, 512],
         "stages": [i for i in range(2, 10)],
         "split_k": split_k_candidates,
+        # BF16 split-K searches both workspace and packed-atomic reduction.
+        "split_k_atomic": (
+            [False, True]
+            if args.enable_split_k and args.dtype is torch.bfloat16 and args.n % 2 == 0
+            else [False]
+        ),
         "m_waves": [1, 2, 4],
         "n_waves": [1, 2, 4],
         "group_m": [0, 4],
@@ -370,14 +376,18 @@ def gemm_gfx1250_get_configs(args):
             "n_waves": [2],
             "interleave": [True],
             "split_k": [1],
+            "split_k_atomic": [False],
         })
     keys = selections.keys()
     values = selections.values()
     configs = [dict(zip(keys, combo)) for combo in itertools.product(*values)]
     configs = [
         config for config in configs
-        if not config["interleave"]
-        or (config["m_waves"], config["n_waves"]) not in ((2, 4), (4, 2), (4, 4))
+        if (
+            not config["interleave"]
+            or (config["m_waves"], config["n_waves"]) not in ((2, 4), (4, 2), (4, 4))
+        )
+        and (not config["split_k_atomic"] or config["split_k"] > 1)
     ]
     device_props = torch.cuda.get_device_properties(torch.cuda.current_device())
     b_k_contiguous = args.layout == "nt"
@@ -413,6 +423,7 @@ def gemm_gfx1250_get_configs(args):
                 b_k_contiguous,
                 config["split_k"],
                 interleave=config["interleave"],
+                split_k_atomic=config["split_k_atomic"],
             )
             valid_configs.append(config)
         except Exception:
