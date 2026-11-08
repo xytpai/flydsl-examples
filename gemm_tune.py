@@ -359,9 +359,26 @@ def gemm_gfx1250_get_configs(args):
         # NN keeps the original schedule; the validator checks NT quadrant fit.
         "interleave": [False, True] if args.layout == "nt" else [False],
     }
+    if args.layout == "nt" and min(args.m, args.n, args.k) >= 4096:
+        # Pin large NT GEMMs while retaining the group_m search.
+        selections.update({
+            "block_m": [256],
+            "block_n": [256],
+            "block_k": [128],
+            "stages": [2],
+            "m_waves": [2],
+            "n_waves": [2],
+            "interleave": [True],
+            "split_k": [1],
+        })
     keys = selections.keys()
     values = selections.values()
     configs = [dict(zip(keys, combo)) for combo in itertools.product(*values)]
+    configs = [
+        config for config in configs
+        if not config["interleave"]
+        or (config["m_waves"], config["n_waves"]) not in ((2, 4), (4, 2), (4, 4))
+    ]
     device_props = torch.cuda.get_device_properties(torch.cuda.current_device())
     b_k_contiguous = args.layout == "nt"
     pruner = GemmConfigPruner(

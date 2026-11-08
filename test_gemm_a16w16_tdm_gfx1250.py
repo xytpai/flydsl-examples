@@ -1314,12 +1314,14 @@ def tuner_device_props(monkeypatch):
 def test_nt_candidates_include_valid_interleaving(dtype, tuner_device_props):
     import gemm_tune as tuner
 
-    args = tuner.Args(dtype, 8192, 8192, 8192, "nt", enable_split_k=True)
+    args = tuner.Args(dtype, 8192, 8192, 3072, "nt", enable_split_k=True)
     configs = tuner.gemm_gfx1250_get_configs(args)
     plain = [c for c in configs if not c["interleave"]]
     interleaved = [c for c in configs if c["interleave"]]
-    assert len(plain) == 650
-    assert len(interleaved) == 308
+    assert plain and interleaved
+    blocked_waves = {(2, 4), (4, 2), (4, 4)}
+    assert blocked_waves <= {(c["m_waves"], c["n_waves"]) for c in plain}
+    assert all((c["m_waves"], c["n_waves"]) not in blocked_waves for c in interleaved)
     assert all(c["split_k"] == 1 for c in configs)  # existing large-grid pruner
     plain_tiles = {
         tuple((key, value) for key, value in c.items() if key != "interleave")
@@ -1347,6 +1349,7 @@ def test_split_k_interleaved_candidates(tuner_device_props):
     assert any(c["split_k"] == 3 for c in interleaved)
     assert any(c["split_k"] > 1 for c in interleaved)
     for config in interleaved:
+        assert (config["m_waves"], config["n_waves"]) not in {(2, 4), (4, 2), (4, 4)}
         tuner.validate_gemm_gfx1250_config(
             args.m, args.n, args.k, config["block_m"], config["block_n"],
             config["block_k"], config["stages"], config["m_waves"],
@@ -1356,13 +1359,72 @@ def test_split_k_interleaved_candidates(tuner_device_props):
         )
 
 
-def test_nn_does_not_enumerate_interleaving(tuner_device_props):
+@pytest.mark.parametrize("shape", [(256, 256, 1024), (8192, 8192, 8192)])
+def test_nn_does_not_enumerate_interleaving(shape, tuner_device_props):
     import gemm_tune as tuner
 
-    args = tuner.Args(torch.bfloat16, 256, 256, 1024, "nn", enable_split_k=True)
+    args = tuner.Args(torch.bfloat16, *shape, "nn", enable_split_k=True)
     configs = tuner.gemm_gfx1250_get_configs(args)
     assert configs
     assert all(c["interleave"] is False for c in configs)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("enable_split_k", [False, True])
+@pytest.mark.parametrize("shape", [
+    (4096, 4096, 4096), (8192, 8192, 8192),
+    (4112, 55296, 6144), (4112, 6144, 24576),
+])
+def test_large_nt_tuner_fixed_policy(dtype, enable_split_k, shape, tuner_device_props):
+    import gemm_tune as tuner
+
+    args = tuner.Args(dtype, *shape, "nt", enable_split_k=enable_split_k)
+    configs = tuner.gemm_gfx1250_get_configs(args)
+    fixed = dict(
+        block_m=256, block_n=256, block_k=128, stages=2,
+        m_waves=2, n_waves=2, interleave=True, split_k=1,
+        mma_m=16, mma_n=16, mma_k=32,
+    )
+    assert len(configs) == 2
+    assert {config["group_m"] for config in configs} == {0, 4}
+    for config in configs:
+        assert {key: value for key, value in config.items() if key != "group_m"} == fixed
+        tuner.validate_gemm_gfx1250_config(
+            args.m, args.n, args.k, config["block_m"], config["block_n"],
+            config["block_k"], config["stages"], config["m_waves"],
+            config["n_waves"], config["group_m"],
+            tuner.GEMM_DTYPE_FP16 if dtype is torch.float16 else tuner.GEMM_DTYPE_BF16,
+            config["mma_m"], config["mma_n"], config["mma_k"],
+            True, config["split_k"], interleave=config["interleave"],
+        )
+
+
+@pytest.mark.parametrize("shape", [
+    (4095, 4096, 4096), (4096, 4095, 4096), (4096, 4096, 3968),
+])
+def test_large_nt_tuner_requires_all_dimensions(shape, tuner_device_props):
+    import gemm_tune as tuner
+
+    configs = tuner.gemm_gfx1250_get_configs(
+        tuner.Args(torch.bfloat16, *shape, "nt", enable_split_k=True)
+    )
+    assert any(not config["interleave"] for config in configs)
+    assert any(config["interleave"] for config in configs)
+    assert any(config["block_m"] != 256 for config in configs)
+    assert all(
+        not config["interleave"]
+        or (config["m_waves"], config["n_waves"]) not in {(2, 4), (4, 2), (4, 4)}
+        for config in configs
+    )
+
+
+def test_large_nt_tuner_keeps_validation(tuner_device_props):
+    import gemm_tune as tuner
+
+    # The requested fixed BK128 cannot process this K; do not bypass validation
+    # or silently fall back to a different policy.
+    args = tuner.Args(torch.bfloat16, 4096, 4096, 4160, "nt")
+    assert tuner.gemm_gfx1250_get_configs(args) == []
 
 
 def test_pruner_preserves_both_schedules_and_counts_padding(tuner_device_props):
