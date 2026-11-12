@@ -31,102 +31,43 @@ to CUDA/CuTeDSL, but targets AMD GPUs through FlyDSL.
 HTI currently requires `stages=2`, `m_waves=2`, and `k_waves=1`.
 Inputs and dimensions must satisfy the kernel's vector-alignment constraints.
 
+### gfx1250: TDM GEMM
 
-### gfx1250: PeakGemm multi-stage TDM GEMM
-
-**BF16 8192³ follow-up:** the no-spill implementation already measured
-**2.84–2.87 PFLOPS in short bursts** on two f01 GPUs. Under sustained load,
-PPT limiting reduced GFX clock to about 1.5 GHz and throughput to 2.21–2.24
-PFLOPS; C++ PeakGemm showed the same effect. See the
-[ISA/ATT and power-state analysis](docs/gfx1250_bf16_analysis.md).
-Use `--mode both --dtype bf16 --json bf16_phases.json` to report burst and
-sustained results separately; the default legacy timing remains unchanged.
-
-
-`kernels/gemm_a16w16_tdm_gfx1250.py` is a small port of
+`kernels/gemm_a16w16_tdm_gfx1250.py` implements multi-stage TDM loads and
+wave32 WMMA, based on
 [PeakGemm's TDM kernel](https://github.com/xytpai/PeakGemm/blob/3d2a481/include/peak_gemm/kernel/hgemm_tdm_gfx1250.hpp).
-It keeps the same pipeline structure:
 
-1. Prefetch `stages - 1` tiles into a padded LDS ring.
-2. Wait for the oldest A/B tile, issue the next two TDM loads, then run
-   wave32 `16x16x32` WMMA. The main loop handles two K tiles per iteration.
-3. Drain outstanding tiles and reuse LDS for coalesced output stores.
+- FP16/BF16 inputs, FP32 accumulation and input-dtype output.
+- `NN` and `NT` layouts, M/N boundary tiles, and aligned padded strides and
+  storage offsets. A/C are row-major; B follows the selected layout.
+- Optional contiguous `[N]` bias, added after rounding the product to the
+  output dtype.
+- Configurable tiles, stages, wave counts, block ordering and optional NT
+  interleaved scheduling.
+- Cluster split-K via `split_k=1..9`. The default reduction sums
+  input-dtype partials in FP32. `split_k_atomic=True` uses packed BF16
+  atomics instead; it requires split-K and even N, rounds each update, and
+  can produce different results depending on arrival order.
+- A separate `gemm_fp8_ptpc_gfx1250` entry point accepts FP8 E4M3 inputs,
+  FP32 row/column scales, and optional BF16 bias; output is BF16.
+- Optional output buffer and stream; graph capture/replay after warmup.
 
-Each wave copies disjoint rows. A workgroup barrier after the TDM wait makes
-the whole tile visible and prevents recycling LDS while another wave reads it.
-The entry point exposes tile sizes, wave counts and stage count directly;
-there is no automatic tuning or dispatch to another GEMM implementation.
+Pointers and leading strides must be 16-byte aligned, and output must not
+overlap inputs. K must be divisible by `split_k * block_k`, with at least
+`stages - 1` K tiles per split. Tiles must satisfy WMMA divisibility and
+fit the 320 KiB LDS budget; the entry points validate these constraints.
 
 ```python
 import torch
 from kernels.gemm_a16w16_tdm_gfx1250 import gemm_a16w16_gfx1250
 
-a = torch.randn((8192, 8192), device="cuda", dtype=torch.float16)
-b = torch.randn((8192, 8192), device="cuda", dtype=torch.float16).t()
-c = gemm_a16w16_gfx1250(a, b)  # tile=256x256x128, waves=4x4, stages=2
-
-# A deeper pipeline needs a smaller K tile to fit in LDS.
-c = gemm_a16w16_gfx1250(a, b, block_k=64, stages=4)
+a = torch.randn((8192, 8192), device="cuda", dtype=torch.bfloat16)
+b = torch.randn((8192, 8192), device="cuda", dtype=torch.bfloat16).t()
+c = gemm_a16w16_gfx1250(a, b, layout="nt")
 ```
 
-First-version contract:
-
-- FP16/BF16 inputs, FP32 accumulation, input-dtype output.
-- Logical `A[M,K] @ B[K,N]`; A/C contiguous and B a transposed contiguous
-  `[N,K]` tensor (NT layout). Pointers must be 16-byte aligned.
-- Optional contiguous `[N]` bias, **added after rounding the accumulator to
-  the output dtype**, matching PeakGemm.
-- Full tiles only: M/N/K divisible by block sizes, with at least `stages - 1`
-  K tiles. No split-K, boundary masking, or arbitrary strides.
-- Padded A/B buffers and output shuffle share at most 320 KiB of LDS.
-  For example, `256x256x128` fits 2 stages, but not 3.
-- Optional `out`, `group_m` block ordering and `stream`; graph capture/replay
-  is supported after warmup. Output must not overlap any input.
-
-Run correctness tests and a graph-based benchmark:
-
-```bash
-pytest -q test_gemm_a16w16_tdm_gfx1250.py
-
-python test_gemm_a16w16_tdm_gfx1250.py --mnk 8192 8192 8192
-python test_gemm_a16w16_tdm_gfx1250.py --mnk 8192 8192 8192 --tile 256 256 64 --stages 2 3 4
-```
-
-Measured on f01 gfx1250 with FlyDSL 0.4.1, 2026-11-02, M=N=K=8192,
-4x4 waves, no bias. These are median GPU-event times from 9 HIP graph replays,
-each containing 20 GEMM launches; compilation, allocations and reference
-computation are excluded. This is one measurement run, not an autotuning result.
-
-| Tile | Stages | FP16 TFLOPS | BF16 TFLOPS |
-|---|---:|---:|---:|
-| 256x256x128 | 2 | 2523.68 | 2357.00 |
-| 256x256x64 | 2 | 2311.21 | 2237.56 |
-| 256x256x64 | 3 | 2391.39 | 2302.37 |
-| 256x256x64 | 4 | 2413.68 | 2364.64 |
-
-At fixed BK=64, deeper staging helps this shape. More stages do not always
-win: BK=128 with 2 stages remains faster for FP16 in this run.
-
-**Follow-up: avoid register spills in the K remainder.** The initial port's
-optional last-main-tile `if` was lowered to a predicated region that kept old
-and new accumulator sets live. With the default tile, that used 256 VGPRs
-and 484 bytes of scratch per thread. A zero-or-one-trip loop keeps the
-accumulators loop-carried instead: 212 VGPRs, no spills and no scratch for
-both FP16 and BF16, without changing the pipeline math or supported shapes.
-
-A separate GPU1 run (8192 cubed, default tile, same inputs, 41 randomized
-paired rounds, 20 launches per HIP graph) measured:
-
-| Dtype | Initial FlyDSL TFLOPS | No-spill FlyDSL TFLOPS | PeakGemm C++ TFLOPS |
-|---|---:|---:|---:|
-| FP16 | 2174.17 | 2358.10 | 2402.00 |
-| BF16 | 2144.97 | 2328.93 | 2370.97 |
-
-All 105 correctness tests passed. BF16 improved by 8.6% in that run.
-These follow-up numbers are a paired comparison on GPU1, not directly
-comparable to the earlier absolute numbers above. In particular, the
-same-run C++ baseline also did not reach 2.5 PFLOPS.
-
+Direct calls use explicit/default configuration parameters. Use
+[policy tuning](#policy-tuning) to search FP16/BF16 configurations for a shape.
 
 ## Layout Convention
 
@@ -178,10 +119,10 @@ c = gemm_a16w16(
 
 ## Install FlyDSL from Source
 
-The original gfx950 example uses the following revision. The gfx1250 TDM
-example was tested separately with FlyDSL 0.4.1 and requires gfx1250 WMMA plus
-`rocdl.cdna5.make_tiled_tdm_atom` support. The older revision below has not
-been validated for that new path:
+The revision below is for the original gfx950 example. The gfx1250 path
+requires a FlyDSL build with gfx1250 WMMA, TDM
+(`rocdl.cdna5.make_tiled_tdm_atom`), and cluster support; this older revision
+has not been validated for that path.
 
 ```bash
 pip uninstall -y flydsl
@@ -197,16 +138,23 @@ pip install -e .
 
 ## Tests
 
-Run the GEMM correctness suite:
+Run the suite for your GPU architecture:
 
 ```bash
-pytest -sv test_gemm_a16w16_gfx950.py
+pytest -sv test_gemm_a16w16_gfx950.py       # gfx950
+pytest -sv test_gemm_a16w16_tdm_gfx1250.py   # gfx1250
 ```
 
 Run a focused layout test:
 
 ```bash
 pytest -sv test_gemm_a16w16_gfx950.py -k "main_loop and nt"
+```
+
+Run the gfx1250 benchmark cases through pytest:
+
+```bash
+pytest -sv test_gemm_a16w16_tdm_gfx1250.py -k benchmark_smoke
 ```
 
 After changing FlyDSL compiler or kernel sources, clear the JIT cache when
@@ -218,7 +166,7 @@ rm -rf ~/.flydsl/cache
 
 ## Policy Tuning
 
-Tune one shape:
+Tune one shape (`gemm_tune.py` selects the kernel for the detected GPU):
 
 ```bash
 python gemm_tune.py \
@@ -253,9 +201,12 @@ python gemm_tune.py \
   --out temp/gemm_a16w16_tuned
 ```
 
-The tuner validates each policy, compiles policies in parallel, benchmarks
-successful candidates, and writes the selected configurations to JSONL.
-Use `--compile-workers` to control policy compilation concurrency.
+The tuner validates policies, compiles them in parallel, and benchmarks
+successful candidates. `--single` prints the selected configuration;
+`--tune_all` writes configurations to `<out>.jsonl`. Use `--compile-workers`
+to control policy compilation concurrency. On gfx1250, tuning supports
+FP16/BF16 with `NN` or `NT` layouts; `--enable-split-k` includes cluster
+sizes 2 through 9 subject to configuration validity.
 
 ## PyTorch Backend Comparison
 
@@ -274,11 +225,13 @@ Use `--shape-index` to run a single built-in shape.
 
 ```text
 kernels/
-  gemm_a16w16_gfx950.py        # A16W16 GEMM
-  gemm_a16w16_gfx950_utils.py  # Layout, LDS, split-K, and store helpers
-test_gemm_a16w16_gfx950.py     # GEMM correctness and benchmarks
-gemm_tune.py                    # Policy search and tuning
-torch_benchmark.py              # torch.compile backend comparison
+  gemm_a16w16_gfx950.py         # gfx950 A16W16 GEMM
+  gemm_a16w16_gfx950_utils.py   # Layout, LDS, split-K, and store helpers
+  gemm_a16w16_tdm_gfx1250.py    # gfx1250 TDM/WMMA GEMM
+test_gemm_a16w16_gfx950.py      # gfx950 correctness and benchmarks
+test_gemm_a16w16_tdm_gfx1250.py # gfx1250 correctness and benchmarks
+gemm_tune.py                   # Policy search and tuning
+torch_benchmark.py             # torch.compile backend comparison
 ```
 
 ## References
