@@ -1136,6 +1136,8 @@ def test_interleaved_pipeline_replay(dtype, stages, k_tiles, split_k, has_bias):
             if fp8:
                 scale_a.mul_(0.9)
                 scale_b.mul_(1.1)
+            if bias is not None:
+                bias.neg_()
             for (out, _), graph in zip(outputs, graphs):
                 out.fill_(float("nan"))
                 graph.replay()
@@ -1229,6 +1231,68 @@ def test_interleaved_odd_n_and_independent_reference(dtype, has_bias):
     torch.testing.assert_close(out.cpu(), reference, atol=0.015, rtol=0.02)
     assert torch.all(storage[:, :8] == 17) and torch.all(storage[:, n + 8:] == 17)
     assert torch.all(storage[0] == 17) and torch.all(storage[-1] == 17)
+
+
+@pytest.mark.parametrize("dtype,n_waves", [
+    (torch.bfloat16, 2), (torch.bfloat16, 4),
+    (torch.float16, 2), (torch.float16, 4),
+    (torch.float8_e4m3fn, 2),
+])
+def test_interleaved_bias_rounding_and_replay(dtype, n_waves):
+    fp8 = dtype == torch.float8_e4m3fn
+    output_dtype = torch.bfloat16 if fp8 else dtype
+    m, n, k = 257, 259, 256
+    a, _ = _interleave_offset_matrix(m, k, dtype)
+    weight, _ = _interleave_offset_matrix(n, k, dtype)
+    out, storage = _interleave_offset_matrix(m, n, output_dtype)
+    # These exact products round to 1 before bias. Fusing bias into the FP32
+    # accumulator instead would leave a nonzero residual when bias is -1.
+    factor = 1 / 64 if dtype == torch.float16 else 1 / 16
+    a_values = torch.zeros(m, k)
+    b_values = torch.zeros(n, k)
+    a_values[:, 0] = b_values[:, 0] = 1
+    a_values[:, 1] = b_values[:, 1] = factor
+    a.copy_(a_values.to(dtype))
+    weight.copy_(b_values.to(dtype))
+    bias_storage = torch.full((n + 16,), 17.0, device="cuda", dtype=output_dtype)
+    bias = bias_storage[8:8 + n]
+    bias.fill_(-1)
+    scale_a = torch.ones(m, device="cuda")
+    scale_b = torch.ones(n, device="cuda")
+    config = dict(
+        block_m=256, block_n=256, block_k=128, stages=2,
+        m_waves=2, n_waves=n_waves, group_m=0, split_k=1, interleave=True,
+    )
+
+    def run():
+        if fp8:
+            gemm_fp8_ptpc_gfx1250(a, weight.t(), scale_a, scale_b, out, bias, **config)
+        else:
+            gemm_a16w16_gfx1250(a, weight.t(), out, bias, **config)
+
+    product = a_values @ b_values.t()
+    rounded = product.to(output_dtype)
+    assert torch.all(rounded == 1)
+    assert torch.all((product - 1).to(output_dtype) != 0)
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            run()
+        for bias_value in (-1.0, -0.5, 1.0):
+            bias.fill_(bias_value)
+            out.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            reference = (rounded.float() + bias_value).to(output_dtype)
+            torch.testing.assert_close(out.cpu(), reference, atol=0, rtol=0)
+            assert torch.all(storage[0] == 17) and torch.all(storage[-1] == 17)
+            assert torch.all(storage[:, :8] == 17) and torch.all(storage[:, n + 8:] == 17)
+            assert torch.all(bias == bias_value)
+            assert torch.all(bias_storage[:8] == 17) and torch.all(bias_storage[n + 8:] == 17)
+    finally:
+        graph.reset()
 
 
 # ====================================== interleave tuner regression ====================================
@@ -1501,6 +1565,7 @@ def test_gemm_a16w16_gfx1250_split_k_benchmark(
         ( 4096,   256,  4096, 128, 128, 128,  3,  4,  4,  4,  0,  True, "nn", False),
         ( 4096,   256,  4096, 128, 128, 128,  3,  4,  4,  4,  0,  True, "nt", False),
         ( 8192,  8192,  8192, 256, 256, 128,  2,  1,  2,  2,  0, False, "nt",  True),
+        ( 8192,  8192,  8192, 256, 256, 128,  2,  1,  2,  2,  0,  True, "nt",  True),
         ( 4112, 55296,  6144, 256, 256, 128,  2,  1,  2,  2,  0,  True, "nt",  True),
         # fmt: on
     ],
