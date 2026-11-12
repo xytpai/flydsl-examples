@@ -1,12 +1,15 @@
+import json
 import torch
 import pytest
 from torch.profiler import profile, ProfilerActivity
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from types import SimpleNamespace
 
 from kernels.gemm_a16w16_tdm_gfx1250 import (
     GEMM_DTYPE_BF16,
     gemm_a16w16_gfx1250,
     gemm_fp8_ptpc_gfx1250,
+    make_gemm_a16w16_gfx1250_kernel_name,
     validate_gemm_gfx1250_config,
 )
 
@@ -29,6 +32,7 @@ class _TestArgs:
     has_bias: bool
     layout: str = "nt"
     split_k: int = 1
+    interleave: bool = False
 
 
 @dataclass
@@ -46,6 +50,7 @@ class _Fp8PtpcArgs:
     has_bias: bool
     layout: str = "nt"
     split_k: int = 1
+    interleave: bool = False
 
 
 def _require_gfx1250():
@@ -121,6 +126,7 @@ def _kernel_kwargs(args: _TestArgs):
         "n_waves": args.n_waves,
         "group_m": args.group_m,
         "split_k": args.split_k,
+        "interleave": args.interleave,
     }
 
 
@@ -246,6 +252,7 @@ def _fp8_ptpc_kernel_kwargs(args: _Fp8PtpcArgs):
         "n_waves": args.n_waves,
         "group_m": args.group_m,
         "split_k": args.split_k,
+        "interleave": args.interleave,
     }
 
 
@@ -1057,6 +1064,303 @@ def test_gemm_fp8_ptpc_gfx1250_all_paths(
     )
 
 
+# ======================================= interleave regression =======================================
+
+def _interleave_offset_matrix(rows, cols, dtype):
+    alignment = 16 // torch.empty((), dtype=dtype).element_size()
+    storage = torch.full(
+        (rows + 2, (cols + alignment - 1) // alignment * alignment + 2 * alignment),
+        17.0, device="cuda", dtype=dtype,
+    )
+    matrix = storage[1:rows + 1, alignment:cols + alignment]
+    matrix.copy_((torch.randn(rows, cols, device="cuda") * 0.2).to(dtype))
+    return matrix, storage
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("stages,k_tiles", [(2, 1), (2, 2), (2, 3), (3, 2), (3, 5), (4, 3), (4, 8)])
+@pytest.mark.parametrize("split_k,has_bias", [(1, False), (1, True), (3, True)])
+def test_interleaved_pipeline_replay(dtype, stages, k_tiles, split_k, has_bias):
+    torch.manual_seed(129)
+    torch.set_num_threads(1)
+    fp8 = dtype == torch.float8_e4m3fn
+    tile = 256 if fp8 else 128
+    block_k = 128 if fp8 or stages < 4 else 64
+    # FP8 tile256 needs at most four BK128 stages (278528B).
+    m, n, k = 137, 144, split_k * block_k * k_tiles
+    output_dtype = torch.bfloat16 if fp8 else dtype
+    a, _ = _interleave_offset_matrix(m, k, dtype)
+    weight, _ = _interleave_offset_matrix(n, k, dtype)
+    b = weight.t()
+    outputs = [_interleave_offset_matrix(m, n, output_dtype) for _ in range(2)]
+    scale_a = torch.rand(m, device="cuda") * 0.5 + 0.1
+    scale_b = torch.rand(n, device="cuda") * 0.5 + 0.1
+    bias = torch.randn(n, device="cuda", dtype=output_dtype) * 0.1 if has_bias else None
+    config = dict(
+        block_m=tile, block_n=tile, block_k=block_k, stages=stages,
+        m_waves=2, n_waves=2, group_m=3, split_k=split_k,
+    )
+
+    def run(interleave):
+        out = outputs[int(interleave)][0]
+        if fp8:
+            return gemm_fp8_ptpc_gfx1250(
+                a, b, scale_a, scale_b, out, bias, interleave=interleave, **config,
+            )
+        return gemm_a16w16_gfx1250(a, b, out, bias, interleave=interleave, **config)
+
+    for flag in (False, True):
+        run(flag)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(outputs[1][0], outputs[0][0], atol=0, rtol=0)
+    graphs = []
+    try:
+        for flag in (False, True):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                run(flag)
+            graphs.append(graph)
+        for rep in range(4):
+            a.copy_((-a.float()).to(dtype))
+            weight.copy_((-weight.float()).to(dtype))
+            if rep == 1:
+                a.zero_()
+            elif rep == 2:
+                a.copy_((torch.randn(m, k, device="cuda") * 0.2).to(dtype))
+            if fp8:
+                scale_a.mul_(0.9)
+                scale_b.mul_(1.1)
+            for (out, _), graph in zip(outputs, graphs):
+                out.fill_(float("nan"))
+                graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(outputs[1][0], outputs[0][0], atol=0, rtol=0)
+            assert torch.isfinite(outputs[1][0]).all()
+            for _, storage in outputs:
+                assert torch.all(storage[0] == 17) and torch.all(storage[-1] == 17)
+                assert torch.all(storage[:, :8] == 17)
+                assert torch.all(storage[:, n + 8:] == 17)
+    finally:
+        for graph in graphs:
+            graph.reset()
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("block_m,block_n,m_waves,n_waves", [
+    (256, 256, 2, 4), (128, 256, 2, 2), (256, 128, 2, 2),
+])
+@pytest.mark.parametrize("split_k", [1, 2, 5, 9])
+def test_interleaved_rectangular_wave_tiles(dtype, block_m, block_n, m_waves, n_waves, split_k):
+    torch.manual_seed(333)
+    m, n, k = 257, 264, split_k * 384
+    a = torch.randn(m, k, device="cuda", dtype=dtype) * 0.2
+    b = (torch.randn(n, k, device="cuda", dtype=dtype) * 0.2).t()
+    config = dict(
+        block_m=block_m, block_n=block_n, m_waves=m_waves, n_waves=n_waves,
+        block_k=128, stages=2, split_k=split_k, group_m=4,
+    )
+    original = gemm_a16w16_gfx1250(a, b, **config)
+    interleaved = gemm_a16w16_gfx1250(a, b, **config, interleave=True)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(interleaved, original, rtol=0, atol=0)
+    if split_k == 1:
+        reference = (a.float() @ b.float()).to(dtype)
+        torch.testing.assert_close(interleaved.float(), reference.float(), atol=0.03, rtol=0.03)
+
+
+@pytest.mark.parametrize("changes", [
+    {"b_k_contiguous": False}, {"block_m": 96}, {"m_waves": 4},
+    {"interleave": "yes"},
+])
+def test_interleaved_configuration_rejected(changes):
+    config = dict(
+        m=128, n=128, k=512, block_m=128, block_n=128, block_k=128,
+        stages=2, m_waves=2, n_waves=2, group_m=0,
+        dtype_id=GEMM_DTYPE_BF16, mma_m=16, mma_n=16, mma_k=32,
+        b_k_contiguous=True, split_k=1, interleave=True,
+    )
+    config.update(changes)
+    with pytest.raises(ValueError):
+        validate_gemm_gfx1250_config(**config)
+
+
+def test_schedule_kernel_names_are_separate():
+    args = (GEMM_DTYPE_BF16, 128, 128, 128, 2, 2, 2, 0, False, True, 16, 16, 32, 1)
+    original = make_gemm_a16w16_gfx1250_kernel_name(*args)
+    assert original == make_gemm_a16w16_gfx1250_kernel_name(*args, interleave=False)
+    assert make_gemm_a16w16_gfx1250_kernel_name(*args, interleave=True) == original + "_interleave"
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("has_bias", [False, True])
+def test_interleaved_odd_n_and_independent_reference(dtype, has_bias):
+    torch.manual_seed(736)
+    fp8 = dtype == torch.float8_e4m3fn
+    output_dtype = torch.bfloat16 if fp8 else dtype
+    m, n, k = 131, 139, 512
+    a, _ = _interleave_offset_matrix(m, k, dtype)
+    weight, _ = _interleave_offset_matrix(n, k, dtype)
+    out, storage = _interleave_offset_matrix(m, n, output_dtype)
+    scale_a = torch.rand(m, device="cuda") * 0.25 + 0.125
+    scale_b = torch.rand(n, device="cuda") * 0.25 + 0.125
+    bias = torch.randn(n, device="cuda", dtype=output_dtype) * 0.1 if has_bias else None
+    config = dict(
+        block_m=256, block_n=256, block_k=128, stages=2,
+        m_waves=2, n_waves=2, interleave=True,
+    )
+    if fp8:
+        gemm_fp8_ptpc_gfx1250(a, weight.t(), scale_a, scale_b, out, bias, **config)
+    else:
+        gemm_a16w16_gfx1250(a, weight.t(), out, bias, **config)
+    torch.cuda.synchronize()
+    # Small full CPU FP32 oracle; it does not reuse either kernel schedule.
+    reference = a.cpu().float() @ weight.cpu().float().t()
+    if fp8:
+        reference = reference * scale_a.cpu()[:, None] * scale_b.cpu()[None, :]
+    reference = reference.to(output_dtype)
+    if bias is not None:
+        reference = (reference.float() + bias.cpu().float()).to(output_dtype)
+    torch.testing.assert_close(out.cpu(), reference, atol=0.015, rtol=0.02)
+    assert torch.all(storage[:, :8] == 17) and torch.all(storage[:, n + 8:] == 17)
+    assert torch.all(storage[0] == 17) and torch.all(storage[-1] == 17)
+
+
+# ====================================== interleave tuner regression ====================================
+
+@pytest.fixture
+def tuner_device_props(monkeypatch):
+    props = SimpleNamespace(
+        multi_processor_count=256, warp_size=32, gcnArchName="gfx1250",
+        max_threads_per_multi_processor=2048,
+        shared_memory_per_block=320 * 1024,
+        shared_memory_per_multiprocessor=320 * 1024,
+    )
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda *_: props)
+    return props
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_nt_candidates_include_valid_interleaving(dtype, tuner_device_props):
+    import gemm_tune as tuner
+
+    args = tuner.Args(dtype, 8192, 8192, 8192, "nt", enable_split_k=True)
+    configs = tuner.gemm_gfx1250_get_configs(args)
+    plain = [c for c in configs if not c["interleave"]]
+    interleaved = [c for c in configs if c["interleave"]]
+    assert len(plain) == 650
+    assert len(interleaved) == 308
+    assert all(c["split_k"] == 1 for c in configs)  # existing large-grid pruner
+    plain_tiles = {
+        tuple((key, value) for key, value in c.items() if key != "interleave")
+        for c in plain
+    }
+    for config in interleaved:
+        tile = tuple((key, value) for key, value in config.items() if key != "interleave")
+        assert tile in plain_tiles
+        tuner.validate_gemm_gfx1250_config(
+            args.m, args.n, args.k, config["block_m"], config["block_n"],
+            config["block_k"], config["stages"], config["m_waves"],
+            config["n_waves"], config["group_m"],
+            tuner.GEMM_DTYPE_FP16 if dtype is torch.float16 else tuner.GEMM_DTYPE_BF16,
+            config["mma_m"], config["mma_n"], config["mma_k"],
+            True, config["split_k"], interleave=True,
+        )
+
+
+def test_split_k_interleaved_candidates(tuner_device_props):
+    import gemm_tune as tuner
+
+    args = tuner.Args(torch.bfloat16, 128, 128, 3072, "nt", enable_split_k=True)
+    configs = tuner.gemm_gfx1250_get_configs(args)
+    interleaved = [c for c in configs if c["interleave"]]
+    assert any(c["split_k"] == 3 for c in interleaved)
+    assert any(c["split_k"] > 1 for c in interleaved)
+    for config in interleaved:
+        tuner.validate_gemm_gfx1250_config(
+            args.m, args.n, args.k, config["block_m"], config["block_n"],
+            config["block_k"], config["stages"], config["m_waves"],
+            config["n_waves"], config["group_m"], tuner.GEMM_DTYPE_BF16,
+            config["mma_m"], config["mma_n"], config["mma_k"],
+            True, config["split_k"], interleave=True,
+        )
+
+
+def test_nn_does_not_enumerate_interleaving(tuner_device_props):
+    import gemm_tune as tuner
+
+    args = tuner.Args(torch.bfloat16, 256, 256, 1024, "nn", enable_split_k=True)
+    configs = tuner.gemm_gfx1250_get_configs(args)
+    assert configs
+    assert all(c["interleave"] is False for c in configs)
+
+
+def test_pruner_preserves_both_schedules_and_counts_padding(tuner_device_props):
+    import gemm_tune as tuner
+
+    config = dict(
+        block_m=256, block_n=256, block_k=32, stages=2,
+        m_waves=2, n_waves=2, split_k=1, group_m=0,
+    )
+    pruner = tuner.GemmConfigPruner(256, 256, 1024, tuner_device_props, 2, arch="gfx1250")
+    plain = dict(config, interleave=False)
+    interleaved = dict(config, interleave=True)
+    assert pruner._lds_bytes(plain) == 256 * 256 * 2
+    assert pruner._lds_bytes(interleaved) == 256 * (256 + 8) * 2
+    assert pruner.prune([plain, interleaved]) == [plain, interleaved]
+
+
+def test_winner_serialization_keeps_interleave(monkeypatch):
+    # Test winner bookkeeping deterministically, separately from GPU timing.
+    import gemm_tune as tuner
+
+    configs = [dict(interleave=False), dict(interleave=True)]
+    monkeypatch.setattr(tuner, "gpu_arch", "gfx1250")
+    monkeypatch.setattr(tuner, "gemm_a16w16_get_configs", lambda _: configs)
+    monkeypatch.setattr(tuner, "parallel_compile_policies", lambda _, cs, **kw: cs)
+    monkeypatch.setattr(
+        tuner, "tuning_benchmark",
+        lambda _, kwargs: 5.0 if kwargs["interleave"] else 10.0,
+    )
+    result = tuner.tune_single(tuner.Args(torch.bfloat16, 256, 256, 1024, "nt"))
+    restored = json.loads(json.dumps(asdict(result)))
+    assert restored["config"]["interleave"] is True
+    assert restored["duration"] == 5.0
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_compile_benchmark_and_replay_candidate(dtype):
+    import gemm_tune as tuner
+
+    if not torch.cuda.is_available() or tuner.gpu_arch != "gfx1250":
+        pytest.skip("requires gfx1250")
+    torch.set_num_threads(1)
+    args = tuner.Args(dtype, 128, 128, 512, "nt", compile_workers=2)
+    configs = tuner.gemm_gfx1250_get_configs(args)
+    pair = [
+        c for c in configs
+        if all(c[key] == value for key, value in dict(
+            block_m=128, block_n=128, block_k=128, stages=2,
+            m_waves=2, n_waves=2, split_k=1, group_m=0,
+        ).items())
+    ]
+    assert len(pair) == 2 and {c["interleave"] for c in pair} == {False, True}
+    compiled = tuner.parallel_compile_policies(args, pair, max_workers=2)
+    assert len(compiled) == 2
+    for config in compiled:
+        # Actual existing profiler benchmark and input/bias generator.
+        duration = tuner.tuning_benchmark(args, kwargs=config, niters=5)
+        assert 0 < duration < float("inf")
+        restored = json.loads(json.dumps(config))
+        a, b, bias = tuner.create_inputs(args)
+        out = tuner.create_outputs(args)[0]
+        tuner.run_gemm(a, b, out, bias, restored, args.layout)
+        torch.cuda.synchronize()
+        reference = (a.float() @ b.float()).to(dtype)
+        reference = (reference.float() + bias.float()).to(dtype)
+        torch.testing.assert_close(out, reference, atol=.03, rtol=.02)
+
+
 # =========================================== benchmark ===========================================
 
 
@@ -1107,50 +1411,91 @@ def test_gemm_a16w16_gfx1250_split_k_benchmark(
     benchmark(args)
 
 
-@pytest.mark.parametrize("layout", ["nn", "nt"])
 @pytest.mark.parametrize("dtype", ["bf16"])
 @pytest.mark.parametrize(
     "m, n, k, block_m, block_n, block_k, stages, split_k, "
-    "m_waves, n_waves, group_m, has_bias",
+    "m_waves, n_waves, group_m, has_bias, layout, interleave",
     [
-        (8, 4096, 4096, 16, 128, 256, 2, 8, 1, 4, 0, True),
-        (16, 4096, 4096, 16, 64, 128, 5, 8, 1, 4, 0, True),
-        (32, 4096, 4096, 32, 64, 64, 4, 8, 2, 4, 0, True),
-        (64, 4096, 4096, 64, 64, 256, 3, 4, 4, 4, 0, True),
-        (128, 4096, 4096, 128, 64, 128, 5, 4, 4, 2, 0, True),
-        (256, 4096, 4096, 128, 64, 256, 3, 2, 4, 4, 0, True),
-        (512, 4096, 4096, 256, 128, 128, 3, 4, 4, 4, 0, True),
-        (1024, 4096, 4096, 256, 128, 128, 2, 2, 4, 4, 0, True),
-        (2048, 4096, 4096, 128, 256, 128, 3, 1, 4, 4, 4, True),
-        (1024, 1024, 1024, 64, 64, 128, 3, 1, 4, 4, 0, True),
-        (2048, 2048, 2048, 128, 128, 256, 2, 1, 4, 4, 4, True),
-        (4096, 4096, 4096, 256, 256, 128, 2, 1, 4, 2, 4, True),
-        (4096, 4096, 8192, 256, 256, 128, 2, 1, 4, 2, 4, True),
-        (8192, 8192, 8192, 256, 256, 128, 2, 1, 4, 2, 0, True),
-        (8, 7168, 2048, 16, 64, 128, 3, 4, 1, 2, 0, True),
-        (32, 384, 7168, 16, 32, 128, 7, 8, 1, 2, 0, True),
-        (32, 14336, 4096, 32, 128, 128, 3, 4, 2, 4, 0, True),
-        (16, 28672, 4096, 16, 128, 128, 6, 1, 1, 4, 0, True),
-        (4096, 256, 4096, 128, 128, 128, 4, 4, 4, 4, 0, True),
-        (8, 4096, 4096, 16, 64, 128, 3, 8, 1, 2, 0, True),
-        (16, 4096, 4096, 16, 64, 128, 5, 8, 1, 4, 0, True),
-        (32, 4096, 4096, 32, 64, 128, 3, 8, 2, 4, 0, True),
-        (64, 4096, 4096, 32, 64, 128, 5, 4, 2, 4, 0, True),
-        (128, 4096, 4096, 128, 64, 128, 3, 4, 4, 4, 0, True),
-        (256, 4096, 4096, 128, 128, 128, 3, 4, 4, 4, 0, True),
-        (512, 4096, 4096, 128, 128, 128, 3, 2, 4, 4, 0, True),
-        (1024, 4096, 4096, 128, 256, 128, 3, 2, 4, 4, 0, True),
-        (2048, 4096, 4096, 128, 256, 128, 3, 1, 4, 4, 4, True),
-        (1024, 1024, 1024, 128, 64, 256, 3, 2, 4, 2, 0, True),
-        (2048, 2048, 2048, 128, 128, 128, 3, 1, 4, 4, 4, True),
-        (4096, 4096, 4096, 256, 256, 128, 2, 1, 4, 2, 0, True),
-        (4096, 4096, 8192, 256, 256, 128, 2, 1, 4, 2, 4, True),
-        (8192, 8192, 8192, 256, 256, 128, 2, 1, 4, 2, 0, True),
-        (8, 7168, 2048, 16, 64, 256, 3, 2, 1, 4, 0, True),
-        (32, 384, 7168, 16, 64, 512, 3, 7, 1, 4, 0, True),
-        (32, 14336, 4096, 32, 64, 128, 4, 2, 2, 2, 0, True),
-        (16, 28672, 4096, 16, 64, 256, 3, 1, 1, 4, 4, True),
-        (4096, 256, 4096, 128, 128, 128, 3, 4, 4, 4, 0, True),
+        # fmt: off
+        # m, n, k, block_m, block_n, block_k, stages, split_k, m_waves, n_waves, group_m, has_bias, layout, interleave
+        (    8,  4096,  4096,  16, 128, 256,  2,  8,  1,  4,  0,  True, "nn", False),
+        (    8,  4096,  4096,  16, 128, 256,  2,  8,  1,  4,  0,  True, "nt", False),
+        (   16,  4096,  4096,  16,  64, 128,  5,  8,  1,  4,  0,  True, "nn", False),
+        (   16,  4096,  4096,  16,  64, 128,  5,  8,  1,  4,  0,  True, "nt", False),
+        (   32,  4096,  4096,  32,  64,  64,  4,  8,  2,  4,  0,  True, "nn", False),
+        (   32,  4096,  4096,  32,  64,  64,  4,  8,  2,  4,  0,  True, "nt", False),
+        (   64,  4096,  4096,  64,  64, 256,  3,  4,  4,  4,  0,  True, "nn", False),
+        (   64,  4096,  4096,  64,  64, 256,  3,  4,  4,  4,  0,  True, "nt", False),
+        (  128,  4096,  4096, 128,  64, 128,  5,  4,  4,  2,  0,  True, "nn", False),
+        (  128,  4096,  4096, 128,  64, 128,  5,  4,  4,  2,  0,  True, "nt", False),
+        (  256,  4096,  4096, 128,  64, 256,  3,  2,  4,  4,  0,  True, "nn", False),
+        (  256,  4096,  4096, 128,  64, 256,  3,  2,  4,  4,  0,  True, "nt", False),
+        (  512,  4096,  4096, 256, 128, 128,  3,  4,  4,  4,  0,  True, "nn", False),
+        (  512,  4096,  4096, 256, 128, 128,  3,  4,  4,  4,  0,  True, "nt", False),
+        ( 1024,  4096,  4096, 256, 128, 128,  2,  2,  4,  4,  0,  True, "nn", False),
+        ( 1024,  4096,  4096, 256, 128, 128,  2,  2,  4,  4,  0,  True, "nt", False),
+        ( 2048,  4096,  4096, 128, 256, 128,  3,  1,  4,  4,  4,  True, "nn", False),
+        ( 2048,  4096,  4096, 128, 256, 128,  3,  1,  4,  4,  4,  True, "nt", False),
+        ( 1024,  1024,  1024,  64,  64, 128,  3,  1,  4,  4,  0,  True, "nn", False),
+        ( 1024,  1024,  1024,  64,  64, 128,  3,  1,  4,  4,  0,  True, "nt", False),
+        ( 2048,  2048,  2048, 128, 128, 256,  2,  1,  4,  4,  4,  True, "nn", False),
+        ( 2048,  2048,  2048, 128, 128, 256,  2,  1,  4,  4,  4,  True, "nt", False),
+        ( 4096,  4096,  4096, 256, 256, 128,  2,  1,  4,  2,  4,  True, "nn", False),
+        ( 4096,  4096,  4096, 256, 256, 128,  2,  1,  4,  2,  4,  True, "nt", False),
+        ( 4096,  4096,  8192, 256, 256, 128,  2,  1,  4,  2,  4,  True, "nn", False),
+        ( 4096,  4096,  8192, 256, 256, 128,  2,  1,  4,  2,  4,  True, "nt", False),
+        ( 8192,  8192,  8192, 256, 256, 128,  2,  1,  4,  2,  0,  True, "nn", False),
+        ( 8192,  8192,  8192, 256, 256, 128,  2,  1,  4,  2,  0,  True, "nt", False),
+        (    8,  7168,  2048,  16,  64, 128,  3,  4,  1,  2,  0,  True, "nn", False),
+        (    8,  7168,  2048,  16,  64, 128,  3,  4,  1,  2,  0,  True, "nt", False),
+        (   32,   384,  7168,  16,  32, 128,  7,  8,  1,  2,  0,  True, "nn", False),
+        (   32,   384,  7168,  16,  32, 128,  7,  8,  1,  2,  0,  True, "nt", False),
+        (   32, 14336,  4096,  32, 128, 128,  3,  4,  2,  4,  0,  True, "nn", False),
+        (   32, 14336,  4096,  32, 128, 128,  3,  4,  2,  4,  0,  True, "nt", False),
+        (   16, 28672,  4096,  16, 128, 128,  6,  1,  1,  4,  0,  True, "nn", False),
+        (   16, 28672,  4096,  16, 128, 128,  6,  1,  1,  4,  0,  True, "nt", False),
+        ( 4096,   256,  4096, 128, 128, 128,  4,  4,  4,  4,  0,  True, "nn", False),
+        ( 4096,   256,  4096, 128, 128, 128,  4,  4,  4,  4,  0,  True, "nt", False),
+        (    8,  4096,  4096,  16,  64, 128,  3,  8,  1,  2,  0,  True, "nn", False),
+        (    8,  4096,  4096,  16,  64, 128,  3,  8,  1,  2,  0,  True, "nt", False),
+        (   16,  4096,  4096,  16,  64, 128,  5,  8,  1,  4,  0,  True, "nn", False),
+        (   16,  4096,  4096,  16,  64, 128,  5,  8,  1,  4,  0,  True, "nt", False),
+        (   32,  4096,  4096,  32,  64, 128,  3,  8,  2,  4,  0,  True, "nn", False),
+        (   32,  4096,  4096,  32,  64, 128,  3,  8,  2,  4,  0,  True, "nt", False),
+        (   64,  4096,  4096,  32,  64, 128,  5,  4,  2,  4,  0,  True, "nn", False),
+        (   64,  4096,  4096,  32,  64, 128,  5,  4,  2,  4,  0,  True, "nt", False),
+        (  128,  4096,  4096, 128,  64, 128,  3,  4,  4,  4,  0,  True, "nn", False),
+        (  128,  4096,  4096, 128,  64, 128,  3,  4,  4,  4,  0,  True, "nt", False),
+        (  256,  4096,  4096, 128, 128, 128,  3,  4,  4,  4,  0,  True, "nn", False),
+        (  256,  4096,  4096, 128, 128, 128,  3,  4,  4,  4,  0,  True, "nt", False),
+        (  512,  4096,  4096, 128, 128, 128,  3,  2,  4,  4,  0,  True, "nn", False),
+        (  512,  4096,  4096, 128, 128, 128,  3,  2,  4,  4,  0,  True, "nt", False),
+        ( 1024,  4096,  4096, 128, 256, 128,  3,  2,  4,  4,  0,  True, "nn", False),
+        ( 1024,  4096,  4096, 128, 256, 128,  3,  2,  4,  4,  0,  True, "nt", False),
+        ( 2048,  4096,  4096, 128, 256, 128,  3,  1,  4,  4,  4,  True, "nn", False),
+        ( 2048,  4096,  4096, 128, 256, 128,  3,  1,  4,  4,  4,  True, "nt", False),
+        ( 1024,  1024,  1024, 128,  64, 256,  3,  2,  4,  2,  0,  True, "nn", False),
+        ( 1024,  1024,  1024, 128,  64, 256,  3,  2,  4,  2,  0,  True, "nt", False),
+        ( 2048,  2048,  2048, 128, 128, 128,  3,  1,  4,  4,  4,  True, "nn", False),
+        ( 2048,  2048,  2048, 128, 128, 128,  3,  1,  4,  4,  4,  True, "nt", False),
+        ( 4096,  4096,  4096, 256, 256, 128,  2,  1,  4,  2,  0,  True, "nn", False),
+        ( 4096,  4096,  4096, 256, 256, 128,  2,  1,  4,  2,  0,  True, "nt", False),
+        ( 4096,  4096,  8192, 256, 256, 128,  2,  1,  4,  2,  4,  True, "nn", False),
+        ( 4096,  4096,  8192, 256, 256, 128,  2,  1,  4,  2,  4,  True, "nt", False),
+        ( 8192,  8192,  8192, 256, 256, 128,  2,  1,  4,  2,  0,  True, "nn", False),
+        ( 8192,  8192,  8192, 256, 256, 128,  2,  1,  4,  2,  0,  True, "nt", False),
+        (    8,  7168,  2048,  16,  64, 256,  3,  2,  1,  4,  0,  True, "nn", False),
+        (    8,  7168,  2048,  16,  64, 256,  3,  2,  1,  4,  0,  True, "nt", False),
+        (   32,   384,  7168,  16,  64, 512,  3,  7,  1,  4,  0,  True, "nn", False),
+        (   32,   384,  7168,  16,  64, 512,  3,  7,  1,  4,  0,  True, "nt", False),
+        (   32, 14336,  4096,  32,  64, 128,  4,  2,  2,  2,  0,  True, "nn", False),
+        (   32, 14336,  4096,  32,  64, 128,  4,  2,  2,  2,  0,  True, "nt", False),
+        (   16, 28672,  4096,  16,  64, 256,  3,  1,  1,  4,  4,  True, "nn", False),
+        (   16, 28672,  4096,  16,  64, 256,  3,  1,  1,  4,  4,  True, "nt", False),
+        ( 4096,   256,  4096, 128, 128, 128,  3,  4,  4,  4,  0,  True, "nn", False),
+        ( 4096,   256,  4096, 128, 128, 128,  3,  4,  4,  4,  0,  True, "nt", False),
+        ( 8192,  8192,  8192, 256, 256, 128,  2,  1,  2,  2,  0, False, "nt",  True),
+        # fmt: on
     ],
 )
 def test_gemm_a16w16_gfx1250_benchmark_smoke(
@@ -1168,6 +1513,7 @@ def test_gemm_a16w16_gfx1250_benchmark_smoke(
     n_waves: int,
     group_m: int,
     has_bias: bool,
+    interleave: bool,
 ):
     args = _TestArgs(
         _dtype_from_name(dtype),
@@ -1184,7 +1530,10 @@ def test_gemm_a16w16_gfx1250_benchmark_smoke(
         has_bias,
         layout,
         split_k,
+        interleave,
     )
+    if interleave:
+        check_acc(args)
     benchmark(args)
 
 
