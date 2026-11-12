@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: MIT
-"""Wave32 TDM GEMM for gfx1250, including FP8 per-token per-channel."""
+"""Wave32 TDM GEMM for gfx1250, including FP8 per-token per-channel.
+
+Optional NT quadrant interleaving uses opposite serpentine orders on even/odd
+waves. Both schedules share one kernel, TDM operands and the output epilogue.
+"""
 
 import functools
 from typing import Optional
@@ -53,9 +57,29 @@ FRAGMENT_LOAD_BITS = 16 * 8
 STORE_VEC_BITS = 16 * 8
 
 
+def _validate_interleaved_tile(
+    block_m, block_n, m_waves, n_waves, mma_m, mma_n, mma_k, elem_bits,
+    b_k_contiguous, interleave,
+):
+    """Each quadrant must hide the independent loads of its next half-fragment."""
+    if type(interleave) is not bool:
+        raise ValueError("interleave must be bool")
+    if not interleave:
+        return
+    m_steps = block_m // (m_waves * mma_m)
+    n_steps = block_n // (n_waves * mma_n)
+    half_m_steps, half_n_steps = m_steps // 2, n_steps // 2
+    fragment_loads = (mma_m * mma_k // WAVE_SIZE) // (FRAGMENT_LOAD_BITS // elem_bits)
+    if (
+        not b_k_contiguous or m_steps % 2 or n_steps % 2
+        or half_m_steps * half_n_steps < max(half_m_steps, half_n_steps) * fragment_loads
+    ):
+        raise ValueError("interleave requires NT and even quadrants with room for LDS loads")
+
+
 def validate_gemm_gfx1250_config(
     m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, group_m,
-    dtype_id, mma_m, mma_n, mma_k, b_k_contiguous=True, split_k=1,
+    dtype_id, mma_m, mma_n, mma_k, b_k_contiguous=True, split_k=1, interleave=False,
 ):
     values = (m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, mma_m, mma_n, mma_k)
     if any(type(v) is not int or v <= 0 for v in values):
@@ -88,6 +112,10 @@ def validate_gemm_gfx1250_config(
     if elem_bits is None or STORE_VEC_BITS % elem_bits:
         dtype_name = GEMM_DTYPE_NAMES.get(dtype_id, "unknown")
         raise ValueError(f"unsupported element size for {dtype_name}")
+    _validate_interleaved_tile(
+        block_m, block_n, m_waves, n_waves, mma_m, mma_n, mma_k, elem_bits,
+        b_k_contiguous, interleave,
+    )
     # FP8 PTPC writes BF16. The 16-byte store width follows the output type.
     out_bits = 16 if dtype_id == GEMM_DTYPE_FP8_PTPC else elem_bits
     if STORE_VEC_BITS % out_bits:
@@ -104,7 +132,9 @@ def validate_gemm_gfx1250_config(
     a_stage_size = block_m * (block_k + lds_pad)
     b_stage_size = block_n * (block_k + lds_pad) if b_k_contiguous else block_k * (block_n + lds_pad)
     ab_bits = stages * (a_stage_size + b_stage_size) * elem_bits
-    c_bits = block_m * block_n * out_bits
+    # The interleaved schedule writes row-contiguous fragments into padded LDS.
+    c_pitch = block_n + (STORE_VEC_BITS // out_bits if interleave else 0)
+    c_bits = block_m * c_pitch * out_bits
     shared_bytes = (max(ab_bits, c_bits) + 7) // 8
     if shared_bytes > 320 * 1024:
         raise ValueError("pipeline exceeds gfx1250's 320 KiB LDS capacity")
@@ -121,7 +151,7 @@ def validate_gemm_gfx1250_config(
 
 def make_gemm_a16w16_gfx1250_kernel_name(
     dtype_id, block_m, block_n, block_k, stages, m_waves, n_waves, group_m, has_bias, b_k_contiguous,
-    mma_m, mma_n, mma_k, split_k,
+    mma_m, mma_n, mma_k, split_k, interleave=False,
 ):
     dtype_name = GEMM_DTYPE_NAMES[dtype_id]
     layout = "nt" if b_k_contiguous else "nn"
@@ -129,6 +159,7 @@ def make_gemm_a16w16_gfx1250_kernel_name(
         f"hgemm_{dtype_name}_t{block_m}x{block_n}x{block_k}x{stages}"
         f"_w{m_waves}x{n_waves}_gm{group_m}_bias{int(has_bias)}_l{layout}"
         f"_sk{split_k}_mma{mma_m}x{mma_n}x{mma_k}"
+        f"{'_interleave' if interleave else ''}"
     )
 
 
@@ -148,6 +179,7 @@ class GemmA16W16Gfx1250Param:
     mma_n: fx.Constexpr[int]
     mma_k: fx.Constexpr[int]
     split_k: fx.Constexpr[int]
+    interleave: fx.Constexpr[bool]
 
 
 @functools.lru_cache(maxsize=128)
@@ -166,6 +198,7 @@ def build_gemm_gfx1250(
     mma_n: int,
     mma_k: int,
     split_k: int = 1,
+    interleave: bool = False,
 ):
     is_fp8_ptpc = dtype_id == GEMM_DTYPE_FP8_PTPC
     if is_fp8_ptpc:
@@ -202,9 +235,15 @@ def build_gemm_gfx1250(
         b_tile_stride = (b_pitch, 1)
     # FP8 PTPC keeps A/B in FP8 and the output tile in BF16, so the arena is
     # counted in input elements and the C tile occupies out_bits/elem_bits slots.
-    c_slots = block_m * block_n * out_bits // elem_bits
+    c_pitch = block_n + (STORE_VEC_BITS // out_bits if interleave else 0)
+    c_slots = block_m * c_pitch * out_bits // elem_bits
     shared_elements = max(stages * (a_stage_size + b_stage_size), c_slots)
     m_steps, n_steps = block_m // (m_waves * mma_m), block_n // (n_waves * mma_n)
+    half_m_steps, half_n_steps = m_steps // 2, n_steps // 2
+    _validate_interleaved_tile(
+        block_m, block_n, m_waves, n_waves, mma_m, mma_n, mma_k, elem_bits,
+        b_k_contiguous, interleave,
+    )
 
     @fx.struct
     class SharedStorage:
@@ -253,13 +292,13 @@ def build_gemm_gfx1250(
 
         # Full tensor, not the tile. A tile that hangs past M or N stays
         # block-sized in LDS; TDM zero-fills the out-of-range elements.
-        def tdm_operand(global_pointer, global_shape, global_stride, tile_shape, tile_stride):
+        def tdm_operand(global_pointer, global_shape, global_stride, tile_shape, tile_stride, store=False):
             global_view = fx.make_view(
                 global_pointer,
                 fx.make_layout(global_shape, global_stride),
             )
             atom, coords = rocdl.cdna5.make_tiled_tdm_atom(
-                rocdl.TensorLoad(),
+                rocdl.TensorStore() if store else rocdl.TensorLoad(),
                 global_view,
                 fx.make_layout(tile_shape, tile_stride),
                 tile_shape,
@@ -388,68 +427,311 @@ def build_gemm_gfx1250(
         k_rank = fx.block_idx.y
         k_tiles = (k // split_k) // block_k
         k_tile_base = k_rank * k_tiles
-        for stage in range_constexpr(stages - 1):
-            copy_tile(stage, k_tile_base + fx.Int32(stage))
+        if const_expr(interleave):
+            # Two b128 loads per BF16/FP16 fragment, four per FP8 fragment.
+            fragment_words = frag_elems * elem_bits // 32
+            quadrant_steps = half_m_steps * half_n_steps
+            wmma_k_steps = block_k // mma_k
+            load_atom = fx.make_copy_atom(fx.UniversalCopy(FRAGMENT_LOAD_BITS), fx.Int32)
+            load_layout = fx.make_layout(FRAGMENT_LOAD_BITS // 32, 1)
+            aligned_lds_type = fx.PointerType.get(
+                elem_ty=fx.Int32.ir_type,
+                address_space=fx.AddressSpace.Shared,
+                alignment=16,
+            )
 
-        # Two tiles per iteration. Double buffering retains literal LDS offsets;
-        # deeper pipelines advance the ring modulo stages.
-        main_tiles = k_tiles - (stages - 1)
-        current_stage = fx.Int32(0)
-        for pair in range(main_tiles // 2):
-            for step in range_constexpr(2):
-                read_stage = step if stages == 2 else current_stage
+            def fragment_pointer(operand, stage, k_step):
+                if const_expr(operand == "a"):
+                    pointer, stage_size, wave_start, pitch = shared_a, a_stage_size, wave_row, a_pitch
+                else:
+                    pointer, stage_size, wave_start, pitch = shared_b, b_stage_size, wave_col, b_pitch
+                pointer = (
+                    pointer + stage * stage_size + (wave_start + lane % 16) * pitch
+                    + k_step * mma_k + lane // 16 * frag_load_elems
+                )
+                return pointer, mma_m * pitch
+
+            def load_fragment_part(pointer, element_offset):
+                address = fx.Int32(fx.ptrtoint(pointer)) + fx.Int32(element_offset) * (elem_bits // 8)
+                source = fx.inttoptr(aligned_lds_type, address)
+                values = fx.make_rmem_tensor(load_layout, fx.Int32)
+                fx.copy(load_atom, fx.make_view(source, load_layout), values)
+                return values.load()
+
+            def join_fragment_parts(parts):
+                values = parts[0].shuffle(parts[1], list(range(8)))
+                if const_expr(frag_loads == 4):
+                    values = values.shuffle(
+                        parts[2].shuffle(parts[3], list(range(8))), list(range(16))
+                    )
+                return values
+
+            def load_packed_fragment(pointer, element_offset):
+                return join_fragment_parts([
+                    load_fragment_part(pointer, element_offset + part * frag_k_stride)
+                    for part in range_constexpr(frag_loads)
+                ])
+
+            a_first_half = [
+                fx.make_rmem_tensor(fragment_words, fx.Int32)
+                for _ in range_constexpr(half_m_steps)
+            ]
+            b_first_half = [
+                fx.make_rmem_tensor(fragment_words, fx.Int32)
+                for _ in range_constexpr(half_n_steps)
+            ]
+
+            def first_half_loads(stage, k_step, parity):
+                a_pointer, a_row_stride = fragment_pointer("a", stage, k_step)
+                b_pointer, b_row_stride = fragment_pointer("b", stage, k_step)
+                a_loads = [
+                    lambda index=index: a_first_half[index].store(
+                        load_packed_fragment(a_pointer, index * a_row_stride)
+                    )
+                    for index in range_constexpr(half_m_steps)
+                ]
+                b_loads = [
+                    lambda index=index: b_first_half[index].store(
+                        load_packed_fragment(b_pointer, index * b_row_stride)
+                    )
+                    for index in range_constexpr(half_n_steps)
+                ]
+                return (a_loads, b_loads) if parity == 0 else (b_loads, a_loads)
+
+            def second_half_loads(operand, stage, k_step):
+                count = half_m_steps if operand == "a" else half_n_steps
+                pointer, row_stride = fragment_pointer(operand, stage, k_step)
+                fragments = [None] * count
+                parts = [[] for _ in range_constexpr(count)]
+
+                def load_part(index, part):
+                    parts[index].append(load_fragment_part(
+                        pointer, (count + index) * row_stride + part * frag_k_stride
+                    ))
+                    if const_expr(part == frag_loads - 1):
+                        fragment = fx.make_rmem_tensor(fragment_words, fx.Int32)
+                        fragment.store(join_fragment_parts(parts[index]))
+                        fragments[index] = fragment
+
+                loads = {
+                    index * frag_loads + part: (
+                        lambda index=index, part=part: load_part(index, part)
+                    )
+                    for index in range(count) for part in range(frag_loads)
+                }
+                return loads, fragments
+
+            def compute_quadrant(
+                m_step_start, n_step_start, a_fragments, b_fragments,
+                loads, n_fast, before=None,
+            ):
+                if const_expr(before is not None):
+                    before()
+                for step in range_constexpr(quadrant_steps):
+                    if const_expr(n_fast):
+                        m_index, n_index = step // half_n_steps, step % half_n_steps
+                    else:
+                        m_index, n_index = step % half_m_steps, step // half_m_steps
+                    acc = accumulators[(m_step_start + m_index) * n_steps + n_step_start + n_index]
+                    # Swap operands so each lane owns consecutive output columns.
+                    # The interleaved epilogue below restores logical C[M, N].
+                    fx.gemm(mma, acc, b_fragments[n_index], a_fragments[m_index], acc)
+                    if const_expr(step in loads):
+                        loads[step]()
+                    if const_expr(step == max(loads, default=-1)):
+                        for _ in range_constexpr(len(loads)):
+                            rocdl.sched_mfma(1)
+                            rocdl.sched_dsrd(frag_loads // 2)
+                        rocdl.sched_barrier(0)
+
+            def compute_interleaved_tile(k_tile, has_next_tile, parity, read_stage=None):
+                read_stage = k_tile % stages if read_stage is None else read_stage
+                for k_step in range_constexpr(wmma_k_steps):
+                    at_boundary = k_step == wmma_k_steps - 1
+                    next_stage = (
+                        ((1 - read_stage) if stages == 2 else (k_tile + 1) % stages)
+                        if at_boundary else read_stage
+                    )
+                    next_k_step = 0 if at_boundary else k_step + 1
+
+                    def signal_next_stage(at_boundary=at_boundary):
+                        rocdl.sched_barrier(0)
+                        rocdl.s_wait_dscnt(0)
+                        if const_expr(at_boundary and has_next_tile):
+                            tdm_ops.tensor_wait(2 * (stages - 2))
+                            rocdl.s_barrier_signal(-1)
+                        rocdl.sched_barrier(0)
+
+                    def refill_stage(at_boundary=at_boundary):
+                        if const_expr(at_boundary and has_next_tile):
+                            rocdl.s_barrier_wait(-1)
+                            copy_tile(read_stage, fx.min(k_tile_base + k_tile + stages, last_tile))
+                        rocdl.sched_barrier(0)
+
+                    has_next_step = not at_boundary or has_next_tile
+                    early_loads, late_loads = first_half_loads(next_stage, next_k_step, parity) if has_next_step else ([], [])
+                    refill_step = quadrant_steps // 4
+                    early_load_slots = quadrant_steps - refill_step
+                    third_quadrant_loads = {refill_step - 1: refill_stage}
+                    third_quadrant_loads.update({
+                        refill_step + index: load for index, load in enumerate(early_loads[:early_load_slots])
+                    })
+                    last_quadrant_loads = dict(enumerate(early_loads[early_load_slots:]))
+                    last_quadrant_loads.update({
+                        quadrant_steps - len(late_loads) + index: load
+                        for index, load in enumerate(late_loads)
+                    })
+                    # Even: Q00 -> Q01 -> Q11 -> Q10. Odd: Q00 -> Q10 -> Q11 -> Q01.
+                    # The next first half replaces its old registers only after
+                    # the final quadrant that reads them; no double RF buffer.
+                    if parity == 0:
+                        loads, b_second_half = second_half_loads("b", read_stage, k_step)
+                        compute_quadrant(0, 0, a_first_half, b_first_half, loads, False)
+                        loads, a_second_half = second_half_loads("a", read_stage, k_step)
+                        compute_quadrant(0, half_n_steps, a_first_half, b_second_half, loads, False)
+                        compute_quadrant(
+                            half_m_steps, half_n_steps, a_second_half, b_second_half,
+                            third_quadrant_loads, True, signal_next_stage,
+                        )
+                        compute_quadrant(
+                            half_m_steps, 0, a_second_half, b_first_half,
+                            last_quadrant_loads, True,
+                        )
+                    else:
+                        loads, a_second_half = second_half_loads("a", read_stage, k_step)
+                        compute_quadrant(0, 0, a_first_half, b_first_half, loads, True)
+                        loads, b_second_half = second_half_loads("b", read_stage, k_step)
+                        compute_quadrant(half_m_steps, 0, a_second_half, b_first_half, loads, True)
+                        compute_quadrant(
+                            half_m_steps, half_n_steps, a_second_half, b_second_half,
+                            third_quadrant_loads, False, signal_next_stage,
+                        )
+                        compute_quadrant(
+                            0, half_n_steps, a_first_half, b_second_half,
+                            last_quadrant_loads, False,
+                        )
+
+            # Clamp unused tail prefetches to the split's last tile. This also
+            # admits the existing minimum stages-1 tiles without reading past K.
+            last_tile = k_tile_base + k_tiles - 1
+            for stage in range_constexpr(stages):
+                copy_tile(fx.Int32(stage), fx.min(k_tile_base + stage, last_tile))
+            tdm_ops.tensor_wait(2 * (stages - 1))
+            fx.gpu.barrier()
+            for loads in first_half_loads(fx.Int32(0), 0, 0):
+                for load in loads:
+                    load()
+
+            def run_interleaved(parity):
+                for pair in range((k_tiles - 1) // 2):
+                    for step in range_constexpr(2):
+                        compute_interleaved_tile(
+                            pair * 2 + step, True, parity, step if stages == 2 else None
+                        )
+                for remaining in range((k_tiles - 1) % 2):
+                    compute_interleaved_tile(k_tiles - 2, True, parity)
+                compute_interleaved_tile(k_tiles - 1, False, parity)
+
+            wave_parity = fx.Int32(rocdl.readfirstlane(T.i32, wave % 2))
+            if wave_parity == 0:
+                run_interleaved(0)
+            else:
+                run_interleaved(1)
+            tdm_ops.tensor_wait(0)
+        else:
+            for stage in range_constexpr(stages - 1):
+                copy_tile(stage, k_tile_base + fx.Int32(stage))
+
+            # Two tiles per iteration. Double buffering retains literal LDS offsets;
+            # deeper pipelines advance the ring modulo stages.
+            main_tiles = k_tiles - (stages - 1)
+            current_stage = fx.Int32(0)
+            for pair in range(main_tiles // 2):
+                for step in range_constexpr(2):
+                    read_stage = step if stages == 2 else current_stage
+                    wait_tile(stages - 2)
+                    copy_tile(
+                        (read_stage + stages - 1) % stages,
+                        k_tile_base + pair * 2 + step + stages - 1,
+                    )
+                    compute_tile(read_stage)
+                    current_stage = (current_stage + 1) % stages
+
+            # A one-trip loop keeps the accumulators loop-carried instead of
+            # materializing both sides of a predicated remainder branch.
+            for remaining in range(main_tiles % 2):
                 wait_tile(stages - 2)
                 copy_tile(
-                    (read_stage + stages - 1) % stages,
-                    k_tile_base + pair * 2 + step + stages - 1,
+                    (current_stage + stages - 1) % stages,
+                    k_tile_base + main_tiles + stages - 2,
                 )
-                compute_tile(read_stage)
+                compute_tile(current_stage)
                 current_stage = (current_stage + 1) % stages
 
-        # A one-trip loop keeps the accumulators loop-carried instead of
-        # materializing both sides of a predicated remainder branch.
-        for remaining in range(main_tiles % 2):
-            wait_tile(stages - 2)
-            copy_tile(
-                (current_stage + stages - 1) % stages,
-                k_tile_base + main_tiles + stages - 2,
-            )
-            compute_tile(current_stage)
-            current_stage = (current_stage + 1) % stages
+            # Drain: retire the remaining loads in order without issuing more.
+            for tail in range_constexpr(stages - 1):
+                wait_tile(stages - 2 - tail)
+                compute_tile(current_stage)
+                current_stage = (current_stage + 1) % stages
 
-        # Drain: retire the remaining loads in order without issuing more.
-        for tail in range_constexpr(stages - 1):
-            wait_tile(stages - 2 - tail)
-            compute_tile(current_stage)
-            current_stage = (current_stage + 1) % stages
-
-        # Reuse the A/B LDS arena for coalesced output stores.
-        # Native WMMA output: column=lane%16, row=lane//16*acc_elems+register_index.
+        # Reuse the A/B arena only after all TDM and fragment reads have retired.
         fx.gpu.barrier()
-        # Reuse row/column scales across accumulator tiles. Clamped edge
-        # lanes are never committed to global output.
-        if const_expr(is_fp8_ptpc and split_k == 1):
-            row_scales = []
+        if const_expr(interleave):
+            if const_expr(is_fp8_ptpc and split_k == 1):
+                row_scales = [
+                    fx.ptr_load(
+                        scale_a + fx.min(row_start + wave_row + mi * mma_m + lane % 16, m - 1),
+                        result_type=fx.Float32.ir_type,
+                    )
+                    for mi in range_constexpr(m_steps)
+                ]
+                col_scales = [
+                    fx.Vector.from_elements([
+                        fx.ptr_load(
+                            scale_b + fx.min(
+                                col_start + wave_col + ni * mma_n + lane // 16 * acc_elems + i, n - 1
+                            ),
+                            result_type=fx.Float32.ir_type,
+                        )
+                        for i in range_constexpr(acc_elems)
+                    ])
+                    for ni in range_constexpr(n_steps)
+                ]
             for mi in range_constexpr(m_steps):
-                row = row_start + wave_row + mi * mma_m + lane // 16 * acc_elems
-                row_scales.append(fx.Vector.from_elements([
-                    fx.ptr_load(scale_a + fx.min(row + i, m - 1), result_type=fx.Float32.ir_type)
-                    for i in range_constexpr(acc_elems)
-                ]))
-            col_scales = []
-            for ni in range_constexpr(n_steps):
-                col = col_start + wave_col + ni * mma_n + lane % 16
-                col_scales.append(fx.ptr_load(scale_b + fx.min(col, n - 1), result_type=fx.Float32.ir_type))
-        for mi in range_constexpr(m_steps):
-            for ni in range_constexpr(n_steps):
-                row = wave_row + mi * mma_m + lane // 16 * acc_elems
-                col = wave_col + ni * mma_n + lane % 16
-                values = accumulators[mi * n_steps + ni].load()
-                if const_expr(is_fp8_ptpc and split_k == 1):
-                    values = values * row_scales[mi] * col_scales[ni]
-                values = values.to(out_dtype)
-                for i in range_constexpr(acc_elems):
-                    fx.ptr_store(values[i], shared_out + (row + i) * block_n + col)
+                for ni in range_constexpr(n_steps):
+                    row = wave_row + mi * mma_m + lane % 16
+                    col = wave_col + ni * mma_n + lane // 16 * acc_elems
+                    values = accumulators[mi * n_steps + ni].load()
+                    if const_expr(is_fp8_ptpc and split_k == 1):
+                        values = values * row_scales[mi] * col_scales[ni]
+                    fx.make_view(
+                        shared_out + row * c_pitch + col, fx.make_layout(acc_elems, 1)
+                    ).store(values.to(out_dtype))
+        else:
+            # Reuse row/column scales across accumulator tiles. Clamped edge
+            # lanes are never committed to global output.
+            if const_expr(is_fp8_ptpc and split_k == 1):
+                row_scales = []
+                for mi in range_constexpr(m_steps):
+                    row = row_start + wave_row + mi * mma_m + lane // 16 * acc_elems
+                    row_scales.append(fx.Vector.from_elements([
+                        fx.ptr_load(scale_a + fx.min(row + i, m - 1), result_type=fx.Float32.ir_type)
+                        for i in range_constexpr(acc_elems)
+                    ]))
+                col_scales = []
+                for ni in range_constexpr(n_steps):
+                    col = col_start + wave_col + ni * mma_n + lane % 16
+                    col_scales.append(fx.ptr_load(scale_b + fx.min(col, n - 1), result_type=fx.Float32.ir_type))
+            for mi in range_constexpr(m_steps):
+                for ni in range_constexpr(n_steps):
+                    row = wave_row + mi * mma_m + lane // 16 * acc_elems
+                    col = wave_col + ni * mma_n + lane % 16
+                    values = accumulators[mi * n_steps + ni].load()
+                    if const_expr(is_fp8_ptpc and split_k == 1):
+                        values = values * row_scales[mi] * col_scales[ni]
+                    values = values.to(out_dtype)
+                    for i in range_constexpr(acc_elems):
+                        fx.ptr_store(values[i], shared_out + (row + i) * block_n + col)
         fx.gpu.barrier()
 
         def commit_output(values, row, col, apply_scale=False):
@@ -516,17 +798,35 @@ def build_gemm_gfx1250(
                         fx.ptr_store(value, destination + element)
 
         tile_elems = block_m * block_n
-        if const_expr(split_k == 1):
+        if const_expr(interleave and split_k == 1 and not has_bias):
+            c_tile = (block_m, c_pitch)
+            atom_c, coords_c = tdm_operand(
+                out + fx.Int64(row_start) * fx.Int64(c_leading_stride) + col_start,
+                (fx.max(0, fx.min(block_m, m - row_start)),
+                 fx.max(0, fx.min(block_n, n - col_start))),
+                (c_leading_stride, 1), c_tile, (c_pitch, 1), store=True,
+            )
+            shared_c = fx.make_view(
+                shared_out,
+                fx.make_layout((c_tile, 1), ((c_pitch, 1), block_m * c_pitch)),
+            )
+            src, dst = rocdl.cdna5.tdm_partition(
+                atom_c, wave, fx.make_layout(waves, 1),
+                shared_c, coords_c[None, (0, None)],
+            )
+            fx.copy(atom_c, src[None, 0], dst[None, 0])
+            tdm_ops.tensor_wait(0)
+        elif const_expr(split_k == 1):
             for i in range_constexpr(tile_elems // (threads * out_vec_elems)):
                 offset = (i * threads + tid) * out_vec_elems
                 row, col = offset // block_n, offset % block_n
-                values = fx.ptr_load(shared_out + offset, result_type=T.vec(out_vec_elems, out_dtype.ir_type))
+                values = fx.ptr_load(shared_out + row * c_pitch + col, result_type=T.vec(out_vec_elems, out_dtype.ir_type))
                 commit_output(values, row, col)
         else:
             for i in range_constexpr(tile_elems // (threads * out_vec_elems)):
                 offset = (i * threads + tid) * out_vec_elems
                 row, col = offset // block_n, offset % block_n
-                values = fx.ptr_load(shared_out + offset, result_type=T.vec(out_vec_elems, out_dtype.ir_type))
+                values = fx.ptr_load(shared_out + row * c_pitch + col, result_type=T.vec(out_vec_elems, out_dtype.ir_type))
                 partial = (
                     workspace
                     + fx.Int64(block_id) * (split_k * tile_elems)
@@ -609,7 +909,15 @@ def build_gemm_gfx1250(
         mma_n,
         mma_k,
         split_k,
+        interleave,
     )
+    if interleave:
+        launch.compile_hints["llvm_options"] = {
+            "amdgpu-expert-scheduling-mode": True,
+            "amdgpu-sched-strategy": "coexec",
+            "enable-post-misched": True,
+            "amdgpu-barrier-signal-wait-latency": 32,
+        }
     return launch
 
 
@@ -632,6 +940,7 @@ def gemm_a16w16_gfx1250(
     split_k: int = 1,
     stream: Optional[torch.cuda.Stream] = None,
     layout: str = "nt",
+    interleave: bool = False,
 ) -> torch.Tensor:
     """C = A[M,K] @ B[K,N]; FP16/BF16 output, optional bias.
 
@@ -642,6 +951,9 @@ def gemm_a16w16_gfx1250(
     partial tile; K must contain at least ``stages - 1`` complete tiles.
     No split-K tail: K must be divisible by split_k * block_k. split_k is the
     cluster size along the K split and must be in 1..9.
+    ``interleave=True`` uses four quadrant tiles per wave and opposite serpentine
+    orders on even/odd waves. It requires NT B and sufficiently large even wave
+    tiles; the default schedule and split-K reduction semantics are unchanged.
     """
     if a.ndim != 2 or b.ndim != 2 or a.shape[1] != b.shape[0]:
         raise ValueError("expected A[M,K] and B[K,N]")
@@ -657,7 +969,7 @@ def gemm_a16w16_gfx1250(
     n = b.shape[1]
     validate_gemm_gfx1250_config(
         m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, group_m,
-        dtype_id, mma_m, mma_n, mma_k, layout == "nt", split_k,
+        dtype_id, mma_m, mma_n, mma_k, layout == "nt", split_k, interleave,
     )
     a_leading_stride = _leading_stride(a, 1, 0, k, f"A does not satisfy the {layout.upper()} layout")
     if layout == "nt":
@@ -730,6 +1042,7 @@ def gemm_a16w16_gfx1250(
             mma_n=mma_n,
             mma_k=mma_k,
             split_k=split_k,
+            interleave=interleave,
         )
         launch = build_gemm_gfx1250(
             dtype_id,
@@ -746,6 +1059,7 @@ def gemm_a16w16_gfx1250(
             mma_n,
             mma_k,
             split_k,
+            interleave,
         )
         dispatch_args = (
             *pointers,
@@ -788,13 +1102,15 @@ def gemm_fp8_ptpc_gfx1250(
     split_k: int = 1,
     stream: Optional[torch.cuda.Stream] = None,
     layout: str = "nt",
+    interleave: bool = False,
 ) -> torch.Tensor:
     """C = scale_a[M] * scale_b[N] * (A[M,K] @ B[K,N]), BF16 output.
 
     A and B are FP8 E4M3. The WMMA loop accumulates the unscaled product in
     fp32. scale_a and scale_b are FP32 and are multiplied once in the
     epilogue, after a cluster split-K sum. Optional bias is BF16 and is added
-    after that result is rounded.
+    after that result is rounded. ``interleave=True`` uses the same optional
+    NT quadrant schedule as the BF16/FP16 entrypoint; scaling is unchanged.
     """
     if a.ndim != 2 or b.ndim != 2 or a.shape[1] != b.shape[0]:
         raise ValueError("expected A[M,K] and B[K,N]")
@@ -810,7 +1126,7 @@ def gemm_fp8_ptpc_gfx1250(
     n = b.shape[1]
     validate_gemm_gfx1250_config(
         m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, group_m,
-        GEMM_DTYPE_FP8_PTPC, mma_m, mma_n, mma_k, layout == "nt", split_k,
+        GEMM_DTYPE_FP8_PTPC, mma_m, mma_n, mma_k, layout == "nt", split_k, interleave,
     )
     a_leading_stride = _leading_stride(a, 1, 0, k, f"A does not satisfy the {layout.upper()} layout")
     if layout == "nt":
@@ -885,6 +1201,7 @@ def gemm_fp8_ptpc_gfx1250(
             mma_n=mma_n,
             mma_k=mma_k,
             split_k=split_k,
+            interleave=interleave,
         )
         launch = build_gemm_gfx1250(
             GEMM_DTYPE_FP8_PTPC,
@@ -901,6 +1218,7 @@ def gemm_fp8_ptpc_gfx1250(
             mma_n,
             mma_k,
             split_k,
+            interleave,
         )
         dispatch_args = (
             *pointers,

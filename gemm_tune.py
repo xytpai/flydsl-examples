@@ -116,9 +116,11 @@ class GemmConfigPruner:
             b_stage = config["block_n"] * (block_k + pad)
         else:
             b_stage = block_k * (config["block_n"] + pad)
+        # The quadrant epilogue adds 16 bytes per C row in LDS.
+        c_pad = 16 // self.element_bytes if config.get("interleave", False) else 0
         elements = max(
             config["stages"] * (a_stage + b_stage),
-            config["block_m"] * config["block_n"],
+            config["block_m"] * (config["block_n"] + c_pad),
         )
         return elements * self.element_bytes
 
@@ -354,6 +356,8 @@ def gemm_gfx1250_get_configs(args):
         "mma_m": [16],
         "mma_n": [16],
         "mma_k": [32],
+        # NN keeps the original schedule; the validator checks NT quadrant fit.
+        "interleave": [False, True] if args.layout == "nt" else [False],
     }
     keys = selections.keys()
     values = selections.values()
@@ -391,6 +395,7 @@ def gemm_gfx1250_get_configs(args):
                 config["mma_k"],
                 b_k_contiguous,
                 config["split_k"],
+                interleave=config["interleave"],
             )
             valid_configs.append(config)
         except Exception:
