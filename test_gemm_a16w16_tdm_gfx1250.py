@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 from kernels.gemm_a16w16_tdm_gfx1250 import (
     GEMM_DTYPE_BF16,
+    GEMM_DTYPE_FP16,
     gemm_a16w16_gfx1250,
     gemm_fp8_ptpc_gfx1250,
     make_gemm_a16w16_gfx1250_kernel_name,
@@ -33,6 +34,7 @@ class _TestArgs:
     layout: str = "nt"
     split_k: int = 1
     interleave: bool = False
+    split_k_atomic: bool = False
 
 
 @dataclass
@@ -133,6 +135,7 @@ def _kernel_kwargs(args: _TestArgs):
         "group_m": args.group_m,
         "split_k": args.split_k,
         "interleave": args.interleave,
+        "split_k_atomic": args.split_k_atomic,
     }
 
 
@@ -907,7 +910,8 @@ def test_gemm_a16w16_gfx1250_wide_k_tile():
     check_acc(args)
 
 
-def test_gemm_a16w16_gfx1250_split_k_uses_two_streams():
+@pytest.mark.parametrize("split_k_atomic", [False, True])
+def test_gemm_a16w16_gfx1250_split_k_uses_two_streams(split_k_atomic):
     args = _TestArgs(
         dtype=torch.bfloat16,
         m=64,
@@ -923,6 +927,7 @@ def test_gemm_a16w16_gfx1250_split_k_uses_two_streams():
         has_bias=True,
         layout="nt",
         split_k=2,
+        split_k_atomic=split_k_atomic,
     )
     a, b, bias = create_inputs(args)
     out0 = create_outputs(args)[0]
@@ -1295,6 +1300,189 @@ def test_interleaved_bias_rounding_and_replay(dtype, n_waves):
         graph.reset()
 
 
+@pytest.mark.parametrize("split_k", range(2, 10))
+@pytest.mark.parametrize("layout,interleave", [("nn", False), ("nt", False), ("nt", True)])
+@pytest.mark.parametrize("has_bias", [False, True])
+def test_split_k_atomic_zero_and_graph_replay(split_k, layout, interleave, has_bias):
+    m, n, k = 137, 130, split_k * 256
+    a, _ = _interleave_offset_matrix(m, k, torch.bfloat16)
+    weight, _ = _interleave_offset_matrix(n, k, torch.bfloat16)
+    a.fill_(1 / 16)
+    weight.fill_(1 / 16)
+    if layout == "nt":
+        b = weight.t()
+    else:
+        b, _ = _interleave_offset_matrix(k, n, torch.bfloat16)
+        b.copy_(weight.t())
+    out, storage = _interleave_offset_matrix(m, n, torch.bfloat16)
+    bias = torch.full((n,), 0.5, device="cuda", dtype=torch.bfloat16) if has_bias else None
+    config = dict(
+        block_m=128, block_n=128, block_k=128, stages=2,
+        m_waves=2, n_waves=2, group_m=0, split_k=split_k,
+        layout=layout, interleave=interleave, split_k_atomic=True,
+    )
+    gemm_a16w16_gfx1250(a, b, out, bias, **config)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            gemm_a16w16_gfx1250(a, b, out, bias, **config)
+        for rep in range(6):
+            sign = -1 if rep % 2 else 1
+            a.fill_(sign / 16)
+            if bias is not None:
+                bias.fill_(sign * 0.5)
+            out.fill_(float("nan") if rep % 2 else 123)
+            graph.replay()
+            torch.cuda.synchronize()
+            expected = sign * (split_k + (0.5 if has_bias else 0))
+            torch.testing.assert_close(out, torch.full_like(out, expected), atol=0, rtol=0)
+            assert torch.all(storage[0] == 17) and torch.all(storage[-1] == 17)
+            assert torch.all(storage[:, :8] == 17) and torch.all(storage[:, n + 8:] == 17)
+    finally:
+        graph.reset()
+
+
+@pytest.mark.parametrize("split_k,interleave", [(2, False), (3, True), (9, True)])
+def test_split_k_atomic_random_reference(split_k, interleave):
+    torch.manual_seed(182)
+    m, n, k = 137, 144, split_k * 256
+    a = torch.randn(m, k, dtype=torch.bfloat16) * 0.2
+    weight = torch.randn(n, k, dtype=torch.bfloat16) * 0.2
+    bias = torch.randn(n, dtype=torch.bfloat16) * 0.1
+    reference = a.float() @ weight.float().t() + bias.float()
+    a, weight, bias = a.cuda(), weight.cuda(), bias.cuda()
+    out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
+    for _ in range(8):
+        out.fill_(float("nan"))
+        gemm_a16w16_gfx1250(
+            a, weight.t(), out, bias,
+            block_m=128, block_n=128, block_k=128, stages=2,
+            m_waves=2, n_waves=2, split_k=split_k,
+            interleave=interleave, split_k_atomic=True,
+        )
+        torch.cuda.synchronize()
+        actual = out.cpu().float()
+        assert torch.isfinite(actual).all()
+        # BF16 atomic accumulation has order-dependent intermediate rounding.
+        relative_l2 = (actual - reference).norm() / reference.norm()
+        assert relative_l2 < 0.01
+        torch.testing.assert_close(actual, reference, atol=0.25, rtol=0.03)
+
+
+def test_split_k_atomic_grouped_grid():
+    m, n, k = 2057, 2050, 768
+    a = torch.full((m, k), 1 / 16, device="cuda", dtype=torch.bfloat16)
+    b = torch.full((n, k), 1 / 16, device="cuda", dtype=torch.bfloat16).t()
+    out, storage = _interleave_offset_matrix(m, n, torch.bfloat16)
+    for _ in range(4):
+        out.fill_(float("nan"))
+        gemm_a16w16_gfx1250(
+            a, b, out, block_m=128, block_n=128, block_k=128,
+            stages=2, m_waves=2, n_waves=2, group_m=4,
+            split_k=3, interleave=True, split_k_atomic=True,
+        )
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out, torch.full_like(out, 3), atol=0, rtol=0)
+        assert torch.all(storage[0] == 17) and torch.all(storage[-1] == 17)
+        assert torch.all(storage[:, :8] == 17) and torch.all(storage[:, n + 8:] == 17)
+
+
+def test_split_k_atomic_does_not_allocate_workspace(monkeypatch):
+    a = torch.full((128, 768), 1 / 16, device="cuda", dtype=torch.bfloat16)
+    b = a.t()
+    out = torch.empty(128, 128, device="cuda", dtype=torch.bfloat16)
+    kwargs = dict(
+        block_m=128, block_n=128, block_k=128, stages=2,
+        m_waves=2, n_waves=2, split_k=3, interleave=True, split_k_atomic=True,
+    )
+    gemm_a16w16_gfx1250(a, b, out, **kwargs)
+    torch.cuda.synchronize()
+
+    def unexpected_allocation(*args, **kwargs):
+        pytest.fail("atomic split-K must not allocate a workspace")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch, "empty", unexpected_allocation)
+        gemm_a16w16_gfx1250(a, b, out, **kwargs)
+        torch.cuda.synchronize()
+    torch.testing.assert_close(out, torch.full_like(out, 3), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("changes", [
+    {"split_k": 1}, {"dtype_id": GEMM_DTYPE_FP16}, {"n": 129}, {"split_k_atomic": "yes"},
+])
+def test_split_k_atomic_config_rejections(changes):
+    config = dict(
+        m=128, n=128, k=768, block_m=128, block_n=128, block_k=128,
+        stages=2, m_waves=2, n_waves=2, group_m=0, dtype_id=GEMM_DTYPE_BF16,
+        mma_m=16, mma_n=16, mma_k=32, b_k_contiguous=True,
+        split_k=3, interleave=True, split_k_atomic=True,
+    )
+    config.update(changes)
+    with pytest.raises(ValueError, match="split_k_atomic"):
+        validate_gemm_gfx1250_config(**config)
+
+
+def test_split_k_atomic_rejects_odd_output_stride():
+    a = torch.ones(128, 768, device="cuda", dtype=torch.bfloat16)
+    storage = torch.empty(128, 129, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="16-byte-aligned"):
+        gemm_a16w16_gfx1250(
+            a, a.t(), storage[:, :128],
+            block_m=128, block_n=128, block_k=128,
+            stages=2, m_waves=2, n_waves=2, split_k=3, split_k_atomic=True,
+        )
+
+
+def test_split_k_atomic_kernel_names_are_separate():
+    args = (GEMM_DTYPE_BF16, 128, 128, 128, 2, 2, 2, 0, False, True, 16, 16, 32, 3)
+    original = make_gemm_a16w16_gfx1250_kernel_name(*args)
+    assert original == make_gemm_a16w16_gfx1250_kernel_name(*args, split_k_atomic=False)
+    assert make_gemm_a16w16_gfx1250_kernel_name(*args, split_k_atomic=True) == original + "_atomic"
+
+
+def test_split_k_workspace_stores_bf16_partials(monkeypatch):
+    m = n = 128
+    k, split_k = 768, 3
+    a = torch.zeros(m, k, device="cuda", dtype=torch.bfloat16)
+    weight = torch.zeros(n, k, device="cuda", dtype=torch.bfloat16)
+    for part in range(split_k):
+        a[:, part * 256] = weight[:, part * 256] = 1
+        a[:, part * 256 + 1] = weight[:, part * 256 + 1] = 1 / 16
+    out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
+    config = dict(
+        block_m=128, block_n=128, block_k=128, stages=2,
+        m_waves=2, n_waves=2, split_k=split_k,
+        interleave=True, split_k_atomic=False,
+    )
+    gemm_a16w16_gfx1250(a, weight.t(), out, **config)
+    torch.cuda.synchronize()
+    allocations = []
+    original_empty = torch.empty
+
+    def capture_allocation(*args, **kwargs):
+        tensor = original_empty(*args, **kwargs)
+        allocations.append(tensor)
+        return tensor
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch, "empty", capture_allocation)
+        gemm_a16w16_gfx1250(a, weight.t(), out, **config)
+        torch.cuda.synchronize()
+    assert len(allocations) == 1
+    workspace = allocations[0]
+    assert workspace.dtype == torch.bfloat16
+    assert workspace.shape == (split_k * m * n,)
+    assert workspace.element_size() == 2
+    assert workspace.numel() * workspace.element_size() == split_k * m * n * 2
+    # Each partial is 1 + 1/256 in FP32 but rounds to 1 in BF16 workspace.
+    torch.testing.assert_close(workspace, torch.ones_like(workspace), atol=0, rtol=0)
+    torch.testing.assert_close(out, torch.full_like(out, 3), atol=0, rtol=0)
+    full_sum = torch.tensor(split_k * (1 + 1 / 256)).bfloat16()
+    assert full_sum.item() != 3
+
+
 # ====================================== interleave tuner regression ====================================
 
 @pytest.fixture
@@ -1382,7 +1570,7 @@ def test_large_nt_tuner_fixed_policy(dtype, enable_split_k, shape, tuner_device_
     configs = tuner.gemm_gfx1250_get_configs(args)
     fixed = dict(
         block_m=256, block_n=256, block_k=128, stages=2,
-        m_waves=2, n_waves=2, interleave=True, split_k=1,
+        m_waves=2, n_waves=2, interleave=True, split_k=1, split_k_atomic=False,
         mma_m=16, mma_n=16, mma_k=32,
     )
     assert len(configs) == 2
@@ -1493,20 +1681,124 @@ def test_compile_benchmark_and_replay_candidate(dtype):
         torch.testing.assert_close(out, reference, atol=.03, rtol=.02)
 
 
+@pytest.mark.parametrize("layout", ["nn", "nt"])
+def test_tuner_enumerates_both_split_k_reductions(layout, tuner_device_props):
+    import gemm_tune as tuner
+
+    args = tuner.Args(torch.bfloat16, 128, 128, 3072, layout, enable_split_k=True)
+    configs = tuner.gemm_gfx1250_get_configs(args)
+    keys = [tuple(sorted(config.items())) for config in configs]
+    assert len(keys) == len(set(keys))
+    paired = {}
+    for config in configs:
+        key = tuple(sorted((key, value) for key, value in config.items() if key != "split_k_atomic"))
+        paired.setdefault(key, set()).add(config["split_k_atomic"])
+        tuner.validate_gemm_gfx1250_config(
+            args.m, args.n, args.k, config["block_m"], config["block_n"],
+            config["block_k"], config["stages"], config["m_waves"], config["n_waves"],
+            config["group_m"], tuner.GEMM_DTYPE_BF16,
+            config["mma_m"], config["mma_n"], config["mma_k"],
+            layout == "nt", config["split_k"], interleave=config["interleave"],
+            split_k_atomic=config["split_k_atomic"],
+        )
+    assert any(config["split_k_atomic"] for config in configs)
+    for key, policies in paired.items():
+        assert policies == ({False, True} if dict(key)["split_k"] > 1 else {False})
+
+
+@pytest.mark.parametrize("dtype,n,enabled", [
+    (torch.float16, 128, True),
+    (torch.bfloat16, 139, True),
+    (torch.bfloat16, 128, False),
+])
+def test_tuner_excludes_unsupported_atomic_policies(dtype, n, enabled, tuner_device_props):
+    import gemm_tune as tuner
+
+    args = tuner.Args(dtype, 128, n, 3072, "nt", enable_split_k=enabled)
+    configs = tuner.gemm_gfx1250_get_configs(args)
+    assert configs and all(config["split_k_atomic"] is False for config in configs)
+    if enabled:
+        assert any(config["split_k"] > 1 for config in configs)
+    else:
+        assert all(config["split_k"] == 1 for config in configs)
+
+
+@pytest.mark.parametrize("winner_atomic", [False, True])
+def test_tuner_winner_preserves_reduction_policy(monkeypatch, winner_atomic):
+    import gemm_tune as tuner
+
+    configs = [
+        dict(split_k=3, interleave=True, split_k_atomic=atomic)
+        for atomic in (False, True)
+    ]
+    monkeypatch.setattr(tuner, "gpu_arch", "gfx1250")
+    monkeypatch.setattr(tuner, "gemm_a16w16_get_configs", lambda _: configs)
+    monkeypatch.setattr(tuner, "parallel_compile_policies", lambda _, cs, **kw: cs)
+    monkeypatch.setattr(
+        tuner, "tuning_benchmark",
+        lambda _, kwargs: 5.0 if kwargs["split_k_atomic"] == winner_atomic else 10.0,
+    )
+    result = tuner.tune_single(tuner.Args(torch.bfloat16, 128, 128, 3072, "nt", enable_split_k=True))
+    restored = json.loads(json.dumps(asdict(result)))
+    assert restored["config"]["split_k_atomic"] is winner_atomic
+    assert restored["config"]["split_k"] == 3
+    assert restored["duration"] == 5.0
+
+
+@pytest.mark.parametrize("layout", ["nn", "nt"])
+def test_tuner_compile_benchmark_both_reductions(layout):
+    import gemm_tune as tuner
+
+    torch.set_num_threads(1)
+    args = tuner.Args(torch.bfloat16, 128, 128, 768, layout, enable_split_k=True, compile_workers=2)
+    configs = tuner.gemm_gfx1250_get_configs(args)
+    selected = [
+        config for config in configs
+        if all(config[key] == value for key, value in dict(
+            block_m=128, block_n=128, block_k=128, stages=2,
+            m_waves=2, n_waves=2, split_k=3, group_m=0,
+        ).items())
+    ]
+    expected = {(False, False), (False, True)}
+    if layout == "nt":
+        expected |= {(True, False), (True, True)}
+    assert {(c["interleave"], c["split_k_atomic"]) for c in selected} == expected
+    compiled = tuner.parallel_compile_policies(args, selected, max_workers=2)
+    assert len(compiled) == len(selected)
+    for config in compiled:
+        duration = tuner.tuning_benchmark(args, kwargs=config, niters=5)
+        assert 0 < duration < float("inf")
+        restored = json.loads(json.dumps(config))
+        a = torch.full((128, 768), 1 / 16, device="cuda", dtype=torch.bfloat16)
+        b = torch.full(
+            (768, 128) if layout == "nn" else (128, 768),
+            1 / 16, device="cuda", dtype=torch.bfloat16,
+        )
+        if layout == "nt":
+            b = b.t()
+        bias = torch.full((128,), 0.5, device="cuda", dtype=torch.bfloat16)
+        out = torch.full((128, 128), float("nan"), device="cuda", dtype=torch.bfloat16)
+        tuner.run_gemm(a, b, out, bias, restored, layout)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out, torch.full_like(out, 3.5), atol=0, rtol=0)
+
+
 # =========================================== benchmark ===========================================
 
 
 @pytest.mark.parametrize(
     "m, n, k, block_m, block_n, block_k, stages, split_k, "
-    "m_waves, n_waves, group_m, has_bias",
+    "m_waves, n_waves, group_m, has_bias, interleave, split_k_atomic",
     [
         # fmt: off
-        ( 4096,  128, 6144,  64,  64, 256, 2,  2,  2,  2,  0, False),
-        (  512, 2560, 6144, 128, 128, 128, 2,  3,  2,  4,  4, False),
-        (  576,  256, 4096,  64,  64, 256, 2,  4,  2,  2,  0,  True),
-        ( 1024,  128, 6144,  64,  64, 256, 2,  6,  2,  2,  0,  True),
-        ( 1216,   64, 7168,  64,  64, 256, 2,  7,  2,  2,  0, False),
-        ( 1280,   64, 4096,  64,  64, 256, 2,  8,  2,  2,  0, False),
+        ( 4096,  128, 6144,  64,  64, 256, 2,  2,  2,  2,  0, False, False, False),
+        (  512, 2560, 6144, 128, 128, 128, 2,  3,  2,  4,  4, False, False, False),
+        (  576,  256, 4096,  64,  64, 256, 2,  4,  2,  2,  0,  True, False, False),
+        ( 1024,  128, 6144,  64,  64, 256, 2,  6,  2,  2,  0,  True, False, False),
+        ( 1216,   64, 7168,  64,  64, 256, 2,  7,  2,  2,  0, False, False, False),
+        ( 1280,   64, 4096,  64,  64, 256, 2,  8,  2,  2,  0, False, False, False),
+        (  256,  256, 8192, 128, 128, 128, 2,  8,  2,  2,  0, False,  True, False),
+        (  256,  256, 8192, 128, 128, 128, 2,  8,  2,  2,  0, False,  True,  True),
         # fmt: on
     ],
 )
@@ -1523,6 +1815,8 @@ def test_gemm_a16w16_gfx1250_split_k_benchmark(
     n_waves: int,
     group_m: int,
     has_bias: bool,
+    interleave: bool,
+    split_k_atomic: bool,
 ):
     args = _TestArgs(
         dtype=torch.bfloat16,
@@ -1539,7 +1833,11 @@ def test_gemm_a16w16_gfx1250_split_k_benchmark(
         has_bias=has_bias,
         layout="nt",
         split_k=split_k,
+        interleave=interleave,
+        split_k_atomic=split_k_atomic,
     )
+    if split_k_atomic:
+        check_acc(args)
     benchmark(args)
 
 

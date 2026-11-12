@@ -11,7 +11,7 @@ from typing import Optional
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import const_expr, range_constexpr, rocdl, tdm_ops
+from flydsl.expr import const_expr, llvm, range_constexpr, rocdl, tdm_ops
 from flydsl.expr.rocdl.cluster import cluster_barrier
 from flydsl.expr.typing import T
 
@@ -79,8 +79,12 @@ def _validate_interleaved_tile(
 
 def validate_gemm_gfx1250_config(
     m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, group_m,
-    dtype_id, mma_m, mma_n, mma_k, b_k_contiguous=True, split_k=1, interleave=False,
+    dtype_id, mma_m, mma_n, mma_k, b_k_contiguous=True, split_k=1, interleave=False, split_k_atomic=False,
 ):
+    if type(split_k_atomic) is not bool:
+        raise ValueError("split_k_atomic must be bool")
+    if split_k_atomic and (dtype_id != GEMM_DTYPE_BF16 or split_k == 1 or n % 2):
+        raise ValueError("split_k_atomic requires BF16, split_k > 1 and even N")
     values = (m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, mma_m, mma_n, mma_k)
     if any(type(v) is not int or v <= 0 for v in values):
         raise ValueError(
@@ -151,7 +155,7 @@ def validate_gemm_gfx1250_config(
 
 def make_gemm_a16w16_gfx1250_kernel_name(
     dtype_id, block_m, block_n, block_k, stages, m_waves, n_waves, group_m, has_bias, b_k_contiguous,
-    mma_m, mma_n, mma_k, split_k, interleave=False,
+    mma_m, mma_n, mma_k, split_k, interleave=False, split_k_atomic=False,
 ):
     dtype_name = GEMM_DTYPE_NAMES[dtype_id]
     layout = "nt" if b_k_contiguous else "nn"
@@ -160,6 +164,7 @@ def make_gemm_a16w16_gfx1250_kernel_name(
         f"_w{m_waves}x{n_waves}_gm{group_m}_bias{int(has_bias)}_l{layout}"
         f"_sk{split_k}_mma{mma_m}x{mma_n}x{mma_k}"
         f"{'_interleave' if interleave else ''}"
+        f"{'_atomic' if split_k_atomic else ''}"
     )
 
 
@@ -180,6 +185,7 @@ class GemmA16W16Gfx1250Param:
     mma_k: fx.Constexpr[int]
     split_k: fx.Constexpr[int]
     interleave: fx.Constexpr[bool]
+    split_k_atomic: fx.Constexpr[bool]
 
 
 @functools.lru_cache(maxsize=128)
@@ -199,6 +205,7 @@ def build_gemm_gfx1250(
     mma_k: int,
     split_k: int = 1,
     interleave: bool = False,
+    split_k_atomic: bool = False,
 ):
     is_fp8_ptpc = dtype_id == GEMM_DTYPE_FP8_PTPC
     if is_fp8_ptpc:
@@ -427,6 +434,29 @@ def build_gemm_gfx1250(
         k_rank = fx.block_idx.y
         k_tiles = (k // split_k) // block_k
         k_tile_base = k_rank * k_tiles
+        if const_expr(split_k_atomic):
+            # Every cluster owns a disjoint output tile. Publish rank-0 zeros
+            # before any rank starts its packed BF16 atomic accumulation.
+            if k_rank == 0:
+                for i in range_constexpr(block_m * block_n // (threads * out_vec_elems)):
+                    offset = (i * threads + tid) * out_vec_elems
+                    row, col = offset // block_n, offset % block_n
+                    destination = (
+                        out + fx.Int64(row_start + row) * fx.Int64(c_leading_stride) + col_start + col
+                    )
+                    if (row_start + block_m <= m) and (col_start + block_n <= n):
+                        fx.make_view(destination, fx.make_layout(out_vec_elems, 1)).store(
+                            fx.full(out_vec_elems, 0.0, out_dtype)
+                        )
+                    else:
+                        for pair in range_constexpr(out_vec_elems // 2):
+                            if (row_start + row < m) and (col_start + col + pair * 2 + 1 < n):
+                                fx.make_view(destination + pair * 2, fx.make_layout(2, 1)).store(
+                                    fx.full(2, 0.0, out_dtype)
+                                )
+            llvm.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Release)
+            cluster_barrier()
+            llvm.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Acquire)
         if const_expr(interleave):
             # Two b128 loads per BF16/FP16 fragment, four per FP8 fragment.
             fragment_words = frag_elems * elem_bits // 32
@@ -817,7 +847,64 @@ def build_gemm_gfx1250(
                         fx.ptr_store(value, destination + element)
 
         tile_elems = block_m * block_n
-        if const_expr(interleave and split_k == 1):
+        if const_expr(split_k_atomic):
+            output_view = fx.make_view(out, fx.make_layout((m, n), (c_leading_stride, 1)))
+            output_buffer = rocdl.make_buffer_tensor(output_view)
+            atomic_atom = fx.make_copy_atom(rocdl.BufferAtomicPkAdd(out_dtype), out_dtype)
+            pair_layout = fx.make_layout(2, 1)
+            pair_fragment = fx.make_rmem_tensor(pair_layout, out_dtype)
+            for i in range_constexpr(tile_elems // (threads * out_vec_elems)):
+                offset = (i * threads + tid) * out_vec_elems
+                row, col = offset // block_n, offset % block_n
+                values = fx.ptr_load(
+                    shared_out + row * c_pitch + col,
+                    result_type=T.vec(out_vec_elems, out_dtype.ir_type),
+                )
+                for pair in range_constexpr(out_vec_elems // 2):
+                    pair_col = col_start + col + pair * 2
+                    if (row_start + row < m) and (pair_col + 1 < n):
+                        pair_fragment.store(fx.Vector.from_elements(
+                            [values[pair * 2], values[pair * 2 + 1]], out_dtype,
+                        ))
+                        destination = fx.make_view(
+                            fx.get_iter(output_buffer)
+                            + (row_start + row) * c_leading_stride + pair_col,
+                            pair_layout,
+                        )
+                        fx.copy_atom_call(atomic_atom, pair_fragment, destination)
+            llvm.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Release)
+            if const_expr(has_bias):
+                # Bias must follow the completed sum, not be added once per rank.
+                cluster_barrier()
+                llvm.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Acquire)
+                if k_rank == 0:
+                    for i in range_constexpr(tile_elems // (threads * out_vec_elems)):
+                        offset = (i * threads + tid) * out_vec_elems
+                        row, col = offset // block_n, offset % block_n
+                        destination = (
+                            out + fx.Int64(row_start + row) * fx.Int64(c_leading_stride) + col_start + col
+                        )
+                        if (row_start + block_m <= m) and (col_start + block_n <= n):
+                            values = fx.ptr_load(
+                                destination, result_type=T.vec(out_vec_elems, out_dtype.ir_type)
+                            )
+                            bias_values = fx.ptr_load(
+                                bias + col_start + col, result_type=T.vec(out_vec_elems, out_dtype.ir_type)
+                            )
+                            values = (values.to(fx.Float32) + bias_values.to(fx.Float32)).to(out_dtype)
+                            fx.make_view(destination, fx.make_layout(out_vec_elems, 1)).store(values)
+                        else:
+                            for pair in range_constexpr(out_vec_elems // 2):
+                                if (row_start + row < m) and (col_start + col + pair * 2 + 1 < n):
+                                    values = fx.ptr_load(
+                                        destination + pair * 2, result_type=T.vec(2, out_dtype.ir_type)
+                                    )
+                                    bias_values = fx.ptr_load(
+                                        bias + col_start + col + pair * 2, result_type=T.vec(2, out_dtype.ir_type)
+                                    )
+                                    values = (values.to(fx.Float32) + bias_values.to(fx.Float32)).to(out_dtype)
+                                    fx.make_view(destination + pair * 2, pair_layout).store(values)
+        elif const_expr(interleave and split_k == 1):
             c_tile = (block_m, c_pitch)
             atom_c, coords_c = tdm_operand(
                 out + fx.Int64(row_start) * fx.Int64(c_leading_stride) + col_start,
@@ -929,6 +1016,7 @@ def build_gemm_gfx1250(
         mma_k,
         split_k,
         interleave,
+        split_k_atomic,
     )
     if interleave:
         launch.compile_hints["llvm_options"] = {
@@ -960,6 +1048,7 @@ def gemm_a16w16_gfx1250(
     stream: Optional[torch.cuda.Stream] = None,
     layout: str = "nt",
     interleave: bool = False,
+    split_k_atomic: bool = False,
 ) -> torch.Tensor:
     """C = A[M,K] @ B[K,N]; FP16/BF16 output, optional bias.
 
@@ -973,6 +1062,12 @@ def gemm_a16w16_gfx1250(
     ``interleave=True`` uses four quadrant tiles per wave and opposite serpentine
     orders on even/odd waves. It requires NT B and sufficiently large even wave
     tiles; the default schedule and split-K reduction semantics are unchanged.
+
+    ``split_k_atomic=True`` opts into workspace-free cluster reduction using
+    packed BF16 atomic adds. It requires split_k > 1, even N and an even output
+    leading stride. Each atomic update rounds to BF16 and rank arrival order
+    is unspecified, so results may differ between runs and from the default
+    FP32 sum of rounded partials. Bias is added once after the completed sum.
     """
     if a.ndim != 2 or b.ndim != 2 or a.shape[1] != b.shape[0]:
         raise ValueError("expected A[M,K] and B[K,N]")
@@ -988,7 +1083,7 @@ def gemm_a16w16_gfx1250(
     n = b.shape[1]
     validate_gemm_gfx1250_config(
         m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, group_m,
-        dtype_id, mma_m, mma_n, mma_k, layout == "nt", split_k, interleave,
+        dtype_id, mma_m, mma_n, mma_k, layout == "nt", split_k, interleave, split_k_atomic,
     )
     a_leading_stride = _leading_stride(a, 1, 0, k, f"A does not satisfy the {layout.upper()} layout")
     if layout == "nt":
@@ -1000,6 +1095,8 @@ def gemm_a16w16_gfx1250(
     if out.shape != (m, n) or out.dtype != a.dtype or out.device != a.device:
         raise ValueError("out must be [M,N] with the input dtype and device")
     c_leading_stride = _leading_stride(out, 1, 0, n, "out must be row-major [M,N]")
+    if split_k_atomic and c_leading_stride % 2:
+        raise ValueError("split_k_atomic requires an even output leading stride")
     if bias is not None and (
         bias.shape != (n,)
         or bias.dtype != a.dtype
@@ -1025,9 +1122,11 @@ def gemm_a16w16_gfx1250(
             raise ValueError("stream must belong to the input device")
         dtype = fx.Float16 if dtype_id == GEMM_DTYPE_FP16 else fx.BFloat16
         mn_tiles = ((m + block_m - 1) // block_m) * ((n + block_n - 1) // block_n)
+        # Partials use the input/output dtype: BF16 GEMM has a 2-byte BF16
+        # workspace. Only the post-barrier register sum is FP32.
         workspace = (
             out
-            if split_k == 1
+            if split_k == 1 or split_k_atomic
             else torch.empty(
                 (mn_tiles * split_k * block_m * block_n,),
                 device=a.device,
@@ -1062,6 +1161,7 @@ def gemm_a16w16_gfx1250(
             mma_k=mma_k,
             split_k=split_k,
             interleave=interleave,
+            split_k_atomic=split_k_atomic,
         )
         launch = build_gemm_gfx1250(
             dtype_id,
@@ -1079,6 +1179,7 @@ def gemm_a16w16_gfx1250(
             mma_k,
             split_k,
             interleave,
+            split_k_atomic,
         )
         dispatch_args = (
             *pointers,
@@ -1221,6 +1322,7 @@ def gemm_fp8_ptpc_gfx1250(
             mma_k=mma_k,
             split_k=split_k,
             interleave=interleave,
+            split_k_atomic=False,
         )
         launch = build_gemm_gfx1250(
             GEMM_DTYPE_FP8_PTPC,
