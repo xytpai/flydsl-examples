@@ -22,6 +22,12 @@ from kernels.gemm_a16w16_gfx950 import (
     gemm_a16w16,
     make_gemm_a16w16_param_and_validate,
 )
+from kernels.gemm_a16w16_tdm_gfx1250 import (
+    GEMM_DTYPE_BF16,
+    GEMM_DTYPE_FP16,
+    gemm_a16w16_gfx1250,
+    validate_gemm_gfx1250_config,
+)
 
 DEFAULT_COMPILE_WORKERS = 32
 _COMPILE_TENSORS = None
@@ -67,6 +73,8 @@ class GemmConfigPruner:
     target_waves_per_cu: int = 8
     max_split_grid_rounds: int = 2
     max_tile_grid_ratio: int = 4
+    arch: str = "gfx950"
+    b_k_contiguous: bool = True
 
     @staticmethod
     def _ceil_div(value, divisor):
@@ -78,7 +86,7 @@ class GemmConfigPruner:
         )
 
     def _iou(self, config):
-        split_k = config["split_k"]
+        split_k = config.get("split_k", 1)
         padded_m = self._ceil_div(self.m, config["block_m"]) * config["block_m"]
         padded_n = self._ceil_div(self.n, config["block_n"]) * config["block_n"]
         part_k = self.k // split_k
@@ -89,19 +97,41 @@ class GemmConfigPruner:
         )
         return self.m * self.n * self.k / (padded_m * padded_n * padded_k)
 
+    def _lds_bytes(self, config):
+        if self.arch != "gfx1250":
+            return max(
+                config["stages"]
+                * (config["block_m"] + config["block_n"])
+                * config["block_k"]
+                * self.element_bytes,
+                config["k_waves"]
+                * config["block_m"]
+                * config["block_n"]
+                * self.element_bytes,
+            )
+        pad = 8
+        block_k = config["block_k"]
+        a_stage = config["block_m"] * (block_k + pad)
+        if self.b_k_contiguous:
+            b_stage = config["block_n"] * (block_k + pad)
+        else:
+            b_stage = block_k * (config["block_n"] + pad)
+        # The quadrant epilogue adds 16 bytes per C row in LDS.
+        c_pad = 16 // self.element_bytes if config.get("interleave", False) else 0
+        elements = max(
+            config["stages"] * (a_stage + b_stage),
+            config["block_m"] * (config["block_n"] + c_pad),
+        )
+        return elements * self.element_bytes
+
     def _occupancy(self, config):
         props = self.device_props
-        waves = config["m_waves"] * config["n_waves"] * config["k_waves"]
-        lds = max(
-            config["stages"]
-            * (config["block_m"] + config["block_n"])
-            * config["block_k"]
-            * self.element_bytes,
-            config["k_waves"]
-            * config["block_m"]
-            * config["block_n"]
-            * self.element_bytes,
+        waves = (
+            config["m_waves"]
+            * config["n_waves"]
+            * config.get("k_waves", 1)
         )
+        lds = self._lds_bytes(config)
         lds_per_cu = getattr(
             props,
             "shared_memory_per_multiprocessor",
@@ -113,7 +143,7 @@ class GemmConfigPruner:
         ) * waves
         grid = (
             self._tiles(config)
-            * config["split_k"]
+            * config.get("split_k", 1)
             * waves
             / props.multi_processor_count
         )
@@ -132,6 +162,7 @@ class GemmConfigPruner:
         kept = []
         for config, iou in zip(configs, ious):
             tiles = self._tiles(config)
+            split_k = config.get("split_k", 1)
             max_split_k = (
                 1
                 if tiles >= num_cus
@@ -142,7 +173,7 @@ class GemmConfigPruner:
             if (
                 iou >= min_iou
                 and tiles <= max_tiles
-                and config["split_k"] <= max_split_k
+                and split_k <= max_split_k
                 and (
                     config["group_m"] == 0
                     or (tiles >= num_cus and tiles % 8 == 0)
@@ -152,7 +183,7 @@ class GemmConfigPruner:
         best = {}
         keep = set()
         for index, config in sorted(
-            enumerate(kept), key=lambda item: (item[1]["k_waves"], item[0])
+            enumerate(kept), key=lambda item: (item[1].get("k_waves", 1), item[0])
         ):
             key = tuple(
                 (name, value)
@@ -211,19 +242,26 @@ def _init_compile_worker(dtype, m, n, k, layout):
     _COMPILE_LAYOUT = layout
 
 
-def _compile_policy_worker(job):
-    index, config = job
-    try:
-        assert _COMPILE_TENSORS is not None
-        a, b, out, bias = _COMPILE_TENSORS
+def run_gemm(a, b, out, bias, config, layout):
+    if gpu_arch == "gfx1250":
+        gemm_a16w16_gfx1250(a, b, out, bias, layout=layout, **config)
+    else:
         gemm_a16w16(
             a,
             b,
             out,
             bias=bias,
             user_kwargs=config,
-            layout=_COMPILE_LAYOUT,
+            layout=layout,
         )
+
+
+def _compile_policy_worker(job):
+    index, config = job
+    try:
+        assert _COMPILE_TENSORS is not None
+        a, b, out, bias = _COMPILE_TENSORS
+        run_gemm(a, b, out, bias, config, _COMPILE_LAYOUT)
         torch.cuda.synchronize()
         return index, None
     except Exception as error:
@@ -264,7 +302,7 @@ def tuning_benchmark(args, kwargs={}, niters=50):
     c = create_outputs(args)[0]
     c_ref = create_outputs(args)[0]
     torch.addmm(bias, a, b, out=c_ref)
-    gemm_a16w16(a, b, c, bias=bias, user_kwargs=kwargs, layout=args.layout)
+    run_gemm(a, b, c, bias, kwargs, args.layout)
     tol = (
         float(args.k)
         / 2048
@@ -281,16 +319,16 @@ def tuning_benchmark(args, kwargs={}, niters=50):
         activities=[ProfilerActivity.CUDA],
     ) as prof:
         for i in range(niters):
-            gemm_a16w16(
+            run_gemm(
                 inputs[i][0],
                 inputs[i][1],
                 outputs[i][0],
-                bias=inputs[i][2],
-                user_kwargs=kwargs,
-                layout=args.layout,
+                inputs[i][2],
+                kwargs,
+                args.layout,
             )
             torch.cuda.synchronize()
-            torch.cuda.empty_cache()
+            # torch.cuda.empty_cache()
     # table = prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1)
     gemm_a16w16_durations = []
     for event in prof.events():
@@ -300,7 +338,102 @@ def tuning_benchmark(args, kwargs={}, niters=50):
     return duration
 
 
+def gemm_gfx1250_get_configs(args):
+    split_k_candidates = [1]
+    if args.enable_split_k:
+        split_k_candidates.extend(
+            split_k for split_k in range(2, 10) if args.k % split_k == 0
+        )
+    selections = {
+        "block_m": [16, 32, 48, 64, 80, 96, 128, 256],
+        "block_n": [16, 32, 64, 80, 96, 128, 256],
+        "block_k": [64, 128, 256, 512],
+        "stages": [i for i in range(2, 10)],
+        "split_k": split_k_candidates,
+        # BF16 split-K searches both workspace and packed-atomic reduction.
+        "split_k_atomic": (
+            [False, True]
+            if args.enable_split_k and args.dtype is torch.bfloat16 and args.n % 2 == 0
+            else [False]
+        ),
+        "m_waves": [1, 2, 4],
+        "n_waves": [1, 2, 4],
+        "group_m": [0, 4],
+        "mma_m": [16],
+        "mma_n": [16],
+        "mma_k": [32],
+        # NN keeps the original schedule; the validator checks NT quadrant fit.
+        "interleave": [False, True] if args.layout == "nt" else [False],
+    }
+    if args.layout == "nt" and min(args.m, args.n, args.k) >= 4096:
+        # Pin large NT GEMMs while retaining the group_m search.
+        selections.update({
+            "block_m": [256],
+            "block_n": [256],
+            "block_k": [128],
+            "stages": [2],
+            "m_waves": [2],
+            "n_waves": [2],
+            "interleave": [True],
+            "split_k": [1],
+            "split_k_atomic": [False],
+        })
+    keys = selections.keys()
+    values = selections.values()
+    configs = [dict(zip(keys, combo)) for combo in itertools.product(*values)]
+    configs = [
+        config for config in configs
+        if (
+            not config["interleave"]
+            or (config["m_waves"], config["n_waves"]) not in ((2, 4), (4, 2), (4, 4))
+        )
+        and (not config["split_k_atomic"] or config["split_k"] > 1)
+    ]
+    device_props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    b_k_contiguous = args.layout == "nt"
+    pruner = GemmConfigPruner(
+        args.m,
+        args.n,
+        args.k,
+        device_props,
+        2,
+        arch="gfx1250",
+        b_k_contiguous=b_k_contiguous,
+    )
+    configs = pruner.prune(configs)
+    dtype_id = GEMM_DTYPE_FP16 if args.dtype is torch.float16 else GEMM_DTYPE_BF16
+    valid_configs = []
+    for config in configs:
+        try:
+            validate_gemm_gfx1250_config(
+                args.m,
+                args.n,
+                args.k,
+                config["block_m"],
+                config["block_n"],
+                config["block_k"],
+                config["stages"],
+                config["m_waves"],
+                config["n_waves"],
+                config["group_m"],
+                dtype_id,
+                config["mma_m"],
+                config["mma_n"],
+                config["mma_k"],
+                b_k_contiguous,
+                config["split_k"],
+                interleave=config["interleave"],
+                split_k_atomic=config["split_k_atomic"],
+            )
+            valid_configs.append(config)
+        except Exception:
+            pass
+    return valid_configs
+
+
 def gemm_a16w16_get_configs(args):
+    if gpu_arch == "gfx1250":
+        return gemm_gfx1250_get_configs(args)
     split_k_candidates = [1]
     if args.enable_split_k:
         split_k_candidates.extend(
@@ -490,7 +623,7 @@ if __name__ == "__main__":
     parser.add_argument("--dtype", type=str, default="bf16")
     parser.add_argument(
         "--layout",
-        choices=("nn", "nt", "tn", "tt"),
+        choices=("nn", "nt") if gpu_arch == "gfx1250" else ("nn", "nt", "tn", "tt"),
         default="nt",
     )
     parser.add_argument("--single", action="store_true")
@@ -499,7 +632,7 @@ if __name__ == "__main__":
         "--enable_split_k",
         "--enable-split-k",
         action="store_true",
-        help="include valid split_k values greater than 1 in tuning",
+        help="include split_k > 1; gfx1250 searches cluster sizes 2 through 9",
     )
     parser.add_argument(
         "--compile-workers",
