@@ -44,10 +44,10 @@ wave32 WMMA, based on
   output dtype.
 - Configurable tiles, stages, wave counts, block ordering and optional NT
   interleaved scheduling.
-- Cluster split-K via `split_k=1..9`. The default reduction sums
-  input-dtype partials in FP32. `split_k_atomic=True` uses packed BF16
-  atomics instead; it requires split-K and even N, rounds each update, and
-  can produce different results depending on arrival order.
+- Cluster split-K via `split_k=1..9`. Each CTA writes FP32 partials;
+  after one cluster barrier, rank0 sums them in fixed split order and
+  applies scale/bias once. No completion counter or floating-point atomic
+  accumulation is used.
 - A separate `gemm_fp8_ptpc_gfx1250` entry point accepts FP8 E4M3 inputs,
   FP32 row/column scales, and optional BF16 bias; output is BF16.
 - Optional output buffer and stream; graph capture/replay after warmup.
@@ -207,6 +207,13 @@ successful candidates. `--single` prints the selected configuration;
 to control policy compilation concurrency. On gfx1250, tuning supports
 FP16/BF16 with `NN` or `NT` layouts; `--enable-split-k` includes cluster
 sizes 2 through 9 subject to configuration validity.
+
+gfx1250 split-K uses only this FP32-workspace cluster reduction. The old
+`split_k_atomic` option is removed. Partial sums no longer round to BF16/FP16
+before reduction; final output rounding and bias ordering are unchanged.
+Workspace is private to each invocation and allocated on the launch stream,
+including Graph capture. Split1 does not allocate workspace. Re-tune old
+gfx1250 split-K entries: their measured timings used the previous reduction.
 
 ## PyTorch Backend Comparison
 

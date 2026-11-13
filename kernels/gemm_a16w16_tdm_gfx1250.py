@@ -11,13 +11,12 @@ from typing import Optional
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import const_expr, llvm, range_constexpr, rocdl, tdm_ops
+from flydsl.expr import const_expr, range_constexpr, rocdl, tdm_ops
 from flydsl.expr.rocdl.cluster import cluster_barrier
 from flydsl.expr.typing import T
 
 from .common import run_cached
 from .gemm_a16w16_gfx950_utils import BlockSwizzle
-
 
 WAVE_SIZE = 32
 LDS_PAD = 8
@@ -55,6 +54,8 @@ GEMM_DTYPE_BITS = {
 }
 FRAGMENT_LOAD_BITS = 16 * 8
 STORE_VEC_BITS = 16 * 8
+# gfx1250 V# device scope: partials must be visible across cluster CTAs.
+WORKSPACE_CACHE_DEVICE = 0x10
 
 
 def _validate_interleaved_tile(
@@ -79,12 +80,8 @@ def _validate_interleaved_tile(
 
 def validate_gemm_gfx1250_config(
     m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, group_m,
-    dtype_id, mma_m, mma_n, mma_k, b_k_contiguous=True, split_k=1, interleave=False, split_k_atomic=False,
+    dtype_id, mma_m, mma_n, mma_k, b_k_contiguous=True, split_k=1, interleave=False,
 ):
-    if type(split_k_atomic) is not bool:
-        raise ValueError("split_k_atomic must be bool")
-    if split_k_atomic and (dtype_id != GEMM_DTYPE_BF16 or split_k == 1 or n % 2):
-        raise ValueError("split_k_atomic requires BF16, split_k > 1 and even N")
     values = (m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, mma_m, mma_n, mma_k)
     if any(type(v) is not int or v <= 0 for v in values):
         raise ValueError(
@@ -142,8 +139,8 @@ def validate_gemm_gfx1250_config(
     shared_bytes = (max(ab_bits, c_bits) + 7) // 8
     if shared_bytes > 320 * 1024:
         raise ValueError("pipeline exceeds gfx1250's 320 KiB LDS capacity")
-    if split_k not in range(1, 10):
-        raise ValueError("cluster split_k must be in 1..9")
+    if type(split_k) is not int or split_k not in range(1, 10):
+        raise ValueError("split_k must be in 1..9")
     if k % (split_k * block_k):
         raise ValueError("K must be divisible by split_k * block_k")
     if k // split_k < (stages - 1) * block_k:
@@ -155,7 +152,7 @@ def validate_gemm_gfx1250_config(
 
 def make_gemm_a16w16_gfx1250_kernel_name(
     dtype_id, block_m, block_n, block_k, stages, m_waves, n_waves, group_m, has_bias, b_k_contiguous,
-    mma_m, mma_n, mma_k, split_k, interleave=False, split_k_atomic=False,
+    mma_m, mma_n, mma_k, split_k, interleave=False,
 ):
     dtype_name = GEMM_DTYPE_NAMES[dtype_id]
     layout = "nt" if b_k_contiguous else "nn"
@@ -164,7 +161,7 @@ def make_gemm_a16w16_gfx1250_kernel_name(
         f"_w{m_waves}x{n_waves}_gm{group_m}_bias{int(has_bias)}_l{layout}"
         f"_sk{split_k}_mma{mma_m}x{mma_n}x{mma_k}"
         f"{'_interleave' if interleave else ''}"
-        f"{'_atomic' if split_k_atomic else ''}"
+        f"{'_fp32sk' if split_k > 1 else ''}"
     )
 
 
@@ -185,7 +182,6 @@ class GemmA16W16Gfx1250Param:
     mma_k: fx.Constexpr[int]
     split_k: fx.Constexpr[int]
     interleave: fx.Constexpr[bool]
-    split_k_atomic: fx.Constexpr[bool]
 
 
 @functools.lru_cache(maxsize=128)
@@ -205,7 +201,6 @@ def build_gemm_gfx1250(
     mma_k: int,
     split_k: int = 1,
     interleave: bool = False,
-    split_k_atomic: bool = False,
 ):
     is_fp8_ptpc = dtype_id == GEMM_DTYPE_FP8_PTPC
     if is_fp8_ptpc:
@@ -429,34 +424,11 @@ def build_gemm_gfx1250(
                         acc = accumulators[mi * n_steps + ni]
                         fx.gemm(mma, acc, a_fragment, b_fragments[ni], acc)
 
-        # Each cluster rank owns an equal K slice. Tile indices stay in the
+        # Each CTA owns an equal K slice. Tile indices stay in the
         # full-tensor coordinate space.
         k_rank = fx.block_idx.y
         k_tiles = (k // split_k) // block_k
         k_tile_base = k_rank * k_tiles
-        if const_expr(split_k_atomic):
-            # Every cluster owns a disjoint output tile. Publish rank-0 zeros
-            # before any rank starts its packed BF16 atomic accumulation.
-            if k_rank == 0:
-                for i in range_constexpr(block_m * block_n // (threads * out_vec_elems)):
-                    offset = (i * threads + tid) * out_vec_elems
-                    row, col = offset // block_n, offset % block_n
-                    destination = (
-                        out + fx.Int64(row_start + row) * fx.Int64(c_leading_stride) + col_start + col
-                    )
-                    if (row_start + block_m <= m) and (col_start + block_n <= n):
-                        fx.make_view(destination, fx.make_layout(out_vec_elems, 1)).store(
-                            fx.full(out_vec_elems, 0.0, out_dtype)
-                        )
-                    else:
-                        for pair in range_constexpr(out_vec_elems // 2):
-                            if (row_start + row < m) and (col_start + col + pair * 2 + 1 < n):
-                                fx.make_view(destination + pair * 2, fx.make_layout(2, 1)).store(
-                                    fx.full(2, 0.0, out_dtype)
-                                )
-            llvm.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Release)
-            cluster_barrier()
-            llvm.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Acquire)
         if const_expr(interleave):
             # Two b128 loads per BF16/FP16 fragment, four per FP8 fragment.
             fragment_words = frag_elems * elem_bits // 32
@@ -704,262 +676,230 @@ def build_gemm_gfx1250(
                 compute_tile(current_stage)
                 current_stage = (current_stage + 1) % stages
 
-        # Reuse the A/B arena only after all TDM and fragment reads have retired.
-        fx.gpu.barrier()
-        if const_expr(interleave):
-            if const_expr(is_fp8_ptpc and split_k == 1):
-                row_scales = [
-                    fx.ptr_load(
-                        scale_a + fx.min(row_start + wave_row + mi * mma_m + lane % 16, m - 1),
-                        result_type=fx.Float32.ir_type,
-                    )
-                    for mi in range_constexpr(m_steps)
-                ]
-                col_scales = [
-                    fx.Vector.from_elements([
+        def finish_tile():
+            # Reuse the A/B arena only after all TDM and fragment reads have retired.
+            fx.gpu.barrier()
+            if const_expr(interleave):
+                if const_expr(is_fp8_ptpc):
+                    row_scales = [
                         fx.ptr_load(
-                            scale_b + fx.min(
-                                col_start + wave_col + ni * mma_n + lane // 16 * acc_elems + i, n - 1
-                            ),
+                            scale_a + fx.min(row_start + wave_row + mi * mma_m + lane % 16, m - 1),
                             result_type=fx.Float32.ir_type,
                         )
-                        for i in range_constexpr(acc_elems)
-                    ])
-                    for ni in range_constexpr(n_steps)
-                ]
-            if const_expr(has_bias and split_k == 1):
-                # Reuse each column's bias across M fragments. Clamped edge
-                # lanes are discarded by the bounds-checked TDM output store.
-                bias_fragments = [
-                    fx.Vector.from_elements([
-                        fx.ptr_load(
-                            bias + fx.min(
-                                col_start + wave_col + ni * mma_n + lane // 16 * acc_elems + i, n - 1
-                            ),
-                            result_type=out_dtype.ir_type,
-                        )
-                        for i in range_constexpr(acc_elems)
-                    ])
-                    for ni in range_constexpr(n_steps)
-                ]
-            for mi in range_constexpr(m_steps):
-                for ni in range_constexpr(n_steps):
-                    row = wave_row + mi * mma_m + lane % 16
-                    col = wave_col + ni * mma_n + lane // 16 * acc_elems
-                    values = accumulators[mi * n_steps + ni].load()
-                    if const_expr(is_fp8_ptpc and split_k == 1):
-                        values = values * row_scales[mi] * col_scales[ni]
-                    values = values.to(out_dtype)
-                    if const_expr(has_bias and split_k == 1):
-                        # Preserve round(product) + bias, not round(product + bias).
-                        values = (values.to(fx.Float32) + bias_fragments[ni].to(fx.Float32)).to(out_dtype)
-                    fx.make_view(
-                        shared_out + row * c_pitch + col, fx.make_layout(acc_elems, 1)
-                    ).store(values)
-        else:
-            # Reuse row/column scales across accumulator tiles. Clamped edge
-            # lanes are never committed to global output.
-            if const_expr(is_fp8_ptpc and split_k == 1):
-                row_scales = []
-                for mi in range_constexpr(m_steps):
-                    row = row_start + wave_row + mi * mma_m + lane // 16 * acc_elems
-                    row_scales.append(fx.Vector.from_elements([
-                        fx.ptr_load(scale_a + fx.min(row + i, m - 1), result_type=fx.Float32.ir_type)
-                        for i in range_constexpr(acc_elems)
-                    ]))
-                col_scales = []
-                for ni in range_constexpr(n_steps):
-                    col = col_start + wave_col + ni * mma_n + lane % 16
-                    col_scales.append(fx.ptr_load(scale_b + fx.min(col, n - 1), result_type=fx.Float32.ir_type))
-            for mi in range_constexpr(m_steps):
-                for ni in range_constexpr(n_steps):
-                    row = wave_row + mi * mma_m + lane // 16 * acc_elems
-                    col = wave_col + ni * mma_n + lane % 16
-                    values = accumulators[mi * n_steps + ni].load()
-                    if const_expr(is_fp8_ptpc and split_k == 1):
-                        values = values * row_scales[mi] * col_scales[ni]
-                    values = values.to(out_dtype)
-                    for i in range_constexpr(acc_elems):
-                        fx.ptr_store(values[i], shared_out + (row + i) * block_n + col)
-        fx.gpu.barrier()
-
-        def commit_output(values, row, col, apply_scale=False):
-            destination = (
-                out
-                + fx.Int64(row_start + row) * fx.Int64(c_leading_stride)
-                + col_start
-                + col
-            )
-            # Interior tiles store one 16-byte vector along N. An edge tile may
-            # cover rows or columns past M or N; those elements stay unstored.
-            if (row_start + block_m <= m) and (col_start + block_n <= n):
-                # Apply PTPC scaling in FP32, then round before adding bias.
-                if const_expr(apply_scale):
-                    scale_a_value = fx.ptr_load(
-                        scale_a + row_start + row, result_type=fx.Float32.ir_type
-                    )
-                    scaled = []
-                    for element in range_constexpr(out_vec_elems):
-                        scale_b_value = fx.ptr_load(
-                            scale_b + col_start + col + element,
-                            result_type=fx.Float32.ir_type,
-                        )
-                        scaled.append(
-                            (values[element].to(fx.Float32) * scale_a_value * scale_b_value).to(
-                                out_dtype
+                        for mi in range_constexpr(m_steps)
+                    ]
+                    col_scales = [
+                        fx.Vector.from_elements([
+                            fx.ptr_load(
+                                scale_b + fx.min(
+                                    col_start + wave_col + ni * mma_n + lane // 16 * acc_elems + i, n - 1
+                                ),
+                                result_type=fx.Float32.ir_type,
                             )
-                        )
-                    output_values = fx.Vector.from_elements(scaled)
-                else:
-                    output_values = values.to(out_dtype)
+                            for i in range_constexpr(acc_elems)
+                        ])
+                        for ni in range_constexpr(n_steps)
+                    ]
                 if const_expr(has_bias):
-                    bias_values = fx.ptr_load(
-                        bias + col_start + col, result_type=T.vec(out_vec_elems, out_dtype.ir_type)
-                    )
-                    output_values = (
-                        output_values.to(fx.Float32) + bias_values.to(fx.Float32)
-                    ).to(out_dtype)
-                fx.make_view(destination, fx.make_layout(out_vec_elems, 1)).store(
-                    output_values
-                )
-            else:
-                for element in range_constexpr(out_vec_elems):
-                    if (row_start + row < m) and (col_start + col + element < n):
-                        value = values[element]
-                        if const_expr(apply_scale):
-                            scale_a_value = fx.ptr_load(
-                                scale_a + row_start + row, result_type=fx.Float32.ir_type
+                    # Reuse each column's bias across M fragments. Clamped edge
+                    # lanes are discarded by the bounds-checked TDM output store.
+                    bias_fragments = [
+                        fx.Vector.from_elements([
+                            fx.ptr_load(
+                                bias + fx.min(
+                                    col_start + wave_col + ni * mma_n + lane // 16 * acc_elems + i, n - 1
+                                ),
+                                result_type=out_dtype.ir_type,
                             )
+                            for i in range_constexpr(acc_elems)
+                        ])
+                        for ni in range_constexpr(n_steps)
+                    ]
+                for mi in range_constexpr(m_steps):
+                    for ni in range_constexpr(n_steps):
+                        row = wave_row + mi * mma_m + lane % 16
+                        col = wave_col + ni * mma_n + lane // 16 * acc_elems
+                        values = accumulators[mi * n_steps + ni].load()
+                        if const_expr(is_fp8_ptpc):
+                            values = values * row_scales[mi] * col_scales[ni]
+                        values = values.to(out_dtype)
+                        if const_expr(has_bias):
+                            # Preserve round(product) + bias, not round(product + bias).
+                            values = (values.to(fx.Float32) + bias_fragments[ni].to(fx.Float32)).to(out_dtype)
+                        fx.make_view(
+                            shared_out + row * c_pitch + col, fx.make_layout(acc_elems, 1)
+                        ).store(values)
+            else:
+                # Reuse row/column scales across accumulator tiles. Clamped edge
+                # lanes are never committed to global output.
+                if const_expr(is_fp8_ptpc):
+                    row_scales = []
+                    for mi in range_constexpr(m_steps):
+                        row = row_start + wave_row + mi * mma_m + lane // 16 * acc_elems
+                        row_scales.append(fx.Vector.from_elements([
+                            fx.ptr_load(scale_a + fx.min(row + i, m - 1), result_type=fx.Float32.ir_type)
+                            for i in range_constexpr(acc_elems)
+                        ]))
+                    col_scales = []
+                    for ni in range_constexpr(n_steps):
+                        col = col_start + wave_col + ni * mma_n + lane % 16
+                        col_scales.append(fx.ptr_load(scale_b + fx.min(col, n - 1), result_type=fx.Float32.ir_type))
+                for mi in range_constexpr(m_steps):
+                    for ni in range_constexpr(n_steps):
+                        row = wave_row + mi * mma_m + lane // 16 * acc_elems
+                        col = wave_col + ni * mma_n + lane % 16
+                        values = accumulators[mi * n_steps + ni].load()
+                        if const_expr(is_fp8_ptpc):
+                            values = values * row_scales[mi] * col_scales[ni]
+                        values = values.to(out_dtype)
+                        for i in range_constexpr(acc_elems):
+                            fx.ptr_store(values[i], shared_out + (row + i) * block_n + col)
+            fx.gpu.barrier()
+
+            def commit_output(values, row, col, apply_scale=False):
+                destination = (
+                    out
+                    + fx.Int64(row_start + row) * fx.Int64(c_leading_stride)
+                    + col_start
+                    + col
+                )
+                # Interior tiles store one 16-byte vector along N. An edge tile may
+                # cover rows or columns past M or N; those elements stay unstored.
+                if (row_start + block_m <= m) and (col_start + block_n <= n):
+                    # Apply PTPC scaling in FP32, then round before adding bias.
+                    if const_expr(apply_scale):
+                        scale_a_value = fx.ptr_load(
+                            scale_a + row_start + row, result_type=fx.Float32.ir_type
+                        )
+                        scaled = []
+                        for element in range_constexpr(out_vec_elems):
                             scale_b_value = fx.ptr_load(
                                 scale_b + col_start + col + element,
                                 result_type=fx.Float32.ir_type,
                             )
-                            value = (
-                                value.to(fx.Float32) * scale_a_value * scale_b_value
-                            ).to(out_dtype)
-                        else:
-                            value = value.to(out_dtype)
-                        if const_expr(has_bias):
-                            bias_value = fx.ptr_load(
-                                bias + col_start + col + element, result_type=out_dtype.ir_type
+                            scaled.append(
+                                (values[element].to(fx.Float32) * scale_a_value * scale_b_value).to(
+                                    out_dtype
+                                )
                             )
-                            value = (value.to(fx.Float32) + bias_value.to(fx.Float32)).to(out_dtype)
-                        fx.ptr_store(value, destination + element)
+                        output_values = fx.Vector.from_elements(scaled)
+                    else:
+                        output_values = values.to(out_dtype)
+                    if const_expr(has_bias):
+                        bias_values = fx.ptr_load(
+                            bias + col_start + col, result_type=T.vec(out_vec_elems, out_dtype.ir_type)
+                        )
+                        output_values = (
+                            output_values.to(fx.Float32) + bias_values.to(fx.Float32)
+                        ).to(out_dtype)
+                    fx.make_view(destination, fx.make_layout(out_vec_elems, 1)).store(
+                        output_values
+                    )
+                else:
+                    for element in range_constexpr(out_vec_elems):
+                        if (row_start + row < m) and (col_start + col + element < n):
+                            value = values[element]
+                            if const_expr(apply_scale):
+                                scale_a_value = fx.ptr_load(
+                                    scale_a + row_start + row, result_type=fx.Float32.ir_type
+                                )
+                                scale_b_value = fx.ptr_load(
+                                    scale_b + col_start + col + element,
+                                    result_type=fx.Float32.ir_type,
+                                )
+                                value = (
+                                    value.to(fx.Float32) * scale_a_value * scale_b_value
+                                ).to(out_dtype)
+                            else:
+                                value = value.to(out_dtype)
+                            if const_expr(has_bias):
+                                bias_value = fx.ptr_load(
+                                    bias + col_start + col + element, result_type=out_dtype.ir_type
+                                )
+                                value = (value.to(fx.Float32) + bias_value.to(fx.Float32)).to(out_dtype)
+                            fx.ptr_store(value, destination + element)
 
-        tile_elems = block_m * block_n
-        if const_expr(split_k_atomic):
-            output_view = fx.make_view(out, fx.make_layout((m, n), (c_leading_stride, 1)))
-            output_buffer = rocdl.make_buffer_tensor(output_view)
-            atomic_atom = fx.make_copy_atom(rocdl.BufferAtomicPkAdd(out_dtype), out_dtype)
-            pair_layout = fx.make_layout(2, 1)
-            pair_fragment = fx.make_rmem_tensor(pair_layout, out_dtype)
-            for i in range_constexpr(tile_elems // (threads * out_vec_elems)):
-                offset = (i * threads + tid) * out_vec_elems
-                row, col = offset // block_n, offset % block_n
-                values = fx.ptr_load(
-                    shared_out + row * c_pitch + col,
-                    result_type=T.vec(out_vec_elems, out_dtype.ir_type),
+            tile_elems = block_m * block_n
+            if const_expr(interleave):
+                c_tile = (block_m, c_pitch)
+                atom_c, coords_c = tdm_operand(
+                    out + fx.Int64(row_start) * fx.Int64(c_leading_stride) + col_start,
+                    (fx.max(0, fx.min(block_m, m - row_start)),
+                     fx.max(0, fx.min(block_n, n - col_start))),
+                    (c_leading_stride, 1), c_tile, (c_pitch, 1), store=True,
                 )
-                for pair in range_constexpr(out_vec_elems // 2):
-                    pair_col = col_start + col + pair * 2
-                    if (row_start + row < m) and (pair_col + 1 < n):
-                        pair_fragment.store(fx.Vector.from_elements(
-                            [values[pair * 2], values[pair * 2 + 1]], out_dtype,
-                        ))
-                        destination = fx.make_view(
-                            fx.get_iter(output_buffer)
-                            + (row_start + row) * c_leading_stride + pair_col,
-                            pair_layout,
-                        )
-                        fx.copy_atom_call(atomic_atom, pair_fragment, destination)
-            llvm.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Release)
-            if const_expr(has_bias):
-                # Bias must follow the completed sum, not be added once per rank.
-                cluster_barrier()
-                llvm.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Acquire)
-                if k_rank == 0:
-                    for i in range_constexpr(tile_elems // (threads * out_vec_elems)):
-                        offset = (i * threads + tid) * out_vec_elems
-                        row, col = offset // block_n, offset % block_n
-                        destination = (
-                            out + fx.Int64(row_start + row) * fx.Int64(c_leading_stride) + col_start + col
-                        )
-                        if (row_start + block_m <= m) and (col_start + block_n <= n):
-                            values = fx.ptr_load(
-                                destination, result_type=T.vec(out_vec_elems, out_dtype.ir_type)
-                            )
-                            bias_values = fx.ptr_load(
-                                bias + col_start + col, result_type=T.vec(out_vec_elems, out_dtype.ir_type)
-                            )
-                            values = (values.to(fx.Float32) + bias_values.to(fx.Float32)).to(out_dtype)
-                            fx.make_view(destination, fx.make_layout(out_vec_elems, 1)).store(values)
-                        else:
-                            for pair in range_constexpr(out_vec_elems // 2):
-                                if (row_start + row < m) and (col_start + col + pair * 2 + 1 < n):
-                                    values = fx.ptr_load(
-                                        destination + pair * 2, result_type=T.vec(2, out_dtype.ir_type)
-                                    )
-                                    bias_values = fx.ptr_load(
-                                        bias + col_start + col + pair * 2, result_type=T.vec(2, out_dtype.ir_type)
-                                    )
-                                    values = (values.to(fx.Float32) + bias_values.to(fx.Float32)).to(out_dtype)
-                                    fx.make_view(destination + pair * 2, pair_layout).store(values)
-        elif const_expr(interleave and split_k == 1):
-            c_tile = (block_m, c_pitch)
-            atom_c, coords_c = tdm_operand(
-                out + fx.Int64(row_start) * fx.Int64(c_leading_stride) + col_start,
-                (fx.max(0, fx.min(block_m, m - row_start)),
-                 fx.max(0, fx.min(block_n, n - col_start))),
-                (c_leading_stride, 1), c_tile, (c_pitch, 1), store=True,
-            )
-            shared_c = fx.make_view(
-                shared_out,
-                fx.make_layout((c_tile, 1), ((c_pitch, 1), block_m * c_pitch)),
-            )
-            src, dst = rocdl.cdna5.tdm_partition(
-                atom_c, wave, fx.make_layout(waves, 1),
-                shared_c, coords_c[None, (0, None)],
-            )
-            fx.copy(atom_c, src[None, 0], dst[None, 0])
-            tdm_ops.tensor_wait(0)
-        elif const_expr(split_k == 1):
-            for i in range_constexpr(tile_elems // (threads * out_vec_elems)):
-                offset = (i * threads + tid) * out_vec_elems
-                row, col = offset // block_n, offset % block_n
-                values = fx.ptr_load(shared_out + row * c_pitch + col, result_type=T.vec(out_vec_elems, out_dtype.ir_type))
-                commit_output(values, row, col)
-        else:
-            for i in range_constexpr(tile_elems // (threads * out_vec_elems)):
-                offset = (i * threads + tid) * out_vec_elems
-                row, col = offset // block_n, offset % block_n
-                values = fx.ptr_load(shared_out + row * c_pitch + col, result_type=T.vec(out_vec_elems, out_dtype.ir_type))
-                partial = (
-                    workspace
-                    + fx.Int64(block_id) * (split_k * tile_elems)
-                    + fx.Int64(k_rank) * tile_elems
-                    + row * block_n
-                    + col
+                shared_c = fx.make_view(
+                    shared_out,
+                    fx.make_layout((c_tile, 1), ((c_pitch, 1), block_m * c_pitch)),
                 )
-                fx.make_view(partial, fx.make_layout(out_vec_elems, 1)).store(values)
-            cluster_barrier()
-            if k_rank == 0:
+                src, dst = rocdl.cdna5.tdm_partition(
+                    atom_c, wave, fx.make_layout(waves, 1),
+                    shared_c, coords_c[None, (0, None)],
+                )
+                fx.copy(atom_c, src[None, 0], dst[None, 0])
+                tdm_ops.tensor_wait(0)
+            else:
                 for i in range_constexpr(tile_elems // (threads * out_vec_elems)):
                     offset = (i * threads + tid) * out_vec_elems
                     row, col = offset // block_n, offset % block_n
-                    total = fx.ptr_load(
-                        workspace + fx.Int64(block_id) * (split_k * tile_elems) + offset,
-                        result_type=T.vec(out_vec_elems, out_dtype.ir_type),
-                    ).to(fx.Float32)
-                    for part in range_constexpr(split_k - 1):
-                        partial = fx.ptr_load(
-                            workspace
-                            + fx.Int64(block_id) * (split_k * tile_elems)
-                            + (part + 1) * tile_elems
-                            + offset,
-                            result_type=T.vec(out_vec_elems, out_dtype.ir_type),
-                        )
-                        total = total + partial.to(fx.Float32)
-                    commit_output(total, row, col, apply_scale=is_fp8_ptpc)
+                    values = fx.ptr_load(shared_out + row * c_pitch + col, result_type=T.vec(out_vec_elems, out_dtype.ir_type))
+                    commit_output(values, row, col)
+
+        if const_expr(split_k == 1):
+            finish_tile()
+        else:
+            # Private FP32 planes in accumulator/lane order, including padded
+            # M/N entries. No BF16/FP16 rounding until the final epilogue.
+            tile_elems = block_m * block_n
+            tile_base = fx.Int64(block_id) * (split_k * tile_elems)
+            # Device-scope V# loads/stores make the FP32 planes visible across
+            # the cluster without invalidating caches for every output lane.
+            # Each V# covers one tile's workspace; tile_base remains 64-bit.
+            ws = rocdl.make_buffer_tensor(
+                fx.make_view(workspace + tile_base, fx.make_layout(split_k * tile_elems, 1)),
+                max_size=False, num_records_bytes=split_k * tile_elems * 4,
+            )
+            ws_atom = fx.make_copy_atom(rocdl.BufferCopy128b(WORKSPACE_CACHE_DEVICE), fx.Float32)
+            vec4_layout = fx.make_layout(4, 1)
+
+            def store_partial(ai):
+                values = accumulators[ai].load()
+                offset = k_rank * tile_elems + (ai * threads + tid) * acc_elems
+                for half in range_constexpr(acc_elems // 4):
+                    frag = fx.make_rmem_tensor(vec4_layout, fx.Float32)
+                    frag.store(fx.Vector.from_elements([values[half * 4 + e] for e in range_constexpr(4)]))
+                    dst = fx.make_view(fx.get_iter(ws) + offset + half * 4, vec4_layout)
+                    fx.copy(ws_atom, frag, dst)
+
+            def load_partial(ai, part, half):
+                offset = part * tile_elems + (ai * threads + tid) * acc_elems + half * 4
+                frag = fx.make_rmem_tensor(vec4_layout, fx.Float32)
+                src = fx.make_view(fx.get_iter(ws) + offset, vec4_layout)
+                fx.copy(ws_atom, src, frag)
+                return frag
+
+            for ai in range_constexpr(m_steps * n_steps):
+                store_partial(ai)
+            # All device-scope stores complete before signaling the cluster.
+            # Every reducing load is issued only after the cluster wait.
+            rocdl.s_wait_storecnt(0)
+            cluster_barrier()
+            if k_rank == 0:
+                for ai in range_constexpr(m_steps * n_steps):
+                    frags = [
+                        load_partial(ai, part, half)
+                        for half in range_constexpr(acc_elems // 4)
+                        for part in range_constexpr(split_k)
+                    ]
+                    values = []
+                    for half in range_constexpr(acc_elems // 4):
+                        total = frags[half * split_k].load()
+                        for part in range_constexpr(1, split_k):
+                            total = total + frags[half * split_k + part].load()
+                        for e in range_constexpr(4):
+                            values.append(total[e])
+                    accumulators[ai].store(fx.Vector.from_elements(values))
+                finish_tile()
 
     @flyc.jit
     def launch(
@@ -983,21 +923,15 @@ def build_gemm_gfx1250(
             kernel(
                 a, b, out, bias, workspace, scale_a, scale_b, m, n, k,
                 a_leading_stride, b_leading_stride, c_leading_stride,
-            ).launch(
-                grid=(mn_tiles, 1, 1),
-                block=(threads, 1, 1),
-                stream=stream,
-            )
+            ).launch(grid=(mn_tiles, 1, 1), block=(threads, 1, 1), stream=stream)
         else:
             kernel(
                 a, b, out, bias, workspace, scale_a, scale_b, m, n, k,
                 a_leading_stride, b_leading_stride, c_leading_stride,
                 value_attrs={"rocdl.cluster_dims": f"1,{split_k},1"},
             ).launch(
-                grid=(mn_tiles, split_k, 1),
-                block=(threads, 1, 1),
-                stream=stream,
-                cluster=(1, split_k, 1),
+                grid=(mn_tiles, split_k, 1), block=(threads, 1, 1),
+                stream=stream, cluster=(1, split_k, 1),
             )
 
     kernel._func.__name__ = make_gemm_a16w16_gfx1250_kernel_name(
@@ -1016,7 +950,6 @@ def build_gemm_gfx1250(
         mma_k,
         split_k,
         interleave,
-        split_k_atomic,
     )
     if interleave:
         launch.compile_hints["llvm_options"] = {
@@ -1048,7 +981,6 @@ def gemm_a16w16_gfx1250(
     stream: Optional[torch.cuda.Stream] = None,
     layout: str = "nt",
     interleave: bool = False,
-    split_k_atomic: bool = False,
 ) -> torch.Tensor:
     """C = A[M,K] @ B[K,N]; FP16/BF16 output, optional bias.
 
@@ -1058,16 +990,15 @@ def gemm_a16w16_gfx1250(
     padded rows are allowed. C is always row-major. M and N may end on a
     partial tile; K must contain at least ``stages - 1`` complete tiles.
     No split-K tail: K must be divisible by split_k * block_k. split_k is the
-    cluster size along the K split and must be in 1..9.
+    partition count along K and must be in 1..9.
     ``interleave=True`` uses four quadrant tiles per wave and opposite serpentine
     orders on even/odd waves. It requires NT B and sufficiently large even wave
     tiles; the default schedule and split-K reduction semantics are unchanged.
 
-    ``split_k_atomic=True`` opts into workspace-free cluster reduction using
-    packed BF16 atomic adds. It requires split_k > 1, even N and an even output
-    leading stride. Each atomic update rounds to BF16 and rank arrival order
-    is unspecified, so results may differ between runs and from the default
-    FP32 sum of rounded partials. Bias is added once after the completed sum.
+    Split-K uses FP32 partial workspace and one cluster barrier.
+    Rank0 sums the partials in fixed split order and applies scale/bias once.
+    There are no completion counters or floating-point atomic updates.
+    Per-call workspace is allocated on the launch stream, including capture.
     """
     if a.ndim != 2 or b.ndim != 2 or a.shape[1] != b.shape[0]:
         raise ValueError("expected A[M,K] and B[K,N]")
@@ -1083,7 +1014,7 @@ def gemm_a16w16_gfx1250(
     n = b.shape[1]
     validate_gemm_gfx1250_config(
         m, n, k, block_m, block_n, block_k, stages, m_waves, n_waves, group_m,
-        dtype_id, mma_m, mma_n, mma_k, layout == "nt", split_k, interleave, split_k_atomic,
+        dtype_id, mma_m, mma_n, mma_k, layout == "nt", split_k, interleave,
     )
     a_leading_stride = _leading_stride(a, 1, 0, k, f"A does not satisfy the {layout.upper()} layout")
     if layout == "nt":
@@ -1095,8 +1026,6 @@ def gemm_a16w16_gfx1250(
     if out.shape != (m, n) or out.dtype != a.dtype or out.device != a.device:
         raise ValueError("out must be [M,N] with the input dtype and device")
     c_leading_stride = _leading_stride(out, 1, 0, n, "out must be row-major [M,N]")
-    if split_k_atomic and c_leading_stride % 2:
-        raise ValueError("split_k_atomic requires an even output leading stride")
     if bias is not None and (
         bias.shape != (n,)
         or bias.dtype != a.dtype
@@ -1122,27 +1051,28 @@ def gemm_a16w16_gfx1250(
             raise ValueError("stream must belong to the input device")
         dtype = fx.Float16 if dtype_id == GEMM_DTYPE_FP16 else fx.BFloat16
         mn_tiles = ((m + block_m - 1) // block_m) * ((n + block_n - 1) // block_n)
-        # Partials use the input/output dtype: BF16 GEMM has a 2-byte BF16
-        # workspace. Only the post-barrier register sum is FP32.
-        workspace = (
-            out
-            if split_k == 1 or split_k_atomic
-            else torch.empty(
-                (mn_tiles * split_k * block_m * block_n,),
-                device=a.device,
-                dtype=a.dtype,
+        with torch.cuda.stream(stream):
+            workspace = (
+                None if split_k == 1 else torch.empty(
+                    mn_tiles * split_k * block_m * block_n,
+                    device=a.device, dtype=torch.float32,
+                )
             )
-        )
         pointers = [
             flyc.from_c_void_p(dtype, t.data_ptr())
-            for t in (a, b, out, a if bias is None else bias, workspace)
+            for t in (a, b, out, a if bias is None else bias)
         ]
+        pointers.extend((
+            flyc.from_c_void_p(fx.Float32, (a if workspace is None else workspace).data_ptr()),
+        ))
         # FP16/BF16 leaves the scale pointers unused. The FP8 PTPC entry
         # passes real per-token and per-channel scales.
         pointers.extend((
             flyc.from_c_void_p(fx.Float32, a.data_ptr()),
             flyc.from_c_void_p(fx.Float32, a.data_ptr()),
         ))
+        if workspace is not None:
+            workspace.record_stream(stream)
         has_bias = bias is not None
         b_k_contiguous = layout == "nt"
         param = GemmA16W16Gfx1250Param(
@@ -1161,7 +1091,6 @@ def gemm_a16w16_gfx1250(
             mma_k=mma_k,
             split_k=split_k,
             interleave=interleave,
-            split_k_atomic=split_k_atomic,
         )
         launch = build_gemm_gfx1250(
             dtype_id,
@@ -1179,7 +1108,6 @@ def gemm_a16w16_gfx1250(
             mma_k,
             split_k,
             interleave,
-            split_k_atomic,
         )
         dispatch_args = (
             *pointers,
@@ -1228,7 +1156,7 @@ def gemm_fp8_ptpc_gfx1250(
 
     A and B are FP8 E4M3. The WMMA loop accumulates the unscaled product in
     fp32. scale_a and scale_b are FP32 and are multiplied once in the
-    epilogue, after a cluster split-K sum. Optional bias is BF16 and is added
+    epilogue, after the FP32 split-K sum. Optional bias is BF16 and is added
     after that result is rounded. ``interleave=True`` uses the same optional
     NT quadrant schedule as the BF16/FP16 entrypoint; scaling is unchanged.
     """
@@ -1286,24 +1214,24 @@ def gemm_fp8_ptpc_gfx1250(
         if stream.device != a.device:
             raise ValueError("stream must belong to the input device")
         mn_tiles = ((m + block_m - 1) // block_m) * ((n + block_n - 1) // block_n)
-        workspace = (
-            out
-            if split_k == 1
-            else torch.empty(
-                (mn_tiles * split_k * block_m * block_n,),
-                device=a.device,
-                dtype=torch.bfloat16,
+        with torch.cuda.stream(stream):
+            workspace = (
+                None if split_k == 1 else torch.empty(
+                    mn_tiles * split_k * block_m * block_n,
+                    device=a.device, dtype=torch.float32,
+                )
             )
-        )
         pointers = [
             flyc.from_c_void_p(fx.Float8E4M3FN, a.data_ptr()),
             flyc.from_c_void_p(fx.Float8E4M3FN, b.data_ptr()),
             flyc.from_c_void_p(fx.BFloat16, out.data_ptr()),
             flyc.from_c_void_p(fx.BFloat16, (out if bias is None else bias).data_ptr()),
-            flyc.from_c_void_p(fx.BFloat16, workspace.data_ptr()),
+            flyc.from_c_void_p(fx.Float32, (a if workspace is None else workspace).data_ptr()),
             flyc.from_c_void_p(fx.Float32, scale_a.data_ptr()),
             flyc.from_c_void_p(fx.Float32, scale_b.data_ptr()),
         ]
+        if workspace is not None:
+            workspace.record_stream(stream)
         has_bias = bias is not None
         b_k_contiguous = layout == "nt"
         param = GemmA16W16Gfx1250Param(
@@ -1322,7 +1250,6 @@ def gemm_fp8_ptpc_gfx1250(
             mma_k=mma_k,
             split_k=split_k,
             interleave=interleave,
-            split_k_atomic=False,
         )
         launch = build_gemm_gfx1250(
             GEMM_DTYPE_FP8_PTPC,
