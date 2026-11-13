@@ -346,7 +346,7 @@ def gemm_gfx1250_get_configs(args):
         )
     selections = {
         "block_m": [16, 32, 48, 64, 80, 96, 128, 256],
-        "block_n": [16, 32, 64, 80, 96, 128, 256],
+        "block_n": [16, 32, 64, 80, 96, 128, 160, 256],
         "block_k": [64, 128, 256, 512],
         "stages": [i for i in range(2, 10)],
         "split_k": split_k_candidates,
@@ -432,7 +432,7 @@ def gemm_a16w16_get_configs(args):
         )
     selections = {
         "block_m": [16, 32, 48, 64, 80, 96, 128, 256],
-        "block_n": [16, 32, 64, 80, 96, 128, 256],
+        "block_n": [16, 32, 64, 80, 96, 128, 160, 256],
         "block_k": [64, 128, 256],
         "stages": [i for i in range(2, 10)],
         "split_k": split_k_candidates,
