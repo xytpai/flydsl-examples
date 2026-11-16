@@ -1,7 +1,7 @@
 # FlyDSL GEMM Examples
 
 Unofficial, hardware-oriented GEMM implementations built with
-[FlyDSL](https://github.com/ROCm/FlyDSL) for AMD gfx950 GPUs.
+[FlyDSL](https://github.com/ROCm/FlyDSL) for AMD gfx950 and gfx1250 GPUs.
 
 This repository demonstrates how to write high-performance GPU kernels from
 scratch in Python while keeping tiling, data movement, LDS usage, scheduling,
@@ -30,6 +30,44 @@ to CUDA/CuTeDSL, but targets AMD GPUs through FlyDSL.
 
 HTI currently requires `stages=2`, `m_waves=2`, and `k_waves=1`.
 Inputs and dimensions must satisfy the kernel's vector-alignment constraints.
+
+### gfx1250: TDM GEMM
+
+`kernels/gemm_a16w16_tdm_gfx1250.py` implements multi-stage TDM loads and
+wave32 WMMA, based on
+[PeakGemm's TDM kernel](https://github.com/xytpai/PeakGemm/blob/3d2a481/include/peak_gemm/kernel/hgemm_tdm_gfx1250.hpp).
+
+- FP16/BF16 inputs, FP32 accumulation and input-dtype output.
+- `NN` and `NT` layouts, M/N boundary tiles, and aligned padded strides and
+  storage offsets. A/C are row-major; B follows the selected layout.
+- Optional contiguous `[N]` bias, added after rounding the product to the
+  output dtype.
+- Configurable tiles, stages, wave counts, block ordering and optional NT
+  interleaved scheduling.
+- Cluster split-K via `split_k=1..9`. Each CTA writes FP32 partials;
+  after one cluster barrier, rank0 sums them in fixed split order and
+  applies scale/bias once. No completion counter or floating-point atomic
+  accumulation is used.
+- A separate `gemm_fp8_ptpc_gfx1250` entry point accepts FP8 E4M3 inputs,
+  FP32 row/column scales, and optional BF16 bias; output is BF16.
+- Optional output buffer and stream; graph capture/replay after warmup.
+
+Pointers and leading strides must be 16-byte aligned, and output must not
+overlap inputs. K must be divisible by `split_k * block_k`, with at least
+`stages - 1` K tiles per split. Tiles must satisfy WMMA divisibility and
+fit the 320 KiB LDS budget; the entry points validate these constraints.
+
+```python
+import torch
+from kernels.gemm_a16w16_tdm_gfx1250 import gemm_a16w16_gfx1250
+
+a = torch.randn((8192, 8192), device="cuda", dtype=torch.bfloat16)
+b = torch.randn((8192, 8192), device="cuda", dtype=torch.bfloat16).t()
+c = gemm_a16w16_gfx1250(a, b, layout="nt")
+```
+
+Direct calls use explicit/default configuration parameters. Use
+[policy tuning](#policy-tuning) to search FP16/BF16 configurations for a shape.
 
 ## Layout Convention
 
@@ -75,13 +113,16 @@ c = gemm_a16w16(
 ## Requirements
 
 - Linux with ROCm
-- AMD gfx950-class GPU
+- AMD gfx950 GPU for the original GEMM, or gfx1250 for the TDM example
 - ROCm-enabled PyTorch
 - FlyDSL built from source
 
 ## Install FlyDSL from Source
 
-The following revision is the version used by this repository:
+The revision below is for the original gfx950 example. The gfx1250 path
+requires a FlyDSL build with gfx1250 WMMA, TDM
+(`rocdl.cdna5.make_tiled_tdm_atom`), and cluster support; this older revision
+has not been validated for that path.
 
 ```bash
 pip uninstall -y flydsl
@@ -97,16 +138,23 @@ pip install -e .
 
 ## Tests
 
-Run the GEMM correctness suite:
+Run the suite for your GPU architecture:
 
 ```bash
-pytest -sv test_gemm_a16w16_gfx950.py
+pytest -sv test_gemm_a16w16_gfx950.py       # gfx950
+pytest -sv test_gemm_a16w16_tdm_gfx1250.py   # gfx1250
 ```
 
 Run a focused layout test:
 
 ```bash
 pytest -sv test_gemm_a16w16_gfx950.py -k "main_loop and nt"
+```
+
+Run the gfx1250 benchmark cases through pytest:
+
+```bash
+pytest -sv test_gemm_a16w16_tdm_gfx1250.py -k benchmark_smoke
 ```
 
 After changing FlyDSL compiler or kernel sources, clear the JIT cache when
@@ -118,7 +166,7 @@ rm -rf ~/.flydsl/cache
 
 ## Policy Tuning
 
-Tune one shape:
+Tune one shape (`gemm_tune.py` selects the kernel for the detected GPU):
 
 ```bash
 python gemm_tune.py \
@@ -153,9 +201,19 @@ python gemm_tune.py \
   --out temp/gemm_a16w16_tuned
 ```
 
-The tuner validates each policy, compiles policies in parallel, benchmarks
-successful candidates, and writes the selected configurations to JSONL.
-Use `--compile-workers` to control policy compilation concurrency.
+The tuner validates policies, compiles them in parallel, and benchmarks
+successful candidates. `--single` prints the selected configuration;
+`--tune_all` writes configurations to `<out>.jsonl`. Use `--compile-workers`
+to control policy compilation concurrency. On gfx1250, tuning supports
+FP16/BF16 with `NN` or `NT` layouts; `--enable-split-k` includes cluster
+sizes 2 through 9 subject to configuration validity.
+
+gfx1250 split-K uses only this FP32-workspace cluster reduction. The old
+`split_k_atomic` option is removed. Partial sums no longer round to BF16/FP16
+before reduction; final output rounding and bias ordering are unchanged.
+Workspace is private to each invocation and allocated on the launch stream,
+including Graph capture. Split1 does not allocate workspace. Re-tune old
+gfx1250 split-K entries: their measured timings used the previous reduction.
 
 ## PyTorch Backend Comparison
 
@@ -174,11 +232,13 @@ Use `--shape-index` to run a single built-in shape.
 
 ```text
 kernels/
-  gemm_a16w16_gfx950.py        # A16W16 GEMM
-  gemm_a16w16_gfx950_utils.py  # Layout, LDS, split-K, and store helpers
-test_gemm_a16w16_gfx950.py     # GEMM correctness and benchmarks
-gemm_tune.py                    # Policy search and tuning
-torch_benchmark.py              # torch.compile backend comparison
+  gemm_a16w16_gfx950.py         # gfx950 A16W16 GEMM
+  gemm_a16w16_gfx950_utils.py   # Layout, LDS, split-K, and store helpers
+  gemm_a16w16_tdm_gfx1250.py    # gfx1250 TDM/WMMA GEMM
+test_gemm_a16w16_gfx950.py      # gfx950 correctness and benchmarks
+test_gemm_a16w16_tdm_gfx1250.py # gfx1250 correctness and benchmarks
+gemm_tune.py                   # Policy search and tuning
+torch_benchmark.py             # torch.compile backend comparison
 ```
 
 ## References
